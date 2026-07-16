@@ -10,10 +10,14 @@
 #include <ctype.h>
 #include <SDL.h>
 #include "system4.h"
+#include "system4/ain.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 #include "android_bridge.h"
 #include "mixer.h"
+#include "vm.h"
+#include "vm/heap.h"
+#include "vm/page.h"
 
 static bool tts_enabled = false;
 static bool line_has_voice = false;
@@ -79,6 +83,151 @@ void bridge_set_voice_muted(bool on)
 		if (is_voice_mixer(name))
 			mixer_set_mute(i, on ? 1 : 0);
 	}
+}
+
+// --- Читы: доступ к переменным VM ---
+
+static bool cheat_page_valid(int slot)
+{
+	return page_index_valid(slot) && heap_get_page(slot) != NULL;
+}
+
+static bool is_intlike(enum ain_data_type t)
+{
+	return t == AIN_INT || t == AIN_BOOL || t == AIN_LONG_INT;
+}
+
+int bridge_cheat_read(int page_slot, int varno, int *ok)
+{
+	*ok = 0;
+	if (!cheat_page_valid(page_slot))
+		return 0;
+	struct page *p = heap_get_page(page_slot);
+	if (varno < 0 || varno >= p->nr_vars)
+		return 0;
+	if (!is_intlike(variable_type(p, varno, NULL, NULL)))
+		return 0;
+	*ok = 1;
+	return p->values[varno].i;
+}
+
+bool bridge_cheat_write(int page_slot, int varno, int value)
+{
+	int ok;
+	bridge_cheat_read(page_slot, varno, &ok);
+	if (!ok)
+		return false;
+	heap_get_page(page_slot)->values[varno].i = value;
+	return true;
+}
+
+int bridge_cheat_list(const char *filter_utf8, struct bridge_var **out, int max)
+{
+	*out = NULL;
+	if (!ain || !cheat_page_valid(0))
+		return 0;
+	struct page *g = heap_get_page(0);
+	struct bridge_var *arr = xcalloc(max, sizeof(struct bridge_var));
+	int n = 0;
+	for (int i = 0; i < g->nr_vars && i < ain->nr_globals && n < max; i++) {
+		if (!is_intlike(variable_type(g, i, NULL, NULL)))
+			continue;
+		char *name = sjis2utf(ain->globals[i].name, 0);
+		if (filter_utf8 && *filter_utf8 && !strstr(name, filter_utf8)) {
+			free(name);
+			continue;
+		}
+		arr[n].page_slot = 0;
+		arr[n].varno = i;
+		arr[n].name_utf8 = name;
+		arr[n].value = g->values[i].i;
+		n++;
+	}
+	*out = arr;
+	return n;
+}
+
+// Кандидаты скана (живут между вызовами new/narrow)
+#define SCAN_MAX 100000
+static struct { int page_slot; int varno; } *scan_cands = NULL;
+static int scan_n = 0;
+
+static void scan_page(int page_slot, int value, int depth)
+{
+	if (scan_n >= SCAN_MAX || depth > 8 || !cheat_page_valid(page_slot))
+		return;
+	struct page *p = heap_get_page(page_slot);
+	for (int i = 0; i < p->nr_vars && scan_n < SCAN_MAX; i++) {
+		enum ain_data_type t = variable_type(p, i, NULL, NULL);
+		if (is_intlike(t)) {
+			if (p->values[i].i == value) {
+				scan_cands[scan_n].page_slot = page_slot;
+				scan_cands[scan_n].varno = i;
+				scan_n++;
+			}
+		} else {
+			switch (t) {
+			case AIN_STRUCT:
+			case AIN_ARRAY_TYPE:
+				if (p->values[i].i > 0)
+					scan_page(p->values[i].i, value, depth + 1);
+				break;
+			default:
+				break;
+			}
+		}
+	}
+}
+
+static char *cheat_var_name(int page_slot, int varno)
+{
+	if (page_slot == 0 && ain && varno < ain->nr_globals)
+		return sjis2utf(ain->globals[varno].name, 0);
+	char buf[48];
+	snprintf(buf, sizeof(buf), "[слот %d] #%d", page_slot, varno);
+	return xstrdup(buf);
+}
+
+int bridge_cheat_scan(int value, bool narrow, struct bridge_var **out, int max)
+{
+	*out = NULL;
+	if (!scan_cands)
+		scan_cands = xcalloc(SCAN_MAX, sizeof(*scan_cands));
+	if (!narrow) {
+		scan_n = 0;
+		scan_page(0, value, 0);
+	} else {
+		int kept = 0;
+		for (int i = 0; i < scan_n; i++) {
+			int ok;
+			int v = bridge_cheat_read(scan_cands[i].page_slot,
+			                          scan_cands[i].varno, &ok);
+			if (ok && v == value)
+				scan_cands[kept++] = scan_cands[i];
+		}
+		scan_n = kept;
+	}
+
+	int n = scan_n < max ? scan_n : max;
+	struct bridge_var *arr = xcalloc(n > 0 ? n : 1, sizeof(struct bridge_var));
+	for (int i = 0; i < n; i++) {
+		int ok;
+		arr[i].page_slot = scan_cands[i].page_slot;
+		arr[i].varno = scan_cands[i].varno;
+		arr[i].value = bridge_cheat_read(arr[i].page_slot, arr[i].varno, &ok);
+		arr[i].name_utf8 = cheat_var_name(arr[i].page_slot, arr[i].varno);
+	}
+	*out = arr;
+	return scan_n;   // полное число кандидатов (в *out — первые max)
+}
+
+void bridge_cheat_free(struct bridge_var *arr, int n)
+{
+	if (!arr)
+		return;
+	for (int i = 0; i < n; i++)
+		free(arr[i].name_utf8);
+	free(arr);
 }
 
 // Приглушение музыки на время фразы TTS. percent — целевой уровень (0..100)
@@ -154,6 +303,28 @@ void bridge_adv_line_break(void)
 		mute_tested = true;
 		bridge_set_voice_muted(true);
 		bridge_duck_music(true, 15);
+	}
+	// XS4_CHEAT_TEST=<число>: разово просканировать глобалы по значению
+	static bool cheat_tested = false;
+	if (!cheat_tested && getenv("XS4_CHEAT_TEST")) {
+		cheat_tested = true;
+		struct bridge_var *vars;
+		int total = bridge_cheat_scan(atoi(getenv("XS4_CHEAT_TEST")), false, &vars, 10);
+		printf("[CHEAT] кандидатов со значением %s: %d\n",
+		       getenv("XS4_CHEAT_TEST"), total);
+		for (int i = 0; i < (total < 10 ? total : 10); i++)
+			printf("[CHEAT]   slot=%d varno=%d %s = %d\n",
+			       vars[i].page_slot, vars[i].varno,
+			       vars[i].name_utf8, vars[i].value);
+		bridge_cheat_free(vars, total < 10 ? total : 10);
+		struct bridge_var *lst;
+		int ln = bridge_cheat_list(NULL, &lst, 5);
+		printf("[CHEAT] первые %d глобалов:\n", ln);
+		for (int i = 0; i < ln; i++)
+			printf("[CHEAT]   varno=%d %s = %d\n", lst[i].varno,
+			       lst[i].name_utf8, lst[i].value);
+		bridge_cheat_free(lst, ln);
+		fflush(stdout);
 	}
 #endif
 	bridge_trace("line_break");
@@ -250,6 +421,80 @@ Java_io_github_kichikuou_xsystem4_NativeBridge_nativeAdvance(
 {
 	(void)env; (void)self;
 	bridge_advance_message();
+}
+
+// Массив строк "pageSlot\tvarno\tname\tvalue" из bridge_var[]
+static jobjectArray vars_to_jarray(JNIEnv *env, struct bridge_var *vars, int n)
+{
+	jclass str_cls = (*env)->FindClass(env, "java/lang/String");
+	jobjectArray arr = (*env)->NewObjectArray(env, n, str_cls, NULL);
+	for (int i = 0; i < n; i++) {
+		char buf[512];
+		snprintf(buf, sizeof(buf), "%d\t%d\t%s\t%d",
+		         vars[i].page_slot, vars[i].varno,
+		         vars[i].name_utf8 ? vars[i].name_utf8 : "?", vars[i].value);
+		jstring s = (*env)->NewStringUTF(env, buf);
+		if (!s) { (*env)->ExceptionClear(env); continue; }
+		(*env)->SetObjectArrayElement(env, arr, i, s);
+		(*env)->DeleteLocalRef(env, s);
+	}
+	return arr;
+}
+
+#define CHEAT_UI_MAX 500
+
+JNIEXPORT jobjectArray JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatList(
+		JNIEnv *env, jobject self, jstring jfilter)
+{
+	(void)self;
+	const char *filter = jfilter ? (*env)->GetStringUTFChars(env, jfilter, NULL) : NULL;
+	struct bridge_var *vars;
+	int n = bridge_cheat_list(filter, &vars, CHEAT_UI_MAX);
+	if (filter)
+		(*env)->ReleaseStringUTFChars(env, jfilter, filter);
+	jobjectArray arr = vars_to_jarray(env, vars, n);
+	bridge_cheat_free(vars, n);
+	return arr;
+}
+
+// Элемент [0] результата — "TOTAL:<полное число кандидатов>", далее строки переменных.
+JNIEXPORT jobjectArray JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatScan(
+		JNIEnv *env, jobject self, jint value, jboolean narrow)
+{
+	(void)self;
+	struct bridge_var *vars;
+	int total = bridge_cheat_scan(value, narrow, &vars, CHEAT_UI_MAX);
+	int shown = total < CHEAT_UI_MAX ? total : CHEAT_UI_MAX;
+
+	jclass str_cls = (*env)->FindClass(env, "java/lang/String");
+	jobjectArray arr = (*env)->NewObjectArray(env, shown + 1, str_cls, NULL);
+	char hdr[32];
+	snprintf(hdr, sizeof(hdr), "TOTAL:%d", total);
+	jstring h = (*env)->NewStringUTF(env, hdr);
+	(*env)->SetObjectArrayElement(env, arr, 0, h);
+	(*env)->DeleteLocalRef(env, h);
+	for (int i = 0; i < shown; i++) {
+		char buf[512];
+		snprintf(buf, sizeof(buf), "%d\t%d\t%s\t%d",
+		         vars[i].page_slot, vars[i].varno,
+		         vars[i].name_utf8 ? vars[i].name_utf8 : "?", vars[i].value);
+		jstring s = (*env)->NewStringUTF(env, buf);
+		if (!s) { (*env)->ExceptionClear(env); continue; }
+		(*env)->SetObjectArrayElement(env, arr, i + 1, s);
+		(*env)->DeleteLocalRef(env, s);
+	}
+	bridge_cheat_free(vars, shown);
+	return arr;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatWrite(
+		JNIEnv *env, jobject self, jint pageSlot, jint varno, jint value)
+{
+	(void)env; (void)self;
+	return bridge_cheat_write(pageSlot, varno, value);
 }
 
 static JNIEnv *bridge_env(void)
