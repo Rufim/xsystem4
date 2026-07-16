@@ -144,4 +144,69 @@ static void bridge_emit(const char *utf8_text, bool has_voice)
 	printf("[ADV] voice=%d |%s|\n", has_voice, utf8_text);
 	fflush(stdout);
 }
-#endif
+#else /* __ANDROID__ */
+
+#include <jni.h>
+
+static JavaVM *jvm = NULL;
+static jclass bridge_class = NULL;      // GlobalRef на NativeBridge
+static jmethodID mid_on_adv_text = NULL;
+
+JNIEXPORT void JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeInit(JNIEnv *env, jclass cls)
+{
+	(*env)->GetJavaVM(env, &jvm);
+	bridge_class = (*env)->NewGlobalRef(env, cls);
+	mid_on_adv_text = (*env)->GetStaticMethodID(env, cls, "onAdvText",
+	                                            "(Ljava/lang/String;Z)V");
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeSetTts(
+		JNIEnv *env, jclass cls, jboolean on)
+{
+	(void)env; (void)cls;
+	bridge_set_tts_enabled(on);
+	bridge_set_voice_muted(on);
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeDuckMusic(
+		JNIEnv *env, jclass cls, jboolean on, jint percent)
+{
+	(void)env; (void)cls;
+	bridge_duck_music(on, percent);
+}
+
+static JNIEnv *bridge_env(void)
+{
+	if (!jvm)
+		return NULL;
+	JNIEnv *env;
+	if ((*jvm)->GetEnv(jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+		// поток VM живёт до конца процесса — Detach не требуется
+		if ((*jvm)->AttachCurrentThread(jvm, &env, NULL) != JNI_OK)
+			return NULL;
+	}
+	return env;
+}
+
+static void bridge_emit(const char *utf8_text, bool has_voice)
+{
+	if (!tts_enabled || !mid_on_adv_text)
+		return;
+	JNIEnv *env = bridge_env();
+	if (!env)
+		return;
+	jstring jtext = (*env)->NewStringUTF(env, utf8_text);
+	if (!jtext) {
+		(*env)->ExceptionClear(env);
+		return;
+	}
+	(*env)->CallStaticVoidMethod(env, bridge_class, mid_on_adv_text,
+	                             jtext, (jboolean)has_voice);
+	if ((*env)->ExceptionCheck(env))
+		(*env)->ExceptionClear(env);
+	(*env)->DeleteLocalRef(env, jtext);
+}
+#endif /* __ANDROID__ */
