@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <SDL.h>
 #include "system4.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
@@ -16,13 +17,29 @@
 
 static bool tts_enabled = false;
 static bool line_has_voice = false;
-static struct string *line_buf = NULL;
 
+static void bridge_trace(const char *fmt, ...);
 static void bridge_emit(const char *utf8_text, bool has_voice);
 
 void bridge_set_tts_enabled(bool on)
 {
 	tts_enabled = on;
+}
+
+// Синтетическое нажатие Enter — тем же путём, что и реальный ввод (очередь SDL,
+// thread-safe), игра воспринимает его как клик «дальше» в диалоге.
+void bridge_advance_message(void)
+{
+	SDL_Event ev;
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_KEYDOWN;
+	ev.key.state = SDL_PRESSED;
+	ev.key.keysym.sym = SDLK_RETURN;
+	ev.key.keysym.scancode = SDL_SCANCODE_RETURN;
+	SDL_PushEvent(&ev);
+	ev.type = SDL_KEYUP;
+	ev.key.state = SDL_RELEASED;
+	SDL_PushEvent(&ev);
 }
 
 static bool contains_nocase(const char *haystack, const char *needle)
@@ -96,22 +113,37 @@ void bridge_duck_music(bool on, int percent)
 	}
 }
 
+// Строка отображается на экране ровно в момент add_text, поэтому озвучиваем
+// сразу здесь (не откладывая до line_break — иначе TTS отстаёт на строку).
 void bridge_adv_add_text(struct string *sjis_text)
 {
 	if (!sjis_text || !sjis_text->size)
 		return;
-	if (!line_buf)
-		line_buf = string_dup(sjis_text);
-	else
-		string_append(&line_buf, sjis_text);
+	char *utf8 = sjis2utf(sjis_text->text, sjis_text->size);
+	bridge_trace("add_text |%s|", utf8);
+	bridge_emit(utf8, line_has_voice);
+	free(utf8);
+	line_has_voice = false;
 }
 
 void bridge_adv_add_voice(int voice_no)
 {
-	(void)voice_no;
+	bridge_trace("add_voice %d", voice_no);
 	line_has_voice = true;
 }
 
+static void bridge_emit_page_break(void);
+
+// Новая страница диалога: сбросить очередь TTS (не дочитывать прошлое).
+void bridge_adv_page_break(void)
+{
+	bridge_trace("PAGE_break");
+	line_has_voice = false;
+	bridge_emit_page_break();
+}
+
+// Перевод строки внутри страницы — текст уже озвучен в add_text, здесь только
+// отладочная отметка и (на Linux) разовый тест заглушения.
 void bridge_adv_line_break(void)
 {
 #ifndef __ANDROID__
@@ -124,19 +156,24 @@ void bridge_adv_line_break(void)
 		bridge_duck_music(true, 15);
 	}
 #endif
-	if (line_buf && line_buf->size) {
-		char *utf8 = sjis2utf(line_buf->text, line_buf->size);
-		bridge_emit(utf8, line_has_voice);
-		free(utf8);
-	}
-	if (line_buf) {
-		free_string(line_buf);
-		line_buf = NULL;
-	}
-	line_has_voice = false;
+	bridge_trace("line_break");
 }
 
 #ifndef __ANDROID__
+#include <stdarg.h>
+static void bridge_trace(const char *fmt, ...)
+{
+	if (!getenv("XS4_BRIDGE_DEBUG"))
+		return;
+	va_list ap;
+	va_start(ap, fmt);
+	fputs("[TRACE] ", stdout);
+	vprintf(fmt, ap);
+	putchar('\n');
+	va_end(ap);
+	fflush(stdout);
+}
+
 static void bridge_emit(const char *utf8_text, bool has_voice)
 {
 	if (!getenv("XS4_BRIDGE_DEBUG"))
@@ -144,38 +181,75 @@ static void bridge_emit(const char *utf8_text, bool has_voice)
 	printf("[ADV] voice=%d |%s|\n", has_voice, utf8_text);
 	fflush(stdout);
 }
+
+static void bridge_emit_page_break(void)
+{
+	if (!getenv("XS4_BRIDGE_DEBUG"))
+		return;
+	printf("[ADV] --- page ---\n");
+	fflush(stdout);
+}
 #else /* __ANDROID__ */
 
 #include <jni.h>
+#include <stdarg.h>
+#include <android/log.h>
+#define BLOG(...) __android_log_print(ANDROID_LOG_INFO, "xs4bridge", __VA_ARGS__)
+
+static void bridge_trace(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	__android_log_vprint(ANDROID_LOG_INFO, "xs4bridge", fmt, ap);
+	va_end(ap);
+}
 
 static JavaVM *jvm = NULL;
 static jclass bridge_class = NULL;      // GlobalRef на NativeBridge
 static jmethodID mid_on_adv_text = NULL;
+static jmethodID mid_on_adv_page = NULL;
 
+/* NativeBridge — Kotlin object: external fun-методы НЕ статические,
+ * вторым JNI-аргументом приходит экземпляр синглтона (jobject). */
 JNIEXPORT void JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeInit(JNIEnv *env, jclass cls)
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeInit(JNIEnv *env, jobject self)
 {
 	(*env)->GetJavaVM(env, &jvm);
+	jclass cls = (*env)->GetObjectClass(env, self);
 	bridge_class = (*env)->NewGlobalRef(env, cls);
-	mid_on_adv_text = (*env)->GetStaticMethodID(env, cls, "onAdvText",
+	mid_on_adv_text = (*env)->GetStaticMethodID(env, bridge_class, "onAdvText",
 	                                            "(Ljava/lang/String;Z)V");
+	if (!mid_on_adv_text)
+		(*env)->ExceptionClear(env);
+	mid_on_adv_page = (*env)->GetStaticMethodID(env, bridge_class, "onAdvPage", "()V");
+	if (!mid_on_adv_page)
+		(*env)->ExceptionClear(env);
+	BLOG("nativeInit: text=%p page=%p", (void*)mid_on_adv_text, (void*)mid_on_adv_page);
 }
 
 JNIEXPORT void JNICALL
 Java_io_github_kichikuou_xsystem4_NativeBridge_nativeSetTts(
-		JNIEnv *env, jclass cls, jboolean on)
+		JNIEnv *env, jobject self, jboolean on)
 {
-	(void)env; (void)cls;
+	(void)env; (void)self;
 	bridge_set_tts_enabled(on);
 	bridge_set_voice_muted(on);
 }
 
 JNIEXPORT void JNICALL
 Java_io_github_kichikuou_xsystem4_NativeBridge_nativeDuckMusic(
-		JNIEnv *env, jclass cls, jboolean on, jint percent)
+		JNIEnv *env, jobject self, jboolean on, jint percent)
 {
-	(void)env; (void)cls;
+	(void)env; (void)self;
 	bridge_duck_music(on, percent);
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_kichikuou_xsystem4_NativeBridge_nativeAdvance(
+		JNIEnv *env, jobject self)
+{
+	(void)env; (void)self;
+	bridge_advance_message();
 }
 
 static JNIEnv *bridge_env(void)
@@ -193,6 +267,7 @@ static JNIEnv *bridge_env(void)
 
 static void bridge_emit(const char *utf8_text, bool has_voice)
 {
+	BLOG("emit: tts=%d method=%p |%s|", tts_enabled, (void*)mid_on_adv_text, utf8_text);
 	if (!tts_enabled || !mid_on_adv_text)
 		return;
 	JNIEnv *env = bridge_env();
@@ -208,5 +283,17 @@ static void bridge_emit(const char *utf8_text, bool has_voice)
 	if ((*env)->ExceptionCheck(env))
 		(*env)->ExceptionClear(env);
 	(*env)->DeleteLocalRef(env, jtext);
+}
+
+static void bridge_emit_page_break(void)
+{
+	if (!tts_enabled || !mid_on_adv_page)
+		return;
+	JNIEnv *env = bridge_env();
+	if (!env)
+		return;
+	(*env)->CallStaticVoidMethod(env, bridge_class, mid_on_adv_page);
+	if ((*env)->ExceptionCheck(env))
+		(*env)->ExceptionClear(env);
 }
 #endif /* __ANDROID__ */

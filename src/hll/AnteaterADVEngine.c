@@ -124,7 +124,7 @@ void ADVLogList_AddNewLine(void)
 
 void ADVLogList_AddNewPage(void)
 {
-	bridge_adv_line_break();
+	bridge_adv_page_break();
 	if (!enabled) return;
 	log_last = (log_last + 1) % LOG_BUFFER_SIZE;
 	if (log_last == log_first) {
