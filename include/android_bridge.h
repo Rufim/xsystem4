@@ -15,5 +15,7 @@ void bridge_adv_add_voice(int voice_no);
 // Управление (вызывается из JNI / заглушки)
 void bridge_set_tts_enabled(bool on);
 void bridge_set_voice_muted(bool on);
+// Приглушить музыку до percent% исходной громкости (on) / восстановить (off)
+void bridge_duck_music(bool on, int percent);
 
 #endif /* SYSTEM4_ANDROID_BRIDGE_H */
