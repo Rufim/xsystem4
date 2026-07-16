@@ -22,6 +22,7 @@
 #include "xsystem4.h"
 
 #include "AnteaterADVEngine.h"
+#include "android_bridge.h"
 #include "iarray.h"
 #include "hll.h"
 
@@ -106,6 +107,7 @@ void ADVLogList_Clear(void)
 
 void ADVLogList_AddText(struct string **text)
 {
+	bridge_adv_add_text(*text);
 	if (!enabled) return;
 	struct string **line = current_line(current_log());
 	string_append(line, *text);
@@ -113,6 +115,7 @@ void ADVLogList_AddText(struct string **text)
 
 void ADVLogList_AddNewLine(void)
 {
+	bridge_adv_line_break();
 	if (!enabled) return;
 	struct adv_log *log = current_log();
 	log->lines = xrealloc_array(log->lines, log->nr_lines, log->nr_lines+1, sizeof(struct string*));
@@ -121,6 +124,7 @@ void ADVLogList_AddNewLine(void)
 
 void ADVLogList_AddNewPage(void)
 {
+	bridge_adv_line_break();
 	if (!enabled) return;
 	log_last = (log_last + 1) % LOG_BUFFER_SIZE;
 	if (log_last == log_first) {
@@ -132,6 +136,7 @@ void ADVLogList_AddNewPage(void)
 
 void ADVLogList_AddVoice(int voice_no)
 {
+	bridge_adv_add_voice(voice_no);
 	if (!enabled) return;
 	struct adv_log *log = current_log();
 	log->voices = xrealloc_array(log->voices, log->nr_voices, log->nr_voices+1, sizeof(int));
