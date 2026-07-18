@@ -552,8 +552,9 @@ static JNIEnv *bridge_env(void)
 
 static void bridge_emit(const char *utf8_text, bool has_voice)
 {
-	BLOG("emit: tts=%d method=%p |%s|", tts_enabled, (void*)mid_on_adv_text, utf8_text);
-	if (!tts_enabled || !mid_on_adv_text)
+	// Гейта по tts_enabled нет: текст нужен и истории сообщений при выключенной
+	// озвучке; решение «читать или нет» принимает Kotlin (TtsSpeaker).
+	if (!mid_on_adv_text)
 		return;
 	JNIEnv *env = bridge_env();
 	if (!env)
@@ -572,7 +573,7 @@ static void bridge_emit(const char *utf8_text, bool has_voice)
 
 static void bridge_emit_page_break(void)
 {
-	if (!tts_enabled || !mid_on_adv_page)
+	if (!mid_on_adv_page)
 		return;
 	JNIEnv *env = bridge_env();
 	if (!env)
