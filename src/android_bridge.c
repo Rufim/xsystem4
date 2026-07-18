@@ -87,6 +87,7 @@ static bool is_music_mixer(const char *name)
 
 void bridge_set_voice_muted(bool on)
 {
+	mixer_suppress_save(true);   // временный мьют голоса — не персистить
 	int n = mixer_get_numof();
 	for (int i = 0; i < n; i++) {
 		const char *name = mixer_get_name(i);
@@ -97,6 +98,7 @@ void bridge_set_voice_muted(bool on)
 		if (is_voice_mixer(name))
 			mixer_set_mute(i, on ? 1 : 0);
 	}
+	mixer_suppress_save(false);
 }
 
 // --- Читы: доступ к переменным VM ---
@@ -252,9 +254,13 @@ static int nr_ducked = 0;
 
 void bridge_duck_music(bool on, int percent)
 {
+	// Приглушение музыки на время речи — временное, не персистить в настройки.
+	mixer_suppress_save(true);
 	if (on) {
-		if (nr_ducked)   // уже приглушено
+		if (nr_ducked) {  // уже приглушено
+			mixer_suppress_save(false);
 			return;
+		}
 		if (percent < 0) percent = 0;
 		if (percent > 100) percent = 100;
 		int n = mixer_get_numof();
@@ -274,6 +280,7 @@ void bridge_duck_music(bool on, int percent)
 			mixer_set_volume(ducked[i].idx, ducked[i].saved_volume);
 		nr_ducked = 0;
 	}
+	mixer_suppress_save(false);
 }
 
 // Строка отображается на экране ровно в момент add_text, поэтому озвучиваем

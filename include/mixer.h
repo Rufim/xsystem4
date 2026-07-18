@@ -48,6 +48,9 @@ int mixer_get_volume(int n, int *volume);
 int mixer_set_volume(int n, int volume);
 int mixer_get_mute(int n, int *mute);
 int mixer_set_mute(int n, int mute);
+void mixer_save_volumes(void);
+// Временно отключить/включить персистентность громкости (для TTS-заглушения).
+void mixer_suppress_save(bool on);
 
 struct sts_mixer_stream_t;
 int mixer_stream_play(struct sts_mixer_stream_t* stream, int volume);

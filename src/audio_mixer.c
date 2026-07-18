@@ -615,6 +615,68 @@ void channel_close(struct channel *ch)
 #define SJIS_MASTER "\x83\x7d\x83\x58\x83\x5e\x81\x5b"
 #define SJIS_VOICE  "\x89\xb9\x90\xba"
 
+// Персистентность громкостей/мьютов микшера. Оригинальный xsystem4 не сохранял
+// изменения громкости (SetMixerVolume менял только живой gain), и при перезапуске
+// микшер брал громкость из AliceStart.ini -> настройки звука «не сохранялись».
+#include <stdio.h>
+char *savedir_path(const char *path);  // из savedata.c
+#define MIXER_VOL_FILE "MixerVolume.sav"
+
+// Временные изменения громкости/мьюта (приглушение музыки и заглушение голоса
+// для TTS) не должны попадать в сохранённые настройки.
+static bool mixer_save_suppressed = false;
+void mixer_suppress_save(bool on) { mixer_save_suppressed = on; }
+
+void mixer_save_volumes(void)
+{
+	if (mixer_save_suppressed)
+		return;
+	char *path = savedir_path(MIXER_VOL_FILE);
+	if (!path)
+		return;
+	FILE *fp = fopen(path, "wb");
+	free(path);
+	if (!fp)
+		return;
+	int32_t n = nr_mixers;
+	fwrite("MXV1", 1, 4, fp);
+	fwrite(&n, 4, 1, fp);
+	for (int i = 0; i < n; i++) {
+		int32_t v = clamp(0, 100, (int)(mixers[i].mixer.gain * 100));
+		int32_t m = mixers[i].muted;
+		fwrite(&v, 4, 1, fp);
+		fwrite(&m, 4, 1, fp);
+	}
+	fclose(fp);
+}
+
+// Загрузить сохранённые громкости в config.mixer_volumes[] (до инициализации gain).
+static void mixer_load_volumes(void)
+{
+	char *path = savedir_path(MIXER_VOL_FILE);
+	if (!path)
+		return;
+	FILE *fp = fopen(path, "rb");
+	free(path);
+	if (!fp)
+		return;
+	char magic[4];
+	int32_t n = 0;
+	if (fread(magic, 1, 4, fp) == 4 && !memcmp(magic, "MXV1", 4) &&
+	    fread(&n, 4, 1, fp) == 1) {
+		for (int i = 0; i < n; i++) {
+			int32_t v, m;
+			if (fread(&v, 4, 1, fp) != 1 || fread(&m, 4, 1, fp) != 1)
+				break;
+			if (i < (int)config.mixer_nr_channels)
+				config.mixer_volumes[i] = clamp(0, 100, v);
+			if (i < nr_mixers)
+				mixers[i].muted = !!m;
+		}
+	}
+	fclose(fp);
+}
+
 void mixer_init(void)
 {
 	// initialize mixer naming
@@ -660,6 +722,9 @@ void mixer_init(void)
 			parent = &mixers[i];
 		}
 	}
+
+	// применить сохранённые громкости (переопределяют значения из .ini)
+	mixer_load_volumes();
 
 	// initialize mixers
 	for (int i = 0; i < nr_mixers; i++) {
@@ -741,6 +806,8 @@ int mixer_set_volume(int n, int volume)
 	SDL_LockAudioDevice(audio_device);
 	mixers[n].mixer.gain = clamp(0.0f, 1.0f, (float)volume / 100.0f);
 	SDL_UnlockAudioDevice(audio_device);
+	config.mixer_volumes[n] = clamp(0, 100, volume);  // держать config в синхроне
+	mixer_save_volumes();                             // персистить настройку
 	return 1;
 }
 int mixer_get_mute(int n, int *mute)
@@ -756,6 +823,7 @@ int mixer_set_mute(int n, int mute)
 	if (n < 0 || n >= config.mixer_nr_channels)
 		return 0;
 	mixers[n].muted = !!mute;
+	mixer_save_volumes();   // персистить мьют
 	return 1;
 }
 
