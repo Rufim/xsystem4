@@ -30,6 +30,20 @@ void bridge_set_tts_enabled(bool on)
 	tts_enabled = on;
 }
 
+// Счётчик посимвольной отрисовки текста (NewFont). Растёт, пока рисуется/
+// перерисовывается текст на экране — по нему авто-листание видит активную модалку.
+static volatile unsigned newfont_draws = 0;
+
+void bridge_newfont_draw(void)
+{
+	newfont_draws++;
+}
+
+unsigned bridge_ui_draw_count(void)
+{
+	return newfont_draws;
+}
+
 // Синтетическое нажатие Enter — тем же путём, что и реальный ввод (очередь SDL,
 // thread-safe), игра воспринимает его как клик «дальше» в диалоге.
 void bridge_advance_message(void)
@@ -360,6 +374,13 @@ static void bridge_emit_page_break(void)
 	printf("[ADV] --- page ---\n");
 	fflush(stdout);
 }
+
+void bridge_on_skip(int state)
+{
+	if (getenv("XS4_BRIDGE_DEBUG"))
+		printf("[SKIP] state=%d\n", state);
+}
+
 #else /* __ANDROID__ */
 
 #include <jni.h>
@@ -379,11 +400,12 @@ static JavaVM *jvm = NULL;
 static jclass bridge_class = NULL;      // GlobalRef на NativeBridge
 static jmethodID mid_on_adv_text = NULL;
 static jmethodID mid_on_adv_page = NULL;
+static jmethodID mid_on_skip = NULL;
 
 /* NativeBridge — Kotlin object: external fun-методы НЕ статические,
  * вторым JNI-аргументом приходит экземпляр синглтона (jobject). */
 JNIEXPORT void JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeInit(JNIEnv *env, jobject self)
+Java_io_github_rufim_alice_NativeBridge_nativeInit(JNIEnv *env, jobject self)
 {
 	(*env)->GetJavaVM(env, &jvm);
 	jclass cls = (*env)->GetObjectClass(env, self);
@@ -395,11 +417,14 @@ Java_io_github_kichikuou_xsystem4_NativeBridge_nativeInit(JNIEnv *env, jobject s
 	mid_on_adv_page = (*env)->GetStaticMethodID(env, bridge_class, "onAdvPage", "()V");
 	if (!mid_on_adv_page)
 		(*env)->ExceptionClear(env);
+	mid_on_skip = (*env)->GetStaticMethodID(env, bridge_class, "onSkip", "(I)V");
+	if (!mid_on_skip)
+		(*env)->ExceptionClear(env);
 	BLOG("nativeInit: text=%p page=%p", (void*)mid_on_adv_text, (void*)mid_on_adv_page);
 }
 
 JNIEXPORT void JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeSetTts(
+Java_io_github_rufim_alice_NativeBridge_nativeSetTts(
 		JNIEnv *env, jobject self, jboolean on)
 {
 	(void)env; (void)self;
@@ -408,7 +433,7 @@ Java_io_github_kichikuou_xsystem4_NativeBridge_nativeSetTts(
 }
 
 JNIEXPORT void JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeDuckMusic(
+Java_io_github_rufim_alice_NativeBridge_nativeDuckMusic(
 		JNIEnv *env, jobject self, jboolean on, jint percent)
 {
 	(void)env; (void)self;
@@ -416,11 +441,19 @@ Java_io_github_kichikuou_xsystem4_NativeBridge_nativeDuckMusic(
 }
 
 JNIEXPORT void JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeAdvance(
+Java_io_github_rufim_alice_NativeBridge_nativeAdvance(
 		JNIEnv *env, jobject self)
 {
 	(void)env; (void)self;
 	bridge_advance_message();
+}
+
+JNIEXPORT jint JNICALL
+Java_io_github_rufim_alice_NativeBridge_nativeUiDrawCount(
+		JNIEnv *env, jobject self)
+{
+	(void)env; (void)self;
+	return (jint)bridge_ui_draw_count();
 }
 
 // Массив строк "pageSlot\tvarno\tname\tvalue" из bridge_var[]
@@ -444,7 +477,7 @@ static jobjectArray vars_to_jarray(JNIEnv *env, struct bridge_var *vars, int n)
 #define CHEAT_UI_MAX 500
 
 JNIEXPORT jobjectArray JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatList(
+Java_io_github_rufim_alice_NativeBridge_nativeCheatList(
 		JNIEnv *env, jobject self, jstring jfilter)
 {
 	(void)self;
@@ -460,7 +493,7 @@ Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatList(
 
 // Элемент [0] результата — "TOTAL:<полное число кандидатов>", далее строки переменных.
 JNIEXPORT jobjectArray JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatScan(
+Java_io_github_rufim_alice_NativeBridge_nativeCheatScan(
 		JNIEnv *env, jobject self, jint value, jboolean narrow)
 {
 	(void)self;
@@ -490,7 +523,7 @@ Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatScan(
 }
 
 JNIEXPORT jboolean JNICALL
-Java_io_github_kichikuou_xsystem4_NativeBridge_nativeCheatWrite(
+Java_io_github_rufim_alice_NativeBridge_nativeCheatWrite(
 		JNIEnv *env, jobject self, jint pageSlot, jint varno, jint value)
 {
 	(void)env; (void)self;
@@ -541,4 +574,17 @@ static void bridge_emit_page_break(void)
 	if ((*env)->ExceptionCheck(env))
 		(*env)->ExceptionClear(env);
 }
+
+void bridge_on_skip(int state)
+{
+	if (!mid_on_skip)
+		return;
+	JNIEnv *env = bridge_env();
+	if (!env)
+		return;
+	(*env)->CallStaticVoidMethod(env, bridge_class, mid_on_skip, (jint)state);
+	if ((*env)->ExceptionCheck(env))
+		(*env)->ExceptionClear(env);
+}
+
 #endif /* __ANDROID__ */
