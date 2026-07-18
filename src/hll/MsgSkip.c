@@ -25,6 +25,7 @@
 #include "system4/ain.h"
 #include "system4/file.h"
 #include "system4/little_endian.h"
+#include "android_bridge.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
@@ -139,6 +140,7 @@ static int MsgSkip_GetEnable(void)
 static void MsgSkip_SetState(int _state)
 {
 	state = _state;
+	bridge_on_skip(_state);
 }
 
 static int MsgSkip_GetState(void)

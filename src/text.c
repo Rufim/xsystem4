@@ -23,6 +23,7 @@
 #include "gfx/gfx.h"
 #include "gfx/font.h"
 #include "xsystem4.h"
+#include "android_bridge.h"
 
 /*
  * NOTE: There are two different text rendering APIs: SACT2 and DrawGraph.
@@ -199,6 +200,7 @@ float gfx_get_actual_font_size_round_down(unsigned face, float size)
 
 float _gfx_render_text(Texture *dst, char *msg, struct text_render_metrics *tm)
 {
+	bridge_newfont_draw();
 	float pos_x = tm->x;
 	int pos_y = tm->y + tm->font_size->y_offset;
 

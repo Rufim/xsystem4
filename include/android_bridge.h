@@ -18,6 +18,14 @@ void bridge_set_tts_enabled(bool on);
 void bridge_set_voice_muted(bool on);
 // Перелистнуть сообщение (синтетический Enter; для авто-листания после TTS)
 void bridge_advance_message(void);
+// Игра включила/выключила режим «ПРОПУСК» — при включении останавливаем TTS
+void bridge_on_skip(int state);
+// Игра рисует текст посимвольно (NewFont.DrawChar) — счётчик растёт, пока на
+// экране печатается/перерисовывается текст (окна-уведомления вроде «Была
+// схвачена …»). Авто-листание по нему понимает, что появилась модалка, и не
+// пролистывает её тапом.
+void bridge_newfont_draw(void);
+unsigned bridge_ui_draw_count(void);
 // Приглушить музыку до percent% исходной громкости (on) / восстановить (off)
 void bridge_duck_music(bool on, int percent);
 
