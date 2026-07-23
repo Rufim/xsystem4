@@ -330,6 +330,15 @@ void hll_call(int libno, int fno)
 	void *heap_ptrs[HLL_MAX_ARGS];
 	int heap_slots[HLL_MAX_ARGS];
 
+	int dbg_sp0 = stack_ptr;
+	bool dbg_arr = getenv("XSYS4_ARR_TRACE") && !strcmp(ain->libraries[libno].name, "Array");
+	if (dbg_arr) {
+		NOTICE("ARR %s nr_args=%d sp=%d [%d %d %d %d]", f->name, f->nr_arguments, stack_ptr,
+			stack[stack_ptr-1].i, stack[stack_ptr-2].i, stack[stack_ptr-3].i, stack[stack_ptr-4].i);
+		for (int k = 0; k < f->nr_arguments; k++)
+			NOTICE("  arg[%d] type=%d", k, f->arguments[k].type.data);
+	}
+
 	for (int i = f->nr_arguments - 1; i >= 0; i--) {
 		switch (f->arguments[i].type.data) {
 		case AIN_REF_INT:
@@ -361,7 +370,6 @@ void hll_call(int libno, int fno)
 			args[i] = &heap[stack[stack_ptr].i].page;
 			break;
 		case AIN_REF_STRUCT:
-		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
 			stack_ptr--;
 			heap_slots[i] = stack[stack_ptr].i;
@@ -369,6 +377,24 @@ void hll_call(int libno, int fno)
 			ptrs[i] = &heap_ptrs[i];
 			args[i] = &ptrs[i];
 			break;
+		case AIN_REF_ARRAY: {
+			// Ixseal generic array-by-reference: a two-slot variable reference
+			// (containing-page heap index, variable index). Dereference it to
+			// the array page's own heap slot so the callee receives a
+			// `struct page **` to the array (and any reallocation is written
+			// back to that slot below).
+			stack_ptr -= 2;
+			int page_i = stack[stack_ptr].i;
+			int var_i = stack[stack_ptr + 1].i;
+			int arr_slot = (heap_index_valid(page_i) && heap[page_i].page &&
+					var_i >= 0 && var_i < heap[page_i].page->nr_vars)
+				? heap[page_i].page->values[var_i].i : -1;
+			heap_slots[i] = arr_slot;
+			heap_ptrs[i] = (arr_slot >= 0) ? heap[arr_slot].page : NULL;
+			ptrs[i] = &heap_ptrs[i];
+			args[i] = &ptrs[i];
+			break;
+		}
 		case AIN_HLL_PARAM:
 			// Generic container element: pass a pointer to the raw stack slot;
 			// the callee interprets it per the array's element type.
@@ -382,6 +408,9 @@ void hll_call(int libno, int fno)
 			break;
 		}
 	}
+
+	if (dbg_arr)
+		NOTICE("ARR %s consumed %d slots (sp %d->%d)", f->name, dbg_sp0 - stack_ptr, dbg_sp0, stack_ptr);
 
 	union vm_value r;
 	if (lenient_noop) {
@@ -410,9 +439,14 @@ void hll_call(int libno, int fno)
 			heap[heap_slots[i]].s = heap_ptrs[i];
 			break;
 		case AIN_REF_STRUCT:
-		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
 			heap[heap_slots[i]].page = heap_ptrs[i];
+			break;
+		case AIN_REF_ARRAY:
+			// Write the (possibly reallocated) array page back to its slot.
+			if (heap_slots[i] >= 0)
+				heap[heap_slots[i]].page = heap_ptrs[i];
+			j++;  // two-slot (page, var) reference
 			break;
 		case AIN_REF_FUNC_TYPE:
 		case AIN_HLL_FUNC:
