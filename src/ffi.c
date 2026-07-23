@@ -21,6 +21,7 @@
 #include <ffi.h>
 #include "system4/ain.h"
 #include "system4/utfsjis.h"
+#include "system4/string.h"
 #include "vm.h"
 #include "vm/heap.h"
 #include "vm/page.h"
@@ -296,12 +297,31 @@ void hll_call(int libno, int fno)
 {
 	struct ain_hll_function *f = &ain->libraries[libno].functions[fno];
 
+	{
+		const char *flt = getenv("XSYS4_HLL_TRACE");
+		if (flt && (!*flt || strstr(ain->libraries[libno].name, flt)))
+			WARNING("HLLCALL lib%d:fn%d %s.%s", libno, fno, ain->libraries[libno].name, f->name);
+	}
+
 	if (!libraries[libno])
 		VM_ERROR("Unimplemented HLL function: %s.%s", ain->libraries[libno].name, f->name);
 
 	struct hll_function *fun = &libraries[libno][fno];
-	if (!fun->fun)
-		VM_ERROR("Unimplemented HLL function: %s.%s", ain->libraries[libno].name, f->name);
+	bool lenient_noop = false;
+	if (!fun->fun) {
+		if (getenv("XSYS4_TRACE_X"))
+			WARNING("HLLDIAG libno=%d fno=%d name=%s nr_func=%d",
+				libno, fno, f->name, ain->libraries[libno].nr_functions);
+		// Lenient mode: instead of aborting on an unimplemented HLL function,
+		// pop its arguments and return a zero/empty value. Lets us push past a
+		// cascade of missing functions to see how far the game gets.
+		if (getenv("XSYS4_LENIENT_HLL")) {
+			WARNING("LENIENT: stubbing %s.%s -> 0", ain->libraries[libno].name, f->name);
+			lenient_noop = true;
+		} else {
+			VM_ERROR("Unimplemented HLL function: %s.%s", ain->libraries[libno].name, f->name);
+		}
+	}
 
 	void *args[HLL_MAX_ARGS];
 	void *ptrs[HLL_MAX_ARGS];
@@ -341,11 +361,19 @@ void hll_call(int libno, int fno)
 			args[i] = &heap[stack[stack_ptr].i].page;
 			break;
 		case AIN_REF_STRUCT:
+		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
 			stack_ptr--;
 			heap_slots[i] = stack[stack_ptr].i;
 			heap_ptrs[i] = heap[stack[stack_ptr].i].page;
 			ptrs[i] = &heap_ptrs[i];
+			args[i] = &ptrs[i];
+			break;
+		case AIN_HLL_PARAM:
+			// Generic container element: pass a pointer to the raw stack slot;
+			// the callee interprets it per the array's element type.
+			stack_ptr--;
+			ptrs[i] = &stack[stack_ptr];
 			args[i] = &ptrs[i];
 			break;
 		default:
@@ -356,6 +384,11 @@ void hll_call(int libno, int fno)
 	}
 
 	union vm_value r;
+	if (lenient_noop) {
+		r.i = 0;
+		if (f->return_type.data == AIN_STRING)
+			r.ref = string_ref(&EMPTY_STRING);
+	} else
 #ifdef TRACE_HLL
 	trace_hll_call(&ain->libraries[libno], f, fun, &r, args);
 #else
@@ -377,10 +410,16 @@ void hll_call(int libno, int fno)
 			heap[heap_slots[i]].s = heap_ptrs[i];
 			break;
 		case AIN_REF_STRUCT:
+		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
 			heap[heap_slots[i]].page = heap_ptrs[i];
 			break;
 		case AIN_REF_FUNC_TYPE:
+		case AIN_HLL_FUNC:
+			break;
+		case AIN_HLL_PARAM:
+			// Generic value was passed by pointer without a refcount bump; the
+			// callee copies it into the container, so nothing to finalize here.
 			break;
 		case AIN_ARRAY_TYPE:
 			// Sys41VM doesn't make a copy when passing an array by value.
@@ -505,6 +544,7 @@ extern struct static_library lib_StoatSpriteEngine;
 extern struct static_library lib_StretchHelper;
 extern struct static_library lib_SystemService;
 extern struct static_library lib_SystemServiceEx;
+extern struct static_library lib_TextSurfaceManager;
 extern struct static_library lib_TapirEngine;
 extern struct static_library lib_Timer;
 extern struct static_library lib_Toushin3Loader;
@@ -628,6 +668,7 @@ static struct static_library *static_libraries[] = {
 	&lib_StretchHelper,
 	&lib_SystemService,
 	&lib_SystemServiceEx,
+	&lib_TextSurfaceManager,
 	&lib_TapirEngine,
 	&lib_Timer,
 	&lib_Toushin3Loader,
@@ -680,7 +721,22 @@ static ffi_type *ain_to_ffi_type(enum ain_data_type type)
 	case AIN_ARRAY_TYPE:
 	case AIN_REF_TYPE:
 	case AIN_IMAIN_SYSTEM: // ???
+	// page-based типы новых System 4 (Healing Touch и др.): в FFI — указатель.
+	// generic-массив AIN_ARRAY не входит в макрос AIN_ARRAY_TYPE (AIN_REF_ARRAY — в AIN_REF_TYPE).
+	case AIN_ARRAY:
+	case AIN_WRAP:
+	case AIN_OPTION:
+	case AIN_UNKNOWN_TYPE_87:
+	case AIN_IFACE_WRAP:
 		return &ffi_type_pointer;
+	// Ixseal generic-container types (Array HLL): a generic element value is
+	// passed as a pointer to its stack slot (interpreted per the array's element
+	// type by the callee); an HLL function reference is passed as its integer
+	// function index.
+	case AIN_HLL_PARAM:
+		return &ffi_type_pointer;
+	case AIN_HLL_FUNC:
+		return &ffi_type_sint32;
 	default:
 		ERROR("Unhandled type in HLL function: %s", ain_strtype(ain, type, -1));
 	}
@@ -715,8 +771,10 @@ static struct hll_function *link_static_library(struct ain_library *ainlib, stru
 				break;
 			}
 		}
-		if (!dst[i].fun)
-			;//WARNING("Unimplemented library function: %s.%s", ainlib->name, ainlib->functions[i].name);
+		if (!dst[i].fun) {
+			if (getenv("XSYS4_LIST_UNIMPL"))
+				WARNING("UNIMPL: %s.%s", ainlib->name, ainlib->functions[i].name);
+		}
 		else if (ainlib->functions[i].nr_arguments >= HLL_MAX_ARGS)
 			ERROR("Too many arguments to library function: %s", ainlib->functions[i].name);
 	}

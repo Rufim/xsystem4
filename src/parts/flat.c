@@ -876,7 +876,11 @@ bool PE_SetPartsFlat(int parts_no, struct string *filename, int state)
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_flat *f = parts_get_flat(parts, state);
-	if (parts_flat_load(parts, f, filename)) {
+	bool ok = parts_flat_load(parts, f, filename);
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS SetPartsFlat(%d, '%s') -> %d", parts_no,
+		       filename ? display_sjis0(filename->text) : "(null)", ok);
+	if (ok) {
 		f->needs_advance = true;
 		parts_dirty(parts);
 		return true;

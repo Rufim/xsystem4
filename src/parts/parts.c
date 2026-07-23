@@ -20,6 +20,7 @@
 #include "system4/cg.h"
 #include "system4/hashtable.h"
 #include "system4/string.h"
+#include "system4/utfsjis.h"
 
 #include "asset_manager.h"
 #include "audio.h"
@@ -517,6 +518,13 @@ static void parts_update_global_alpha(struct parts *parts, int parent_alpha)
 
 void parts_set_alpha(struct parts *parts, int alpha)
 {
+	if (getenv("XSYS4_MOTION_TRACE") && parts->no >= 90000000) {
+		static int nc = 0;
+		if ((nc++ % 20) == 0 || alpha == 255 || alpha == 0)
+			NOTICE("ALPHA set part %d local=%d->%d parent_g=%d", parts->no,
+			       parts->local.alpha, max(0, min(255, alpha)),
+			       parts->parent ? parts->parent->global.alpha : 255);
+	}
 	parts->local.alpha = max(0, min(255, alpha));
 	parts_update_global_alpha(parts, parts->parent ? parts->parent->global.alpha : 255);
 	parts_dirty(parts);
@@ -987,6 +995,8 @@ void parts_release(int parts_no)
 	struct ht_slot *slot = ht_put_int(parts_table, parts_no, NULL);
 	if (!slot->value)
 		return;
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("parts_release(%d)", parts_no);
 
 	struct parts *parts = slot->value;
 	parts_input_reset_drag(parts);
@@ -1011,6 +1021,23 @@ void parts_release(int parts_no)
 	free(parts);
 	slot->value = NULL;
 	parts_engine_dirty();
+}
+
+void parts_debug_dump(void)
+{
+	struct parts *p;
+	int n = 0;
+	PARTS_LIST_FOREACH(p) {
+		Rectangle *hb = &p->states[0].common.hitbox;
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f",
+		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
+		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
+		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
+		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
+		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y);
+		n++;
+	}
+	NOTICE("parts_debug_dump: %d parts total", n);
 }
 
 void parts_release_all(void)
@@ -1178,6 +1205,8 @@ void PE_UpdateParts(int passed_time, possibly_unused bool is_skip, bool message_
 
 void PE_SetDelegateIndex(int parts_no, int delegate_index)
 {
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT SetDelegateIndex(parts=%d, delegate=%d)", parts_no, delegate_index);
 	parts_get(parts_no)->delegate_index = delegate_index;
 }
 
@@ -1201,7 +1230,10 @@ bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int 
 	}
 
 	struct parts_cg *cg = parts_get_cg(parts, state);
-	return parts_cg_set(parts, cg, cg_name);
+	bool ok = parts_cg_set(parts, cg, cg_name);
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS SetPartsCG(%d, '%s') -> %d", parts_no, display_sjis0(cg_name->text), ok);
+	return ok;
 }
 
 bool PE_SetPartsCG_by_index(int parts_no, int cg_no, int sprite_deform, int state)
@@ -1723,8 +1755,25 @@ void PE_SetZ(int parts_no, int z)
 	parts_set_z(parts_get(parts_no), z);
 }
 
+// Highest Z currently in use (games query this to stack a new component/dialog
+// on top of everything else). We ignore the component argument and report the
+// maximum Z across all parts.
+int PE_GetComponentAbsoluteMaxPosZ(int comp)
+{
+	(void)comp;
+	int maxz = 0;
+	struct parts *p;
+	PARTS_LIST_FOREACH(p) {
+		if (p->global.z > maxz)
+			maxz = p->global.z;
+	}
+	return maxz;
+}
+
 void PE_SetShow(int parts_no, bool show)
 {
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS SetShow(%d, %d)", parts_no, show);
 	parts_set_show(parts_get(parts_no), show);
 }
 
@@ -1757,6 +1806,8 @@ void PE_SetMultiplyColor(int parts_no, int r, int g, int b)
 		min(255, max(0, b)),
 		255
 	};
+	if (getenv("XSYS4_MUL_TRACE"))
+		NOTICE("MUL part %d <- rgb %d,%d,%d", parts_no, r, g, b);
 	parts_set_multiply_color(parts_get(parts_no), multiply_color);
 }
 
@@ -2040,6 +2091,12 @@ int PE_GetComponentType(int parts_no, int state)
 	if (!parts)
 		return -1;
 
+	// Activity "button" parts (パーツタイプ=0) render as CG but report type 0 so
+	// the game recognizes them as buttons (e.g. C_TITLE@Enable registers click
+	// handlers only on type-0 parts).
+	if (parts->is_button)
+		return 0;
+
 	switch (parts->states[state].type) {
 	case PARTS_LAYOUT_BOX: return 8;
 	case PARTS_UNINITIALIZED:  // defaluts to CG
@@ -2059,6 +2116,207 @@ int PE_GetComponentType(int parts_no, int state)
 		break;
 	}
 	VM_ERROR("unsupported component type %d", parts->states[state].type);
+}
+
+// Horizontal-scrollbar / slider. The part's CG is the knob; it slides along the
+// track (length sb_length) between sb_base_x .. sb_base_x + (length - knob_w).
+// Position the knob for the current rate (0..1). Called on init, on the game's
+// per-frame SetHScrollbarScrollRate, and while dragging.
+static void parts_hscrollbar_reposition(struct parts *parts)
+{
+	if (!parts->is_hscrollbar)
+		return;
+	struct parts_common *c = &parts->states[PARTS_STATE_DEFAULT].common;
+	int knob_w = c->w, knob_h = c->h;
+	float r = parts->hscroll_rate;
+	if (r < 0.0f) r = 0.0f;
+	if (r > 1.0f) r = 1.0f;
+	int travel = parts->sb_length - knob_w;
+	if (travel < 0) travel = 0;
+	int x = parts->sb_base_x + (int)(r * travel + 0.5f);
+	int y = parts->sb_base_y + (parts->sb_width - knob_h) / 2;
+	parts_set_pos(parts, (Point){ x, y });
+}
+
+void PE_InitPartsHScrollbar(int parts_no, int base_x, int base_y,
+		int length, int width, int total, int view, float rate)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	parts->is_hscrollbar = true;
+	parts->sb_base_x = base_x;
+	parts->sb_base_y = base_y;
+	parts->sb_length = length;
+	parts->sb_width = width;
+	parts->sb_total = total;
+	parts->sb_view = view;
+	parts->hscroll_rate = rate;
+	parts_hscrollbar_reposition(parts);
+}
+
+// Drag the knob so its centre follows the cursor (absolute window x), clamped to
+// the track; update the rate the game polls via GetHScrollbarScrollRate.
+void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x)
+{
+	if (!parts->is_hscrollbar)
+		return;
+	struct parts_common *c = &parts->states[PARTS_STATE_DEFAULT].common;
+	int knob_w = c->w;
+	int travel = parts->sb_length - knob_w;
+	if (travel <= 0)
+		return;
+	int parent_x = parts->parent ? parts->parent->global.pos.x : 0;
+	int knob_left = cursor_abs_x - parent_x - parts->sb_base_x - knob_w / 2;
+	float r = (float)knob_left / (float)travel;
+	if (r < 0.0f) r = 0.0f;
+	if (r > 1.0f) r = 1.0f;
+	parts->hscroll_rate = r;
+	parts_hscrollbar_reposition(parts);
+}
+
+void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	parts->hscroll_rate = rate;
+	parts_hscrollbar_reposition(parts);
+}
+
+float PE_GetPartsHScrollbarScrollRate(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->hscroll_rate : 0.0f;
+}
+
+// Solid white fill of w×h into every display state. Used for config colour
+// swatches: パーツタイプ=1 with an empty ＣＧ名 but a サイズ — the fill is tinted
+// by the checkbox "button colour" (multiply) to show the palette colour.
+void PE_SetPartsColorFill(int parts_no, int w, int h)
+{
+	if (w <= 0 || h <= 0)
+		return;
+	struct parts *parts = parts_get(parts_no);
+	for (int s = 0; s < PARTS_NR_STATES; s++) {
+		struct parts_cg *cg = parts_get_cg(parts, s);
+		gfx_delete_texture(&cg->common.texture);
+		gfx_init_texture_rgba(&cg->common.texture, w, h, (SDL_Color){255, 255, 255, 255});
+		parts_set_dims(parts, &cg->common, w, h);
+	}
+	parts_dirty(parts);
+}
+
+static void parts_checkbox_reload_cg(struct parts *parts);
+
+// Checkbox state. The config screen toggles and reads these back.
+void PE_SetPartsCheckBoxChecked(int parts_no, bool checked)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	bool nc = !!checked;
+	if (parts->is_checkbox && nc != parts->checkbox_checked) {
+		parts->checkbox_checked = nc;
+		parts_checkbox_reload_cg(parts);
+	} else {
+		parts->checkbox_checked = nc;
+	}
+}
+
+bool PE_GetPartsCheckBoxChecked(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->checkbox_checked : false;
+}
+
+// Load the checkbox box CG for the current checked state into all three display
+// states (通常/オン/ダウン). Checked adds a "／チェック" segment before the state
+// suffix, e.g. "コンフィグ／チェックボックス／チェック／通常".
+static void parts_checkbox_reload_cg(struct parts *parts)
+{
+	if (!parts->is_checkbox || !parts->checkbox_cg_base)
+		return;
+	static const char *const sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+	const char *chk = parts->checkbox_checked ? "／チェック" : "";
+	int base_no = parts->no;
+	for (int s = 1; s <= 3; s++) {
+		char u8[64];
+		int n = 0;
+		for (const char *p = chk; *p; p++) u8[n++] = *p;
+		for (const char *p = sfx[s]; *p; p++) u8[n++] = *p;
+		u8[n] = '\0';
+		char *sjis = utf2sjis(u8, n);
+		struct string *suf = make_string(sjis, strlen(sjis));
+		struct string *full = string_concatenate(parts->checkbox_cg_base, suf);
+		bool ok = PE_SetPartsCG(base_no, full, 0, s);
+		if (getenv("XSYS4_CB_TRACE"))
+			NOTICE("CB reload part %d state %d cg='%s' -> %d", base_no, s, full->text, ok);
+		free_string(full);
+		free_string(suf);
+		free(sjis);
+	}
+}
+
+void PE_InitPartsCheckBox(int parts_no, struct string *cg_base, bool checked)
+{
+	// parts_get (not parts_try_get): the part may not exist yet — this is the
+	// first call for a checkbox part, and it must be created before SetPartsCG.
+	struct parts *parts = parts_get(parts_no);
+	if (!parts)
+		return;
+	parts->is_checkbox = true;
+	if (parts->checkbox_cg_base)
+		free_string(parts->checkbox_cg_base);
+	parts->checkbox_cg_base = cg_base ? string_ref(cg_base) : NULL;
+	parts->checkbox_checked = checked;
+	parts_checkbox_reload_cg(parts);
+}
+
+// Toggle on user click; the game reads the new state via IsCheckBoxChecked.
+void parts_checkbox_toggle(struct parts *parts)
+{
+	if (!parts->is_checkbox)
+		return;
+	parts->checkbox_checked = !parts->checkbox_checked;
+	parts_checkbox_reload_cg(parts);
+}
+
+// Checkbox label colour. Stored so the game can read it back; the checkbox is
+// not yet drawn as a distinct widget.
+void PE_SetPartsCheckBoxColor(int parts_no, int r, int g, int b)
+{
+	if (getenv("XSYS4_MUL_TRACE"))
+		NOTICE("CBCOLOR part %d <- rgb %d,%d,%d", parts_no, r, g, b);
+	struct parts *parts = parts_try_get(parts_no);
+	if (parts) {
+		parts->checkbox_r = r;
+		parts->checkbox_g = g;
+		parts->checkbox_b = b;
+		// The checkbox "button colour" tints the box CG — this is how the config
+		// message-colour swatches show their palette (a single grey CG multiplied
+		// by each colour). Normal checkboxes use white here, so this is a no-op.
+		parts_set_multiply_color(parts, (SDL_Color){
+			min(255, max(0, r)), min(255, max(0, g)), min(255, max(0, b)), 255 });
+	}
+}
+
+int PE_GetPartsCheckBoxR(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->checkbox_r : 0;
+}
+
+int PE_GetPartsCheckBoxG(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->checkbox_g : 0;
+}
+
+int PE_GetPartsCheckBoxB(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->checkbox_b : 0;
 }
 
 bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state)
@@ -2117,16 +2375,15 @@ static void ctrl_stack_init(void)
 // degenerates to a simple push.
 int PE_AddController(int index)
 {
-	if (index != -1)
-		VM_ERROR("index != -1 not supported (got %d)", index);
-	if (ctrl_stack.nr_controllers > 0 &&
-			ctrl_stack.active != ctrl_stack.nr_controllers - 1)
-		VM_ERROR("active controller is not at the top of the stack");
+	// index != -1 у новых игр (напр. 0) — трактуем как обычный push (наш
+	// контроллер-стек прост), чтобы не падать фаталом.
+	(void)index;
 	if (ctrl_stack.nr_controllers >= PARTS_CONTROLLER_STACK_MAX)
 		VM_ERROR("controller stack overflow");
 
 	int no = ctrl_stack.nr_controllers++;
 	ctrl_stack.active = no;
+	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController -> ctrl %d (nr=%d)", no, ctrl_stack.nr_controllers);
 	return no;
 }
 
@@ -2138,13 +2395,13 @@ int PE_AddController(int index)
 // degenerates to a simple pop.
 void PE_RemoveController(struct page **erase_number_list, int index)
 {
-	if (index != -1)
-		VM_ERROR("index != -1 not supported (got %d)", index);
-	if (ctrl_stack.nr_controllers == 0 ||
-			ctrl_stack.active != ctrl_stack.nr_controllers - 1)
-		VM_ERROR("active controller is not at the top of the stack");
+	// index != -1 у новых игр — удаляем текущий активный (верх стека).
+	(void)index;
+	if (ctrl_stack.nr_controllers == 0)
+		return;
 
 	int ctrl_no = ctrl_stack.active;
+	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_RemoveController: releasing ctrl %d (nr=%d)", ctrl_no, ctrl_stack.nr_controllers);
 
 	// Collect and release parts belonging to this controller
 	struct parts *p = TAILQ_FIRST(&parts_list);
@@ -2178,6 +2435,20 @@ void PE_set_active_controller(int controller_no)
 int PE_get_active_controller(void)
 {
 	return ctrl_stack.active;
+}
+
+int PE_get_controller_length(void)
+{
+	return ctrl_stack.nr_controllers;
+}
+
+int PE_get_controller_id(int index)
+{
+	// Контроллеры адресуются индексом стека (AddController возвращает индекс
+	// как ID), поэтому ID i-го контроллера == его индекс.
+	if (index < 0 || index >= ctrl_stack.nr_controllers)
+		return -1;
+	return index;
 }
 
 int PE_get_system_controller(void)

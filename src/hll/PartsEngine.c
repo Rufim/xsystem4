@@ -16,11 +16,21 @@
 
 #include <assert.h>
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "system4/ain.h"
+#include "system4/hashtable.h"
+#include "system4/string.h"
+#include "system4/ex.h"
+#include "system4/utfsjis.h"
+#include "system4/archive.h"
 
 #include "vm/heap.h"
 #include "vm/page.h"
 #include "parts.h"
+#include "asset_manager.h"
+#include "xsystem4.h"
 #include "hll.h"
 
 static void PartsEngine_ModuleInit(void)
@@ -341,6 +351,791 @@ static int PartsEngine_PartsFunc(int func_id, struct page **array_int,
 }
 
 HLL_WARN_UNIMPLEMENTED(, void, PartsEngine, StopSoundWithoutSystemSound);
+// Per-part on-cursor/click sound-effect names. Audio side-effects are out of
+// scope (sound is handled elsewhere / muted); accept and ignore so button setup
+// (e.g. C_TITLE@EnableButton -> Ｐ＿オンカーソル効果音設定) proceeds.
+static void PE_Parts_SetSoundName(int parts_no, struct string *name, int state) { (void)parts_no; (void)name; (void)state; }
+static void PE_Parts_GetSoundName(int parts_no, struct string **out, int state) { (void)parts_no; (void)state; if (out) { if (*out) free_string(*out); *out = string_ref(&EMPTY_STRING); } }
+// Tsumamigui 3: фон под меню сохранения. Визуальный no-op — рендер идёт своим путём.
+static void PE_SetWantSaveBackScene(int parts_no, int enable)
+{
+	if (getenv("XSYS4_BS_TRACE"))
+		NOTICE("BACKSCENE want-save part=%d enable=%d", parts_no, enable);
+}
+// Save-thumbnail of the parts back-scene into a save buffer. Not captured yet —
+// return false (no data) so saving proceeds without a scene thumbnail.
+static bool PE_SaveBackScene(struct page **buf) { (void)buf; return false; }
+// Батч-форма построения parts (3 массива-параметра). Пока no-op: логотип/GUI
+// не строятся из этих операций, но игра проходит дальше к титулу. TODO: декодировать.
+static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, struct page **as) {
+	(void)ai; (void)af; (void)as;
+}
+
+// --- Подсистема Activity (именованные наборы parts) ---
+// Новые игры System 4 группируют parts в именованные «активности». В движке её
+// не было; минимальный реестр: имя -> список (имя_parts, номер_parts) + EX-текст.
+// intent (遷移): a part with a transition method (遷移方法) closes/transitions the
+// activity when clicked. destinations (遷移先) name target .pact pages (empty = just
+// close). BindEndEvent registers MouseLClickEvent on parts where IsExistIntentData.
+struct pe_act_part {
+	struct string *name;
+	int number;
+	int intent_type;               // 遷移方法 (0 = no transition)
+	struct string **intent_dests;  // 遷移先 (non-empty destination names)
+	int nr_intent_dests;
+};
+struct pe_activity {
+	struct pe_act_part *parts;
+	int nr_parts;
+	struct string *ex_text;
+	int ex_id;
+};
+static struct hash_table *pe_activities;
+
+static struct pe_activity *pe_act_find(struct string *name)
+{
+	if (!pe_activities)
+		return NULL;
+	return ht_get(pe_activities, name->text, NULL);
+}
+
+static void PE_Activity_free(void *p)
+{
+	struct pe_activity *a = p;
+	for (int i = 0; i < a->nr_parts; i++) {
+		free_string(a->parts[i].name);
+		for (int j = 0; j < a->parts[i].nr_intent_dests; j++)
+			free_string(a->parts[i].intent_dests[j]);
+		free(a->parts[i].intent_dests);
+	}
+	free(a->parts);
+	if (a->ex_text)
+		free_string(a->ex_text);
+	free(a);
+}
+
+static bool PE_CreateActivity(struct string *name)
+{
+	if (!pe_activities)
+		pe_activities = ht_create(256);
+	if (ht_get(pe_activities, name->text, NULL))
+		return true;
+	struct pe_activity *a = xcalloc(1, sizeof(*a));
+	a->ex_id = -1;
+	ht_put(pe_activities, name->text, NULL)->value = a;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT CreateActivity(name='%s')", display_sjis0(name->text));
+	return true;
+}
+
+static bool PE_IsExistActivity(struct string *name)
+{
+	return pe_act_find(name) != NULL;
+}
+
+static bool PE_ReleaseActivity(struct string *name, struct page **out)
+{
+	struct pe_activity *a = pe_act_find(name);
+	int n = a ? a->nr_parts : 0;
+	union vm_value dim = { .i = n };
+	struct page *page = alloc_array(1, &dim, AIN_ARRAY_INT, 0, false);
+	for (int i = 0; i < n; i++)
+		page->values[i].i = a->parts[i].number;
+	if (*out) {
+		delete_page_vars(*out);
+		free_page(*out);
+	}
+	*out = page;
+	if (a) {
+		// освободить активность и убрать из реестра (перезапись пустышкой-NULL)
+		struct ht_slot *slot = ht_put(pe_activities, name->text, NULL);
+		if (slot->value == a)
+			slot->value = NULL;
+		PE_Activity_free(a);
+	}
+	return true;
+}
+
+static bool PE_AddActivityParts(struct string *act, struct string *parts_name, int number)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a) { PE_CreateActivity(act); a = pe_act_find(act); }
+	a->parts = xrealloc_array(a->parts, a->nr_parts, a->nr_parts + 1, sizeof(*a->parts));
+	a->parts[a->nr_parts].name = string_ref(parts_name);
+	a->parts[a->nr_parts].number = number;
+	a->nr_parts++;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT AddActivityParts(act='%s', name='%s', number=%d)",
+		       display_sjis0(act->text), display_sjis1(parts_name->text), number);
+	return true;
+}
+
+/*
+ * Activity layout loading (.pactex). A .pactex file is in the .ex container
+ * format: a tree of parts (block "アクティビティ" -> "ルートパーツ") where each
+ * node has position/visibility/alpha and type-specific info (CG name per state,
+ * or button CG/flat/text), plus nested "子パーツ" children. ReadActivityFile
+ * parses it and creates the real parts so the dialog/menu actually renders.
+ */
+static int pe_act_part_seq = 90000000;  // unique base for activity-created parts
+
+// look up a child node by UTF-8 name (converted to the .ex file's SJIS encoding)
+static struct ex_tree *act_child(struct ex_tree *t, const char *utf8)
+{
+	if (!t || t->is_leaf)
+		return NULL;
+	char *sjis = utf2sjis(utf8, strlen(utf8));
+	struct ex_tree *r = ex_tree_get_child(t, sjis);
+	free(sjis);
+	return r;
+}
+
+static int act_int(struct ex_tree *t, const char *utf8, int dflt)
+{
+	struct ex_tree *c = act_child(t, utf8);
+	if (c && c->is_leaf && c->leaf.value.type == EX_INT)
+		return c->leaf.value.i;
+	return dflt;
+}
+
+static float act_float(struct ex_tree *t, const char *utf8, float dflt)
+{
+	struct ex_tree *c = act_child(t, utf8);
+	if (c && c->is_leaf) {
+		if (c->leaf.value.type == EX_FLOAT)
+			return c->leaf.value.f;
+		if (c->leaf.value.type == EX_INT)
+			return (float)c->leaf.value.i;
+	}
+	return dflt;
+}
+
+static struct string *act_str(struct ex_tree *t, const char *utf8)
+{
+	struct ex_tree *c = act_child(t, utf8);
+	if (c && c->is_leaf && c->leaf.value.type == EX_STRING)
+		return c->leaf.value.s;
+	return NULL;
+}
+
+// nth element of a list-valued child, as int (floats truncated)
+static int act_list_int(struct ex_tree *t, const char *utf8, int idx, int dflt)
+{
+	struct ex_tree *c = act_child(t, utf8);
+	if (!c || !c->is_leaf || c->leaf.value.type != EX_LIST)
+		return dflt;
+	struct ex_list *l = c->leaf.value.list;
+	if (idx < 0 || (unsigned)idx >= l->nr_items)
+		return dflt;
+	struct ex_value *v = &l->items[idx].value;
+	if (v->type == EX_INT)
+		return v->i;
+	if (v->type == EX_FLOAT)
+		return (int)v->f;
+	return dflt;
+}
+
+// nth element of a list-valued child, as float
+static float act_list_float(struct ex_tree *t, const char *utf8, int idx, float dflt)
+{
+	struct ex_tree *c = act_child(t, utf8);
+	if (!c || !c->is_leaf || c->leaf.value.type != EX_LIST)
+		return dflt;
+	struct ex_list *l = c->leaf.value.list;
+	if (idx < 0 || (unsigned)idx >= l->nr_items)
+		return dflt;
+	struct ex_value *v = &l->items[idx].value;
+	if (v->type == EX_FLOAT)
+		return v->f;
+	if (v->type == EX_INT)
+		return (float)v->i;
+	return dflt;
+}
+
+static float act_float(struct ex_tree *t, const char *utf8, float dflt);
+
+static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8, int state)
+{
+	struct ex_tree *st = act_child(ti, state_utf8);
+	if (!st)
+		return;
+	// A state may be a Flat (パーツタイプ=20), a CG (11), or Text (13).
+	struct string *flat = act_str(st, "フラット名");
+	if (flat && flat->size) {
+		PE_SetPartsFlat(no, flat, state);
+		return;
+	}
+	// Text state: テキスト + テキスト装飾 (font). Used e.g. by the config sample
+	// message ("サンプル") whose 通常状態 is a パーツタイプ=13 text sub-node.
+	if (act_int(st, "パーツタイプ", -1) == 13) {
+		struct string *txt = act_str(st, "テキスト");
+		if (txt && txt->size) {
+			struct ex_tree *fd = act_child(st, "テキスト装飾");
+			if (fd) {
+				PE_SetFont(no, act_int(fd, "フォントタイプ", 0),
+					act_int(fd, "フォントサイズ", 16),
+					act_list_int(fd, "フォント色", 0, 255),
+					act_list_int(fd, "フォント色", 1, 255),
+					act_list_int(fd, "フォント色", 2, 255),
+					act_float(fd, "フォント太さ", 0.0f),
+					act_list_int(fd, "フォント縁取り色", 0, 0),
+					act_list_int(fd, "フォント縁取り色", 1, 0),
+					act_list_int(fd, "フォント縁取り色", 2, 0),
+					act_float(fd, "フォント縁取り", 0.0f), state);
+				// 字間隔/行間隔 (char/line spacing) — often negative to tighten the
+				// layout (the config sample message uses 行間隔=-5). Set before
+				// SetText so the char advances are built with the right spacing.
+				PE_SetTextCharSpace(no, act_int(fd, "字間隔", 0), state);
+				PE_SetTextLineSpace(no, act_int(fd, "行間隔", 0), state);
+			}
+			PE_SetText(no, txt, state);
+		}
+		return;
+	}
+	// Construction-process viewport (パーツタイプ=18): used as a clip region for
+	// preview content (e.g. the config message-window sample). We don't run the
+	// full compositing procedure; we only need an opaque mask of the viewport
+	// rect so it can serve as an alpha-clipper (rectangular clip) for siblings.
+	// The 手順1 create op's 先矩形 gives the size [.,.,.,.,w,h].
+	if (act_int(st, "パーツタイプ", -1) == 18) {
+		struct ex_tree *proc = act_child(st, "手順リスト");
+		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
+		if (step1) {
+			int w = act_list_int(step1, "先矩形", 4, 0);
+			int h = act_list_int(step1, "先矩形", 5, 0);
+			if (w > 0 && h > 0)
+				PE_SetPartsColorFill(no, w, h);
+		}
+		return;
+	}
+	struct string *cg = act_str(st, "ＣＧ名");
+	if (cg && cg->size)
+		PE_SetPartsCG(no, cg, 0, state);
+}
+
+// Returns the (top-level) parts number built for `node`, or -1 for a leaf/null.
+static int act_build_part(struct pe_activity *a, struct ex_tree *node, int parent_no)
+{
+	if (!node || node->is_leaf)
+		return -1;
+	int no = ++pe_act_part_seq;
+
+	// register name -> number so the game can resolve it (GetActivityPartsNumber)
+	a->parts = xrealloc_array(a->parts, a->nr_parts, a->nr_parts + 1, sizeof(*a->parts));
+	struct pe_act_part *ap = &a->parts[a->nr_parts];
+	ap->name = string_ref(node->name);
+	ap->number = no;
+	ap->intent_type = 0;
+	ap->intent_dests = NULL;
+	ap->nr_intent_dests = 0;
+	a->nr_parts++;
+
+	// intent (遷移): 遷移方法 = transition method, 遷移先 = destination list.
+	// A part with a transition method acts as an "end/transition" element: when
+	// clicked, MouseLClickEvent builds an intent from this and the framework
+	// closes/transitions the activity. (BindEndEvent gates on IsExistIntentData.)
+	// NOTE: ap is stable here — the recursion below reallocs a->parts, so we must
+	// finish filling ap before recursing.
+	ap->intent_type = act_int(node, "遷移方法", 0);
+	struct ex_tree *dst = act_child(node, "遷移先");
+	if (dst && dst->is_leaf && dst->leaf.value.type == EX_LIST) {
+		struct ex_list *l = dst->leaf.value.list;
+		for (unsigned i = 0; i < l->nr_items; i++) {
+			struct ex_value *v = &l->items[i].value;
+			if (v->type == EX_STRING && v->s && v->s->size > 0) {
+				ap->intent_dests = xrealloc_array(ap->intent_dests,
+					ap->nr_intent_dests, ap->nr_intent_dests + 1, sizeof(struct string *));
+				ap->intent_dests[ap->nr_intent_dests++] = string_ref(v->s);
+			}
+		}
+	}
+
+	struct ex_tree *ti = act_child(node, "種類別情報");
+	int ptype = ti ? act_int(ti, "パーツタイプ", -1) : -1;
+	if (getenv("XSYS4_PT_TRACE")) {
+		struct string *dcg = ti ? act_str(ti, "ＣＧ名") : NULL;
+		NOTICE("PT part '%s' no=%d ptype=%d cg='%s'", display_sjis0(node->name->text),
+		       no, ptype, dcg ? display_sjis1(dcg->text) : "(nil)");
+	}
+
+	if (ptype == 0 && ti) {
+		// button (パーツタイプ=0): the .pactex gives a *base* CG name; the actual
+		// per-state assets append a state suffix — normal/hover/down are stored as
+		// "<base>／通常", "<base>／オン", "<base>／ダウン" in the CG archive.
+		// (state param: 1=DEFAULT/通常, 2=HOVERED/オン, 3=CLICKED/ダウン)
+		static const char *const btn_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+		struct string *cg = act_str(ti, "ＣＧ名");
+		struct string *flat = act_str(ti, "フラット名");
+		int bw = act_list_int(ti, "サイズ", 0, 0);
+		int bh = act_list_int(ti, "サイズ", 1, 0);
+		for (int s = 1; s <= 3; s++) {
+			bool have_visual = false;
+			if (cg && cg->size) {
+				char *sjis = utf2sjis(btn_sfx[s], strlen(btn_sfx[s]));
+				struct string *suf = make_string(sjis, strlen(sjis));
+				struct string *full = string_concatenate(cg, suf);
+				have_visual = PE_SetPartsCG(no, full, 0, s);
+				free_string(full);
+				free_string(suf);
+				free(sjis);
+			} else if (flat && flat->size) {
+				have_visual = PE_SetPartsFlat(no, flat, s);
+			}
+			// Fallback hit-area from the declared size ONLY when no CG/flat loaded.
+			// (SetPartsRectangleDetectionSize resets the state to RECT_DETECTION,
+			// which would erase a CG; a loaded CG provides its own hitbox.)
+			if (!have_visual && bw > 0 && bh > 0)
+				PE_SetPartsRectangleDetectionSize(no, bw, bh, s);
+		}
+		PE_SetClickable(no, true);
+		PE_SetPartsIsButton(no, true);  // report component type 0 (button) to the game
+	} else if (ptype == 3 && ti) {
+		// horizontal scrollbar / slider (パーツタイプ=3). ＣＧ名 is a *base* name;
+		// the draggable knob ("bar") is stored per-state as "<base>／バー／通常",
+		// "<base>／バー／オン", "<base>／バー／ダウン" in the CG archive (the groove
+		// "<base>／背景" and the frame CG provide the rail). Track geometry
+		// (length/width/total/view/rate) lives here in 種類別情報.
+		static const char *const bar_sfx[4] = { NULL, "／バー／通常", "／バー／オン", "／バー／ダウン" };
+		struct string *cg = act_str(ti, "ＣＧ名");
+		struct string *flat = act_str(ti, "フラット名");
+		if (cg && cg->size) {
+			for (int s = 1; s <= 3; s++) {
+				char *sjis = utf2sjis(bar_sfx[s], strlen(bar_sfx[s]));
+				struct string *suf = make_string(sjis, strlen(sjis));
+				struct string *full = string_concatenate(cg, suf);
+				PE_SetPartsCG(no, full, 0, s);
+				free_string(full);
+				free_string(suf);
+				free(sjis);
+			}
+		} else if (flat && flat->size) {
+			PE_SetPartsFlat(no, flat, 1);
+		}
+		int base_x = act_list_int(node, "座標", 0, 0);
+		int base_y = act_list_int(node, "座標", 1, 0);
+		PE_InitPartsHScrollbar(no, base_x, base_y,
+			act_int(ti, "長さ", 0), act_int(ti, "幅", 0),
+			act_int(ti, "全体スクロール量", 0), act_int(ti, "表示量", 1),
+			act_float(ti, "スクロールレート", 0.0f));
+		PE_SetClickable(no, true);
+	} else if (ptype == 1 && ti) {
+		// checkbox (パーツタイプ=1): ＣＧ名 is a base; the box has checked/unchecked
+		// variants. テキスト is the label drawn to the right of the box.
+		struct string *cg = act_str(ti, "ＣＧ名");
+		bool checked = act_int(ti, "チェック状態", 0) != 0;
+		if (cg && cg->size) {
+			PE_InitPartsCheckBox(no, cg, checked);
+		} else {
+			// No CG: a colour-swatch button — render a solid fill of its size,
+			// tinted by the checkbox colour the game sets (SetCheckBoxColor).
+			int sw = act_list_int(ti, "サイズ", 0, 0);
+			int sh = act_list_int(ti, "サイズ", 1, 0);
+			if (sw > 0 && sh > 0)
+				PE_SetPartsColorFill(no, sw, sh);
+		}
+		PE_SetClickable(no, true);
+		struct string *txt = act_str(ti, "テキスト");
+		if (txt && txt->size) {
+			int base_x = act_list_int(node, "座標", 0, 0);
+			int base_y = act_list_int(node, "座標", 1, 0);
+			int box_w = PE_GetPartsWidth(no, 1);
+			if (box_w <= 0) box_w = act_list_int(ti, "サイズ", 0, 0);
+			if (box_w <= 0) box_w = 32;
+			int box_h = PE_GetPartsHeight(no, 1);
+			int fsize = act_int(ti, "フォントサイズ", 16);
+			int tno = ++pe_act_part_seq;
+			PE_SetText(tno, txt, 1);
+			PE_SetFont(tno, act_int(ti, "フォントタイプ", 0), fsize,
+				act_list_int(ti, "フォント色", 0, 255),
+				act_list_int(ti, "フォント色", 1, 255),
+				act_list_int(ti, "フォント色", 2, 255),
+				act_float(ti, "フォント太さ", 0.0f),
+				act_list_int(ti, "フォント縁取り色", 0, 0),
+				act_list_int(ti, "フォント縁取り色", 1, 0),
+				act_list_int(ti, "フォント縁取り色", 2, 0),
+				act_float(ti, "フォント縁取り", 0.0f), 1);
+			int ty = base_y + (box_h > fsize ? (box_h - fsize) / 2 : 0);
+			PE_SetPos(tno, base_x + box_w + 4, ty);
+			if (parent_no >= 0)
+				PE_SetParentPartsNumber(tno, parent_no);
+			PE_SetShow(tno, 1);
+		}
+	} else if (ti) {
+		// CG part: per-state CG names
+		act_set_state_cg(no, ti, "通常状態", 1);
+		act_set_state_cg(no, ti, "オンカーソル状態", 2);
+		act_set_state_cg(no, ti, "キーダウン状態", 3);
+	}
+
+	PE_SetPos(no, act_list_int(node, "座標", 0, 0), act_list_int(node, "座標", 1, 0));
+	PE_SetZ(no, act_list_int(node, "座標", 2, 0));
+	PE_SetAlpha(no, act_int(node, "アルファ", 255));
+	// 拡大縮小 (scale x,y): e.g. the config sample-window system icons are 0.5.
+	float sx = act_list_float(node, "拡大縮小", 0, 1.0f);
+	float sy = act_list_float(node, "拡大縮小", 1, 1.0f);
+	if (sx != 1.0f)
+		PE_SetPartsMagX(no, sx);
+	if (sy != 1.0f)
+		PE_SetPartsMagY(no, sy);
+	if (act_int(node, "クリック許可", 0))
+		PE_SetClickable(no, true);
+	if (parent_no >= 0)
+		PE_SetParentPartsNumber(no, parent_no);
+	PE_SetShow(no, act_int(node, "表示", 1));
+
+	// recurse into child parts. A パーツタイプ=18 "display range" child acts as a
+	// clip viewport: subsequent siblings (the preview scene/message-window/icons)
+	// are clipped to its rect via the alpha-clipper. This mirrors how the engine
+	// confines preview content to a box (used by config message-window previews).
+	struct ex_tree *kids = act_child(node, "子パーツ");
+	if (kids && !kids->is_leaf) {
+		int clip_viewport_no = -1;
+		for (unsigned i = 0; i < kids->nr_children; i++) {
+			int cno = act_build_part(a, &kids->children[i], no);
+			if (cno < 0)
+				continue;
+			struct ex_tree *cti = act_child(&kids->children[i], "種類別情報");
+			struct ex_tree *cnorm = cti ? act_child(cti, "通常状態") : NULL;
+			bool is_viewport = cnorm && act_int(cnorm, "パーツタイプ", -1) == 18;
+			if (is_viewport)
+				clip_viewport_no = cno;
+			else if (clip_viewport_no >= 0)
+				PE_SetPartsAlphaClipperPartsNumber(cno, clip_viewport_no);
+		}
+	}
+	return no;
+}
+
+static bool PE_ReadActivityFile(struct string *activity_name, struct string *file_name)
+{
+	struct pe_activity *a = pe_act_find(activity_name);
+	if (!a) { PE_CreateActivity(activity_name); a = pe_act_find(activity_name); }
+
+	struct archive_data *dfile = asset_get_by_name(ASSET_PACT, file_name->text, NULL);
+	if (!dfile) {
+		WARNING("ReadActivityFile: '%s' not found in Pact archive", display_sjis0(file_name->text));
+		return false;
+	}
+	struct ex *ex = ex_read(dfile->data, dfile->size);
+	archive_free_data(dfile);
+	if (!ex) {
+		WARNING("ReadActivityFile: failed to parse '%s'", display_sjis0(file_name->text));
+		return false;
+	}
+
+	char *sjis = utf2sjis("アクティビティ", strlen("アクティビティ"));
+	struct ex_value *act = ex_get(ex, sjis);
+	free(sjis);
+	if (act && act->type == EX_TREE && !act->tree->is_leaf && act->tree->nr_children >= 1) {
+		if (getenv("XSYS4_PARTS_TRACE") || getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_ACT_TRACE")) {
+			NOTICE("ReadActivityFile '%s' -> building parts (active ctrl=%d), pre-registered nr_parts=%d",
+			       display_sjis0(file_name->text), PE_get_active_controller(), a->nr_parts);
+			for (int i = 0; i < a->nr_parts; i++)
+				NOTICE("   pre-reg[%d] name='%s' number=%d",
+				       i, display_sjis0(a->parts[i].name->text), a->parts[i].number);
+		}
+		act_build_part(a, &act->tree->children[0], -1);  // ルートパーツ
+		if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_DUMP_PARTS")) {
+			NOTICE("=== parts right after ReadActivityFile build ===");
+			parts_debug_dump();
+		}
+	}
+	ex_free(ex);
+	return true;
+}
+
+// Activity "end keys" are optional keyboard shortcuts that close an activity
+// (e.g. ESC to cancel). Not tracked yet — report none so BindEndType proceeds
+// and the activity is driven by its on-screen buttons instead.
+static void PE_SetActivityEndKey(struct string *act, int key) { (void)act; (void)key; }
+static void PE_EraseActivityEndKey(struct string *act, int key) { (void)act; (void)key; }
+static bool PE_IsExistActivityEndKey(struct string *act, int key) { (void)act; (void)key; return false; }
+static int PE_NumofActivityEndKey(struct string *act) { (void)act; return 0; }
+static int PE_GetActivityEndKey(struct string *act, int index) { (void)act; (void)index; return 0; }
+
+// Recompute transform matrices for the frame. Our renderer derives transforms
+// from part params directly, so this is a no-op.
+static void PE_UpdateMatrix(bool b) { (void)b; }
+
+// Activity "close parts" (parts whose click closes the activity) and "intent
+// data" (data passed between activities) — activity metadata not tracked yet.
+// The dialogs we target are driven by their on-screen buttons, so report empty.
+static void PE_AddActivityCloseParts(struct string *a, struct string *p) { (void)a; (void)p; }
+static void PE_RemoveActivityCloseParts(struct string *a, struct string *p) { (void)a; (void)p; }
+static void PE_RemoveAllActivityCloseParts(struct string *a) { (void)a; }
+static bool PE_IsExistActivityCloseParts(struct string *a, struct string *p) { (void)a; (void)p; return false; }
+static int pe_act_find_by_name(struct pe_activity *a, struct string *pn);
+
+// Intent data is populated by ReadActivityFile from each part's 遷移方法/遷移先.
+// The game never calls Set/Add here (it only queries), so those stay no-ops.
+static void PE_SetActivityIntentData(struct string *a, struct string *b, struct string *c, int d) { (void)a; (void)b; (void)c; (void)d; }
+static void PE_AddActivityIntentDataDestination(struct string *a, struct string *b, struct string *c) { (void)a; (void)b; (void)c; }
+
+static struct pe_act_part *pe_act_intent_part(struct string *act, struct string *pn)
+{
+	struct pe_activity *a = pe_act_find(act);
+	int idx = pe_act_find_by_name(a, pn);
+	return idx >= 0 ? &a->parts[idx] : NULL;
+}
+
+// A part "has intent data" iff it declares a transition method (遷移方法 != 0).
+// BindEndEvent gates MouseLClickEvent registration on this, so it must be true
+// for buttons that close/transition the activity.
+static bool PE_IsExistActivityIntentData(struct string *act, struct string *pn)
+{
+	struct pe_act_part *p = pe_act_intent_part(act, pn);
+	bool r = p && p->intent_type != 0;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT IsExistActivityIntentData(act='%s', name='%s') -> %d",
+		       display_sjis0(act->text), display_sjis1(pn->text), r);
+	return r;
+}
+static int PE_NumofActivityIntentDataDestination(struct string *act, struct string *pn)
+{
+	struct pe_act_part *p = pe_act_intent_part(act, pn);
+	return p ? p->nr_intent_dests : 0;
+}
+static void PE_GetActivityIntentDataDestination(struct string **out, int i, struct string *act, struct string *pn)
+{
+	struct pe_act_part *p = pe_act_intent_part(act, pn);
+	if (*out) free_string(*out);
+	*out = string_ref(p && i >= 0 && i < p->nr_intent_dests ? p->intent_dests[i] : &EMPTY_STRING);
+}
+static int PE_GetActivityIntentDataType(struct string *act, struct string *pn)
+{
+	struct pe_act_part *p = pe_act_intent_part(act, pn);
+	return p ? p->intent_type : 0;
+}
+
+static int pe_act_find_by_name(struct pe_activity *a, struct string *pn)
+{
+	for (int i = 0; a && i < a->nr_parts; i++)
+		if (!strcmp(a->parts[i].name->text, pn->text))
+			return i;
+	return -1;
+}
+
+static bool PE_RemoveActivityParts(struct string *act, struct string *parts_name)
+{
+	struct pe_activity *a = pe_act_find(act);
+	int idx = pe_act_find_by_name(a, parts_name);
+	if (idx < 0)
+		return false;
+	free_string(a->parts[idx].name);
+	memmove(&a->parts[idx], &a->parts[idx+1], (a->nr_parts - idx - 1) * sizeof(*a->parts));
+	a->nr_parts--;
+	return true;
+}
+
+static bool PE_RemoveAllActivityParts(struct string *act)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a)
+		return false;
+	for (int i = 0; i < a->nr_parts; i++)
+		free_string(a->parts[i].name);
+	a->nr_parts = 0;
+	return true;
+}
+
+static int PE_NumofActivityParts(struct string *act)
+{
+	struct pe_activity *a = pe_act_find(act);
+	return a ? a->nr_parts : 0;
+}
+
+static bool PE_GetActivityParts(int index, struct string *act, struct string **name, int *number)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a || index < 0 || index >= a->nr_parts)
+		return false;
+	if (*name) free_string(*name);
+	*name = string_ref(a->parts[index].name);
+	*number = a->parts[index].number;
+	return true;
+}
+
+static bool PE_IsExistActivityPartsByName(struct string *act, struct string *pn)
+{
+	return pe_act_find_by_name(pe_act_find(act), pn) >= 0;
+}
+
+static bool PE_IsExistActivityPartsByNumber(struct string *act, int number)
+{
+	struct pe_activity *a = pe_act_find(act);
+	for (int i = 0; a && i < a->nr_parts; i++)
+		if (a->parts[i].number == number)
+			return true;
+	return false;
+}
+
+static int PE_GetActivityPartsNumber(struct string *act, struct string *pn)
+{
+	struct pe_activity *a = pe_act_find(act);
+	int idx = pe_act_find_by_name(a, pn);
+	int r = idx >= 0 ? a->parts[idx].number : -1;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT GetActivityPartsNumber(act='%s', name='%s') -> %d",
+		       display_sjis0(act->text), display_sjis1(pn->text), r);
+	return r;
+}
+
+static void PE_GetActivityPartsName(struct string **out, struct string *act, int number)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (*out) free_string(*out);
+	*out = NULL;
+	for (int i = 0; a && i < a->nr_parts; i++) {
+		if (a->parts[i].number == number) {
+			*out = string_ref(a->parts[i].name);
+			return;
+		}
+	}
+	*out = string_ref(&EMPTY_STRING);
+}
+
+static void PE_SetActivityEXText(struct string *act, struct string *text)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a) { PE_CreateActivity(act); a = pe_act_find(act); }
+	if (a->ex_text) free_string(a->ex_text);
+	a->ex_text = string_ref(text);
+}
+
+static void PE_GetActivityEXText(struct string *act, struct string **out)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (*out) free_string(*out);
+	*out = string_ref(a && a->ex_text ? a->ex_text : &EMPTY_STRING);
+}
+
+static int PE_GetActivityEXID(struct string *act)
+{
+	struct pe_activity *a = pe_act_find(act);
+	return a ? a->ex_id : -1;
+}
+
+// Проверка наличия файла активности: ищем запись в Pact-архиве так же, как это
+// делает ReadActivityFile. Без этого CConfigView@Execute (и другие экраны-меню)
+// получают пустое имя активности и рисуют чёрный экран.
+static bool PE_IsExistActivityFile(struct string *a)
+{
+	if (!a || !a->text || !a->text[0])
+		return false;
+	struct archive_data *dfile = asset_get_by_name(ASSET_PACT, a->text, NULL);
+	if (!dfile)
+		return false;
+	archive_free_data(dfile);
+	return true;
+}
+
+// Остальные файловые операции активностей — не поддержаны: безопасные заглушки.
+HLL_QUIET_UNIMPLEMENTED(true,  bool, PartsEngine, WriteActivityFile, struct string *a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, SaveActivityEXText, struct string **a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, LoadActivityEXText, struct string *a, struct string *b);
+
+// --- Button-виджеты (GUI-тулкит новых игр). Внешний вид пока не реализуем;
+// сеттеры — no-op, геттеры — разумные дефолты. Кнопки считаем включёнными,
+// чтобы логика меню могла по ним кликать. ---
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonSize, int a, int b, int c);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonEnable, int a, bool b);
+HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsButtonEnable, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonColor, int a, int b, int c, int d);
+HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonR, int a);
+HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonG, int a);
+HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonB, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonFontProperty, int a, int b, int c, int d, int e, int f, float g, int h, int i, int j, float k);
+// ВАЖНО: ref-output геттеры ОБЯЗАНЫ заполнять выходы — иначе игра читает
+// неинициализированный локал (мусор INT_MIN) и, напр., сохраняет как размер
+// шрифта → текст не рисуется. Пишем разумные дефолты (размер шрифта 16).
+static void PE_GetButtonFontProperty(int a, int *type, int *size, int *r, int *g, int *b,
+	float *weight, int *sr, int *sg, int *sb, float *sw) {
+	(void)a;
+	if (type) *type = 0;
+	if (size) *size = 16;
+	if (r) *r = 255; if (g) *g = 255; if (b) *b = 255;
+	if (weight) *weight = 1.0f;
+	if (sr) *sr = 0; if (sg) *sg = 0; if (sb) *sb = 0;
+	if (sw) *sw = 0.0f;
+}
+static void PE_str_out(struct string **out) {
+	if (*out) free_string(*out);
+	*out = string_ref(&EMPTY_STRING);
+}
+static void PE_GetButtonCGName(int a, struct string **b) { (void)a; PE_str_out(b); }
+static void PE_GetButtonFlatName(int a, struct string **b) { (void)a; PE_str_out(b); }
+static void PE_GetButtonText(int a, struct string **b) { (void)a; PE_str_out(b); }
+
+// Button parts are backed by the normal parts state machine (3 states:
+// default/hovered/clicked). Setting a button's flat/CG name must actually
+// load the resource into all states so the button renders — otherwise the
+// title menu (built entirely from flat buttons) stays invisible (black).
+static void PE_SetButtonCGName(int parts_no, struct string *name) {
+	for (int st = 1; st <= 3; st++)  // default/hovered/clicked
+		PE_SetPartsCG(parts_no, name, 0, st);
+}
+static void PE_SetButtonFlatName(int parts_no, struct string *name) {
+	for (int st = 1; st <= 3; st++)  // default/hovered/clicked
+		PE_SetPartsFlat(parts_no, name, st);
+}
+
+// Newer movie-parts API (CreatePartsMovie/PlayPartsMovie/IsEndPartsMovie/
+// ReleasePartsMovie). Video playback for these is not implemented yet, so we
+// treat the movie as instantly finished — this SKIPS the OP movie so the game
+// proceeds to the title menu instead of waiting forever on a black screen.
+static bool PE_CreatePartsMovie(int parts_no, struct string *filename, int a, int b, int c, int d, int e, int f) {
+	(void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS CreatePartsMovie(%d, '%s') [skip]", parts_no,
+		       filename ? filename->text : "(null)");
+	return true;
+}
+static bool PE_PlayPartsMovie(int parts_no, int state) {
+	(void)state;
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS PlayPartsMovie(%d) [skip]", parts_no);
+	return true;
+}
+static bool PE_IsEndPartsMovie(int parts_no, int state) {
+	(void)parts_no; (void)state;
+	return true;  // report finished immediately so the OP is skipped
+}
+static bool PE_ReleasePartsMovie(int parts_no, int state) {
+	(void)parts_no; (void)state;
+	return true;
+}
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonText, int a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonTextOriginPosMode, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetButtonTextOriginPosMode, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonCharSpace, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetButtonCharSpace, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonLineSpace, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetButtonLineSpace, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetCheckBoxButtonWidth, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetCheckBoxButtonHeight, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetCheckBoxButtonMode, int a, bool b);
+HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, IsCheckBoxButtonMode, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarMoveSizeByButton, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarMoveSizeByButton, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarMoveSizeByButton, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarMoveSizeByButton, int a);
+HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, IsRadioButtonBoxExistGUI, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearRadioButtonBoxChild, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, AddRadioButtonBoxChild, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, RemoveRadioButtonBoxChild, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, NumofRadioButtonBoxChild, int a);
+HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetRadioButtonBoxChild, int a, int b);
+
+// --- Дочерние parts. Иерархия (для рендера) через готовый parent-указатель;
+// запросы количества/по-индексу минимальны. ---
+static void PE_AddChild(int parent, int child) { PE_SetParentPartsNumber(child, parent); }
+static void PE_InsertChild(int parent, int child, int index) { (void)index; PE_SetParentPartsNumber(child, parent); }
+static void PE_RemoveChild(int parent, int child) { (void)parent; PE_SetParentPartsNumber(child, -1); }
+static bool PE_IsExistChild(int parent, int child) { return PE_GetParentPartsNumber(child) == parent; }
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearChild, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, NumofChild, int a);
+HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChild, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChildIndex, int a, int b);
 
 static void PartsEngine_PreLink(void);
 
@@ -353,11 +1148,17 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Init, PE_Init),
 	    HLL_EXPORT(Update, PartsEngine_Update),
 	    HLL_TODO_EXPORT(UpdateGUIController, PartsEngine_UpdateGUIController),
+	    HLL_EXPORT(SetWantSaveBackScene, PE_SetWantSaveBackScene),
+	    HLL_EXPORT(SaveBackScene, PE_SaveBackScene),
 	    HLL_EXPORT(GetFreeSystemPartsNumber, PE_GetFreeNumber),
 	    // FIXME: what is the difference?
 	    HLL_EXPORT(GetFreeSystemPartsNumberNotSaved, PE_GetFreeNumber),
 	    HLL_EXPORT(IsExistParts, PE_IsExist),
 	    HLL_EXPORT(SetPartsCG, PE_SetPartsCG),
+	    HLL_EXPORT(CreatePartsMovie, PE_CreatePartsMovie),
+	    HLL_EXPORT(PlayPartsMovie, PE_PlayPartsMovie),
+	    HLL_EXPORT(IsEndPartsMovie, PE_IsEndPartsMovie),
+	    HLL_EXPORT(ReleasePartsMovie, PE_ReleasePartsMovie),
 	    HLL_EXPORT(GetPartsCGName, PE_GetPartsCGName),
 	    HLL_EXPORT(SetPartsCGSurfaceArea, PE_SetPartsCGSurfaceArea),
 	    HLL_EXPORT(SetLoopCG, PE_SetLoopCG),
@@ -463,6 +1264,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetPartsOriginPosMode, PE_SetPartsOriginPosMode),
 	    HLL_EXPORT(GetPartsOriginPosMode, PE_GetPartsOriginPosMode),
 	    HLL_EXPORT(SetParentPartsNumber, PE_SetParentPartsNumber),
+	    HLL_EXPORT(Parts_GetParentPartsNumber, PE_GetParentPartsNumber),
 	    HLL_EXPORT(SetPartsGroupNumber, PE_SetPartsGroupNumber),
 	    HLL_EXPORT(SetPartsGroupDecideOnCursor, PE_SetPartsGroupDecideOnCursor),
 	    HLL_EXPORT(SetPartsGroupDecideClick, PE_SetPartsGroupDecideClick),
@@ -514,18 +1316,105 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Load, PE_Load),
 	    // Rance 9
 	    HLL_EXPORT(PartsFunc, PartsEngine_PartsFunc),
+	    HLL_EXPORT(AddPartsConstructionProcess, PE_AddPartsConstructionProcess),
 	    HLL_EXPORT(Release, PE_ReleaseParts),
 	    HLL_TODO_EXPORT(ReleaseAll, PartsEngine_ReleaseAll),
 	    HLL_EXPORT(ReleaseAllWithoutSystem, PE_ReleaseAllWithoutSystem),
 	    HLL_EXPORT(GetFreeNumber, PE_GetFreeNumber),
 	    HLL_EXPORT(IsExist, PE_IsExist),
 	    HLL_EXPORT(AddController, PE_AddController),
+	    HLL_EXPORT(SetActiveController, PE_set_active_controller),
+	    HLL_EXPORT(GetActiveController, PE_get_active_controller),
+	    HLL_EXPORT(GetControllerLength, PE_get_controller_length),
+	    HLL_EXPORT(GetControllerID, PE_get_controller_id),
+	    HLL_EXPORT(CreateActivity, PE_CreateActivity),
+	    HLL_EXPORT(IsExistActivity, PE_IsExistActivity),
+	    HLL_EXPORT(ReleaseActivity, PE_ReleaseActivity),
+	    HLL_EXPORT(AddActivityParts, PE_AddActivityParts),
+	    HLL_EXPORT(RemoveActivityParts, PE_RemoveActivityParts),
+	    HLL_EXPORT(RemoveAllActivityParts, PE_RemoveAllActivityParts),
+	    HLL_EXPORT(NumofActivityParts, PE_NumofActivityParts),
+	    HLL_EXPORT(GetActivityParts, PE_GetActivityParts),
+	    HLL_EXPORT(IsExistActivityPartsByName, PE_IsExistActivityPartsByName),
+	    HLL_EXPORT(IsExistActivityPartsByNumber, PE_IsExistActivityPartsByNumber),
+	    HLL_EXPORT(GetActivityPartsNumber, PE_GetActivityPartsNumber),
+	    HLL_EXPORT(GetActivityPartsName, PE_GetActivityPartsName),
+	    HLL_EXPORT(SetActivityEXText, PE_SetActivityEXText),
+	    HLL_EXPORT(GetActivityEXText, PE_GetActivityEXText),
+	    HLL_EXPORT(GetActivityEXID, PE_GetActivityEXID),
+	    HLL_EXPORT(IsExistActivityFile, PE_IsExistActivityFile),
+	    HLL_EXPORT(ReadActivityFile, PE_ReadActivityFile),
+	    HLL_EXPORT(SetActivityEndKey, PE_SetActivityEndKey),
+	    HLL_EXPORT(EraseActivityEndKey, PE_EraseActivityEndKey),
+	    HLL_EXPORT(IsExistActivityEndKey, PE_IsExistActivityEndKey),
+	    HLL_EXPORT(NumofActivityEndKey, PE_NumofActivityEndKey),
+	    HLL_EXPORT(GetComponentAbsoluteMaxPosZ, PE_GetComponentAbsoluteMaxPosZ),
+	    HLL_EXPORT(UpdateMatrix, PE_UpdateMatrix),
+	    HLL_EXPORT(GetActivityEndKey, PE_GetActivityEndKey),
+	    HLL_EXPORT(AddActivityCloseParts, PE_AddActivityCloseParts),
+	    HLL_EXPORT(RemoveActivityCloseParts, PE_RemoveActivityCloseParts),
+	    HLL_EXPORT(RemoveAllActivityCloseParts, PE_RemoveAllActivityCloseParts),
+	    HLL_EXPORT(IsExistActivityCloseParts, PE_IsExistActivityCloseParts),
+	    HLL_EXPORT(SetActivityIntentData, PE_SetActivityIntentData),
+	    HLL_EXPORT(AddActivityIntentDataDestination, PE_AddActivityIntentDataDestination),
+	    HLL_EXPORT(IsExistActivityIntentData, PE_IsExistActivityIntentData),
+	    HLL_EXPORT(NumofActivityIntentDataDestination, PE_NumofActivityIntentDataDestination),
+	    HLL_EXPORT(GetActivityIntentDataDestination, PE_GetActivityIntentDataDestination),
+	    HLL_EXPORT(GetActivityIntentDataType, PE_GetActivityIntentDataType),
+	    HLL_EXPORT(WriteActivityFile, PartsEngine_WriteActivityFile),
+	    HLL_EXPORT(SaveActivityEXText, PartsEngine_SaveActivityEXText),
+	    HLL_EXPORT(LoadActivityEXText, PartsEngine_LoadActivityEXText),
+	    HLL_EXPORT(SetButtonSize, PartsEngine_SetButtonSize),
+	    HLL_EXPORT(SetButtonEnable, PartsEngine_SetButtonEnable),
+	    HLL_EXPORT(IsButtonEnable, PartsEngine_IsButtonEnable),
+	    HLL_EXPORT(SetButtonColor, PartsEngine_SetButtonColor),
+	    HLL_EXPORT(GetButtonR, PartsEngine_GetButtonR),
+	    HLL_EXPORT(GetButtonG, PartsEngine_GetButtonG),
+	    HLL_EXPORT(GetButtonB, PartsEngine_GetButtonB),
+	    HLL_EXPORT(SetButtonFontProperty, PartsEngine_SetButtonFontProperty),
+	    HLL_EXPORT(GetButtonFontProperty, PE_GetButtonFontProperty),
+	    HLL_EXPORT(SetButtonCGName, PE_SetButtonCGName),
+	    HLL_EXPORT(GetButtonCGName, PE_GetButtonCGName),
+	    HLL_EXPORT(SetButtonFlatName, PE_SetButtonFlatName),
+	    HLL_EXPORT(GetButtonFlatName, PE_GetButtonFlatName),
+	    HLL_EXPORT(SetButtonText, PartsEngine_SetButtonText),
+	    HLL_EXPORT(GetButtonText, PE_GetButtonText),
+	    HLL_EXPORT(SetButtonTextOriginPosMode, PartsEngine_SetButtonTextOriginPosMode),
+	    HLL_EXPORT(GetButtonTextOriginPosMode, PartsEngine_GetButtonTextOriginPosMode),
+	    HLL_EXPORT(SetButtonCharSpace, PartsEngine_SetButtonCharSpace),
+	    HLL_EXPORT(GetButtonCharSpace, PartsEngine_GetButtonCharSpace),
+	    HLL_EXPORT(SetButtonLineSpace, PartsEngine_SetButtonLineSpace),
+	    HLL_EXPORT(GetButtonLineSpace, PartsEngine_GetButtonLineSpace),
+	    HLL_EXPORT(GetCheckBoxButtonWidth, PartsEngine_GetCheckBoxButtonWidth),
+	    HLL_EXPORT(GetCheckBoxButtonHeight, PartsEngine_GetCheckBoxButtonHeight),
+	    HLL_EXPORT(SetCheckBoxButtonMode, PartsEngine_SetCheckBoxButtonMode),
+	    HLL_EXPORT(IsCheckBoxButtonMode, PartsEngine_IsCheckBoxButtonMode),
+	    HLL_EXPORT(SetVScrollbarMoveSizeByButton, PartsEngine_SetVScrollbarMoveSizeByButton),
+	    HLL_EXPORT(GetVScrollbarMoveSizeByButton, PartsEngine_GetVScrollbarMoveSizeByButton),
+	    HLL_EXPORT(SetHScrollbarMoveSizeByButton, PartsEngine_SetHScrollbarMoveSizeByButton),
+	    HLL_EXPORT(GetHScrollbarMoveSizeByButton, PartsEngine_GetHScrollbarMoveSizeByButton),
+	    HLL_EXPORT(IsRadioButtonBoxExistGUI, PartsEngine_IsRadioButtonBoxExistGUI),
+	    HLL_EXPORT(ClearRadioButtonBoxChild, PartsEngine_ClearRadioButtonBoxChild),
+	    HLL_EXPORT(AddRadioButtonBoxChild, PartsEngine_AddRadioButtonBoxChild),
+	    HLL_EXPORT(RemoveRadioButtonBoxChild, PartsEngine_RemoveRadioButtonBoxChild),
+	    HLL_EXPORT(NumofRadioButtonBoxChild, PartsEngine_NumofRadioButtonBoxChild),
+	    HLL_EXPORT(GetRadioButtonBoxChild, PartsEngine_GetRadioButtonBoxChild),
+	    HLL_EXPORT(AddChild, PE_AddChild),
+	    HLL_EXPORT(InsertChild, PE_InsertChild),
+	    HLL_EXPORT(RemoveChild, PE_RemoveChild),
+	    HLL_EXPORT(IsExistChild, PE_IsExistChild),
+	    HLL_EXPORT(ClearChild, PartsEngine_ClearChild),
+	    HLL_EXPORT(NumofChild, PartsEngine_NumofChild),
+	    HLL_EXPORT(GetChild, PartsEngine_GetChild),
+	    HLL_EXPORT(GetChildIndex, PartsEngine_GetChildIndex),
 	    HLL_EXPORT(RemoveController, PE_RemoveController),
 	    HLL_EXPORT(UpdateComponent, PartsEngine_Update),
 	    HLL_EXPORT(Parts_SetThumbnailReductionSize, PE_SetThumbnailReductionSize),
 	    HLL_EXPORT(Parts_SetThumbnailMode, PE_SetThumbnailMode),
 	    HLL_EXPORT(GetClickNumber, PE_GetClickPartsNumber),
 	    HLL_EXPORT(StopSoundWithoutSystemSound, PartsEngine_StopSoundWithoutSystemSound),
+	    HLL_EXPORT(Parts_SetSoundName, PE_Parts_SetSoundName),
+	    HLL_EXPORT(Parts_GetSoundName, PE_Parts_GetSoundName),
 	    HLL_TODO_EXPORT(ReleaseActivity, PartsEngine_ReleaseActivity),
 	    HLL_TODO_EXPORT(CrateActivityBinary, PartsEngine_CrateActivityBinary),
 	    HLL_TODO_EXPORT(ReadActivityBinary, PartsEngine_ReadActivityBinary),
@@ -638,12 +1527,12 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetCheckBoxSize, PartsEngine_SetCheckBoxSize),
 	    HLL_TODO_EXPORT(SetCheckBoxDrag, PartsEngine_SetCheckBoxDrag),
 	    HLL_TODO_EXPORT(IsCheckBoxDrag, PartsEngine_IsCheckBoxDrag),
-	    HLL_TODO_EXPORT(CheckBoxChecked, PartsEngine_CheckBoxChecked),
-	    HLL_TODO_EXPORT(IsCheckBoxChecked, PartsEngine_IsCheckBoxChecked),
-	    HLL_TODO_EXPORT(SetCheckBoxColor, PartsEngine_SetCheckBoxColor),
-	    HLL_TODO_EXPORT(GetCheckBoxR, PartsEngine_GetCheckBoxR),
-	    HLL_TODO_EXPORT(GetCheckBoxG, PartsEngine_GetCheckBoxG),
-	    HLL_TODO_EXPORT(GetCheckBoxB, PartsEngine_GetCheckBoxB),
+	    HLL_EXPORT(CheckBoxChecked, PE_SetPartsCheckBoxChecked),
+	    HLL_EXPORT(IsCheckBoxChecked, PE_GetPartsCheckBoxChecked),
+	    HLL_EXPORT(SetCheckBoxColor, PE_SetPartsCheckBoxColor),
+	    HLL_EXPORT(GetCheckBoxR, PE_GetPartsCheckBoxR),
+	    HLL_EXPORT(GetCheckBoxG, PE_GetPartsCheckBoxG),
+	    HLL_EXPORT(GetCheckBoxB, PE_GetPartsCheckBoxB),
 	    HLL_TODO_EXPORT(SetCheckBoxFontProperty, PartsEngine_SetCheckBoxFontProperty),
 	    HLL_TODO_EXPORT(GetCheckBoxFontProperty, PartsEngine_GetCheckBoxFontProperty),
 	    HLL_TODO_EXPORT(SetCheckBoxOnCursorSoundNumber, PartsEngine_SetCheckBoxOnCursorSoundNumber),
@@ -687,12 +1576,12 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetHScrollbarTotalSize, PartsEngine_SetHScrollbarTotalSize),
 	    HLL_TODO_EXPORT(SetHScrollbarViewSize, PartsEngine_SetHScrollbarViewSize),
 	    HLL_TODO_EXPORT(SetHScrollbarScrollPos, PartsEngine_SetHScrollbarScrollPos),
-	    HLL_TODO_EXPORT(SetHScrollbarScrollRate, PartsEngine_SetHScrollbarScrollRate),
+	    HLL_EXPORT(SetHScrollbarScrollRate, PE_SetPartsHScrollbarScrollRate),
 	    HLL_TODO_EXPORT(SetHScrollbarMoveSizeByButton, PartsEngine_SetHScrollbarMoveSizeByButton),
 	    HLL_TODO_EXPORT(GetHScrollbarTotalSize, PartsEngine_GetHScrollbarTotalSize),
 	    HLL_TODO_EXPORT(GetHScrollbarViewSize, PartsEngine_GetHScrollbarViewSize),
 	    HLL_TODO_EXPORT(GetHScrollbarScrollPos, PartsEngine_GetHScrollbarScrollPos),
-	    HLL_TODO_EXPORT(GetHScrollbarScrollRate, PartsEngine_GetHScrollbarScrollRate),
+	    HLL_EXPORT(GetHScrollbarScrollRate, PE_GetPartsHScrollbarScrollRate),
 	    HLL_TODO_EXPORT(GetHScrollbarMoveSizeByButton, PartsEngine_GetHScrollbarMoveSizeByButton),
 	    HLL_TODO_EXPORT(SetHScrollbarCGName, PartsEngine_SetHScrollbarCGName),
 	    HLL_TODO_EXPORT(GetHScrollbarCGName, PartsEngine_GetHScrollbarCGName),

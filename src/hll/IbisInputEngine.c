@@ -39,7 +39,7 @@ static void IbisInputEngine_Joystick_ClearCaptureFlag(void)
 }
 
 //int IbisInputEngine_Joystick_GetNumofDevice(void);
-HLL_WARN_UNIMPLEMENTED(0, int,  IbisInputEngine, Joystick_GetNumofDevice);
+HLL_QUIET_UNIMPLEMENTED(0, int,  IbisInputEngine, Joystick_GetNumofDevice);
 
 bool IbisInputEngine_Joystick_IsKeyDown(int DeviceNumber, int JoystickCode)
 {

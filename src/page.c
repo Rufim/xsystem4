@@ -90,6 +90,9 @@ union vm_value variable_initval(enum ain_data_type type)
 		return (union vm_value) { .i = -1 };
 	case AIN_ARRAY_TYPE:
 	case AIN_DELEGATE:
+	// новый generic-массив System 4 (тип 79): тоже page-слот пустого массива,
+	// иначе член-массив == 0 и паттерн «DELETE old; X_A_INIT» портит чужие слоты
+	case AIN_ARRAY:
 		slot = heap_alloc_slot(VM_PAGE);
 		heap_set_page(slot, NULL);
 		return (union vm_value) { .i = slot };

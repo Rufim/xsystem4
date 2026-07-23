@@ -336,6 +336,22 @@ static void render_flat_cg(struct parts *parts, Texture *tex,
 	// should not shift the on-screen position. This translation cancels
 	// the offset that the sub-rect's top-left would otherwise introduce.
 	glm_translate(render_m, (vec3){ -(float)key->area_x, -(float)key->area_y, 0.0f });
+	// key->origin_mode (formerly "uk2") is the layer's anchor/registration point
+	// on the standard 1-9 grid (1=top-left, 5=center, ...). origin_x/origin_y are
+	// usually 0, so the anchor is expressed via this mode; apply it against the
+	// content size so e.g. a full-screen zoom layer (mode 5) is centered instead
+	// of pinned top-left. Mode 1 (top-left) is a no-op, preserving old behavior.
+	{
+		int cw = key->area_width ? key->area_width : tex->w;
+		int ch = key->area_height ? key->area_height : tex->h;
+		int m = key->origin_mode;
+		float ax = (m == 2 || m == 5 || m == 8) ? cw / 2.0f
+			 : (m == 3 || m == 6 || m == 9) ? (float)cw : 0.0f;
+		float ay = (m == 4 || m == 5 || m == 6) ? ch / 2.0f
+			 : (m == 7 || m == 8 || m == 9) ? (float)ch : 0.0f;
+		if (ax != 0.0f || ay != 0.0f)
+			glm_translate(render_m, (vec3){ -ax, -ay, 0.0f });
+	}
 	glm_scale(render_m, (vec3){ tex->w, tex->h, 1.0f });
 
 	Rectangle rect;
@@ -583,6 +599,13 @@ static void parts_render_flash(struct parts *parts, struct parts_flash *f)
 
 void parts_render(struct parts *parts)
 {
+	if (getenv("XSYS4_RENDER_TRACE") && parts->no >= 90000000) {
+		struct parts_state *s = &parts->states[parts->state];
+		NOTICE("RENDER part %d: show=%d msgwin=%d state=%d type=%d tex=%u pos=%d,%d wh=%dx%d alpha=%d",
+		       parts->no, parts->global.show, parts->message_window, parts->state,
+		       s->type, s->common.texture.handle, parts->global.pos.x, parts->global.pos.y,
+		       s->common.w, s->common.h, parts->global.alpha);
+	}
 	if (!parts->global.show)
 		return;
 	if (parts->message_window && !parts_message_window_show)

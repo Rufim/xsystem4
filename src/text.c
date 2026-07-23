@@ -105,6 +105,13 @@ static struct font *get_font(unsigned face)
 		}
 		return font_fnl[face];
 	}
+	// Prefer the game's embedded .fnl font for the standard faces (0=gothic,
+	// 1=mincho) when it is available: this matches the original glyphs, metrics
+	// and line spacing far better than a substitute system TTF. Falls back to
+	// FreeType when no .fnl is loaded (games without one are unaffected).
+	// Toggle off with XSYS4_NO_FNL to compare.
+	if (face <= 1 && font_fnl[face] && !getenv("XSYS4_NO_FNL"))
+		return font_fnl[face];
 	if (face > 1)
 		return font_ttf[0];
 	return font_ttf[face];
@@ -201,6 +208,7 @@ float gfx_get_actual_font_size_round_down(unsigned face, float size)
 float _gfx_render_text(Texture *dst, char *msg, struct text_render_metrics *tm)
 {
 	bridge_newfont_draw();
+	bridge_text_drawn(msg);
 	float pos_x = tm->x;
 	int pos_y = tm->y + tm->font_size->y_offset;
 

@@ -37,16 +37,34 @@ static int click_down_parts = 0;
 // drag state
 static struct parts *drag_parts = NULL;
 static bool is_dragging = false;
+// scrollbar (config slider) currently being dragged, if any
+static struct parts *dragging_scrollbar = NULL;
 static Point drag_initial_pos;
 static Point drag_start_cursor;
 static struct parts *drop_target = NULL;
 
 static bool parts_hittest(struct parts *parts, int state, Point pos)
 {
-	Rectangle hitbox = parts->states[state].common.hitbox;
-	if (parts->parent) {
-		hitbox.x += parts->parent->global.pos.x;
-		hitbox.y += parts->parent->global.pos.y;
+	struct parts_common *c = &parts->states[state].common;
+	float sx = parts->global.scale.x, sy = parts->global.scale.y;
+	Rectangle hitbox;
+	if (sx != 1.0f || sy != 1.0f) {
+		// Scaled parts render as global.pos + scale·origin_offset, size scale·wh.
+		// The stored hitbox is unscaled, so recompute it here (e.g. the config
+		// message-window sample is drawn at 0.5× — its hit area must match, or
+		// its full-size box would swallow clicks meant for the buttons behind).
+		hitbox = (Rectangle){
+			parts->global.pos.x + (int)(c->origin_offset.x * sx),
+			parts->global.pos.y + (int)(c->origin_offset.y * sy),
+			(int)(c->w * sx),
+			(int)(c->h * sy),
+		};
+	} else {
+		hitbox = c->hitbox;
+		if (parts->parent) {
+			hitbox.x += parts->parent->global.pos.x;
+			hitbox.y += parts->parent->global.pos.y;
+		}
 	}
 	return SDL_PointInRect(&pos, &hitbox);
 }
@@ -64,6 +82,8 @@ void parts_input_reset_drag(struct parts *parts)
 		drag_state_reset();
 	else if (parts == drop_target)
 		drop_target = NULL;
+	if (parts == dragging_scrollbar)
+		dragging_scrollbar = NULL;
 }
 
 static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clicking,
@@ -153,6 +173,10 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		audio_play_sound(parts->on_click_sound);
 		clicked_parts = parts->no;
 
+		// Checkbox: flip state on click; the game reads it via IsCheckBoxChecked.
+		if (parts->is_checkbox)
+			parts_checkbox_toggle(parts);
+
 		parts_msg_push(parts, PARTS_MSG_MOUSE_CLICK,
 				"iii", cur_pos.x, cur_pos.y, VK_LBUTTON);
 		parts_msg_push(parts, PARTS_MSG_KEY_UP, "i", VK_LBUTTON);
@@ -165,6 +189,20 @@ void PE_UpdateInputState(int passed_time)
 	bool cur_clicking = key_is_down(VK_LBUTTON);
 	mouse_get_pos(&cur_pos.x, &cur_pos.y);
 
+	if (getenv("XSYS4_INPUT_TRACE")) {
+		static int ncalls = 0;
+		if ((ncalls++ % 30) == 0 || cur_clicking || clicked_parts)
+			NOTICE("INPUT UpdateInputState #%d: clicking=%d pos=%d,%d clicked_parts=%d",
+			       ncalls, cur_clicking, cur_pos.x, cur_pos.y, clicked_parts);
+	}
+	if (getenv("XSYS4_DUMP_PARTS")) {
+		static int dcnt = 0;
+		if ((dcnt++ % 120) == 5) {
+			NOTICE("--- PARTS DUMP (live) ---");
+			parts_debug_dump();
+		}
+	}
+
 	bool hover_consumed = false;
 	bool click_consumed = false;
 	struct parts *parts;
@@ -172,6 +210,30 @@ void PE_UpdateInputState(int passed_time)
 	PARTS_LIST_FOREACH_REVERSE(parts) {
 		parts_update_mouse(parts, cur_pos, cur_clicking, passed_time,
 				&hover_consumed, &click_consumed);
+	}
+
+	// Horizontal scrollbar (config sliders): grab on press anywhere in the track
+	// band, then follow the cursor. The knob CG is small, so hit-test the whole
+	// track rectangle for a forgiving grab + click-to-jump.
+	if (cur_clicking && !prev_clicking && !dragging_scrollbar) {
+		PARTS_LIST_FOREACH_REVERSE(parts) {
+			if (!parts->is_hscrollbar || !parts->global.show)
+				continue;
+			int px = parts->parent ? parts->parent->global.pos.x : 0;
+			int py = parts->parent ? parts->parent->global.pos.y : 0;
+			Rectangle track = { px + parts->sb_base_x, py + parts->sb_base_y,
+					parts->sb_length, parts->sb_width };
+			if (SDL_PointInRect(&cur_pos, &track)) {
+				dragging_scrollbar = parts;
+				break;
+			}
+		}
+	}
+	if (dragging_scrollbar) {
+		if (cur_clicking)
+			parts_hscrollbar_drag_to(dragging_scrollbar, cur_pos.x);
+		else
+			dragging_scrollbar = NULL;
 	}
 
 	// Drag movement processing
@@ -256,6 +318,11 @@ bool PE_GetPartsPassCursor(int parts_no)
 void PE_SetClickable(int parts_no, bool clickable)
 {
 	parts_get(parts_no)->clickable = !!clickable;
+}
+
+void PE_SetPartsIsButton(int parts_no, bool is_button)
+{
+	parts_get(parts_no)->is_button = !!is_button;
 }
 
 bool PE_GetPartsClickable(int parts_no)

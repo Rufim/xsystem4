@@ -18,6 +18,7 @@
 
 #include "system4.h"
 #include "system4/ain.h"
+#include "system4/string.h"
 
 #include "vm.h"
 #include "hll.h"
@@ -93,6 +94,103 @@ static int rance9_wav_prepare(int ch, int num)
 	return wav_prepare_from_archive_data(ch, dfile);
 }
 
+/*
+ * Newer games (e.g. Tsumamigui 3) use a flat sound API keyed by an integer
+ * ID instead of the namespaced Music_ and Sound_ API. All audio (BGM, SE and
+ * opening songs) lives in the ASSET_SOUND archive, addressed by basename (no
+ * extension). The flat ID doubles as a channel id in the shared wav pool
+ * (audio.c's id_pool grows on demand), so playback maps straight onto the
+ * existing wav_* backend. GetFreeID/GetFreeSeID hand out a currently-idle id
+ * from the [Min,Max] range the game requests, which keeps the id space bounded
+ * and lets finished one-shots be reused.
+ */
+#define KSE_SND_TRACE() (getenv("XSYS4_SND_TRACE") != NULL)
+
+static int kse_get_free_id(int min_id, int max_id)
+{
+	if (max_id < min_id)
+		max_id = min_id;
+	for (int id = min_id; id <= max_id; id++) {
+		if (!wav_is_playing(id))
+			return id;
+	}
+	return min_id;
+}
+
+static int KiwiSoundEngine_GetFreeID(int min_id, int max_id)
+{
+	int id = kse_get_free_id(min_id, max_id);
+	if (KSE_SND_TRACE()) NOTICE("KSE GetFreeID(%d,%d) -> %d", min_id, max_id, id);
+	return id;
+}
+
+static int KiwiSoundEngine_GetFreeSeID(int min_id, int max_id)
+{
+	return KiwiSoundEngine_GetFreeID(min_id, max_id);
+}
+
+// Load a sound by name from the Sound archive and prepare it on channel `id`.
+static bool kse_prepare_name(int id, struct string *name)
+{
+	if (!name || id < 0)
+		return false;
+	struct archive_data *dfile = asset_get_by_name(ASSET_SOUND, name->text, NULL);
+	if (!dfile) {
+		if (KSE_SND_TRACE()) NOTICE("KSE: sound '%s' not found", name->text);
+		return false;
+	}
+	// wav_prepare_from_archive_data takes ownership of dfile.
+	return wav_prepare_from_archive_data(id, dfile);
+}
+
+static bool KiwiSoundEngine_flat_IsExistFile(struct string *s) { return s && asset_exists_by_name(ASSET_SOUND, s->text, NULL); }
+static bool KiwiSoundEngine_flat_IsExistID(int id) { (void)id; return true; }
+static bool KiwiSoundEngine_flat_IsExistSeID(int id) { (void)id; return true; }
+static bool KiwiSoundEngine_flat_IsPlay(int id) { return wav_is_playing(id); }
+static bool KiwiSoundEngine_flat_IsPlaySe(int id) { return wav_is_playing(id); }
+static bool KiwiSoundEngine_flat_IsFade(int id) { return wav_is_fading(id); }
+static bool KiwiSoundEngine_flat_IsPause(int id) { return wav_is_paused(id); }
+static bool KiwiSoundEngine_flat_Prepare(int id, struct string *s, bool streaming)
+{
+	(void)streaming;  // we always decode from the archive; no separate stream path
+	if (KSE_SND_TRACE()) NOTICE("KSE Prepare(id=%d, name='%s', streaming=%d)", id, s?s->text:"(null)", streaming);
+	return kse_prepare_name(id, s);
+}
+static bool KiwiSoundEngine_flat_Unprepare(int id) { wav_unprepare(id); return true; }
+static bool KiwiSoundEngine_flat_Play(int id) { bool r = wav_play(id); if (KSE_SND_TRACE()) NOTICE("KSE Play(id=%d) -> %d, len=%dms, playing=%d", id, r, wav_get_time_length(id), wav_is_playing(id)); return r; }
+static bool KiwiSoundEngine_flat_PlaySe(int id, struct string *s)
+{
+	if (KSE_SND_TRACE()) NOTICE("KSE PlaySe(id=%d, name='%s')", id, s?s->text:"(null)");
+	if (!kse_prepare_name(id, s))
+		return false;
+	wav_set_loop_count(id, 1);  // one-shot
+	return wav_play(id);
+}
+static bool KiwiSoundEngine_flat_Stop(int id) { wav_stop(id); return true; }
+static bool KiwiSoundEngine_flat_StopSe(int id) { wav_stop(id); return true; }
+static bool KiwiSoundEngine_flat_Pause(int id) { wav_pause(id); return true; }
+static bool KiwiSoundEngine_flat_Restart(int id) { wav_restart(id); return true; }
+static bool KiwiSoundEngine_flat_Fade(int id, int time, float volume, bool stop, int fade_type)
+{
+	(void)fade_type;
+	int vol = (int)(volume <= 1.0f ? volume * 100.0f + 0.5f : volume);
+	wav_fade(id, time, vol, stop);
+	return true;
+}
+static bool KiwiSoundEngine_flat_StopFade(int id) { wav_stop_fade(id); return true; }
+static bool KiwiSoundEngine_flat_Seek(int id, int millisec) { wav_seek(id, millisec); return true; }
+static bool KiwiSoundEngine_flat_SetLoopCount(int id, int n) { wav_set_loop_count(id, n); return true; }
+static bool KiwiSoundEngine_flat_SetSeParam(int a, int b, bool c) { (void)a; (void)b; (void)c; return true; }
+static int KiwiSoundEngine_flat_GetLength(int id) { return wav_get_time_length(id); }
+static int KiwiSoundEngine_flat_GetLengthFromFile(struct string *s) { (void)s; return 0; }
+static int KiwiSoundEngine_flat_GetPos(int id) { return wav_get_pos(id); }
+static int KiwiSoundEngine_flat_GetLoopCount(int id) { return wav_get_loop_count(id); }
+static int KiwiSoundEngine_flat_GetGroupNum(int id) { (void)id; return 0; }
+static int KiwiSoundEngine_flat_GetGroupNumFromFile(struct string *s) { (void)s; return 0; }
+static float KiwiSoundEngine_flat_GetGroupVolume(int id) { (void)id; return 1.0f; }
+static int KiwiSoundEngine_flat_MillisecondsToSamples(int a, int b) { (void)a; (void)b; return 0; }
+static int KiwiSoundEngine_flat_GetSoundFileName(int id, struct string **out) { (void)id; if (out) { if (*out) free_string(*out); *out = string_ref(&EMPTY_STRING); } return 0; }
+
 static void KiwiSoundEngine_PreLink(void);
 
 HLL_LIBRARY(KiwiSoundEngine,
@@ -140,7 +238,38 @@ HLL_LIBRARY(KiwiSoundEngine,
 	    HLL_EXPORT(GetSEGroup, KiwiSoundEngine_GetSEGroup),
 	    HLL_EXPORT(GetVoiceGroup, KiwiSoundEngine_GetVoiceGroup),
 	    HLL_EXPORT(GetGimicSEGroup, KiwiSoundEngine_GetGimicSEGroup),
-	    HLL_EXPORT(GetBackVoiceGroup, KiwiSoundEngine_GetBackVoiceGroup)
+	    HLL_EXPORT(GetBackVoiceGroup, KiwiSoundEngine_GetBackVoiceGroup),
+	    HLL_EXPORT(GetFreeID, KiwiSoundEngine_GetFreeID),
+	    HLL_EXPORT(GetFreeSeID, KiwiSoundEngine_GetFreeSeID),
+	    HLL_EXPORT(IsExistFile, KiwiSoundEngine_flat_IsExistFile),
+	    HLL_EXPORT(IsExistID, KiwiSoundEngine_flat_IsExistID),
+	    HLL_EXPORT(IsExistSeID, KiwiSoundEngine_flat_IsExistSeID),
+	    HLL_EXPORT(IsPlay, KiwiSoundEngine_flat_IsPlay),
+	    HLL_EXPORT(IsPlaySe, KiwiSoundEngine_flat_IsPlaySe),
+	    HLL_EXPORT(IsFade, KiwiSoundEngine_flat_IsFade),
+	    HLL_EXPORT(IsPause, KiwiSoundEngine_flat_IsPause),
+	    HLL_EXPORT(Prepare, KiwiSoundEngine_flat_Prepare),
+	    HLL_EXPORT(Unprepare, KiwiSoundEngine_flat_Unprepare),
+	    HLL_EXPORT(Play, KiwiSoundEngine_flat_Play),
+	    HLL_EXPORT(PlaySe, KiwiSoundEngine_flat_PlaySe),
+	    HLL_EXPORT(Stop, KiwiSoundEngine_flat_Stop),
+	    HLL_EXPORT(StopSe, KiwiSoundEngine_flat_StopSe),
+	    HLL_EXPORT(Pause, KiwiSoundEngine_flat_Pause),
+	    HLL_EXPORT(Restart, KiwiSoundEngine_flat_Restart),
+	    HLL_EXPORT(Fade, KiwiSoundEngine_flat_Fade),
+	    HLL_EXPORT(StopFade, KiwiSoundEngine_flat_StopFade),
+	    HLL_EXPORT(Seek, KiwiSoundEngine_flat_Seek),
+	    HLL_EXPORT(SetLoopCount, KiwiSoundEngine_flat_SetLoopCount),
+	    HLL_EXPORT(SetSeParam, KiwiSoundEngine_flat_SetSeParam),
+	    HLL_EXPORT(GetLength, KiwiSoundEngine_flat_GetLength),
+	    HLL_EXPORT(GetLengthFromFile, KiwiSoundEngine_flat_GetLengthFromFile),
+	    HLL_EXPORT(GetPos, KiwiSoundEngine_flat_GetPos),
+	    HLL_EXPORT(GetLoopCount, KiwiSoundEngine_flat_GetLoopCount),
+	    HLL_EXPORT(GetGroupNum, KiwiSoundEngine_flat_GetGroupNum),
+	    HLL_EXPORT(GetGroupNumFromFile, KiwiSoundEngine_flat_GetGroupNumFromFile),
+	    HLL_EXPORT(GetGroupVolume, KiwiSoundEngine_flat_GetGroupVolume),
+	    HLL_EXPORT(MillisecondsToSamples, KiwiSoundEngine_flat_MillisecondsToSamples),
+	    HLL_EXPORT(GetSoundFileName, KiwiSoundEngine_flat_GetSoundFileName)
 	);
 
 static void KiwiSoundEngine_PreLink(void)

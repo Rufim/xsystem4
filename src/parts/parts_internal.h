@@ -414,6 +414,27 @@ struct parts {
 	int delegate_index;
 	int sprite_deform;
 	bool clickable;
+	// True for activity "button" parts (パーツタイプ=0) created by ReadActivityFile.
+	// Such parts render as CG (hover/click state-switch) but must report component
+	// type 0 to the game, which enables click handlers only on type-0 parts.
+	bool is_button;
+	// Widget state for config-style screens (scrollbars/sliders and checkboxes).
+	// Not yet rendered as interactive widgets, but the game reads these back, so
+	// we store what it sets to keep the config UI logic consistent.
+	float hscroll_rate;
+	bool checkbox_checked;
+	int checkbox_r, checkbox_g, checkbox_b;
+	// Horizontal scrollbar (config slider, パーツタイプ=3). The part's CG is the
+	// draggable knob; the track is a separate frame CG. Geometry comes from the
+	// .pactex 種類別情報. The knob slides between sb_base_x .. sb_base_x+(len-knob_w).
+	bool is_hscrollbar;
+	int sb_length, sb_width;   // track length (x) and width (y)
+	int sb_total, sb_view;     // scroll amounts (for pos<->rate conversion)
+	int sb_base_x, sb_base_y;  // knob home position (track origin, from 座標)
+	// Checkbox (パーツタイプ=1). The box CG has checked/unchecked variants
+	// ("<base>[／チェック]／通常|オン|ダウン"); clicking toggles checkbox_checked.
+	bool is_checkbox;
+	struct string *checkbox_cg_base;
 	bool pass_cursor;
 	bool lock_input_state;
 	bool want_save;
@@ -490,6 +511,7 @@ extern int parts_nr_numeral_fonts;
 void parts_list_resort(struct parts *parts);
 void parts_component_dirty(struct parts *parts);
 void parts_recalculate_hitbox(struct parts *parts);
+void parts_debug_dump(void);
 void parts_state_reset(struct parts_state *state, enum parts_type type);
 bool parts_cg_set(struct parts *parts, struct parts_cg *cg, struct string *cg_name);
 bool parts_cg_set_by_index(struct parts *parts, struct parts_cg *cg, int cg_no);
@@ -549,6 +571,8 @@ enum parts_message_type {
 };
 
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);
+void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
+void parts_checkbox_toggle(struct parts *parts);
 
 // construction.c
 void parts_cp_op_free(struct parts_cp_op *op);

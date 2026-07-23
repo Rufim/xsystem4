@@ -60,11 +60,20 @@ static struct font_size *fnl_font_get_size(struct font *_font, float size)
 	struct fnl_font_size *closest = &font->sizes[0];
 	for (unsigned i = 0; i < font->nr_sizes; i++) {
 		float diff = fabsf(font->sizes[i].super.size - size);
-		if (diff < min_diff) {
+		// On a size tie, prefer the smallest denominator: a bitmap face whose
+		// native height is close to the requested size renders with far more ink
+		// (and crisper) than a large face downscaled by a big denominator, which
+		// looks thin/small. The default first-match kept the large downscaled
+		// face, so glyphs came out noticeably smaller than the original engine.
+		if (diff < min_diff - 0.01f ||
+		    (diff < min_diff + 0.01f && font->sizes[i].denominator < closest->denominator)) {
 			min_diff = diff;
 			closest = &font->sizes[i];
 		}
 	}
+	if (getenv("XSYS4_FNL_TRACE"))
+		NOTICE("FNL get_size req=%.1f -> chosen=%.2f (denom=%u, face_h=%u)",
+		       size, closest->super.size, closest->denominator, closest->bitmap_size->face->height);
 	return &closest->super;
 }
 
@@ -161,7 +170,13 @@ static bool fnl_font_get_glyph(struct font_size *_size, struct glyph *glyph, uin
 				acc[i] += fullsize->pixels[src_row*fullsize->width + src_col];
 			}
 		}
-		uint8_t p = acc[i] / (size->denominator * size->denominator);
+		unsigned avg = acc[i] / (size->denominator * size->denominator);
+		// Box-averaging a 1-bit glyph fades edge pixels to faint grey, so the
+		// visible ink shrinks and downscaled text looks thinner/smaller than the
+		// original engine (whose glyphs fill ~0.79 of the cell). Apply a gamma
+		// (<1) to the coverage so partially-covered edge pixels stay opaque,
+		// preserving the glyph's full extent and weight.
+		uint8_t p = (uint8_t)(255.0f * powf(avg / 255.0f, 0.35f) + 0.5f);
 		pixels[(dst_row+off_y)*width + (dst_col+off_x)] = p;
 	}
 

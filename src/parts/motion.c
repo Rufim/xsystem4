@@ -494,6 +494,8 @@ void PE_AddMotionSound(int sound_no, int begin_t)
 
 void PE_BeginMotion(void)
 {
+	if (getenv("XSYS4_MOTION_TRACE"))
+		NOTICE("MOTION BeginMotion (began_click=%d) end_t=%d", parts_began_click, motion_end_t);
 	if (parts_began_click)
 		return;
 
@@ -506,6 +508,8 @@ void PE_BeginMotion(void)
 
 void PE_EndMotion(void)
 {
+	if (getenv("XSYS4_MOTION_TRACE"))
+		NOTICE("MOTION EndMotion (began_click=%d) is_motion=%d motion_t=%d", parts_began_click, is_motion, motion_t);
 	if (parts_began_click)
 		return;
 	motion_t = 0;
@@ -535,6 +539,10 @@ void PE_SeekEndMotion(void)
 void PE_UpdateMotionTime(int time, possibly_unused bool skip)
 {
 	// TODO: use skip
+	static int nc = 0;
+	if (getenv("XSYS4_MOTION_TRACE") && (nc++ % 30) == 0)
+		NOTICE("MOTION UpdateMotionTime(time=%d) is_motion=%d paused=%d motion_t=%d end=%d",
+		       time, is_motion, is_motion_paused, motion_t, motion_end_t);
 	if (is_motion_paused)
 		return;
 	PE_SetMotionTime(motion_t + time);

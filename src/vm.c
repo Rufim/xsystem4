@@ -21,6 +21,7 @@
 #include <math.h>
 #include <time.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <assert.h>
 #include <SDL.h> // for system.MsgBox
 
@@ -32,6 +33,7 @@
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
+#include "android_bridge.h"
 #include "debugger.h"
 #include "input.h"
 #include "savedata.h"
@@ -72,6 +74,44 @@ struct ain *ain;
 size_t instr_ptr = 0;
 
 bool vm_reset_once = false;
+
+// Diagnostic: trace entry into specific function indices, set via
+// XSYS4_FN_TRACE=<comma-separated fn numbers>. Env-gated, harmless.
+static int fn_trace_list[32];
+static int fn_trace_count = -1;
+// Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr> logs every entered
+// function whose name contains <substr>. Env-gated, harmless.
+static const char *fn_trace_ns = (const char *)1; // 1 = not-yet-resolved
+static void vm_fn_trace_ns(int fno)
+{
+	if (fn_trace_ns == (const char *)1)
+		fn_trace_ns = getenv("XSYS4_FN_TRACE_NS");
+	if (!fn_trace_ns || !*fn_trace_ns)
+		return;
+	if (fno < 0 || fno >= ain->nr_functions)
+		return;
+	const char *n = ain->functions[fno].name;
+	if (n && strstr(n, fn_trace_ns))
+		WARNING("NSTRACE fn %d %s", fno, n);
+}
+static void vm_fn_trace(int fno, const char *via)
+{
+	if (fn_trace_count < 0) {
+		fn_trace_count = 0;
+		const char *e = getenv("XSYS4_FN_TRACE");
+		while (e && *e && fn_trace_count < 32) {
+			fn_trace_list[fn_trace_count++] = (int)strtol(e, (char**)&e, 0);
+			while (*e == ',' || *e == ' ') e++;
+		}
+	}
+	for (int i = 0; i < fn_trace_count; i++) {
+		if (fn_trace_list[i] == fno) {
+			WARNING("FNTRACE %s -> fn %d (%s)", via, fno,
+				(fno >= 0 && fno < ain->nr_functions) ? ain->functions[fno].name : "?");
+			return;
+		}
+	}
+}
 
 // Read the opcode at ADDR.
 static int16_t get_opcode(size_t addr)
@@ -395,8 +435,57 @@ static int _function_call(int fno, int return_address)
 	return slot;
 }
 
+/*
+ * Daiteikoku: режим «бесконечные события» (тумблер в android_bridge).
+ *
+ * Фаза действий игрока — это сцена событий: App@run делает switch(context.scene),
+ * где case 9 -> App@sceneEvent (меню 行動一覧), case 22 -> App@sceneEnemyPhase.
+ * Штатно выбор любого события уводит в фазу врага: App@sceneEvent проигрывает
+ * событие (EventCaller@call), применяет последствия (GFD_Event_EventPhaseResult)
+ * и вызывает App@changeScene(22). Кнопка «Конец фазы» вызывает changeScene(22)
+ * напрямую, без GFD_Event_EventPhaseResult.
+ *
+ * В режиме бесконечных событий на ветке «событие проиграно» подменяем аргумент
+ * changeScene 22 -> 9: игра остаётся в сцене событий и, поскольку объект
+ * SceneEvent она к этому моменту уже удалила (context[10] = -1), на следующем
+ * кадре меню перестраивается со свежим списком. Ветку «Конец фазы» и аварийный
+ * выход (App@sceneEvent при context[62] != 0) не трогаем: там нет вызова
+ * GFD_Event_EventPhaseResult, поэтому флаг pending не взводится.
+ *
+ * Все вызовы движка проходят через function_call, поэтому хук здесь один.
+ */
+#define DTK_SCENE_EVENT 9
+#define DTK_SCENE_ENEMY 22
+
+static void infinite_events_hook(int fno)
+{
+	static int f_change = -2, f_scene = -2, f_result = -2;
+	static bool pending = false;
+	if (!bridge_infinite_events_enabled()) { pending = false; return; }
+	if (f_change == -2) {
+		f_change = ain_get_function(ain, (char *)"App@changeScene");
+		f_scene  = ain_get_function(ain, (char *)"App@sceneEvent");
+		f_result = ain_get_function(ain, (char *)"GFD_Event_EventPhaseResult");
+	}
+	if (f_change < 0 || f_scene < 0 || f_result < 0)
+		return;  // не Daiteikoku (или другая сборка .ain) — режим неприменим
+	if (fno == f_scene) { pending = false; return; }  // новый кадр сцены событий
+	if (call_stack_ptr < 1 || call_stack[call_stack_ptr - 1].fno != f_scene)
+		return;  // интересуют только прямые вызовы из App@sceneEvent
+	if (fno == f_result) {
+		pending = true;  // событие проиграно в этом кадре
+	} else if (fno == f_change && pending) {
+		pending = false;
+		// на вершине стека — аргумент сцены (22); держим игрока в сцене событий
+		if (stack_ptr > 0 && stack[stack_ptr - 1].i == DTK_SCENE_ENEMY)
+			stack[stack_ptr - 1].i = DTK_SCENE_EVENT;
+	}
+}
+
 static void function_call(int fno, int return_address)
 {
+	infinite_events_hook(fno);
+	vm_fn_trace_ns(fno);
 	int slot = _function_call(fno, return_address);
 
 	// pop arguments, store in local page
@@ -409,6 +498,17 @@ static void function_call(int fno, int return_address)
 			break;
 		default:
 			break;
+		}
+	}
+	if (fn_trace_count != 0) {
+		for (int i = 0; i < fn_trace_count; i++) {
+			if (fn_trace_list[i] == fno) {
+				WARNING("FNARGS fn %d nargs=%d a0=%d a1=%d a2=%d", fno, f->nr_args,
+					f->nr_args>0?heap[slot].page->values[0].i:-1,
+					f->nr_args>1?heap[slot].page->values[1].i:-1,
+					f->nr_args>2?heap[slot].page->values[2].i:-1);
+				break;
+			}
 		}
 	}
 }
@@ -434,6 +534,12 @@ static void delegate_call(int dg_no, int return_address)
 	int dg_index = stack_peek(0 + return_values).i;
 	int obj, fun;
 	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun)) {
+		if (fn_trace_count != 0)
+			vm_fn_trace(fun, "DG_CALL");
+		vm_fn_trace_ns(fun);
+		if (getenv("XSYS4_DG_TRACE"))
+			WARNING("DGALL dg_no=%d idx=%d -> fn %d (%s)", dg_no, dg_index, fun,
+				(fun >= 0 && fun < ain->nr_functions) ? ain->functions[fun].name : "?");
 		// pop previous return value
 		if (ain->delegates[dg_no].return_type.data != AIN_VOID) {
 			stack_pop();
@@ -492,6 +598,16 @@ void vm_call(int fno, int struct_page)
 
 static void function_return(void)
 {
+	if (fn_trace_count > 0) {
+		int rfno = call_stack[call_stack_ptr-1].fno;
+		for (int i = 0; i < fn_trace_count; i++) {
+			if (fn_trace_list[i] == rfno) {
+				WARNING("FNTRACE RETURN fn %d -> top=%d", rfno,
+					stack_ptr > 0 ? stack[stack_ptr-1].i : -999);
+				break;
+			}
+		}
+	}
 	unref_call_frame(&call_stack[call_stack_ptr-1]);
 	instr_ptr = call_stack[call_stack_ptr-1].return_address;
 	call_stack_ptr--;
@@ -559,7 +675,12 @@ static void system_call(enum syscall_code code)
 	case SYS_MSGBOX: {
 		struct string *str = stack_peek_string(0);
 		char *utf = sjis2utf(str->text, str->size);
-		SDL_ShowSimpleMessageBox(0, "xsystem4", utf, NULL);
+		// Test mode: skip the native modal (it blocks the loop and renders on the
+		// default display, bypassing a virtual X server) — just log the text.
+		if (getenv("XSYS4_AUTO_MSGBOX"))
+			NOTICE("AUTO_MSGBOX: '%s'", utf);
+		else
+			SDL_ShowSimpleMessageBox(0, "xsystem4", utf, NULL);
 		free(utf);
 		// XXX: caller S_POPs
 		break;
@@ -578,7 +699,10 @@ static void system_call(enum syscall_code code)
 			ok_cancel_buttons,
 			NULL
 		};
-		if (SDL_ShowMessageBox(&mbox, &result)) {
+		if (getenv("XSYS4_AUTO_MSGBOX")) {
+			NOTICE("AUTO_MSGBOX_OK_CANCEL: '%s' -> OK", utf);
+			result = 1;  // auto-confirm (OK) for automated testing
+		} else if (SDL_ShowMessageBox(&mbox, &result)) {
 			WARNING("Error displaying message box");
 		}
 		free(utf);
@@ -661,8 +785,15 @@ static void system_call(enum syscall_code code)
 			stop_continue_buttons,
 			NULL
 		};
-		if (SDL_ShowMessageBox(&mbox, &result)) {
-			WARNING("Error displaying message box");
+		// По умолчанию авто-Continue: system.Error — это assert самого скрипта игры
+		// (у него есть кнопка Continue). Модальный диалог на каждый assert (напр.
+		// Tsumamigui 3 при инициализации сыплет min>max) блокировал бы игру, особенно
+		// на Android. Для отладки можно вернуть диалог через XSYS4_STOP_ON_GAME_ERROR.
+		if (getenv("XSYS4_STOP_ON_GAME_ERROR")) {
+			if (SDL_ShowMessageBox(&mbox, &result))
+				WARNING("Error displaying message box");
+		} else {
+			result = 0;
 		}
 		free(utf);
 		if (result == 1) {
@@ -897,6 +1028,72 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	//
+	// --- System 4 «X_*» инструкции (новые релизы: Dohna Dohna, Healing Touch) ---
+	//
+	case X_DUP: {
+		// DUP для нескольких значений: копирует верхние N слотов блоком.
+		// Обобщает DUP (N=1) и DUP2 (N=2): [.. v0..vN-1] -> [.. v0..vN-1 v0..vN-1].
+		int n = get_argument(0);
+		int base = stack_ptr - n;
+		for (int i = 0; i < n; i++)
+			stack[stack_ptr++] = stack[base + i];
+		break;
+	}
+	case X_REF: {
+		// REF для нескольких значений: снимает ссылку (page,var) и кладёт
+		// N подряд идущих значений из неё (N=1 эквивалентно обычному REF).
+		int n = get_argument(0);
+		union vm_value *ref = stack_pop_var();
+		for (int i = 0; i < n; i++)
+			stack[stack_ptr++] = ref[i];
+		break;
+	}
+	case X_ASSIGN: {
+		// ASSIGN для нескольких значений: [ref(2 слота) v0..vN-1] — снять N значений,
+		// снять ссылку, записать N значений в ref[0..N-1], вернуть их на стек
+		// (как обычный ASSIGN возвращает значение). N=1 эквивалентно ASSIGN.
+		int n = get_argument(0);
+		union vm_value vals[n > 0 ? n : 1];
+		for (int i = n - 1; i >= 0; i--)
+			vals[i] = stack_pop();
+		union vm_value *ref = stack_pop_var();
+		for (int i = 0; i < n; i++)
+			ref[i] = vals[i];
+		for (int i = 0; i < n; i++)
+			stack[stack_ptr++] = vals[i];
+		break;
+	}
+	case X_A_INIT: {
+		// Инициализация generic-массива (тип 79): стек [page, var, size].
+		// Кладём в ссылку свежий пустой массив-слот; size пока не используем
+		// (пустой массив), handle возвращаем на стек (за ним обычно POP).
+		stack_pop(); // размер/аргумент инициализации
+		union vm_value *ref = stack_pop_var();
+		int slot = heap_alloc_slot(VM_PAGE);
+		heap_set_page(slot, NULL);
+		ref->i = slot;
+		stack_push(slot);
+		break;
+	}
+	case X_MOV:
+	case X_A_SIZE:
+	case X_TO_STR:
+	case X_GETENV:
+	case X_SET:
+	case X_ICAST:
+	case X_OP_SET: {
+		// TODO: пока не реализованы — логируем контекст для реверса и падаем.
+		if (getenv("XSYS4_TRACE_X")) {
+			WARNING("X_TRACE op=0x%04x %s arg0=%d arg1=%d sp=%d top=[%d %d %d %d %d %d]",
+				opcode, instructions[opcode].name,
+				get_argument(0), get_argument(1), stack_ptr,
+				stack_ptr>0?stack[stack_ptr-1].i:0, stack_ptr>1?stack[stack_ptr-2].i:0,
+				stack_ptr>2?stack[stack_ptr-3].i:0, stack_ptr>3?stack[stack_ptr-4].i:0,
+				stack_ptr>4?stack[stack_ptr-5].i:0, stack_ptr>5?stack[stack_ptr-6].i:0);
+		}
+		VM_ERROR("Unimplemented X_ opcode: 0x%04x (%s)", opcode, instructions[opcode].name);
+	}
+	//
 	// --- Variables ---
 	//
 	case PUSHGLOBALPAGE: {
@@ -1016,6 +1213,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 	// --- Control Flow ---
 	//
 	case CALLFUNC: {
+		if (fn_trace_count != 0) vm_fn_trace(get_argument(0), "CALLFUNC");
 		function_call(get_argument(0), instr_ptr + instruction_width(CALLFUNC));
 		break;
 	}
@@ -1025,7 +1223,14 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case CALLMETHOD: {
-		method_call(get_argument(0), instr_ptr + instruction_width(CALLMETHOD));
+		// Новые релизы System 4 (Dohna Dohna, Healing Touch): операнд 0 означает
+		// динамический диспатч — индекс метода лежит на вершине стека (аналог
+		// CALLFUNC2). Иначе fn[0]=NULL и прыжок за пределы кода.
+		int fno = get_argument(0);
+		if (fno == 0)
+			fno = stack_pop().i;
+		if (fn_trace_count != 0) vm_fn_trace(fno, "CALLMETHOD");
+		method_call(fno, instr_ptr + instruction_width(CALLMETHOD));
 		break;
 	}
 	case CALLHLL: {
@@ -2360,6 +2565,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 	// -- NOOPs ---
 	case FUNC:
 		break;
+	case CHECKUDO:
+		// System 4: снимает со стека 1 значение (старый объект-ссылку перед
+		// переприсваиванием, паттерн `lhs = obj.method()`). Раньше принимали за
+		// no-op — стек сдвигался, метод получал неверный this (-1). Значение не
+		// разыменовываем/не unref'аем (может быть null или не владеющая ссылка).
+		stack_pop();
+		break;
 	default:
 #ifdef DEBUGGER_ENABLED
 		if ((opcode & OPTYPE_MASK) == BREAKPOINT) {
@@ -2432,9 +2644,18 @@ _Noreturn void vm_reset(void)
 	longjmp(reset_buf, 1);
 }
 
+static void vm_sigusr1_handler(int sig)
+{
+	(void)sig;
+	sys_warning("=== SIGUSR1: VM call stack (top first) ===\n");
+	vm_stack_trace();
+	sys_warning("=== end VM call stack (instr_ptr=0x%zx) ===\n", instr_ptr);
+}
+
 int vm_execute_ain(struct ain *program)
 {
 	ain = program;
+	signal(SIGUSR1, vm_sigusr1_handler);
 	setjmp(reset_buf);
 
 	// initialize VM state

@@ -30,6 +30,19 @@ void bridge_set_tts_enabled(bool on)
 	tts_enabled = on;
 }
 
+// Режим «бесконечные события» (Daiteikoku): читается из vm.c (infinite_events_hook).
+static bool infinite_events = false;
+
+void bridge_set_infinite_events(bool on)
+{
+	infinite_events = on;
+}
+
+bool bridge_infinite_events_enabled(void)
+{
+	return infinite_events;
+}
+
 // Счётчик посимвольной отрисовки текста (NewFont). Растёт, пока рисуется/
 // перерисовывается текст на экране — по нему авто-листание видит активную модалку.
 static volatile unsigned newfont_draws = 0;
@@ -42,6 +55,40 @@ void bridge_newfont_draw(void)
 unsigned bridge_ui_draw_count(void)
 {
 	return newfont_draws;
+}
+
+// Счётчик отрисовки именно через NewFont.DrawChar (HLL).
+static volatile unsigned nf_char_draws = 0;
+
+void bridge_nf_char_draw(void)
+{
+	nf_char_draws++;
+}
+
+unsigned bridge_nf_char_count(void)
+{
+	return nf_char_draws;
+}
+
+// Буфер фактически отрисованного текста (SJIS, посимвольно из
+// _gfx_render_text). Прокачка листания сравнивает его с последней прочитанной
+// репликой: второй бокс рисует ХВОСТ той же реплики (текст совпадает — листаем
+// дальше), модалка-уведомление рисует чужой текст (замираем).
+#define DRAWN_MAX 1024
+static char drawn_buf[DRAWN_MAX];
+static volatile size_t drawn_len = 0;
+
+void bridge_text_drawn(const char *sjis)
+{
+	if (!sjis)
+		return;
+	size_t l = strlen(sjis);
+	size_t cur = drawn_len;
+	if (cur + l >= DRAWN_MAX)
+		return;   // переполнение — хвост не нужен для сравнения
+	memcpy(drawn_buf + cur, sjis, l);
+	drawn_len = cur + l;
+	drawn_buf[drawn_len] = '\0';
 }
 
 // Синтетическое нажатие Enter — тем же путём, что и реальный ввод (очередь SDL,
@@ -440,6 +487,14 @@ Java_io_github_rufim_alice_NativeBridge_nativeSetTts(
 }
 
 JNIEXPORT void JNICALL
+Java_io_github_rufim_alice_NativeBridge_nativeSetInfiniteEvents(
+		JNIEnv *env, jobject self, jboolean on)
+{
+	(void)env; (void)self;
+	bridge_set_infinite_events(on);
+}
+
+JNIEXPORT void JNICALL
 Java_io_github_rufim_alice_NativeBridge_nativeDuckMusic(
 		JNIEnv *env, jobject self, jboolean on, jint percent)
 {
@@ -461,6 +516,29 @@ Java_io_github_rufim_alice_NativeBridge_nativeUiDrawCount(
 {
 	(void)env; (void)self;
 	return (jint)bridge_ui_draw_count();
+}
+
+JNIEXPORT jint JNICALL
+Java_io_github_rufim_alice_NativeBridge_nativeNfCharCount(
+		JNIEnv *env, jobject self)
+{
+	(void)env; (void)self;
+	return (jint)bridge_nf_char_count();
+}
+
+// Забрать и очистить буфер отрисованного текста (SJIS-байты).
+JNIEXPORT jbyteArray JNICALL
+Java_io_github_rufim_alice_NativeBridge_nativeTakeDrawnBytes(
+		JNIEnv *env, jobject self)
+{
+	(void)self;
+	size_t l = drawn_len;
+	jbyteArray arr = (*env)->NewByteArray(env, (jsize)l);
+	if (arr && l)
+		(*env)->SetByteArrayRegion(env, arr, 0, (jsize)l, (const jbyte *)drawn_buf);
+	drawn_len = 0;
+	drawn_buf[0] = '\0';
+	return arr;
 }
 
 // Массив строк "pageSlot\tvarno\tname\tvalue" из bridge_var[]

@@ -15,11 +15,16 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "system4/ex.h"
 #include "system4/string.h"
+#include "system4/ain.h"
 
 #include "xsystem4.h"
+#include "vm.h"
+#include "vm/heap.h"
+#include "vm/page.h"
 #include "hll.h"
 
 #include "system4/utfsjis.h"
@@ -141,6 +146,58 @@ static int MainEXFile_Handle(struct string *name)
 	return v ? v->id : 0;
 }
 
+/*
+ * Newer System 4 games use a string-key based MainEXFile API where each
+ * accessor takes the full dotted path directly (Int(key, ref, exidx), ...)
+ * instead of first resolving an integer handle via Handle(). This resolver
+ * maps a dotted key to the internal handle id so we can reuse the existing
+ * handle-based navigation logic.
+ */
+static int ex_key_handle(struct string *key)
+{
+	struct ex_value *v = ex_get(ex, key->text);
+	if (getenv("XSYS4_EX_TRACE"))
+		WARNING("EX '%s' -> %s", display_sjis0(key->text), v ? "HIT" : "MISS");
+	return v ? v->id : 0;
+}
+
+/* Internal handle-based value readers (shared by scalar and array accessors). */
+static bool hv_int(int handle, int *data)
+{
+	if (handle <= 0 || (unsigned)handle >= nr_handles)
+		return false;
+	if (handles[handle]->type != EX_INT) {
+		WARNING("Value is not an integer");
+		return false;
+	}
+	*data = handles[handle]->i;
+	return true;
+}
+
+static bool hv_float(int handle, float *data)
+{
+	if (handle <= 0 || (unsigned)handle >= nr_handles)
+		return false;
+	if (handles[handle]->type != EX_FLOAT) {
+		WARNING("Value is not a float");
+		return false;
+	}
+	*data = handles[handle]->f;
+	return true;
+}
+
+static bool hv_string(int handle, struct string **data)
+{
+	if (handle <= 0 || (unsigned)handle >= nr_handles)
+		return false;
+	if (handles[handle]->type != EX_STRING) {
+		WARNING("Value is not a string");
+		return false;
+	}
+	*data = string_ref(handles[handle]->s);
+	return true;
+}
+
 static struct ex_table *handle_to_table(int handle)
 {
 	if (handle <= 0 || (unsigned)handle >= nr_handles)
@@ -222,14 +279,17 @@ static int MainEXFile_RA2Handle(int handle, int row, struct string *format_name)
 	return t->rows[row][col].id;
 }
 
-static int MainEXFile_Row(int handle)
+static int MainEXFile_Row(struct string *path, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	return t ? t->nr_rows : 0;
 }
 
-static int MainEXFile_Col(int handle)
+static int MainEXFile_Col(struct string *path, int exidx)
 {
+	(void)exidx;
+	int handle = ex_key_handle(path);
 	if (handle > 0 && (unsigned)handle < nr_handles &&
 	    handles[handle]->type == EX_LIST)
 		return handles[handle]->list->nr_items;
@@ -237,34 +297,39 @@ static int MainEXFile_Col(int handle)
 	return t ? t->nr_columns : 0;
 }
 
-static int MainEXFile_Type(int handle)
+static int MainEXFile_Type(struct string *path, int exidx)
 {
+	(void)exidx;
+	int handle = ex_key_handle(path);
 	if (handle <= 0 || (unsigned)handle >= nr_handles)
 		return 0;
 	return handles[handle]->type;
 }
 
-static int MainEXFile_AType(int handle, int index)
+static int MainEXFile_AType(struct string *path, int index, int exidx)
 {
-	struct ex_list *list = handle_to_list(handle);
+	(void)exidx;
+	struct ex_list *list = handle_to_list(ex_key_handle(path));
 	if (!list)
 		return 0;
 	struct ex_value *v = ex_list_get(list, index);
 	return v ? v->type : 0;
 }
 
-static int MainEXFile_A2Type(int handle, int row, int col)
+static int MainEXFile_A2Type(struct string *path, int row, int col, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	struct ex_value *v = ex_table_get(t, row, col);
 	return v ? v->type : 0;
 }
 
-static int MainEXFile_IA2Type(int handle, int key, struct string *format_name)
+static int MainEXFile_IA2Type(struct string *path, int key, struct string *format_name, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	int row = ex_row_at_int_key(t, key);
@@ -276,9 +341,10 @@ static int MainEXFile_IA2Type(int handle, int key, struct string *format_name)
 	return t->rows[row][col].type;
 }
 
-static int MainEXFile_SA2Type(int handle, struct string *key, struct string *format_name)
+static int MainEXFile_SA2Type(struct string *path, struct string *key, struct string *format_name, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	int row = ex_row_at_string_key(t, key->text);
@@ -290,9 +356,10 @@ static int MainEXFile_SA2Type(int handle, struct string *key, struct string *for
 	return t->rows[row][col].type;
 }
 
-static int MainEXFile_RA2Type(int handle, int row, struct string *format_name)
+static int MainEXFile_RA2Type(struct string *path, int row, struct string *format_name, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	if (row < 0 || (unsigned)row >= t->nr_rows)
@@ -303,32 +370,37 @@ static int MainEXFile_RA2Type(int handle, int row, struct string *format_name)
 	return t->rows[row][col].type;
 }
 
-static bool MainEXFile_Exists(int handle)
+static bool MainEXFile_Exists(struct string *path, int exidx)
 {
+	(void)exidx;
+	int handle = ex_key_handle(path);
 	if (handle <= 0 || (unsigned)handle >= nr_handles)
 		return false;
 	return true;
 }
 
-static bool MainEXFile_AExists(int handle, int index)
+static bool MainEXFile_AExists(struct string *path, int index, int exidx)
 {
-	struct ex_list *list = handle_to_list(handle);
+	(void)exidx;
+	struct ex_list *list = handle_to_list(ex_key_handle(path));
 	if (!list)
 		return false;
 	return !!ex_list_get(list, index);
 }
 
-static bool MainEXFile_A2Exists(int handle, int row, int col)
+static bool MainEXFile_A2Exists(struct string *path, int row, int col, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return false;
 	return !!ex_table_get(t, row, col);
 }
 
-static bool MainEXFile_IA2Exists(int handle, int key, struct string *format_name)
+static bool MainEXFile_IA2Exists(struct string *path, int key, struct string *format_name, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	int row = ex_row_at_int_key(t, key);
@@ -337,9 +409,10 @@ static bool MainEXFile_IA2Exists(int handle, int key, struct string *format_name
 	return ex_col_from_name(t, format_name->text) >= 0;
 }
 
-static bool MainEXFile_SA2Exists(int handle, struct string *key, struct string *format_name)
+static bool MainEXFile_SA2Exists(struct string *path, struct string *key, struct string *format_name, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	int row = ex_row_at_string_key(t, key->text);
@@ -348,9 +421,10 @@ static bool MainEXFile_SA2Exists(int handle, struct string *key, struct string *
 	return ex_col_from_name(t, format_name->text) >= 0;
 }
 
-static bool MainEXFile_RA2Exists(int handle, int row, struct string *format_name)
+static bool MainEXFile_RA2Exists(struct string *path, int row, struct string *format_name, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 	if (row < 0 || (unsigned)row >= t->nr_rows)
@@ -358,48 +432,28 @@ static bool MainEXFile_RA2Exists(int handle, int row, struct string *format_name
 	return ex_col_from_name(t, format_name->text) >= 0;
 }
 
-static bool MainEXFile_Int(int handle, int *data)
+static bool MainEXFile_Int(struct string *path, int *data, int exidx)
 {
-	if (handle <= 0 || (unsigned)handle >= nr_handles)
-		return 0;
-	if (handles[handle]->type != EX_INT) {
-		WARNING("Value is not an integer");
-		return 0;
-	}
-
-	*data = handles[handle]->i;
-	return 1;
+	(void)exidx;
+	return hv_int(ex_key_handle(path), data);
 }
 
-static bool MainEXFile_Float(int handle, float *data)
+static bool MainEXFile_Float(struct string *path, float *data, int exidx)
 {
-	if (handle <= 0 || (unsigned)handle >= nr_handles)
-		return 0;
-	if (handles[handle]->type != EX_FLOAT) {
-		WARNING("Value is not a float");
-		return 0;
-	}
-
-	*data = handles[handle]->f;
-	return 1;
+	(void)exidx;
+	return hv_float(ex_key_handle(path), data);
 }
 
-static bool MainEXFile_String(int handle, struct string **data)
+static bool MainEXFile_String(struct string *path, struct string **data, int exidx)
 {
-	if (handle <= 0 || (unsigned)handle >= nr_handles)
-		return 0;
-	if (handles[handle]->type != EX_STRING) {
-		WARNING("Value is not a string");
-		return 0;
-	}
-
-	*data = string_ref(handles[handle]->s);
-	return 1;
+	(void)exidx;
+	return hv_string(ex_key_handle(path), data);
 }
 
-static bool MainEXFile_AInt(int handle, int index, int *data)
+static bool MainEXFile_AInt(struct string *path, int index, int *data, int exidx)
 {
-	struct ex_list *list = handle_to_list(handle);
+	(void)exidx;
+	struct ex_list *list = handle_to_list(ex_key_handle(path));
 	if (!list)
 		return 0;
 
@@ -415,9 +469,10 @@ static bool MainEXFile_AInt(int handle, int index, int *data)
 	return 1;
 }
 
-static bool MainEXFile_AFloat(int handle, int index, float *data)
+static bool MainEXFile_AFloat(struct string *path, int index, float *data, int exidx)
 {
-	struct ex_list *list = handle_to_list(handle);
+	(void)exidx;
+	struct ex_list *list = handle_to_list(ex_key_handle(path));
 	if (!list)
 		return 0;
 
@@ -433,9 +488,10 @@ static bool MainEXFile_AFloat(int handle, int index, float *data)
 	return 1;
 }
 
-static bool MainEXFile_AString(int handle, int index, struct string **data)
+static bool MainEXFile_AString(struct string *path, int index, struct string **data, int exidx)
 {
-	struct ex_list *list = handle_to_list(handle);
+	(void)exidx;
+	struct ex_list *list = handle_to_list(ex_key_handle(path));
 	if (!list)
 		return 0;
 
@@ -451,9 +507,10 @@ static bool MainEXFile_AString(int handle, int index, struct string **data)
 	return 1;
 }
 
-static bool MainEXFile_A2Int(int handle, int row, int col, int *data)
+static bool MainEXFile_A2Int(struct string *path, int row, int col, int *data, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 
@@ -469,9 +526,10 @@ static bool MainEXFile_A2Int(int handle, int row, int col, int *data)
 	return 1;
 }
 
-static bool MainEXFile_A2Float(int handle, int row, int col, float *data)
+static bool MainEXFile_A2Float(struct string *path, int row, int col, float *data, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 
@@ -487,9 +545,10 @@ static bool MainEXFile_A2Float(int handle, int row, int col, float *data)
 	return 1;
 }
 
-static bool MainEXFile_A2String(int handle, int row, int col, struct string **data)
+static bool MainEXFile_A2String(struct string *path, int row, int col, struct string **data, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return 0;
 
@@ -505,92 +564,103 @@ static bool MainEXFile_A2String(int handle, int row, int col, struct string **da
 	return 1;
 }
 
-static int MainEXFile_GetRowAtIntKey(int handle, int key)
+static int MainEXFile_GetRowAtIntKey(struct string *path, int key, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return -1;
 	return ex_row_at_int_key(t, key);
 }
 
-static int MainEXFile_GetRowAtStringKey(int handle, struct string *key)
+static int MainEXFile_GetRowAtStringKey(struct string *path, struct string *key, int exidx)
 {
-	struct ex_table *t = handle_to_table(handle);
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
 	if (!t)
 		return -1;
 	return ex_row_at_string_key(t, key->text);
 }
 
-static bool MainEXFile_IA2Int(int handle, int key, struct string *format_name, int *data)
+static bool MainEXFile_IA2Int(struct string *path, int key, struct string *format_name, int *data, int exidx)
 {
-	int v_handle = MainEXFile_IA2Handle(handle, key, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_IA2Handle(ex_key_handle(path), key, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_Int(v_handle, data);
+	return hv_int(v_handle, data);
 }
 
-static bool MainEXFile_IA2Float(int handle, int key, struct string *format_name, float *data)
+static bool MainEXFile_IA2Float(struct string *path, int key, struct string *format_name, float *data, int exidx)
 {
-	int v_handle = MainEXFile_IA2Handle(handle, key, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_IA2Handle(ex_key_handle(path), key, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_Float(v_handle, data);
+	return hv_float(v_handle, data);
 }
 
-static bool MainEXFile_IA2String(int handle, int key, struct string *format_name, struct string **data)
+static bool MainEXFile_IA2String(struct string *path, int key, struct string *format_name, struct string **data, int exidx)
 {
-	int v_handle = MainEXFile_IA2Handle(handle, key, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_IA2Handle(ex_key_handle(path), key, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_String(v_handle, data);
+	return hv_string(v_handle, data);
 }
 
-static bool MainEXFile_SA2Int(int handle, struct string *key, struct string *format_name, int *data)
+static bool MainEXFile_SA2Int(struct string *path, struct string *key, struct string *format_name, int *data, int exidx)
 {
-	int v_handle = MainEXFile_SA2Handle(handle, key, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_SA2Handle(ex_key_handle(path), key, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_Int(v_handle, data);
+	return hv_int(v_handle, data);
 }
 
-static bool MainEXFile_SA2Float(int handle, struct string *key, struct string *format_name, float *data)
+static bool MainEXFile_SA2Float(struct string *path, struct string *key, struct string *format_name, float *data, int exidx)
 {
-	int v_handle = MainEXFile_SA2Handle(handle, key, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_SA2Handle(ex_key_handle(path), key, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_Float(v_handle, data);
+	return hv_float(v_handle, data);
 }
 
-static bool MainEXFile_SA2String(int handle, struct string *key, struct string *format_name, struct string **data)
+static bool MainEXFile_SA2String(struct string *path, struct string *key, struct string *format_name, struct string **data, int exidx)
 {
-	int v_handle = MainEXFile_SA2Handle(handle, key, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_SA2Handle(ex_key_handle(path), key, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_String(v_handle, data);
+	return hv_string(v_handle, data);
 }
 
-static bool MainEXFile_RA2Int(int handle, int row, struct string *format_name, int *data)
+static bool MainEXFile_RA2Int(struct string *path, int row, struct string *format_name, int *data, int exidx)
 {
-	int v_handle = MainEXFile_RA2Handle(handle, row, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_RA2Handle(ex_key_handle(path), row, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_Int(v_handle, data);
+	return hv_int(v_handle, data);
 }
 
-static bool MainEXFile_RA2Float(int handle, int row, struct string *format_name, float *data)
+static bool MainEXFile_RA2Float(struct string *path, int row, struct string *format_name, float *data, int exidx)
 {
-	int v_handle = MainEXFile_RA2Handle(handle, row, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_RA2Handle(ex_key_handle(path), row, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_Float(v_handle, data);
+	return hv_float(v_handle, data);
 }
 
-static bool MainEXFile_RA2String(int handle, int row, struct string *format_name, struct string **data)
+static bool MainEXFile_RA2String(struct string *path, int row, struct string *format_name, struct string **data, int exidx)
 {
-	int v_handle = MainEXFile_RA2Handle(handle, row, format_name);
+	(void)exidx;
+	int v_handle = MainEXFile_RA2Handle(ex_key_handle(path), row, format_name);
 	if (v_handle <= 0)
 		return false;
-	return MainEXFile_String(v_handle, data);
+	return hv_string(v_handle, data);
 }
 
 static int MainEXFile_GetNodeNameCount(struct string *tree_path)
@@ -663,9 +733,136 @@ static bool MainEXFile_GetEXName(struct string *tree_path, int index, struct str
 	return false;
 }
 
+// Tsumamigui 3 и др.: разом вернуть имена всех узлов-детей дерева .ex в массив.
+// Хвостовой int (индекс ex-файла) игнорируем, как и прочие функции библиотеки.
+static bool MainEXFile_GetNodeNameList(struct string *tree_path, struct page **out, int ex_index)
+{
+	(void)ex_index;
+	struct ex_value *v = ex_get(ex, tree_path->text);
+	if (!v || v->type != EX_TREE || v->tree->is_leaf)
+		return false;
+
+	struct string **names = NULL;
+	int n = 0;
+	for (unsigned i = 0; i < v->tree->nr_children; i++) {
+		if (v->tree->children[i].is_leaf)
+			continue;
+		names = xrealloc_array(names, n, n + 1, sizeof(struct string *));
+		names[n++] = string_ref(v->tree->children[i].name);
+	}
+
+	union vm_value dim = { .i = n };
+	struct page *page = alloc_array(1, &dim, AIN_ARRAY_STRING, 0, false);
+	for (int i = 0; i < n; i++)
+		page->values[i].i = heap_alloc_string(names[i]);
+	free(names);
+
+	if (*out) {
+		delete_page_vars(*out);
+		free_page(*out);
+	}
+	*out = page;
+	return true;
+}
+
+// Like GetNodeNameList, but returns the names of ALL children (leaf or not).
+// Used by the CG gallery (title「ＣＧ」button) to enumerate entries under a path.
+static bool MainEXFile_GetEXNameList(struct string *tree_path, struct page **out, int ex_index)
+{
+	(void)ex_index;
+	struct ex_value *v = ex_get(ex, tree_path->text);
+	if (!v || v->type != EX_TREE || v->tree->is_leaf)
+		return false;
+
+	struct string **names = NULL;
+	int n = 0;
+	for (unsigned i = 0; i < v->tree->nr_children; i++) {
+		names = xrealloc_array(names, n, n + 1, sizeof(struct string *));
+		names[n++] = string_ref(v->tree->children[i].name);
+	}
+
+	union vm_value dim = { .i = n };
+	struct page *page = alloc_array(1, &dim, AIN_ARRAY_STRING, 0, false);
+	for (int i = 0; i < n; i++)
+		page->values[i].i = heap_alloc_string(names[i]);
+	free(names);
+
+	if (*out) {
+		delete_page_vars(*out);
+		free_page(*out);
+	}
+	*out = page;
+	return true;
+}
+
+/*
+ * Handle-based accessor family. Legacy System 4 games (e.g. Escalayer Reboot)
+ * pass a pre-resolved integer handle (obtained from Handle()/AHandle()/...) and
+ * omit the trailing exidx argument, whereas the string-key family above takes a
+ * dotted path plus exidx. The *Handle() resolvers are already handle-based and
+ * shared between both interfaces; only the value/metadata accessors differ.
+ * MainEXFile_PreLink() swaps these in when the .ain declares the handle-based
+ * signature (Int's first argument is int, not string), leaving string-key games
+ * such as Tsumamigui 3 completely untouched.
+ */
+static int  MEX_h_Row(int h) { struct ex_table *t = handle_to_table(h); return t ? t->nr_rows : 0; }
+static int  MEX_h_Col(int h) { if (h > 0 && (unsigned)h < nr_handles && handles[h]->type == EX_LIST) return handles[h]->list->nr_items; struct ex_table *t = handle_to_table(h); return t ? t->nr_columns : 0; }
+static int  MEX_h_Type(int h) { if (h <= 0 || (unsigned)h >= nr_handles) return 0; return handles[h]->type; }
+static int  MEX_h_AType(int h, int i) { struct ex_list *l = handle_to_list(h); if (!l) return 0; struct ex_value *v = ex_list_get(l, i); return v ? v->type : 0; }
+static int  MEX_h_A2Type(int h, int col, int row) { struct ex_table *t = handle_to_table(h); if (!t) return 0; struct ex_value *v = ex_table_get(t, col, row); return v ? v->type : 0; }
+static int  MEX_h_IA2Type(int h, int key, struct string *fn) { int vh = MainEXFile_IA2Handle(h, key, fn); return vh > 0 ? MEX_h_Type(vh) : 0; }
+static int  MEX_h_SA2Type(int h, struct string *key, struct string *fn) { int vh = MainEXFile_SA2Handle(h, key, fn); return vh > 0 ? MEX_h_Type(vh) : 0; }
+static int  MEX_h_RA2Type(int h, int row, struct string *fn) { int vh = MainEXFile_RA2Handle(h, row, fn); return vh > 0 ? MEX_h_Type(vh) : 0; }
+static bool MEX_h_Exists(int h) { return h > 0 && (unsigned)h < nr_handles; }
+static bool MEX_h_AExists(int h, int i) { struct ex_list *l = handle_to_list(h); return l && !!ex_list_get(l, i); }
+static bool MEX_h_A2Exists(int h, int col, int row) { struct ex_table *t = handle_to_table(h); return t && !!ex_table_get(t, col, row); }
+static bool MEX_h_IA2Exists(int h, int key, struct string *fn) { return MainEXFile_IA2Handle(h, key, fn) > 0; }
+static bool MEX_h_SA2Exists(int h, struct string *key, struct string *fn) { return MainEXFile_SA2Handle(h, key, fn) > 0; }
+static bool MEX_h_RA2Exists(int h, int row, struct string *fn) { return MainEXFile_RA2Handle(h, row, fn) > 0; }
+static bool MEX_h_Int(int h, int *d) { return hv_int(h, d); }
+static bool MEX_h_Float(int h, float *d) { return hv_float(h, d); }
+static bool MEX_h_String(int h, struct string **d) { return hv_string(h, d); }
+static bool MEX_h_AInt(int h, int i, int *d) { return hv_int(MainEXFile_AHandle(h, i), d); }
+static bool MEX_h_AFloat(int h, int i, float *d) { return hv_float(MainEXFile_AHandle(h, i), d); }
+static bool MEX_h_AString(int h, int i, struct string **d) { return hv_string(MainEXFile_AHandle(h, i), d); }
+static bool MEX_h_A2Int(int h, int a, int b, int *d) { struct ex_table *t = handle_to_table(h); if (!t) return 0; struct ex_value *v = ex_table_get(t, a, b); if (!v || v->type != EX_INT) return 0; *d = v->i; return 1; }
+static bool MEX_h_A2Float(int h, int a, int b, float *d) { struct ex_table *t = handle_to_table(h); if (!t) return 0; struct ex_value *v = ex_table_get(t, a, b); if (!v || v->type != EX_FLOAT) return 0; *d = v->f; return 1; }
+static bool MEX_h_A2String(int h, int a, int b, struct string **d) { struct ex_table *t = handle_to_table(h); if (!t) return 0; struct ex_value *v = ex_table_get(t, a, b); if (!v || v->type != EX_STRING) return 0; *d = string_ref(v->s); return 1; }
+static int  MEX_h_GetRowAtIntKey(int h, int key) { struct ex_table *t = handle_to_table(h); return t ? ex_row_at_int_key(t, key) : -1; }
+static int  MEX_h_GetRowAtStringKey(int h, struct string *key) { struct ex_table *t = handle_to_table(h); return t ? ex_row_at_string_key(t, key->text) : -1; }
+static bool MEX_h_IA2Int(int h, int key, struct string *fn, int *d) { return hv_int(MainEXFile_IA2Handle(h, key, fn), d); }
+static bool MEX_h_IA2Float(int h, int key, struct string *fn, float *d) { return hv_float(MainEXFile_IA2Handle(h, key, fn), d); }
+static bool MEX_h_IA2String(int h, int key, struct string *fn, struct string **d) { return hv_string(MainEXFile_IA2Handle(h, key, fn), d); }
+static bool MEX_h_SA2Int(int h, struct string *key, struct string *fn, int *d) { return hv_int(MainEXFile_SA2Handle(h, key, fn), d); }
+static bool MEX_h_SA2Float(int h, struct string *key, struct string *fn, float *d) { return hv_float(MainEXFile_SA2Handle(h, key, fn), d); }
+static bool MEX_h_SA2String(int h, struct string *key, struct string *fn, struct string **d) { return hv_string(MainEXFile_SA2Handle(h, key, fn), d); }
+static bool MEX_h_RA2Int(int h, int row, struct string *fn, int *d) { return hv_int(MainEXFile_RA2Handle(h, row, fn), d); }
+static bool MEX_h_RA2Float(int h, int row, struct string *fn, float *d) { return hv_float(MainEXFile_RA2Handle(h, row, fn), d); }
+static bool MEX_h_RA2String(int h, int row, struct string *fn, struct string **d) { return hv_string(MainEXFile_RA2Handle(h, row, fn), d); }
+
+/*
+ * Default-return value accessors. Another string-key variant (e.g. Healing
+ * Touch) takes the fallback value as an argument and returns the resolved value
+ * directly, instead of the bool + ref-out convention of the family above. Only
+ * the value accessors differ; Row/Col/Type/Exists match the string-key family
+ * and are left in place.
+ */
+static int MEX_d_Int(struct string *name, int def, int id) { (void)id; int v; return hv_int(ex_key_handle(name), &v) ? v : def; }
+static float MEX_d_Float(struct string *name, float def, int id) { (void)id; float v; return hv_float(ex_key_handle(name), &v) ? v : def; }
+static struct string *MEX_d_String(struct string *name, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(ex_key_handle(name), &v) ? v : string_ref(def); }
+static int MEX_d_AInt(struct string *name, int index, int def, int id) { (void)id; int v; return hv_int(MainEXFile_AHandle(ex_key_handle(name), index), &v) ? v : def; }
+static float MEX_d_AFloat(struct string *name, int index, float def, int id) { (void)id; float v; return hv_float(MainEXFile_AHandle(ex_key_handle(name), index), &v) ? v : def; }
+static struct string *MEX_d_AString(struct string *name, int index, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(MainEXFile_AHandle(ex_key_handle(name), index), &v) ? v : string_ref(def); }
+static int MEX_d_A2Int(struct string *name, int row, int col, int def, int id) { (void)id; int v; return hv_int(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : def; }
+static float MEX_d_A2Float(struct string *name, int row, int col, float def, int id) { (void)id; float v; return hv_float(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : def; }
+static struct string *MEX_d_A2String(struct string *name, int row, int col, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : string_ref(def); }
+
+static void MainEXFile_PreLink(void);
+
 HLL_LIBRARY(MainEXFile,
 	    HLL_EXPORT(_ModuleInit, MainEXFile_ModuleInit),
 	    HLL_EXPORT(_ModuleFini, MainEXFile_ModuleFini),
+	    HLL_EXPORT(_PreLink, MainEXFile_PreLink),
 	    HLL_EXPORT(ReloadDebugEXFile, MainEXFile_ReloadDebugEXFile),
 	    HLL_EXPORT(Handle, MainEXFile_Handle),
 	    HLL_EXPORT(AHandle, MainEXFile_AHandle),
@@ -710,4 +907,83 @@ HLL_LIBRARY(MainEXFile,
 	    HLL_EXPORT(GetNodeNameCount, MainEXFile_GetNodeNameCount),
 	    HLL_EXPORT(GetEXNameCount, MainEXFile_GetEXNameCount),
 	    HLL_EXPORT(GetNodeName, MainEXFile_GetNodeName),
+	    HLL_EXPORT(GetNodeNameList, MainEXFile_GetNodeNameList),
+	    HLL_EXPORT(GetEXNameList, MainEXFile_GetEXNameList),
 	    HLL_EXPORT(GetEXName, MainEXFile_GetEXName));
+
+/*
+ * Select the accessor interface based on the .ain's declared signatures. The
+ * string-key family (path + exidx) is the default (registered above); when the
+ * game instead uses the legacy handle-based signatures — detected by Int's
+ * first argument being an int handle rather than a string — swap in the
+ * handle-based family. The *Handle() resolvers and Handle() are identical in
+ * both interfaces and are left in place.
+ */
+static void MainEXFile_PreLink(void)
+{
+	int libno = ain_get_library(ain, "MainEXFile");
+	if (libno < 0)
+		return;
+	int fno = ain_get_library_function(ain, libno, "Int");
+	if (fno < 0)
+		return;
+	struct ain_hll_function *fn = &ain->libraries[libno].functions[fno];
+	if (fn->nr_arguments < 1)
+		return;
+
+	if (fn->arguments[0].type.data != AIN_INT) {
+		// String-key interface. Two sub-variants share the same Row/Col/Type/
+		// Exists metadata accessors (already registered) but differ in the value
+		// accessors: the default is bool Int(name, ref int, id) (kept as-is);
+		// when Int instead takes a plain-int fallback (int Int(name, def, id))
+		// swap in the default-return value accessors.
+		if (fn->nr_arguments >= 2 && fn->arguments[1].type.data == AIN_INT) {
+			static_library_replace(&lib_MainEXFile, "Int", MEX_d_Int);
+			static_library_replace(&lib_MainEXFile, "Float", MEX_d_Float);
+			static_library_replace(&lib_MainEXFile, "String", MEX_d_String);
+			static_library_replace(&lib_MainEXFile, "AInt", MEX_d_AInt);
+			static_library_replace(&lib_MainEXFile, "AFloat", MEX_d_AFloat);
+			static_library_replace(&lib_MainEXFile, "AString", MEX_d_AString);
+			static_library_replace(&lib_MainEXFile, "A2Int", MEX_d_A2Int);
+			static_library_replace(&lib_MainEXFile, "A2Float", MEX_d_A2Float);
+			static_library_replace(&lib_MainEXFile, "A2String", MEX_d_A2String);
+		}
+		return;
+	}
+
+	// Handle-based interface (Int's first argument is an int handle).
+	static_library_replace(&lib_MainEXFile, "Row", MEX_h_Row);
+	static_library_replace(&lib_MainEXFile, "Col", MEX_h_Col);
+	static_library_replace(&lib_MainEXFile, "Type", MEX_h_Type);
+	static_library_replace(&lib_MainEXFile, "AType", MEX_h_AType);
+	static_library_replace(&lib_MainEXFile, "A2Type", MEX_h_A2Type);
+	static_library_replace(&lib_MainEXFile, "IA2Type", MEX_h_IA2Type);
+	static_library_replace(&lib_MainEXFile, "SA2Type", MEX_h_SA2Type);
+	static_library_replace(&lib_MainEXFile, "RA2Type", MEX_h_RA2Type);
+	static_library_replace(&lib_MainEXFile, "Exists", MEX_h_Exists);
+	static_library_replace(&lib_MainEXFile, "AExists", MEX_h_AExists);
+	static_library_replace(&lib_MainEXFile, "A2Exists", MEX_h_A2Exists);
+	static_library_replace(&lib_MainEXFile, "IA2Exists", MEX_h_IA2Exists);
+	static_library_replace(&lib_MainEXFile, "SA2Exists", MEX_h_SA2Exists);
+	static_library_replace(&lib_MainEXFile, "RA2Exists", MEX_h_RA2Exists);
+	static_library_replace(&lib_MainEXFile, "Int", MEX_h_Int);
+	static_library_replace(&lib_MainEXFile, "Float", MEX_h_Float);
+	static_library_replace(&lib_MainEXFile, "String", MEX_h_String);
+	static_library_replace(&lib_MainEXFile, "AInt", MEX_h_AInt);
+	static_library_replace(&lib_MainEXFile, "AFloat", MEX_h_AFloat);
+	static_library_replace(&lib_MainEXFile, "AString", MEX_h_AString);
+	static_library_replace(&lib_MainEXFile, "A2Int", MEX_h_A2Int);
+	static_library_replace(&lib_MainEXFile, "A2Float", MEX_h_A2Float);
+	static_library_replace(&lib_MainEXFile, "A2String", MEX_h_A2String);
+	static_library_replace(&lib_MainEXFile, "GetRowAtIntKey", MEX_h_GetRowAtIntKey);
+	static_library_replace(&lib_MainEXFile, "GetRowAtStringKey", MEX_h_GetRowAtStringKey);
+	static_library_replace(&lib_MainEXFile, "IA2Int", MEX_h_IA2Int);
+	static_library_replace(&lib_MainEXFile, "IA2Float", MEX_h_IA2Float);
+	static_library_replace(&lib_MainEXFile, "IA2String", MEX_h_IA2String);
+	static_library_replace(&lib_MainEXFile, "SA2Int", MEX_h_SA2Int);
+	static_library_replace(&lib_MainEXFile, "SA2Float", MEX_h_SA2Float);
+	static_library_replace(&lib_MainEXFile, "SA2String", MEX_h_SA2String);
+	static_library_replace(&lib_MainEXFile, "RA2Int", MEX_h_RA2Int);
+	static_library_replace(&lib_MainEXFile, "RA2Float", MEX_h_RA2Float);
+	static_library_replace(&lib_MainEXFile, "RA2String", MEX_h_RA2String);
+}

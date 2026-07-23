@@ -22,6 +22,7 @@
 #include "vm/page.h"
 #include "xsystem4.h"
 #include "hll.h"
+#include "android_bridge.h"
 
 static Point NewFont_cursor = { 0, 0 };
 static struct text_render_metrics NewFont_metrics = {0};
@@ -110,6 +111,8 @@ static int NewFont_DrawChar(int sp_no, int c)
 	if (!sp)
 		return 0;
 
+	bridge_nf_char_draw();
+
 	char text[3] = { c & 0xff, c >> 8, 0 };
 	struct texture *t = sprite_get_texture(sp);
 	NewFont_metrics.x = NewFont_cursor.x;
@@ -123,6 +126,8 @@ static int NewFont_DrawShadowChar(int sp_no, int c)
 	struct sact_sprite *sp = sact_get_sprite(sp_no);
 	if (!sp)
 		return 0;
+
+	bridge_nf_char_draw();
 
 	char text[3] = { c & 0xff, c >> 8, 0 };
 	struct texture *t = sprite_get_texture(sp);

@@ -565,7 +565,9 @@ int main(int argc, char *argv[])
 	} else {
 		usage_error("Can't initialize game with argument '%s'", argv[0]);
 	}
-	ainfile = gamedir_path(config.ain_filename);
+	// icase: CodeName в .ini может отличаться регистром от файла (Sengoku Rance:
+	// Rance7.ain vs rance7.ain) — на регистрозависимой ФС иначе «Error opening AIN».
+	ainfile = gamedir_path_icase(config.ain_filename);
 
 	read_user_config();
 

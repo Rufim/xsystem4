@@ -42,8 +42,13 @@ static STAILQ_HEAD(, parts_message) msg_queue =
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...)
 {
 	// Message system is introduced in Rance 9
-	if (!parts_multi_controller)
+	if (!parts_multi_controller) {
+		if (getenv("XSYS4_MSG_TRACE"))
+			NOTICE("MSG DROP (no multi_controller) type=%d parts=%d", type, parts->no);
 		return;
+	}
+	if (getenv("XSYS4_MSG_TRACE") && type != 6 /*skip per-frame MOUSE_ON spam*/)
+		NOTICE("MSG PUSH type=%d parts=%d delegate=%d", type, parts->no, parts->delegate_index);
 
 	struct parts_message *msg = xmalloc(sizeof(*msg));
 	msg->parts_no = parts->no;
@@ -84,6 +89,9 @@ void PE_PopMessage(void)
 	if (STAILQ_EMPTY(&msg_queue))
 		return;
 	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	if (getenv("XSYS4_MSG_TRACE") && msg->type != 6)
+		NOTICE("MSG POP  type=%d parts=%d delegate=%d nvars=%d",
+		       msg->type, msg->parts_no, msg->delegate_index, msg->nr_variables);
 	STAILQ_REMOVE_HEAD(&msg_queue, entry);
 	free(msg);
 }

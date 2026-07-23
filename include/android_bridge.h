@@ -16,6 +16,10 @@ void bridge_adv_add_voice(int voice_no);
 // Управление (вызывается из JNI / заглушки)
 void bridge_set_tts_enabled(bool on);
 void bridge_set_voice_muted(bool on);
+// Режим «бесконечные события» (Daiteikoku): после проигрыша выбранного события
+// вернуться в меню выбора, а не завершать фазу (см. vm.c infinite_events_hook).
+void bridge_set_infinite_events(bool on);
+bool bridge_infinite_events_enabled(void);
 // Перелистнуть сообщение (синтетический Enter; для авто-листания после TTS)
 void bridge_advance_message(void);
 // Игра включила/выключила режим «ПРОПУСК» — при включении останавливаем TTS
@@ -25,6 +29,9 @@ void bridge_on_skip(int state);
 // схвачена …»). Авто-листание по нему понимает, что появилась модалка, и не
 // пролистывает её тапом.
 void bridge_newfont_draw(void);
+void bridge_nf_char_draw(void);
+unsigned bridge_nf_char_count(void);
+void bridge_text_drawn(const char *sjis);
 unsigned bridge_ui_draw_count(void);
 // Приглушить музыку до percent% исходной громкости (on) / восстановить (off)
 void bridge_duck_music(bool on, int percent);

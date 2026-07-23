@@ -16,6 +16,10 @@
 
 #include <stdbool.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
 #include <SDL.h>
 #include "system4.h"
 #include "queue.h"
@@ -32,6 +36,110 @@
 #endif
 
 bool key_state[VK_NR_KEYCODES];
+
+/*
+ * Deterministic test-input channel (XSYS4_TEST_INPUT=<fifo/file>). Commands
+ * (one per line) are injected as real SDL events via SDL_PushEvent, so they go
+ * through the exact same path as hardware input (edge detection, handlers) and
+ * work on any display (Xvfb/Xephyr/real), bypassing X/Wayland input routing:
+ *   key <name>       press+release a key (RETURN, SPACE, Z, ESCAPE, UP, DOWN, LEFT, RIGHT)
+ *   click <x> <y>    left click at window coords (x,y)
+ *   move <x> <y>     set reported mouse position (window coords)
+ * A press is held for a few frames then released so edge-triggered logic fires.
+ */
+static bool test_input_enabled;
+static int test_mouse_x = -1, test_mouse_y = -1;
+static int test_input_fd = -2;
+// pending release events, fired once SDL_GetTicks() reaches deadline_ms
+static struct { uint32_t deadline_ms; SDL_Event ev; } test_pending[16];
+static int test_pending_n;
+#define TEST_HOLD_MS 120
+
+static SDL_Scancode test_scancode(const char *name)
+{
+	if (!strcasecmp(name, "RETURN") || !strcasecmp(name, "ENTER")) return SDL_SCANCODE_RETURN;
+	if (!strcasecmp(name, "SPACE")) return SDL_SCANCODE_SPACE;
+	if (!strcasecmp(name, "ESCAPE") || !strcasecmp(name, "ESC")) return SDL_SCANCODE_ESCAPE;
+	if (!strcasecmp(name, "Z")) return SDL_SCANCODE_Z;
+	if (!strcasecmp(name, "UP")) return SDL_SCANCODE_UP;
+	if (!strcasecmp(name, "DOWN")) return SDL_SCANCODE_DOWN;
+	if (!strcasecmp(name, "LEFT")) return SDL_SCANCODE_LEFT;
+	if (!strcasecmp(name, "RIGHT")) return SDL_SCANCODE_RIGHT;
+	return SDL_SCANCODE_UNKNOWN;
+}
+
+static void test_queue_release(const SDL_Event *ev)
+{
+	if (test_pending_n >= 16) return;
+	test_pending[test_pending_n].deadline_ms = SDL_GetTicks() + TEST_HOLD_MS;
+	test_pending[test_pending_n].ev = *ev;
+	test_pending_n++;
+}
+
+static void test_input_update(void)
+{
+	const char *path = getenv("XSYS4_TEST_INPUT");
+	if (!path)
+		return;
+	test_input_enabled = true;
+
+	// fire due release events
+	uint32_t now = SDL_GetTicks();
+	for (int i = 0; i < test_pending_n; ) {
+		if (now >= test_pending[i].deadline_ms) {
+			SDL_PushEvent(&test_pending[i].ev);
+			test_pending[i] = test_pending[--test_pending_n];
+		} else {
+			i++;
+		}
+	}
+
+	if (test_input_fd == -2)
+		test_input_fd = open(path, O_RDONLY | O_NONBLOCK);
+	if (test_input_fd < 0)
+		return;
+	char buf[1024];
+	ssize_t n = read(test_input_fd, buf, sizeof(buf) - 1);
+	if (n <= 0)
+		return;
+	buf[n] = '\0';
+	char *save = NULL;
+	for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		char name[32]; int x = 0, y = 0;
+		if (sscanf(line, "key %31s", name) == 1) {
+			SDL_Scancode sc = test_scancode(name);
+			if (sc == SDL_SCANCODE_UNKNOWN) { NOTICE("TEST_INPUT: unknown key '%s'", name); continue; }
+			SDL_Event down = {0};
+			down.type = SDL_KEYDOWN;
+			down.key.state = SDL_PRESSED;
+			down.key.keysym.scancode = sc;
+			down.key.keysym.sym = SDL_GetKeyFromScancode(sc);
+			SDL_PushEvent(&down);
+			SDL_Event up = down;
+			up.type = SDL_KEYUP;
+			up.key.state = SDL_RELEASED;
+			test_queue_release(&up);
+			NOTICE("TEST_INPUT: key %s", name);
+		} else if (sscanf(line, "click %d %d", &x, &y) == 2) {
+			test_mouse_x = x; test_mouse_y = y;
+			SDL_Event down = {0};
+			down.type = SDL_MOUSEBUTTONDOWN;
+			down.button.button = SDL_BUTTON_LEFT;
+			down.button.state = SDL_PRESSED;
+			down.button.clicks = 1;
+			down.button.x = x; down.button.y = y;
+			SDL_PushEvent(&down);
+			SDL_Event up = down;
+			up.type = SDL_MOUSEBUTTONUP;
+			up.button.state = SDL_RELEASED;
+			test_queue_release(&up);
+			NOTICE("TEST_INPUT: click %d,%d", x, y);
+		} else if (sscanf(line, "move %d %d", &x, &y) == 2) {
+			test_mouse_x = x; test_mouse_y = y;
+		}
+	}
+}
+
 static enum sact_keycode sdl_keytable[] = {
 	[SDL_SCANCODE_0] = VK_0,
 	[SDL_SCANCODE_1] = VK_1,
@@ -200,6 +308,11 @@ void key_clear_flag(bool no_ctrl)
 
 void mouse_get_pos(int *x, int *y)
 {
+	if (test_input_enabled && test_mouse_x >= 0) {
+		*x = test_mouse_x;
+		*y = test_mouse_y;
+		return;
+	}
 	int wx, wy;
 	SDL_PumpEvents();
 	SDL_GetMouseState(&wx, &wy);
@@ -612,6 +725,7 @@ void handle_window_events(void)
 
 void handle_events(void)
 {
+	test_input_update();
 	fire_deferred_events();
 
 	SDL_Event e;

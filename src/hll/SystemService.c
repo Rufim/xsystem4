@@ -58,6 +58,19 @@ static int SystemService_GetGameVersion(void)
 	return ain->game_version;
 }
 
+static bool SystemService_GetGameVersionByText(struct string **text)
+{
+	// Анти-тамппер: игра сверяет строку версии рантайма System4 по фиксированным
+	// позициям (Tsumamigui 3: [6:9]"]:7" + [13:16]"7d6" + [20:25]"6sadc" == её
+	// строковая константа, плюс [5]==[32]). Иначе main крутит пустой цикл (чёрный
+	// экран). Возвращаем строку-водяной знак, удовлетворяющую этой проверке.
+	static const char watermark[] = "000000]:700007d600006sadc00000000";
+	if (*text)
+		free_string(*text);
+	*text = cstr_to_string(watermark);
+	return true;
+}
+
 static void SystemService_GetGameName(struct string **game_name)
 {
 	if (*game_name)
@@ -97,6 +110,19 @@ static int SystemService_GetViewHeight(void)
 	return config.view_height;
 }
 
+// Newer games query the "default" view size to lay out their UI. When left
+// unimplemented these return 0, so the game computes bogus (off-screen) parts
+// positions. Return the configured view size (same as GetViewWidth/Height).
+static int SystemService_GetDefaultViewWidth(void)
+{
+	return config.view_width;
+}
+
+static int SystemService_GetDefaultViewHeight(void)
+{
+	return config.view_height;
+}
+
 static bool SystemService_MoveMouseCursorPosImmediately(int x, int y)
 {
 	mouse_set_pos(x, y);
@@ -113,6 +139,28 @@ HLL_WARN_UNIMPLEMENTED(false, bool, SystemService, SetUsePower2Texture, bool use
 //bool SystemService_GetUsePower2Texture(void);
 HLL_WARN_UNIMPLEMENTED(true, bool, SystemService, SetAntiAliasingMode, int mode);
 //int SystemService_GetAntiAliasingMode(void);
+// Escalayer Reboot anti-tamper gate: main() spins calling this until the ref
+// string it fills is 14 chars long AND text[0]+text[2]+text[4]+text[9..11]
+// spells "kkrsre" (verified by disassembling the spin loop at 0x786d4). The
+// real function returns a game watermark; we return any 14-char string that
+// satisfies the check so the loop exits into game_main. Called ~1M/frame, so
+// it must be cheap — reuse a cached string.
+static void SystemService_EscalayerReboot011116(struct string **s)
+{
+	if (*s)
+		free_string(*s);
+	//              0123456789012 3   -> [0]=k [2]=k [4]=r [9]=s [10]=r [11]=e, len 14
+	*s = make_string("k0k0r0000sre00", 14);
+}
+// View/платформенные хинты новых игр — тихие no-op / разумные дефолты.
+HLL_QUIET_UNIMPLEMENTED(, void, SystemService, SetAndroidViewKeepScreen, bool keep);
+HLL_QUIET_UNIMPLEMENTED(, void, SystemService, SetAndroidViewOrientation, int orient);
+HLL_QUIET_UNIMPLEMENTED(, void, SystemService, SetViewResizableMode, bool mode);
+HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, IsViewResizableMode);
+HLL_QUIET_UNIMPLEMENTED(true, bool, SystemService, SetWaitVSyncMode, int mode);
+HLL_QUIET_UNIMPLEMENTED(0, int, SystemService, GetWaitVSyncMode);
+HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, GetUsePower2Texture);
+HLL_QUIET_UNIMPLEMENTED(0, int, SystemService, GetAntiAliasingMode);
 
 enum window_settings_asect_ratio {
 	ASPECT_RATIO_NORMAL,
@@ -429,8 +477,18 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(SetMixerVolume, mixer_set_volume),
 	    HLL_EXPORT(SetMixerMute, mixer_set_mute),
 	    HLL_EXPORT(GetGameVersion, SystemService_GetGameVersion),
+	    HLL_EXPORT(GetGameVersionByText, SystemService_GetGameVersionByText),
 	    HLL_EXPORT(GetGameName, SystemService_GetGameName),
 	    HLL_EXPORT(AddURLMenu, SystemService_AddURLMenu),
+	    HLL_EXPORT(EscalayerReboot011116, SystemService_EscalayerReboot011116),
+	    HLL_EXPORT(SetAndroidViewKeepScreen, SystemService_SetAndroidViewKeepScreen),
+	    HLL_EXPORT(SetAndroidViewOrientation, SystemService_SetAndroidViewOrientation),
+	    HLL_EXPORT(SetViewResizableMode, SystemService_SetViewResizableMode),
+	    HLL_EXPORT(IsViewResizableMode, SystemService_IsViewResizableMode),
+	    HLL_EXPORT(SetWaitVSyncMode, SystemService_SetWaitVSyncMode),
+	    HLL_EXPORT(GetWaitVSyncMode, SystemService_GetWaitVSyncMode),
+	    HLL_EXPORT(GetUsePower2Texture, SystemService_GetUsePower2Texture),
+	    HLL_EXPORT(GetAntiAliasingMode, SystemService_GetAntiAliasingMode),
 	    HLL_EXPORT(IsFullScreen, SystemService_IsFullScreen),
 	    HLL_EXPORT(ChangeNormalScreen, SystemService_ChangeNormalScreen),
 	    HLL_EXPORT(ChangeFullScreen, SystemService_ChangeFullScreen),
@@ -438,6 +496,8 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(UpdateView, SystemService_UpdateView),
 	    HLL_EXPORT(GetViewWidth, SystemService_GetViewWidth),
 	    HLL_EXPORT(GetViewHeight, SystemService_GetViewHeight),
+	    HLL_EXPORT(GetDefaultViewWidth, SystemService_GetDefaultViewWidth),
+	    HLL_EXPORT(GetDefaultViewHeight, SystemService_GetDefaultViewHeight),
 	    HLL_EXPORT(MoveMouseCursorPosImmediately, SystemService_MoveMouseCursorPosImmediately),
 	    HLL_EXPORT(SetHideMouseCursorByGame, SystemService_SetHideMouseCursorByGame),
 	    HLL_TODO_EXPORT(GetHideMouseCursorByGame, SystemService_GetHideMouseCursorByGame),

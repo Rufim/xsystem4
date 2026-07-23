@@ -105,12 +105,28 @@ void ADVLogList_Clear(void)
 	logs = NULL;
 }
 
-void ADVLogList_AddText(struct string **text)
+static void advlog_add_text_impl(struct string *text)
 {
-	bridge_adv_add_text(*text);
+	bridge_adv_add_text(text);
 	if (!enabled) return;
 	struct string **line = current_line(current_log());
-	string_append(line, *text);
+	string_append(line, text);
+}
+
+// Reference-string form (arg declared as `ref string`, AIN_REF_STRING).
+void ADVLogList_AddText(struct string **text)
+{
+	advlog_add_text_impl(*text);
+}
+
+// By-value form (arg declared as plain `string`, AIN_STRING). Tsumamigui 3's
+// ADVLogList_AddText(string Text, int WindowNo) passes the text by value, so the
+// ffi hands us a `struct string *` directly — dereferencing it (the ref form)
+// reads the string header as a pointer and crashes. Selected in PreLink by the
+// declared argument type.
+static void advlog_add_text_byval(struct string *text)
+{
+	advlog_add_text_impl(text);
 }
 
 void ADVLogList_AddNewLine(void)
@@ -485,7 +501,13 @@ static void AnteaterADVEngine_ModuleFini(void)
 
 static void AnteaterADVEngine_ADVLogList_AddText_with_window(struct string **text, possibly_unused int window_no)
 {
-	ADVLogList_AddText(text);
+	advlog_add_text_impl(*text);
+}
+
+// (string Text, int WindowNo) — Text by value. See advlog_add_text_byval.
+static void AnteaterADVEngine_ADVLogList_AddText_with_window_byval(struct string *text, possibly_unused int window_no)
+{
+	advlog_add_text_impl(text);
 }
 
 HLL_LIBRARY(AnteaterADVEngine,
@@ -527,6 +549,16 @@ static void AnteaterADVEngine_PreLink(void)
 
 	fun = get_fun(libno, "ADVLogList_AddText");
 	if (fun && fun->nr_arguments == 2) {
-		static_library_replace(&lib_AnteaterADVEngine, "ADVLogList_AddText", AnteaterADVEngine_ADVLogList_AddText_with_window);
+		// The 2-arg form is (Text, WindowNo). Text may be declared by value
+		// (AIN_STRING) or by reference (AIN_REF_STRING); pick the matching
+		// handler so the ffi-marshalled pointer is dereferenced correctly.
+		bool byval = fun->arguments[0].type.data == AIN_STRING;
+		static_library_replace(&lib_AnteaterADVEngine, "ADVLogList_AddText",
+			byval ? (void*)AnteaterADVEngine_ADVLogList_AddText_with_window_byval
+			      : (void*)AnteaterADVEngine_ADVLogList_AddText_with_window);
+	} else if (fun && fun->nr_arguments == 1 && fun->arguments[0].type.data == AIN_STRING) {
+		// 1-arg by-value form (some StoatSpriteEngine-era titles).
+		static_library_replace(&lib_AnteaterADVEngine, "ADVLogList_AddText",
+			(void*)advlog_add_text_byval);
 	}
 }

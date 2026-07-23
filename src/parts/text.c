@@ -196,6 +196,7 @@ bool PE_SetFont(int parts_no, int type, int size, int r, int g, int b, float bol
 {
 	if (!parts_state_valid(--state))
 		return false;
+	if (getenv("XSYS4_FONT_TRACE")) NOTICE("SETFONT part=%d type=%d size=%d edge=%.1f", parts_no, type, size, edge_weight);
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_text *text = parts_get_text(parts, state);

@@ -280,7 +280,149 @@ static int Array_NV_sceq(struct page *array, int index, int num, int *out_index)
 //int Array_VS_and(struct page *sArray, int nMember);
 //int Array_VS_or(struct page *sArray, int nMember);
 
+/*
+ * Ixseal generic container API. Newer System 4 games (Healing Touch, Dohna
+ * Dohna, …) replaced the array bytecode instructions with this Array library;
+ * each method takes the array variable's page by reference as `self`. We wire
+ * the methods onto the array_* helpers in page.c, reading the element data
+ * type / struct type / rank from the array page itself. Generic element values
+ * arrive as a pointer to their raw stack slot (AIN_HLL_PARAM). Comparator and
+ * predicate overloads (taking an AIN_HLL_FUNC) are intentionally routed to the
+ * same default-order implementations: we never invoke a VM callback, so a
+ * missing/garbage function index can never be dereferenced — custom orderings
+ * simply degrade to the built-in element comparison.
+ */
+static int ix_rank(struct page *a) { return (a && a->type == ARRAY_PAGE && a->array.rank > 0) ? a->array.rank : 1; }
+static enum ain_data_type ix_dtype(struct page *a) { return (a && a->type == ARRAY_PAGE) ? a->a_type : AIN_ARRAY_INT; }
+static int ix_stype(struct page *a) { return (a && a->type == ARRAY_PAGE) ? a->array.struct_type : 0; }
+
+static void ix_resize(struct page **self, int n)
+{
+	if (!self)
+		return;
+	union vm_value dim = { .i = n < 0 ? 0 : n };
+	*self = realloc_array(*self, ix_rank(*self), &dim, ix_dtype(*self), ix_stype(*self), true);
+}
+
+static void Array_Alloc(struct page **self, int numof) { ix_resize(self, numof); }
+static void Array_Realloc(struct page **self, int numof) { ix_resize(self, numof); }
+static void Array_Free(struct page **self) { ix_resize(self, 0); }
+static void Array_ix_Clear(struct page **self) { ix_resize(self, 0); }
+static int  Array_ix_Numof(struct page **self) { return self ? array_numof(*self, 1) : 0; }
+static bool Array_Empty(struct page **self) { return !self || array_numof(*self, 1) == 0; }
+
+static void Array_PushBack(struct page **self, union vm_value *value)
+{
+	if (!self || !value)
+		return;
+	*self = array_pushback(*self, *value, ix_dtype(*self), ix_stype(*self));
+}
+
+static void Array_PopBack(struct page **self) { if (self) *self = array_popback(*self); }
+
+static void Array_ix_Insert(struct page **self, int index, union vm_value *value)
+{
+	if (!self || !value)
+		return;
+	*self = array_insert(*self, index, *value, ix_dtype(*self), ix_stype(*self));
+}
+
+static bool Array_ix_Erase(struct page **self, int index, int length)
+{
+	if (!self || !*self)
+		return false;
+	bool any = false;
+	int n = length > 0 ? length : 1;
+	for (int k = 0; k < n; k++) {
+		bool ok = false;
+		*self = array_erase(*self, index, &ok);
+		if (!ok)
+			break;
+		any = true;
+	}
+	return any;
+}
+
+static int Array_ix_Copy(struct page **self, struct page **src)
+{
+	if (!self || !*self || !src || !*src)
+		return 0;
+	int n = array_numof(*src, 1);
+	int cap = array_numof(*self, 1);
+	if (n > cap)
+		n = cap;
+	array_copy(*self, 0, *src, 0, n);
+	return n;
+}
+
+static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
+
+static int Array_ix_Fill(struct page **self, union vm_value *value)
+{
+	if (!self || !*self || !value)
+		return 0;
+	return array_fill(*self, 0, array_numof(*self, 1), *value);
+}
+
+static int Array_ix_Find(struct page **self, union vm_value *search)
+{
+	if (!self || !*self || !search)
+		return -1;
+	return array_find(*self, 0, array_numof(*self, 1), *search, 0);
+}
+
+static bool Array_ix_IsExist(struct page **self, union vm_value *search)
+{
+	return Array_ix_Find(self, search) >= 0;
+}
+
+// These sort in place. The .ain declares an array/wrap return (for fluent
+// chaining), but a raw page pointer must never be pushed as a VM value (it would
+// be misread as a heap-slot index). Returning null is safe for the common
+// statement-style usage; callers that chain would need the real handle, which
+// isn't available here.
+static struct page *Array_ix_Sort(struct page **self)
+{
+	if (self)
+		array_sort(*self, 0);
+	return NULL;
+}
+
+static struct page *Array_ix_DescSort(struct page **self)
+{
+	if (self) {
+		array_sort(*self, 0);
+		array_reverse(*self);
+	}
+	return NULL;
+}
+
 HLL_LIBRARY(Array,
+	    HLL_EXPORT(Alloc, Array_Alloc),
+	    HLL_EXPORT(Realloc, Array_Realloc),
+	    HLL_EXPORT(Free, Array_Free),
+	    HLL_EXPORT(Clear, Array_ix_Clear),
+	    HLL_EXPORT(Numof, Array_ix_Numof),
+	    HLL_EXPORT(Count, Array_ix_Numof),
+	    HLL_EXPORT(Empty, Array_Empty),
+	    HLL_EXPORT(PushBack, Array_PushBack),
+	    HLL_EXPORT(Add, Array_PushBack),
+	    HLL_EXPORT(PopBack, Array_PopBack),
+	    HLL_EXPORT(Insert, Array_ix_Insert),
+	    HLL_EXPORT(Erase, Array_ix_Erase),
+	    HLL_EXPORT(Copy, Array_ix_Copy),
+	    HLL_EXPORT(Duplicate, Array_ix_Copy),
+	    HLL_EXPORT(Concat, Array_ix_Copy),
+	    HLL_EXPORT(AddRange, Array_ix_Copy),
+	    HLL_EXPORT(Reverse, Array_Reverse),
+	    HLL_EXPORT(Fill, Array_ix_Fill),
+	    HLL_EXPORT(Find, Array_ix_Find),
+	    HLL_EXPORT(FindLast, Array_ix_Find),
+	    HLL_EXPORT(IsExist, Array_ix_IsExist),
+	    HLL_EXPORT(Sort, Array_ix_Sort),
+	    HLL_EXPORT(AscSort, Array_ix_Sort),
+	    HLL_EXPORT(QuickSort, Array_ix_Sort),
+	    HLL_EXPORT(DescSort, Array_ix_DescSort),
 	    HLL_TODO_EXPORT(NV_copy, Array_NV_copy),
 	    HLL_TODO_EXPORT(NV_add, Array_NV_add),
 	    HLL_TODO_EXPORT(NV_sub, Array_NV_sub),
