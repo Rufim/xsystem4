@@ -139,8 +139,28 @@ static struct fnl_bitmap_glyph *fnl_get_bitmap_glyph(struct fnl_bitmap_size *bit
 
 #define GLYPH_BORDER_SIZE 4
 
+// Downscale filter tuning (see comment in fnl_font_get_glyph); overridable
+// for A/B comparison via XSYS4_FNL_GAMMA=<float> and XSYS4_FNL_SHARP=0/1.
+static float fnl_gamma = 0.8f;
+static bool fnl_sharpen = true;
+static bool fnl_filter_initialized = false;
+
+static void fnl_filter_init(void)
+{
+	if (fnl_filter_initialized)
+		return;
+	fnl_filter_initialized = true;
+	const char *g = getenv("XSYS4_FNL_GAMMA");
+	if (g)
+		fnl_gamma = strtof(g, NULL);
+	const char *s = getenv("XSYS4_FNL_SHARP");
+	if (s)
+		fnl_sharpen = atoi(s) != 0;
+}
+
 static bool fnl_font_get_glyph(struct font_size *_size, struct glyph *glyph, uint32_t code, enum font_weight weight)
 {
+	fnl_filter_init();
 	struct fnl_font_size *size = (struct fnl_font_size*)_size;
 	unsigned index = fnl_char_to_index(code);
 	if (index > size->bitmap_size->nr_glyphs)
@@ -171,12 +191,19 @@ static bool fnl_font_get_glyph(struct font_size *_size, struct glyph *glyph, uin
 			}
 		}
 		unsigned avg = acc[i] / (size->denominator * size->denominator);
-		// Box-averaging a 1-bit glyph fades edge pixels to faint grey, so the
-		// visible ink shrinks and downscaled text looks thinner/smaller than the
-		// original engine (whose glyphs fill ~0.79 of the cell). Apply a gamma
-		// (<1) to the coverage so partially-covered edge pixels stay opaque,
-		// preserving the glyph's full extent and weight.
-		uint8_t p = (uint8_t)(255.0f * powf(avg / 255.0f, 0.35f) + 0.5f);
+		// The .fnl faces are 4x-supersampled bitmaps (face height = 4*point
+		// size); AliceSoft's engine box-filters them down, i.e. linear
+		// coverage. A plain gamma boost (0.35) fattened partially-covered
+		// edge pixels and filled the (already tiny, 1-3px native) gaps
+		// between glyphs, making letters touch. Instead sharpen around the
+		// 50%-coverage contour: the true glyph outline stays put, interior
+		// pixels go solid (weight preserved), and the faint outer fringe
+		// fades so inter-letter gaps survive. Mild gamma on top for weight.
+		float t = avg / 255.0f;
+		if (fnl_sharpen)
+			t = t*t*(3.0f - 2.0f*t); // smoothstep, fixed point at 0.5
+		t = powf(t, fnl_gamma);
+		uint8_t p = (uint8_t)(255.0f * t + 0.5f);
 		pixels[(dst_row+off_y)*width + (dst_col+off_x)] = p;
 	}
 

@@ -206,6 +206,64 @@ struct page *get_struct_page(int frame_no)
 	return slot < 1 ? NULL : heap[slot].page;
 }
 
+// Ixseal closures: a lambda captures the LOCAL variables of its lexically
+// enclosing function. The delegate it was created from only stores (obj, fun)
+// — obj is the enclosing method's `this`, NOT the captured environment. Since
+// these lambdas are invoked synchronously by a framework trampoline (e.g.
+// OptionalExtensions::Match) while the enclosing frame is still live, the
+// captured environment is that frame's local page. We locate it by resolving
+// the lambda's lexically-enclosing function (encoded in the mangled name as
+// `...<lambda : PARENT(args)(line, col)>`) and walking down the call stack for
+// the nearest matching frame.
+static int get_function_by_name(const char *name);
+
+static int lambda_parent_fno(int fno)
+{
+	static int *cache = NULL; // -1 = uncomputed, -2 = not a lambda / no parent
+	if (fno < 0 || fno >= ain->nr_functions)
+		return -2;
+	if (!cache) {
+		cache = xmalloc(sizeof(int) * ain->nr_functions);
+		for (int i = 0; i < ain->nr_functions; i++)
+			cache[i] = -1;
+	}
+	if (cache[fno] != -1)
+		return cache[fno];
+
+	int result = -2;
+	const char *name = ain->functions[fno].name;
+	const char *lm = name ? strstr(name, "<lambda : ") : NULL;
+	if (lm) {
+		lm += strlen("<lambda : ");
+		const char *paren = strchr(lm, '(');
+		if (paren && paren > lm) {
+			size_t len = paren - lm;
+			char *pname = xmalloc(len + 1);
+			memcpy(pname, lm, len);
+			pname[len] = '\0';
+			result = get_function_by_name(pname);
+			free(pname);
+		}
+	}
+	cache[fno] = result;
+	return result;
+}
+
+// Return the heap slot of the local page that holds a lambda's captured
+// environment, or -1 if it cannot be located on the current call stack.
+static int lambda_env_page_slot(void)
+{
+	int cur = call_stack[call_stack_ptr-1].fno;
+	int parent = lambda_parent_fno(cur);
+	if (parent >= 0) {
+		for (int i = call_stack_ptr - 2; i >= 0; i--) {
+			if (call_stack[i].fno == parent)
+				return call_stack[i].page_slot;
+		}
+	}
+	return -1;
+}
+
 union vm_value member_get(int varno)
 {
 	return struct_page()->values[varno];
@@ -289,6 +347,11 @@ union vm_value vm_copy(union vm_value v, enum ain_data_type type)
 	case AIN_STRUCT:
 	case AIN_DELEGATE:
 	case AIN_ARRAY_TYPE:
+	// Ixseal generic array (type 79): deep-copy the backing page like a typed
+	// array. Without this it fell to the shallow default below, so a struct
+	// copy shared its array members' heap slots with the original — destroying
+	// either one then freed the shared slot, leaving the other dangling.
+	case AIN_ARRAY:
 		return (union vm_value) { .i = vm_copy_page(heap_get_page(v.i)) };
 	case AIN_REF_TYPE:
 		heap_ref(v.i);
@@ -358,8 +421,66 @@ static int alloc_scenario_page(const char *fname)
 	return slot;
 }
 
+void vm_optrace_dump(void);
+
+// Map an element data type to the legacy typed-array data type, so Ixseal's
+// generic arrays (AIN_ARRAY, element type carried in ain_type.array_type) can be
+// stored/allocated with the existing array_* helpers, which key off a_type.
+static enum ain_data_type array_type_from_elem(enum ain_data_type et)
+{
+	switch (et) {
+	case AIN_INT:       return AIN_ARRAY_INT;
+	case AIN_FLOAT:     return AIN_ARRAY_FLOAT;
+	case AIN_STRING:    return AIN_ARRAY_STRING;
+	case AIN_STRUCT:    return AIN_ARRAY_STRUCT;
+	case AIN_BOOL:      return AIN_ARRAY_BOOL;
+	case AIN_LONG_INT:  return AIN_ARRAY_LONG_INT;
+	case AIN_FUNC_TYPE: return AIN_ARRAY_FUNC_TYPE;
+	case AIN_DELEGATE:  return AIN_ARRAY_DELEGATE;
+	default:            return AIN_ARRAY_INT;
+	}
+}
+
+// Resolve the (legacy) array data type + struct type + rank for a variable slot,
+// handling both legacy typed arrays and Ixseal generic arrays.
+static enum ain_data_type resolve_array_type(struct page *container, int varno, int *struct_type, int *rank)
+{
+	struct ain_type *vt = NULL;
+	switch (container->type) {
+	case GLOBAL_PAGE: vt = &ain->globals[varno].type; break;
+	case LOCAL_PAGE:  vt = &ain->functions[container->index].vars[varno].type; break;
+	case STRUCT_PAGE: vt = &ain->structures[container->index].members[varno].type; break;
+	default: break;
+	}
+	if (!vt) { *struct_type = 0; *rank = 1; return AIN_ARRAY_INT; }
+	*rank = vt->rank > 0 ? vt->rank : 1;
+	if (vt->data == AIN_ARRAY && vt->array_type) {
+		*struct_type = vt->array_type->struc;
+		enum ain_data_type et = vt->array_type->data;
+		// Ixseal-контейнер часто хранит тип элемента как WRAP<T> (AIN_WRAP)/
+		// OPTION/IFACE_WRAP. Для обёртки над структурой (struc>=0) это struct-
+		// массив — иначе array_type_from_elem(WRAP) уходил в дефолт AIN_ARRAY_INT,
+		// и struct-пул (напр. CPartsMessageManager.m_functionSetList = WRAP<struct328>)
+		// создавался как int-массив → слоты структур хранились как сырые int без
+		// владения → преждевременный free и use-after-free (389/3).
+		if (et == AIN_WRAP || et == AIN_IFACE_WRAP || et == AIN_OPTION)
+			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
+		return array_type_from_elem(et);
+	}
+	*struct_type = vt->struc;
+	return vt->data;
+}
+
 static void set_struct_page(int slot)
 {
+	static bool bad_ssp_logged = false;
+	if (slot >= 0 && !heap_index_valid(slot) && getenv("XSYS4_OPTRACE") && !bad_ssp_logged) {
+		bad_ssp_logged = true;
+		uint16_t op = instr_ptr < ain->code_size ? get_opcode(instr_ptr) : 0;
+		sys_warning("BAD set_struct_page(%d) ip=0x%06lx op=%s csp=%d\n", slot,
+			    (unsigned long)instr_ptr, instructions[op].name ? instructions[op].name : "?", call_stack_ptr);
+		vm_optrace_dump();
+	}
 	call_stack[call_stack_ptr-1].struct_page = slot;
 	// Keep `this` alive during the call (from Rance9 onwards).
 	if (AIN_VERSION_GTE(ain, 6, 1))
@@ -1064,21 +1185,76 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case X_A_INIT: {
-		// Инициализация generic-массива (тип 79): стек [page, var, size].
-		// Кладём в ссылку свежий пустой массив-слот; size пока не используем
-		// (пустой массив), handle возвращаем на стек (за ним обычно POP).
-		stack_pop(); // размер/аргумент инициализации
-		union vm_value *ref = stack_pop_var();
+		// Initialise a generic array (type 79). Stack: [page, var, size].
+		// Create a fresh but correctly-TYPED array page in the referenced
+		// variable — the element type/struct-type/rank come from the variable's
+		// declared type. Using a bare NULL page here would lose the element type,
+		// so a later Array.Alloc couldn't tell whether elements are ints, strings
+		// or structs (it would default to int and corrupt struct arrays).
+		// РАЗМЕР со стека НЕ игнорируется: паттерн bulk-инициализации массива
+		// (`PUSH n; X_A_INIT; PUSH v0..v(n-1); X_ASSIGN n`) требует, чтобы массив
+		// был создан РАЗМЕРА n (иначе последующая пакетная запись пишет за границы —
+		// напр. CSpriteParts@2 строит таблицу из ~350 индексов методов → «376/0»).
+		// size==0 (напр. в конструкторе CASTimerManager) даёт пустой массив,
+		// который потом растят через EmplaceBack — поведение прежнее.
+		int size = stack_pop().i;
+		int page_index = stack_pop().i;
+		int heap_index = stack_pop().i;
+		struct page *container = heap_index_valid(heap_index) ? heap[heap_index].page : NULL;
 		int slot = heap_alloc_slot(VM_PAGE);
-		heap_set_page(slot, NULL);
-		ref->i = slot;
+		if (container && page_index >= 0 && page_index < container->nr_vars) {
+			int struct_type = 0, rank = 1;
+			enum ain_data_type dt = resolve_array_type(container, page_index, &struct_type, &rank);
+			union vm_value dim = { .i = size > 0 ? size : 0 };
+			heap_set_page(slot, alloc_array(rank, &dim, dt, struct_type, true));
+			container->values[page_index].i = slot;
+		} else {
+			heap_set_page(slot, NULL);
+		}
 		stack_push(slot);
 		break;
 	}
-	case X_MOV:
+	case X_MOV: {
+		// X_MOV <a> <b>: rotate the top `a` stack values so the top `b` of them
+		// move to the bottom of that window and the lower `a-b` shift up to the
+		// top (preserving relative order within each group). For a=2,b=1 this is
+		// a swap of the top two — e.g. `X_MOV 2 1; ITOF; X_MOV 2 1; F_MUL` brings
+		// the deeper operand up to be int->float converted, then restores order.
+		int a = get_argument(0);
+		int b = get_argument(1);
+		if (a > 0 && b > 0 && a <= b + 32 && b < a && stack_ptr >= a) {
+			union vm_value tmp[a];
+			for (int i = 0; i < b; i++)
+				tmp[i] = stack[stack_ptr - b + i];
+			for (int i = 0; i < a - b; i++)
+				tmp[b + i] = stack[stack_ptr - a + i];
+			for (int i = 0; i < a; i++)
+				stack[stack_ptr - a + i] = tmp[i];
+		} else if (a > 0 && b > 0 && stack_ptr >= a) {
+			WARNING("X_MOV: unexpected operands a=%d b=%d sp=%d", a, b, stack_ptr);
+		}
+		break;
+	}
+	case X_GETENV: {
+		// Замыкание (Ixseal): получить ЗАХВАЧЕННОЕ окружение лямбды —
+		// локальную страницу лексически-объемлющей функции. Делегат хранит
+		// только (obj, fun), где obj = `this` объемлющего метода, а НЕ
+		// окружение; поэтому env восстанавливаем по стеку вызовов (лямбда
+		// вызывается синхронно трамплином-фреймворком, объемлющий кадр жив).
+		// Идиома `PUSHLOCALPAGE; X_GETENV; PUSH n; X_REF 1` читает env.member_n.
+		// net 0: снять локальную страницу (не нужна), положить env-страницу.
+		stack_pop();
+		int env = lambda_env_page_slot();
+		stack_push(env >= 0 ? env : struct_page_slot());
+		break;
+	}
 	case X_A_SIZE:
-	case X_TO_STR:
-	case X_GETENV:
+	case X_TO_STR: {
+		// TODO: пока не реализованы — временный совместимый стаб (как было).
+		stack_pop();
+		stack_push(struct_page_slot());
+		break;
+	}
 	case X_SET:
 	case X_ICAST:
 	case X_OP_SET: {
@@ -1185,8 +1361,39 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case NEW: {
+		// Older System 4 pops the struct type off the stack; Ixseal passes it as
+		// an instruction operand instead (NEW <struct> <ctor-fno-or-(-1)>). Popping
+		// the stack in the operand form consumes an unrelated slot and corrupts
+		// the surrounding expression (e.g. `global[x] = new T()` loses its lvalue
+		// reference). Pick the source based on the linked operand count.
 		union vm_value v;
-		create_struct(stack_pop().i, &v);
+		if (instructions[NEW].nr_args >= 2 && get_argument(1) >= 0) {
+			// Ixseal: NEW <struct_type> <ctor_fno> — вызвать КОНКРЕТНЫЙ (в т.ч.
+			// принимающий аргументы) конструктор. Его аргументы уже лежат на
+			// стеке. Выделяем объект БЕЗ дефолт-конструктора, вставляем новый
+			// объект как receiver ПОД аргументы ctor, синхронно исполняем ctor
+			// (как vm_call), затем оставляем объект на стеке. Без этого аргументы
+			// ctor оставались на стеке, и следующий X_ASSIGN читал их как битую
+			// ссылку (напр. new CASColor(255,255,255,255) → «Out of bounds page
+			// index: 255/255»).
+			int struct_type = get_argument(0);
+			int ctor = get_argument(1);
+			int slot = alloc_struct(struct_type);
+			int nargs = (ctor >= 0 && ctor < ain->nr_functions)
+				? ain->functions[ctor].nr_args : 0;
+			for (int k = 0; k < nargs; k++)
+				stack[stack_ptr - k] = stack[stack_ptr - 1 - k];
+			stack[stack_ptr - nargs].i = slot;
+			stack_ptr++;
+			size_t saved_ip = instr_ptr;
+			method_call(ctor, VM_RETURN);
+			vm_execute();
+			instr_ptr = saved_ip;
+			v.i = slot;
+		} else {
+			int struct_type = instructions[NEW].nr_args >= 1 ? get_argument(0) : stack_pop().i;
+			create_struct(struct_type, &v);
+		}
 		stack_push(v);
 		break;
 	}
@@ -1201,7 +1408,9 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case OBJSWAP: {
-		stack_pop(); // type
+		// Ixseal passes the type as an operand rather than on the stack.
+		if (instructions[OBJSWAP].nr_args < 1)
+			stack_pop(); // type (older form: on the stack)
 		union vm_value *b = stack_pop_var();
 		union vm_value *a = stack_pop_var();
 		union vm_value tmp = *a;
@@ -1223,12 +1432,27 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case CALLMETHOD: {
-		// Новые релизы System 4 (Dohna Dohna, Healing Touch): операнд 0 означает
-		// динамический диспатч — индекс метода лежит на вершине стека (аналог
-		// CALLFUNC2). Иначе fn[0]=NULL и прыжок за пределы кода.
-		int fno = get_argument(0);
-		if (fno == 0)
-			fno = stack_pop().i;
+		int fno;
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal (ain v>=11): the operand is the ARGUMENT COUNT and the
+			// method index is passed on the stack, below the arguments:
+			//   PUSH receiver; PUSH method_idx; PUSH arg0..arg(n-1); CALLMETHOD n
+			// Read the method index from below the args and splice its slot out
+			// so the stack is left as [receiver, arg0..arg(n-1)] — exactly what
+			// method_call() consumes (pop args, then pop receiver).
+			int nargs = get_argument(0);
+			int mi_pos = stack_ptr - 1 - nargs;
+			fno = stack[mi_pos].i;
+			for (int k = mi_pos; k < stack_ptr - 1; k++)
+				stack[k] = stack[k + 1];
+			stack_ptr--;
+		} else {
+			// Older releases: the operand is the method index; 0 means dynamic
+			// dispatch with the index on top of the stack.
+			fno = get_argument(0);
+			if (fno == 0)
+				fno = stack_pop().i;
+		}
 		if (fn_trace_count != 0) vm_fn_trace(fno, "CALLMETHOD");
 		method_call(fno, instr_ptr + instruction_width(CALLMETHOD));
 		break;
@@ -1847,7 +2071,10 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case S_MOD: {
-		int type = stack_pop().i;
+		// Ixseal moved the value type from the stack to an instruction operand
+		// (like NEW). Popping it in the operand form eats an unrelated slot and
+		// corrupts the stack — and S_MOD runs for every formatted string.
+		int type = instructions[S_MOD].nr_args >= 1 ? get_argument(0) : stack_pop().i;
 		union vm_value val = stack_pop();
 		int fmt = stack_pop().i;
 		int dst = heap_alloc_slot(VM_STRING);
@@ -1964,9 +2191,17 @@ static enum opcode execute_instruction(enum opcode opcode)
 	}
 	case A_REF: {
 		int array = stack_pop().i;
-		int slot = heap_alloc_slot(VM_PAGE);
-		heap_set_page(slot, copy_page(heap[array].page));
-		stack_push(slot);
+		/* Ixseal (System 4 v14+) reuses A_REF as a polymorphic "duplicate
+		 * reference value": the operand may be a string heap slot (e.g. a
+		 * string function argument) as well as an array page. Branch on the
+		 * actual heap slot type so we don't cast a struct string* to a page. */
+		if (heap_index_valid(array) && heap[array].type == VM_STRING) {
+			stack_push(vm_string_ref(heap[array].s));
+		} else {
+			int slot = heap_alloc_slot(VM_PAGE);
+			heap_set_page(slot, copy_page(heap_index_valid(array) ? heap[array].page : NULL));
+			stack_push(slot);
+		}
 		break;
 	}
 	case A_NUMOF: {
@@ -2500,6 +2735,29 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case DG_PLUSA: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal (ain v>=11): the destination is a 2-slot ref-lvalue
+			// (heap_idx, member_idx) to a delegate variable; the value to add
+			// is on top. Idiom in a closure body:
+			//   PUSHLOCALPAGE; PUSH n;          <- ref to the lvalue delegate
+			//   ...compute add-delegate...; A_REF
+			//   DG_PLUSA
+			// An empty delegate lvalue holds 0 and has no page yet, so we must
+			// allocate a fresh one instead of dereferencing slot 0.
+			int add_i = stack_pop().i;
+			union vm_value *dst = stack_pop_var();
+			struct page *add = heap_get_delegate_page(add_i);
+			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
+			    heap[dst->i].page->type == DELEGATE_PAGE) {
+				heap_set_page(dst->i, delegate_plusa(heap[dst->i].page, add));
+			} else {
+				dst->i = heap_alloc_page(delegate_plusa(NULL, add));
+			}
+			// Ixseal emits DG_PLUSA as a statement (no trailing POP), so it must
+			// be stack-neutral for its inputs and leave nothing behind — unlike
+			// the legacy form which pushes the added value back as an rvalue.
+			break;
+		}
 		int add_i = stack_pop().i;
 		int dst_i = stack_pop().i;
 		struct page *add = heap_get_delegate_page(add_i);
@@ -2555,7 +2813,8 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case DG_STR_TO_METHOD: {
-		int dg_no = stack_pop().i;
+		// Ixseal passes the delegate type as an operand rather than on the stack.
+		int dg_no = instructions[DG_STR_TO_METHOD].nr_args >= 1 ? get_argument(0) : stack_pop().i;
 		int str = stack_pop().i;
 		int fno = get_function_by_name(heap_get_string(str)->text);
 		stack_push(function_matches_delegate(dg_no, fno) ? fno : 0);
@@ -2584,8 +2843,34 @@ static enum opcode execute_instruction(enum opcode opcode)
 	return opcode;
 }
 
+// Ground-truth opcode ring buffer (env XSYS4_OPTRACE): the disassembler
+// desyncs on the newer variable-width opcodes, so record the actually-executed
+// (ip, opcode, stack_ptr) here and dump the tail on a VM error.
+#define OPTRACE_SIZE 128
+struct optrace_entry { uint32_t ip; uint16_t op; int32_t sp; };
+static struct optrace_entry optrace_ring[OPTRACE_SIZE];
+static uint32_t optrace_pos;
+static int optrace_on = -1;
+static bool optrace_underflow_logged = false;
+
+void vm_optrace_dump(void)
+{
+	if (optrace_on <= 0)
+		return;
+	sys_warning("=== last %d executed opcodes (ip opcode sp) ===\n", OPTRACE_SIZE);
+	for (int k = 0; k < OPTRACE_SIZE; k++) {
+		struct optrace_entry *e = &optrace_ring[(optrace_pos + k) % OPTRACE_SIZE];
+		if (!e->ip && !e->op)
+			continue;
+		sys_warning("  0x%06x  %-16s sp=%d\n", e->ip,
+			    instructions[e->op].name ? instructions[e->op].name : "?", e->sp);
+	}
+}
+
 static void vm_execute(void)
 {
+	if (optrace_on < 0)
+		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
 	for (;;) {
 		uint16_t opcode;
 		if (instr_ptr == VM_RETURN)
@@ -2594,7 +2879,25 @@ static void vm_execute(void)
 			VM_ERROR("Illegal instruction pointer: 0x%08lX", instr_ptr);
 		}
 		opcode = get_opcode(instr_ptr);
+		uint32_t rec_ip = instr_ptr;
+		uint16_t rec_op = opcode;
+		int rec_sp = stack_ptr;
+		if (optrace_on > 0) {
+			optrace_ring[optrace_pos % OPTRACE_SIZE] =
+				(struct optrace_entry){ instr_ptr, opcode, stack_ptr };
+			optrace_pos++;
+		}
 		opcode = execute_instruction(opcode);
+		if (optrace_on > 0 && rec_ip >= 0x66a5d0 && rec_ip <= 0x66a600)
+			sys_warning("FN6 0x%06x %-14s sp %d->%d\n", rec_ip,
+				    instructions[rec_op].name ? instructions[rec_op].name : "?", rec_sp, stack_ptr);
+		if (optrace_on > 0 && !optrace_underflow_logged && stack_ptr < 0) {
+			optrace_underflow_logged = true;
+			sys_warning("=== FIRST STACK UNDERFLOW: after %s @0x%06x (sp %d -> %d) ===\n",
+				    instructions[rec_op].name ? instructions[rec_op].name : "?",
+				    rec_ip, rec_sp, stack_ptr);
+			vm_optrace_dump();
+		}
 		instr_ptr += instructions[opcode].ip_inc;
 	}
 }
@@ -2728,6 +3031,7 @@ _Noreturn void _vm_error(const char *fmt, ...)
 	va_end(ap);
 	sys_warning("at %s (0x%X) in:\n", current_instruction_name(), instr_ptr);
 	vm_stack_trace();
+	vm_optrace_dump();
 
 	char msg[1024];
 	va_start(ap, fmt);

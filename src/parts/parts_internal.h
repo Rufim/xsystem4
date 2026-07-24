@@ -568,9 +568,16 @@ enum parts_message_type {
 	PARTS_MSG_KEY_TRIGGER    = 14,
 	PARTS_MSG_KEY_DOWN       = 15,
 	PARTS_MSG_KEY_UP         = 17,
+	// Engine message type = game CallDelegate case + 1 (see CPartsMessageManager).
+	// Scroll (game case 19) delivers (ScrollPos, Total) to a scrollbar's registered
+	// scroll delegate. Tsumamigui 3 BACK LOG's ScrollEvent -> SetLineIndex rebuilds
+	// the visible line window from this; without it the list stayed at the initial
+	// bottom-anchored 1-line window and showed nothing.
+	PARTS_MSG_SCROLL         = 20,
 };
 
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);
+void parts_msg_push_global(int type, const char *fmt, ...);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
 void parts_checkbox_toggle(struct parts *parts);
 

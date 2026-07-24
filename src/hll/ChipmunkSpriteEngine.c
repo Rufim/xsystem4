@@ -251,6 +251,9 @@ static bool ChipmunkSpriteEngine_SP_GetFontWidth(struct string *text, int *width
 	}
 
 	*width = gfx_size_text(&text_sprite_ts, text->text);
+	if (getenv("XSYS4_HACKS_TRACE"))
+		NOTICE("SP_GetFontWidth text='%s' face=%d size=%.1f -> width=%d",
+		       display_sjis0(text->text), text_sprite_ts.face, text_sprite_ts.size, *width);
 	return true;
 }
 

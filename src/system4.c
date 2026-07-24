@@ -63,6 +63,9 @@ struct config config = {
 	.echo = false,
 	.text_x_scale = 1.0,
 	.manual_text_x_scale = false,
+	// Небольшой воздух только для пропорциональных глифов (латиница/кириллица);
+	// перекрывается env XSYS4_LETTER_SPACING (0 — полное отключение).
+	.font_letter_spacing = 0.08f,
 	.save_format = SAVE_FORMAT_RSM,
 	.msgskip_delay = 0,
 
@@ -192,6 +195,14 @@ static void read_user_config_file(const char *path, const char *basedir)
 			} else {
 				config.manual_text_x_scale = true;
 				config.text_x_scale = f;
+			}
+		} else if (!strcmp(ini[i].name->text, "font-letter-spacing")) {
+			float f = strtof(ini_string(&ini[i])->text, NULL);
+			if (f < 0.0f || f > 0.5f) {
+				WARNING("Invalid value for font-letter-spacing in config: \"%s\"",
+						ini_string(&ini[i])->text);
+			} else {
+				config.font_letter_spacing = f;
 			}
 		} else if (!strcmp(ini[i].name->text, "msgskip-delay")) {
 			config.msgskip_delay = ini_integer(&ini[i]);

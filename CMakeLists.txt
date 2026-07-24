@@ -194,8 +194,10 @@ target_sources(xsystem4 PRIVATE
   src/hll/Sound2ex.c
   src/hll/StoatSpriteEngine.c
   src/hll/StretchHelper.c
+  src/hll/System.c
   src/hll/SystemService.c
   src/hll/SystemServiceEx.c
+  src/hll/TextSurfaceManager.c
   src/hll/Timer.c
   src/hll/Toushin3Loader.c
   src/hll/vmAnime.c

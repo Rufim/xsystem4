@@ -280,6 +280,10 @@ bool PE_SetPartsFontEdgeColor(int parts_no, int r, int g, int b, int state);
 bool PE_SetPartsFontEdgeWeight(int parts_no, float edge_weight, int state);
 bool PE_SetTextCharSpace(int parts_no, int char_space, int state);
 bool PE_SetTextLineSpace(int parts_no, int line_space, int state);
+int PE_GetTextCharSpace(int parts_no, int state);
+int PE_GetTextLineSpace(int parts_no, int state);
+void PE_GetTextFontProps(int parts_no, int state, int *type, int *size,
+		int *r, int *g, int *b, float *weight);
 
 // flash.c
 bool PE_ExistsFlashFile(struct string *flash_filename);

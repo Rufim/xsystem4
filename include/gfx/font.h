@@ -54,6 +54,9 @@ struct font_size {
 	int y_offset;
 	struct font *font;
 	struct hash_table *glyph_table;
+	// кэш advance полноширинного глифа этого лица (эталон для letter-spacing);
+	// 0 = ещё не вычислен, -1 = полноширинных глифов нет (см. src/text.c)
+	float full_advance;
 };
 
 enum charmap {
@@ -166,6 +169,9 @@ void gfx_draw_text_to_pmap(Texture *dst, int x, int y, char *text);
 float gfx_size_char(struct text_style *ts, const char *ch);
 float gfx_size_char_kerning(struct text_style *ts, uint32_t code, uint32_t code_next);
 float gfx_size_text(struct text_style *ts, const char *text);
+// Добавочный межбуквенный интервал для узких (пропорциональных) глифов;
+// 0 для полноширинных. См. комментарий в src/text.c.
+float gfx_letter_spacing_extra(struct font_size *size, uint32_t code, float advance);
 float gfx_get_actual_font_size(unsigned face, float size);
 float gfx_get_actual_font_size_round_down(unsigned face, float size);
 

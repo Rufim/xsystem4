@@ -14,6 +14,8 @@
  * along with this program; if not, see <http://gnu.org/licenses/>.
  */
 
+#include <math.h>
+
 #include "system4.h"
 #include "system4/fnl.h"
 #include "system4/hashtable.h"
@@ -147,9 +149,84 @@ static struct glyph *font_get_glyph(struct font_size *size, uint32_t code, enum 
 	return slot->value;
 }
 
+/*
+ * Межбуквенный интервал (letter-spacing) для латиницы и кириллицы.
+ *
+ * Пропорциональные письменности (латиница, кириллица) в System 4-играх часто
+ * рисуются через шрифты, где боковых отступов почти нет — особенно в фан-
+ * переводах, где кириллица берётся из полноширинных ячеек японского FNL
+ * (напр. Daiteikoku): шаг = ширина ячейки, но широкие чернила (Ж/М/Щ) съедают
+ * зазор почти до нуля. Добавляем небольшой интервал глифам латиницы/кириллицы;
+ * CJK (кандзи/кана) и полуширинную кану НЕ трогаем — они плотные by design.
+ *
+ * Письменность определяем по коду символа + charmap лица (SJIS/Unicode),
+ * а не по ширине глифа — так корректно обрабатываются и полноширинные
+ * кириллические ячейки (Daiteikoku), и узкая пропорциональная латиница.
+ *
+ * Величина — доля от кегля, двухступенчатая: крупному кеглю (>= порога)
+ * нужна бОльшая разрядка, чем мелкому. База — config.font_letter_spacing /
+ * env XSYS4_LETTER_SPACING (0 полностью отключает); крупный кегль —
+ * XSYS4_LETTER_SPACING_LARGE (деф. 0.10); порог — XSYS4_LETTER_SPACING_SIZE
+ * (деф. 25: сообщения Daiteikoku 26 → крупный, Tsumamigui 24 → базовый).
+ */
+static float letter_spacing_ratio(float size)
+{
+	static float base = -1.0f, large = -1.0f, threshold = -1.0f;
+	if (base < 0.0f) {
+		const char *env = getenv("XSYS4_LETTER_SPACING");
+		base = env ? strtof(env, NULL) : config.font_letter_spacing;
+		if (base < 0.0f)
+			base = 0.0f;
+		env = getenv("XSYS4_LETTER_SPACING_LARGE");
+		large = env ? strtof(env, NULL) : 0.10f;
+		if (base <= 0.0f)
+			large = 0.0f; // база 0 = полное отключение
+		else if (large < base)
+			large = base;
+		env = getenv("XSYS4_LETTER_SPACING_SIZE");
+		threshold = env ? strtof(env, NULL) : 25.0f;
+	}
+	return size >= threshold ? large : base;
+}
+
+// Письменности, которым добавляем интервал: латиница и кириллица.
+static bool is_spacing_script(struct font_size *size, uint32_t code)
+{
+	if (size->font->charmap == CHARMAP_SJIS) {
+		// полуширинная ASCII-латиница (буквы/цифры/пунктуация)
+		if (code >= 0x20 && code <= 0x7e)
+			return true;
+		// кириллица в SJIS (блок JIS X 0208, ряд 7): 0x8440..0x8491
+		if (code >= 0x8440 && code <= 0x8491)
+			return true;
+		return false;
+	}
+	// Unicode: Basic Latin + Latin-1 + Extended-A/B, и кириллица
+	if (code >= 0x20 && code <= 0x24f)
+		return true;
+	if (code >= 0x400 && code <= 0x4ff)
+		return true;
+	return false;
+}
+
+float gfx_letter_spacing_extra(struct font_size *size, uint32_t code, float advance)
+{
+	float r = letter_spacing_ratio(size->size);
+	if (r <= 0.0f || advance <= 0.0f)
+		return 0.0f;
+	if (!is_spacing_script(size, code))
+		return 0.0f;
+	// em-относительный интервал (доля от кегля) с полом в 1px: на мелком
+	// кегле доля даёт <1px, а int-пути игр (SP_GetFontWidth и т.п.)
+	// отбрасывают дробную часть — без пола интервал исчезал бы именно там,
+	// где текст сливается сильнее всего.
+	return fmaxf(1.0f, size->size * r);
+}
+
 static float font_size_char(struct font_size *size, uint32_t code)
 {
-	return size->font->size_char(size, code);
+	float advance = size->font->size_char(size, code);
+	return advance + gfx_letter_spacing_extra(size, code, advance);
 }
 
 static uint32_t char_to_code(const char *ch, enum charmap charmap)
@@ -175,7 +252,8 @@ float gfx_size_char(struct text_style *ts, const char *ch)
 float gfx_size_char_kerning(struct text_style *ts, uint32_t code, uint32_t code_next)
 {
 	struct font_size *size = text_style_font_size(ts);
-	return size->font->size_char_kerning(size, code, code_next);
+	float advance = size->font->size_char_kerning(size, code, code_next);
+	return advance + gfx_letter_spacing_extra(size, code, advance);
 }
 
 float gfx_size_text(struct text_style *ts, const char *text)
@@ -212,6 +290,10 @@ float _gfx_render_text(Texture *dst, char *msg, struct text_render_metrics *tm)
 	float pos_x = tm->x;
 	int pos_y = tm->y + tm->font_size->y_offset;
 
+	static int text_trace = -1;
+	if (text_trace < 0)
+		text_trace = getenv("XSYS4_TEXT_TRACE") ? 1 : 0;
+
 	while (*msg) {
 		pos_x += tm->edge_spacing;
 		// get glyph for character
@@ -221,6 +303,13 @@ float _gfx_render_text(Texture *dst, char *msg, struct text_render_metrics *tm)
 		struct glyph *glyph = font_get_glyph(tm->font_size, code, tm->weight);
 		if (!glyph)
 			continue;
+
+		if (text_trace)
+			NOTICE("TXT code=%04X fsize=%.1f adv=%.2f lsp=%.2f rect=%dx%d scale_x=%.3f xxs=%.3f spacing=%.2f edge_sp=%.2f pos=%.1f",
+			       code, tm->font_size->size, glyph->advance,
+			       gfx_letter_spacing_extra(tm->font_size, code, glyph->advance),
+			       glyph->rect.w, glyph->rect.h, scale_x,
+			       config.text_x_scale, tm->font_spacing, tm->edge_spacing, pos_x);
 
 		// render glyph
 		Texture *t = &glyph->t[tm->weight];
@@ -240,6 +329,9 @@ float _gfx_render_text(Texture *dst, char *msg, struct text_render_metrics *tm)
 
 		// advance
 		pos_x += glyph->advance * scale_x * config.text_x_scale + tm->font_spacing;
+		// тот же межбуквенный интервал, что возвращает font_size_char,
+		// чтобы путь цельной строки был консистентен с поглифовым
+		pos_x += gfx_letter_spacing_extra(tm->font_size, code, glyph->advance);
 		pos_x += tm->edge_spacing;
 	}
 	return pos_x - tm->x;

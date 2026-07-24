@@ -212,6 +212,51 @@ void PE_UpdateInputState(int passed_time)
 				&hover_consumed, &click_consumed);
 	}
 
+	// Mouse wheel: deliver a MOUSE_WHEEL message (Forward/Back counts) to hovered
+	// parts. The engine never generated these, so wheel-scrollable UIs (Tsumamigui 3
+	// BACK LOG: a full-screen part catches the notch -> opens the log; inside the
+	// log CBackLogView@MouseWheelEvent -> scrollbar pos -> ScrollEvent -> SetLineIndex)
+	// could not scroll. Broadcast to every hovered part and let the game's message
+	// manager dispatch to whichever registered a handler.
+	//
+	// We consume the PARTS wheel accumulator (mouse_get/clear_parts_wheel), which is
+	// separate from the poll counts the game reads via IbisInputEngine.MouseWheel_*.
+	// Previously the parts path read the shared poll counts, but the game's per-frame
+	// MouseWheel_ClearCount usually ran first and wiped the notch before the hovered
+	// part ever saw it (so the wheel opened the log with a real mouse but not with the
+	// deterministic test input, purely by call-order luck). With a dedicated
+	// accumulator that we clear ourselves, the hovered part reliably gets every notch
+	// and the game's poll still gets its own copy — neither steals from the other.
+	if (parts_began_click) {
+		int wheel_fwd = 0, wheel_back = 0;
+		mouse_get_parts_wheel(&wheel_fwd, &wheel_back);
+		if (wheel_fwd || wheel_back) {
+			// "Whole" (global) wheel handlers register on parts_no 0
+			// (AddWholeMouseWheelEvent). The backlog/save/load/CG/replay UIs
+			// scroll this way: CBackLogView@MouseWheelEvent is a whole handler,
+			// reached only by a parts_no==0 message -> scrollbar pos ->
+			// ScrollEvent -> SetLineIndex. The hovered text parts have no
+			// per-part delegate, so without this the notch was discarded and the
+			// view never rebuilt (dead scroll). Post once per notch, regardless
+			// of hover; consumed harmlessly if no whole handler is registered.
+			parts_msg_push_global(PARTS_MSG_MOUSE_WHEEL, "ii", wheel_fwd, wheel_back);
+			bool delivered = false;
+			PARTS_LIST_FOREACH_REVERSE(parts) {
+				if (parts->is_hovered) {
+					parts_msg_push(parts, PARTS_MSG_MOUSE_WHEEL, "ii",
+							wheel_fwd, wheel_back);
+					delivered = true;
+					if (getenv("XSYS4_BL_TRACE"))
+						NOTICE("WHEEL deliver part=%d fwd=%d back=%d", parts->no, wheel_fwd, wheel_back);
+				}
+			}
+			if (getenv("XSYS4_BL_TRACE") && !delivered)
+				NOTICE("WHEEL fwd=%d back=%d but NO hovered part (pos=%d,%d began=%d)",
+				       wheel_fwd, wheel_back, cur_pos.x, cur_pos.y, parts_began_click);
+			mouse_clear_parts_wheel();
+		}
+	}
+
 	// Horizontal scrollbar (config sliders): grab on press anywhere in the track
 	// band, then follow the cursor. The knob CG is small, so hit-test the whole
 	// track rectangle for a forgiving grab + click-to-jump.

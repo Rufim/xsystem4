@@ -26,6 +26,8 @@
 
 static struct parts_construction_process *get_cproc(int parts_no, int state)
 {
+	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
+		NOTICE("CP add-op on part=%d state=%d", parts_no, state);
 	return parts_get_construction_process(parts_get(parts_no), state);
 }
 
@@ -61,6 +63,9 @@ bool PE_ClearPartsConstructionProcess(int parts_no, int state);
 
 bool PE_AddCreateToPartsConstructionProcess(int parts_no, int w, int h, int state)
 {
+	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
+		NOTICE("CP AddCreate part=%d w=%d h=%d state=%d valid=%d",
+		       parts_no, w, h, state, parts_state_valid(state-1));
 	if (!parts_state_valid(--state))
 		return false;
 
@@ -334,22 +339,30 @@ bool PE_AddCopyTextToPartsConstructionProcess(int parts_no, int x, int y, struct
 static bool build_create(struct parts *parts, struct parts_construction_process *cproc,
 		struct parts_cp_create *op)
 {
+	// Clamp to at least 1x1: the backlog builds an empty/separator line as a
+	// Width×0 texture (Tsumamigui 3). A 0-dimension GL texture has handle==0 and
+	// makes gfx_set_framebuffer report "Incomplete framebuffer" (fatal) when the
+	// part is later composited. A 1px texture renders nothing visible but is valid.
+	int w = op->w > 0 ? op->w : 1;
+	int h = op->h > 0 ? op->h : 1;
 	gfx_delete_texture(&cproc->common.texture);
-	gfx_init_texture_rgba(&cproc->common.texture, op->w, op->h, (SDL_Color){0,0,0,255});
+	gfx_init_texture_rgba(&cproc->common.texture, w, h, (SDL_Color){0,0,0,255});
 	if (!cproc->common.texture.handle)
 		return false;
-	parts_set_dims(parts, &cproc->common, op->w, op->h);
+	parts_set_dims(parts, &cproc->common, w, h);
 	return true;
 }
 
 static bool build_create_pixel_only(struct parts *parts, struct parts_construction_process *cproc,
 		struct parts_cp_create *op)
 {
+	int w = op->w > 0 ? op->w : 1;
+	int h = op->h > 0 ? op->h : 1;
 	gfx_delete_texture(&cproc->common.texture);
-	gfx_init_texture_rgb(&cproc->common.texture, op->w, op->h, (SDL_Color){0,0,0,255});
+	gfx_init_texture_rgb(&cproc->common.texture, w, h, (SDL_Color){0,0,0,255});
 	if (!cproc->common.texture.handle)
 		return false;
-	parts_set_dims(parts, &cproc->common, op->w, op->h);
+	parts_set_dims(parts, &cproc->common, w, h);
 	return true;
 }
 
@@ -458,11 +471,49 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 {
 	if (!cproc->common.texture.handle)
 		return false;
-	int w = ceilf(gfx_size_text (&op->style, op->text->text));
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("build_copy_text tex=%dx%d x=%d y=%d size=%d color=%d,%d,%d face=%u text='%s'",
+		       cproc->common.texture.w, cproc->common.texture.h, op->x, op->y,
+		       (int)op->style.size, op->style.color.r, op->style.color.g, op->style.color.b,
+		       op->style.face, op->text ? display_sjis0(op->text->text) : "(nil)");
+	if (!op->text)
+		return true;
+	// Multi-line text: the game joins a log message's wrapped lines with '\n' and
+	// sizes the texture for all of them (parts::detail::TextParts_CalcSize counts
+	// '\n' × pixel-height). gfx_render_text draws a SINGLE line, so we split on '\n'
+	// and advance Y per line. Without this the whole message rendered on one line
+	// and ran off the right edge of the box (Tsumamigui 3 BACK LOG). '\n' (0x0A)
+	// never appears as a Shift-JIS trailing byte, so a byte-wise split is safe.
 	int h = ceilf(op->style.size + op->style.edge_up + op->style.edge_down);
-	gfx_fill_with_alpha(&cproc->common.texture, op->x, op->y, w, h,
-			op->style.edge_color.r, op->style.edge_color.g, op->style.edge_color.b, 0);
-	gfx_render_text(&cproc->common.texture, op->x, op->y, op->text->text, &op->style, false);
+	// Per-line pitch: the game sized the texture as nlines × pixel-height
+	// (TextParts_CalcSize counts '\n' × GetPixelHeight), so derive the pitch from
+	// the allocated texture height — matching it exactly keeps every line inside the
+	// texture (no bottom clipping) and the spacing even. Fall back to the style
+	// height if the texture height is unknown.
+	int nlines = 1;
+	for (const char *p = op->text->text; *p; p++)
+		if (*p == '\n')
+			nlines++;
+	int line_h = (cproc->common.texture.h > 0 && nlines > 0)
+		? cproc->common.texture.h / nlines
+		: (int)ceilf(text_style_height(&op->style)) + op->line_space;
+	char *buf = xstrdup(op->text->text);
+	int y = op->y;
+	for (char *line = buf, *p = buf; ; p++) {
+		if (*p != '\n' && *p != '\0')
+			continue;
+		bool end = (*p == '\0');
+		*p = '\0';
+		int w = ceilf(gfx_size_text(&op->style, line));
+		gfx_fill_with_alpha(&cproc->common.texture, op->x, y, w, h,
+				op->style.edge_color.r, op->style.edge_color.g, op->style.edge_color.b, 0);
+		gfx_render_text(&cproc->common.texture, op->x, y, line, &op->style, false);
+		if (end)
+			break;
+		y += line_h;
+		line = p + 1;
+	}
+	free(buf);
 	return true;
 }
 
@@ -552,7 +603,11 @@ bool PE_BuildPartsConstructionProcess(int parts_no, int state)
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_construction_process *cproc = parts_get_construction_process(parts, state);
-	return parts_build_construction_process(parts, cproc);
+	bool r = parts_build_construction_process(parts, cproc);
+	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
+		NOTICE("CP BUILD part=%d state=%d -> %d tex=%u(%dx%d)", parts_no, state, r,
+		       cproc->common.texture.handle, cproc->common.texture.w, cproc->common.texture.h);
+	return r;
 }
 
 bool parts_clear_construction_process(struct parts_construction_process *cproc)
@@ -567,6 +622,8 @@ bool parts_clear_construction_process(struct parts_construction_process *cproc)
 
 bool PE_ClearPartsConstructionProcess(int parts_no, int state)
 {
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("ClearPartsConstructionProcess part=%d state=%d", parts_no, state);
 	if (!parts_state_valid(--state))
 		return false;
 	struct parts *parts = parts_get(parts_no);

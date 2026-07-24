@@ -87,6 +87,13 @@ union vm_value variable_initval(enum ain_data_type type)
 		return (union vm_value) { .i = slot };
 	case AIN_STRUCT:
 	case AIN_REF_TYPE:
+	// Ixseal generic ref-к-элементу-массива (WRAP, тип 82): это ССЫЛКА
+	// (для скаляра — 2 слота [array_slot, idx], для объекта — 1 слот),
+	// null-значение = -1. Игра перед присвоением освобождает старое
+	// содержимое идиомой «X_REF 1; DELETE»; при инициализации нулём
+	// (default-ветка) этот DELETE уносил heap-слот 0 (глобальную
+	// страницу) → double free в CASTimerManager@CreateHandle.
+	case AIN_WRAP:
 		return (union vm_value) { .i = -1 };
 	case AIN_ARRAY_TYPE:
 	case AIN_DELEGATE:
@@ -108,6 +115,9 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 	case AIN_STRUCT:
 	case AIN_DELEGATE:
 	case AIN_ARRAY_TYPE:
+	// Ixseal generic array (type 79): release the backing page slot on destruction,
+	// mirroring variable_initval/vm_copy which also special-case AIN_ARRAY.
+	case AIN_ARRAY:
 	case AIN_REF_TYPE:
 		if (v.i == -1)
 			break;

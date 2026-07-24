@@ -329,4 +329,49 @@ bool PE_SetTextLineSpace(int parts_no, int line_space, int state)
 	return true;
 }
 
+// Геттеры интервалов текста. Нужны бэклогу Tsumamigui 3
+// (CBackLogView@CreateBacklogTextList -> Ｐ＿テキスト字間隔取得/行間隔取得);
+// без них Parts_GetTextCharSpace бросал «Unimplemented HLL function» и ронял
+// движок в отладчик при открытии BACK LOG.
+int PE_GetTextCharSpace(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return 0;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_text *text = parts_get_text(parts, state);
+	return (int)text->ts.font_spacing;
+}
+
+int PE_GetTextLineSpace(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return 0;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_text *text = parts_get_text(parts, state);
+	return text->line_space;
+}
+
+// Fill the actual font properties of a text part's state, for
+// PartsEngine.GetPartsTextFontProperty. Tsumamigui 3 calls that getter on the
+// message-window text parts to learn the font size for the BACK LOG, then builds
+// the log at the returned size — so returning the part's real ts.size (instead of
+// a hardcoded default) makes the log font match the message window. Only fills
+// non-NULL outputs that we actually track; leaves the caller's defaults otherwise.
+void PE_GetTextFontProps(int parts_no, int state, int *type, int *size,
+		int *r, int *g, int *b, float *weight)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	struct parts_text *text = parts_get_text(parts, state);
+	if (type) *type = text->ts.face;
+	if (size) *size = (int)text->ts.size;
+	if (r) *r = text->ts.color.r;
+	if (g) *g = text->ts.color.g;
+	if (b) *b = text->ts.color.b;
+	if (weight) *weight = text->ts.weight / 1000.0f;
+}
+
 

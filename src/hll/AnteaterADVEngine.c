@@ -108,6 +108,8 @@ void ADVLogList_Clear(void)
 static void advlog_add_text_impl(struct string *text)
 {
 	bridge_adv_add_text(text);
+	if (getenv("XSYS4_ADVLOG_TRACE"))
+		NOTICE("ADVLog AddText enabled=%d text=%s", enabled, display_sjis0(text->text));
 	if (!enabled) return;
 	struct string **line = current_line(current_log());
 	string_append(line, text);
@@ -171,8 +173,10 @@ bool ADVLogList_IsEnable(void)
 
 int ADVLogList_GetNumofADVLog(void)
 {
-	if (!logs) return 1;
-	return (log_last - log_first + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE + 1;
+	int n = !logs ? 1 : (log_last - log_first + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE + 1;
+	if (getenv("XSYS4_ADVLOG_TRACE"))
+		NOTICE("ADVLog GetNumofADVLog -> %d (enabled=%d logs=%p)", n, enabled, (void*)logs);
+	return n;
 }
 
 static struct adv_log *log_entry(int log_no)
@@ -186,7 +190,10 @@ static struct adv_log *log_entry(int log_no)
 
 int ADVLogList_GetNumofADVLogText(int log_no)
 {
-	return log_entry(log_no)->nr_lines;
+	int n = log_entry(log_no)->nr_lines;
+	if (getenv("XSYS4_ADVLOG_TRACE"))
+		NOTICE("ADVLog GetNumofADVLogText(log=%d) -> %d", log_no, n);
+	return n;
 }
 
 void ADVLogList_GetADVLogText(int log_no, int line_no, struct string **text)
@@ -197,6 +204,9 @@ void ADVLogList_GetADVLogText(int log_no, int line_no, struct string **text)
 		VM_ERROR("Invalid line number: %d", line_no);
 
 	*text = string_ref(log->lines[line_no]);
+	if (getenv("XSYS4_ADVLOG_TRACE"))
+		NOTICE("ADVLog GetADVLogText(log=%d, line=%d) -> '%s'", log_no, line_no,
+		       display_sjis0(log->lines[line_no]->text));
 }
 
 int ADVLogList_GetNumofADVLogVoice(int log_no)

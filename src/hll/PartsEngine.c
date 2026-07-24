@@ -146,6 +146,11 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 	struct string *text    = heap_get_string(strings[0].i);
 	struct string *cg_name = heap_get_string(strings[1].i);
 
+	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
+		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d str0slot=%d str0len=%d text='%s'",
+		       command, parts_no, dx, dy, font_type, font_size, font_r, font_g, font_b,
+		       strings[0].i, text ? (int)text->size : -1, text ? display_sjis0(text->text) : "(null)");
+
 	switch (command) {
 	case 0:  // CASConstructionProcess::SetCreate
 		PE_AddCreateToPartsConstructionProcess(parts_no, dw, dh, state);
@@ -225,6 +230,44 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 		break;
 	case 18:  // CASConstructionProcess::SetDrawLine
 		WARNING("AddConstructProcess: DrawLine unimplemented");
+		break;
+	case 19:  // CASConstructionProcess::SetCutCGAlphaBlend (equal scale)
+		PE_AddDrawCutCGToPartsConstructionProcess(parts_no, cg_name,
+				dx, dy, dw, dh, sx, sy, dw, dh,
+				interp_type, state);
+		break;
+	case 20:  // CASConstructionProcess::SetCutCGScaleAlphaBlend
+		PE_AddDrawCutCGToPartsConstructionProcess(parts_no, cg_name,
+				dx, dy, dw, dh, sx, sy, sw, sh,
+				interp_type, state);
+		break;
+	case 21:  // CASConstructionProcess::SetCutCGOnlyAlpha (equal scale)
+		PE_AddCopyCutCGToPartsConstructionProcess(parts_no, cg_name,
+				dx, dy, dw, dh, sx, sy, dw, dh,
+				interp_type, state);
+		break;
+	case 22:  // CASConstructionProcess::SetCutCGScaleOnlyAlpha
+		PE_AddCopyCutCGToPartsConstructionProcess(parts_no, cg_name,
+				dx, dy, dw, dh, sx, sy, sw, sh,
+				interp_type, state);
+		break;
+	case 23:  // CASConstructionProcess::SetAlphaBlendText
+		// Text drawn onto a (usually FillAMap'd, alpha=0) transparent surface — the
+		// backlog builds each line this way. Must WRITE the glyph alpha into the
+		// destination, so use the copy-text path (RENDER_COPY: RGB=color, alpha=MAX).
+		// The draw-text path (RENDER_BLENDED) leaves dst alpha untouched → invisible.
+		PE_AddCopyTextToPartsConstructionProcess(parts_no,
+				dx, dy, text, font_type, font_size,
+				font_r, font_g, font_b, bold_weight,
+				edge_r, edge_g, edge_b, edge_weight,
+				char_space, line_space, state);
+		break;
+	case 24:  // CASConstructionProcess::SetOnlyAlphaText
+		PE_AddCopyTextToPartsConstructionProcess(parts_no,
+				dx, dy, text, font_type, font_size,
+				font_r, font_g, font_b, bold_weight,
+				edge_r, edge_g, edge_b, edge_weight,
+				char_space, line_space, state);
 		break;
 	default:
 		WARNING("AddConstructProcess: unknown command %d", command);
@@ -365,10 +408,41 @@ static void PE_SetWantSaveBackScene(int parts_no, int enable)
 // Save-thumbnail of the parts back-scene into a save buffer. Not captured yet —
 // return false (no data) so saving proceeds without a scene thumbnail.
 static bool PE_SaveBackScene(struct page **buf) { (void)buf; return false; }
-// Батч-форма построения parts (3 массива-параметра). Пока no-op: логотип/GUI
-// не строятся из этих операций, но игра проходит дальше к титулу. TODO: декодировать.
+// Direct SaveThumbnail(filename, size) export. Newer games (Tsumamigui 3) call
+// this via AutoSave when opening the town map; without it the unimplemented-HLL
+// error dropped into the debugger REPL and the map never became interactive.
+// Reuse PE_save_thumbnail (same as PartsFunc case 6); the int is the reduction
+// factor. Returning success lets AutoSave complete and the map's input loop run.
+static bool PE_SaveThumbnail(struct string *filename, int reduction_factor)
+{
+	return PE_save_thumbnail(filename, reduction_factor);
+}
+// Батч-форма построения parts (3 массива-параметра). Единый интерфейс, через
+// который игра (parts::AddConstructProcess в .ain) добавляет ВСЕ операции
+// построения parts-текстур: SetCreate/SetFill/SetDrawText/SetCutCG… Раскодируем
+// массивы тем же путём, что и PartsFunc(159), и передаём в дешифратор.
+// Раньше был no-op — из-за этого construction-parts (центр диалога 確認枠,
+// прокручиваемый текст бэклога Tsumamigui 3) строились в 0×0/пустыми.
 static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, struct page **as) {
-	(void)ai; (void)af; (void)as;
+	int nr_ints    = (ai && *ai) ? (*ai)->nr_vars : 0;
+	int nr_floats  = (af && *af) ? (*af)->nr_vars : 0;
+	int nr_strings = (as && *as) ? (*as)->nr_vars : 0;
+	// Ожидаемый формат: 32 int, 2 float, 2 string (см. parts::AddConstructProcess).
+	// Не падаем на неожиданном формате — просто пропускаем операцию.
+	if (nr_ints < 32 || nr_floats < 2 || nr_strings < 2) {
+		if (getenv("XSYS4_CP_TRACE"))
+			NOTICE("AddPartsConstructionProcess: unexpected arg sizes i=%d f=%d s=%d",
+			       nr_ints, nr_floats, nr_strings);
+		return;
+	}
+	union vm_value *ints    = (*ai)->values;
+	union vm_value *floats  = (*af)->values;
+	union vm_value *strings = (*as)->values;
+	if (getenv("XSYS4_CP_TRACE"))
+		NOTICE("AddPartsConstructionProcess part=%d state=%d cmd=%d dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
+		       ints[0].i, ints[1].i, ints[2].i, ints[8].i, ints[9].i,
+		       ints[12].i, ints[13].i, ints[14].i, ints[15].i, ints[16].i, ints[17].i);
+	PartsEngine_add_construction_process(ints, floats, strings);
 }
 
 // --- Подсистема Activity (именованные наборы parts) ---
@@ -613,6 +687,11 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		PE_SetPartsCG(no, cg, 0, state);
 }
 
+// Forward-declared vertical-scrollbar state setters (defined further below).
+static void PartsEngine_SetVScrollbarTotalSize(int parts_no, int size);
+static void PartsEngine_SetVScrollbarViewSize(int parts_no, int size);
+static void PartsEngine_SetVScrollbarScrollRate(int parts_no, float rate);
+
 // Returns the (top-level) parts number built for `node`, or -1 for a leaf/null.
 static int act_build_part(struct pe_activity *a, struct ex_tree *node, int parent_no)
 {
@@ -717,6 +796,29 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			act_int(ti, "長さ", 0), act_int(ti, "幅", 0),
 			act_int(ti, "全体スクロール量", 0), act_int(ti, "表示量", 1),
 			act_float(ti, "スクロールレート", 0.0f));
+		PE_SetClickable(no, true);
+	} else if (ptype == 2 && ti) {
+		// vertical scrollbar (パーツタイプ=2). Same 種類別情報 geometry as the
+		// horizontal slider (全体スクロール量/表示量/スクロールレート). There is no
+		// visual vertical-scrollbar compositor yet, but the BACK LOG viewer *reads*
+		// GetVScrollbarViewSize to decide how many log lines to instantiate
+		// (backlog::detail::CBackLogView@SetLineIndex loops i in 0..ViewSize). With
+		// the old no-op stub ViewSize was 0 → zero lines built → empty list. Register
+		// the track sizes so the getters return real values. TotalSize is overwritten
+		// by the game at runtime (InitVScrollbar sets it to NumofLine); ViewSize comes
+		// from the .pactex here.
+		int total = act_int(ti, "全体スクロール量", 0);
+		int view  = act_int(ti, "表示量", 1);
+		float rate = act_float(ti, "スクロールレート", 0.0f);
+		PartsEngine_SetVScrollbarTotalSize(no, total);
+		PartsEngine_SetVScrollbarViewSize(no, view);
+		PartsEngine_SetVScrollbarScrollRate(no, rate);
+		// Best-effort visual: load the base CG so the rail shows if present.
+		struct string *cg = act_str(ti, "ＣＧ名");
+		if (cg && cg->size)
+			PE_SetPartsCG(no, cg, 0, 1);
+		if (getenv("XSYS4_PT_TRACE"))
+			NOTICE("PT vscrollbar no=%d total=%d view=%d rate=%.3f", no, total, view, rate);
 		PE_SetClickable(no, true);
 	} else if (ptype == 1 && ti) {
 		// checkbox (パーツタイプ=1): ＣＧ名 is a base; the box has checked/unchecked
@@ -1066,6 +1168,38 @@ static void PE_GetButtonCGName(int a, struct string **b) { (void)a; PE_str_out(b
 static void PE_GetButtonFlatName(int a, struct string **b) { (void)a; PE_str_out(b); }
 static void PE_GetButtonText(int a, struct string **b) { (void)a; PE_str_out(b); }
 
+// GetPartsTextFontProperty: геттер свойств шрифта текст-парта (форма как у
+// GetButtonFontProperty + хвостовой State). Полноценного хранилища свойств
+// текст-парта в движке нет — возвращаем разумные дефолты, чтобы вызывающий код
+// (диалоги/бэклог) не читал мусор из ref-out и не падал.
+static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int *g, int *b,
+	float *weight, int *er, int *eg, int *eb, float *ew, int state) {
+	// Sensible defaults first (ref-out getters MUST fill outputs, else callers read
+	// garbage — e.g. a bad size leaves text unrendered).
+	if (type) *type = 0;
+	if (size) *size = 16;
+	if (r) *r = 255; if (g) *g = 255; if (b) *b = 255;
+	if (weight) *weight = 1.0f;
+	if (er) *er = 0; if (eg) *eg = 0; if (eb) *eb = 0;
+	if (ew) *ew = 0.0f;
+	// Tsumamigui 3 reads THIS on the message-window text parts to pick the BACK LOG
+	// font size, then builds the log construction ops at the returned size. Return
+	// the part's ACTUAL font SIZE so the log matches the message window (30) instead
+	// of a hardcoded 16. We deliberately take ONLY the size: the part's internal
+	// ts.face is an engine face id (e.g. 256), not the HLL font TYPE the caller
+	// expects, and feeding it back as `type` makes the game build the log in an
+	// unrenderable font (blank log). Type/color/weight stay at the safe defaults.
+	int real_size = 16;
+	PE_GetTextFontProps(a, state, NULL, &real_size, NULL, NULL, NULL, NULL);
+	if (size) *size = real_size;
+}
+// Фокус ввода (клавиатурная навигация по кнопкам) в движке не реализован —
+// косметика. Явные заглушки, видимые в исходнике.
+static int PE_GetFocusPartsNumber(void) { return -1; }
+static bool PE_IsFocus(int a) { (void)a; return false; }
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetFocus, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetFocusPartsNumber, int a);
+
 // Button parts are backed by the normal parts state machine (3 states:
 // default/hovered/clicked). Setting a button's flat/CG name must actually
 // load the resource into all states so the button renders — otherwise the
@@ -1119,6 +1253,149 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarMoveSizeByButton, int 
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarMoveSizeByButton, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarMoveSizeByButton, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarMoveSizeByButton, int a);
+// Скроллбары (BACK LOG и пр.): вертикального скроллбара в parts пока нет
+// (горизонтальный-слайдер есть — PE_*HScrollbarScrollRate). Тихие заглушки,
+// чтобы UI открывался без падения в REPL; сам ползунок не отрисовывается.
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarOnCursorSoundNumber, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarClickSoundNumber, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarOnCursorSoundNumber, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarClickSoundNumber, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarSize, int a, int b, int c);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarUpHeight, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarDownHeight, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarUpHeight, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarDownHeight, int a);
+// --- Вертикальный скроллбар: минимальная модель состояния (total/view/pos),
+// keyed по номеру parts. Нужна бэклогу Tsumamigui 3: CBackLogView@SetLineIndex
+// строит видимые строки в цикле «for i in 0..GetVScrollbarViewSize()»; при
+// заглушке-0 не создавалось ни одной строки → пустой список. Отрисовку самого
+// ползунка не трогаем (её и не было); модель нужна для логики прокрутки/выдачи. ---
+// Declared in parts_internal.h (not included here); needed to post a Scroll
+// message when the scrollbar position changes.
+struct parts *parts_try_get(int parts_no);
+void parts_msg_push(struct parts *parts, int type, const char *fmt, ...);
+#define PE_PARTS_MSG_SCROLL 20  // == PARTS_MSG_SCROLL (game CallDelegate case 19 + 1)
+
+struct pe_vscrollbar {
+	int parts_no;
+	int total_size;
+	int view_size;
+	int scroll_pos;
+};
+static struct pe_vscrollbar *pe_vscrollbars = NULL;
+static int nr_pe_vscrollbars = 0;
+
+static struct pe_vscrollbar *pe_vscrollbar_get(int parts_no, bool create)
+{
+	for (int i = 0; i < nr_pe_vscrollbars; i++)
+		if (pe_vscrollbars[i].parts_no == parts_no)
+			return &pe_vscrollbars[i];
+	if (!create)
+		return NULL;
+	pe_vscrollbars = xrealloc_array(pe_vscrollbars, nr_pe_vscrollbars,
+			nr_pe_vscrollbars + 1, sizeof(*pe_vscrollbars));
+	struct pe_vscrollbar *sb = &pe_vscrollbars[nr_pe_vscrollbars++];
+	*sb = (struct pe_vscrollbar){ .parts_no = parts_no };
+	return sb;
+}
+
+static void PartsEngine_SetVScrollbarTotalSize(int parts_no, int size)
+{
+	pe_vscrollbar_get(parts_no, true)->total_size = size;
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("VScrollbar[%d] TotalSize=%d", parts_no, size);
+}
+static void PartsEngine_SetVScrollbarViewSize(int parts_no, int size)
+{
+	pe_vscrollbar_get(parts_no, true)->view_size = size;
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("VScrollbar[%d] ViewSize=%d", parts_no, size);
+}
+static void PartsEngine_SetVScrollbarScrollPos(int parts_no, int pos)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, true);
+	int max = sb->total_size - sb->view_size;
+	if (max < 0) max = 0;
+	if (pos < 0) pos = 0;
+	if (pos > max) pos = max;
+	sb->scroll_pos = pos;
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("VScrollbar[%d] SetScrollPos req=%d -> %d (total=%d view=%d max=%d)",
+		       parts_no, pos, sb->scroll_pos, sb->total_size, sb->view_size, max);
+	// Notify the game's scroll delegate (e.g. backlog SetLineIndex) that the bar
+	// moved. The real engine posts a Scroll message when a scrollbar's position is
+	// set; the game's CPartsMessageManager dispatches it to the registered
+	// ScrollEvent. Post (ScrollPos, TotalSize) UNCONDITIONALLY — not only on change.
+	// The backlog's InitVScrollbar sets ScrollPos to NumofLine to trigger the very
+	// first SetLineIndex via ScrollEvent; with a small history (NumofLine <= ViewSize)
+	// the clamped pos stays 0 == old, so gating on change suppressed the initial
+	// render and the log stayed empty until enough lines accrued (>ViewSize). No feedback
+	// loop: SetLineIndex never calls back into SetVScrollbarScrollPos.
+	struct parts *p = parts_try_get(parts_no);
+	if (p)
+		parts_msg_push(p, PE_PARTS_MSG_SCROLL, "ii", pos, sb->total_size);
+}
+static void PartsEngine_SetVScrollbarScrollRate(int parts_no, float rate)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, true);
+	int max = sb->total_size - sb->view_size;
+	if (max < 0) max = 0;
+	if (rate < 0.0f) rate = 0.0f;
+	if (rate > 1.0f) rate = 1.0f;
+	sb->scroll_pos = (int)(rate * max + 0.5f);
+}
+static int PartsEngine_GetVScrollbarTotalSize(int parts_no)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, false);
+	return sb ? sb->total_size : 0;
+}
+static int PartsEngine_GetVScrollbarViewSize(int parts_no)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, false);
+	int v = sb ? sb->view_size : 0;
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("VScrollbar[%d] GetViewSize -> %d", parts_no, v);
+	return v;
+}
+static int PartsEngine_GetVScrollbarScrollPos(int parts_no)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, false);
+	int p = sb ? sb->scroll_pos : 0;
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("VScrollbar[%d] GetScrollPos -> %d", parts_no, p);
+	return p;
+}
+static float PartsEngine_GetVScrollbarScrollRate(int parts_no)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, false);
+	if (!sb) return 0.0f;
+	int max = sb->total_size - sb->view_size;
+	if (max <= 0) return 0.0f;
+	return (float)sb->scroll_pos / (float)max;
+}
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarCGName, int a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, GetVScrollbarCGName, int a, struct string **b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarFlatName, int a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, GetVScrollbarFlatName, int a, struct string **b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarOnCursorSoundNumber, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarClickSoundNumber, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarOnCursorSoundNumber, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarClickSoundNumber, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarSize, int a, int b, int c);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarLeftWidth, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarRightWidth, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarLeftWidth, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarRightWidth, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarTotalSize, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarViewSize, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarScrollPos, int a, int b);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarTotalSize, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarViewSize, int a);
+HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarScrollPos, int a);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarCGName, int a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, GetHScrollbarCGName, int a, struct string **b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarFlatName, int a, struct string *b);
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, GetHScrollbarFlatName, int a, struct string **b);
 HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, IsRadioButtonBoxExistGUI, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearRadioButtonBoxChild, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, AddRadioButtonBoxChild, int a, int b);
@@ -1136,6 +1413,16 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearChild, int a);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, NumofChild, int a);
 HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChild, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChildIndex, int a, int b);
+// Ixseal (Healing Touch/Dohna): SetEventID(parts, ?, event_id) — привязка id
+// события ввода к части; для достижения экрана безвредный no-op.
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetEventID, int a, int b, int c);
+// Parts_StopSwipe() — отменяет свайп-инерцию. Зовётся первым в
+// CBackLogView@MouseWheelEvent (и swipe-обработчиках). Свайп-инерцию не
+// моделируем, поэтому no-op; без него колесо в бэклоге падало в REPL.
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_StopSwipe, void);
+// Ixseal CParts@Comment: attaches a debug/author comment string to a part.
+// Purely diagnostic metadata — safe no-op for reaching the screen.
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_SetComment, int a, struct string *b);
 
 static void PartsEngine_PreLink(void);
 
@@ -1150,6 +1437,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(UpdateGUIController, PartsEngine_UpdateGUIController),
 	    HLL_EXPORT(SetWantSaveBackScene, PE_SetWantSaveBackScene),
 	    HLL_EXPORT(SaveBackScene, PE_SaveBackScene),
+	    HLL_EXPORT(SaveThumbnail, PE_SaveThumbnail),
 	    HLL_EXPORT(GetFreeSystemPartsNumber, PE_GetFreeNumber),
 	    // FIXME: what is the difference?
 	    HLL_EXPORT(GetFreeSystemPartsNumberNotSaved, PE_GetFreeNumber),
@@ -1181,6 +1469,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetPartsFontEdgeWeight, PE_SetPartsFontEdgeWeight),
 	    HLL_EXPORT(SetTextCharSpace, PE_SetTextCharSpace),
 	    HLL_EXPORT(SetTextLineSpace, PE_SetTextLineSpace),
+	    HLL_EXPORT(GetTextCharSpace, PE_GetTextCharSpace),
+	    HLL_EXPORT(GetTextLineSpace, PE_GetTextLineSpace),
 	    HLL_EXPORT(SetHGaugeCG, PE_SetHGaugeCG),
 	    HLL_EXPORT(SetHGaugeRate, PE_SetHGaugeRate_int),
 	    HLL_EXPORT(SetVGaugeCG, PE_SetVGaugeCG),
@@ -1291,14 +1581,16 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(GetClickMissSoundNumber, PartsEngine_GetClickMissSoundNumber),
 	    HLL_EXPORT(BeginMotion, PE_BeginMotion),
 	    HLL_EXPORT(EndMotion, PE_EndMotion),
+	    HLL_EXPORT(PauseMotion, PE_PauseMotion),
 	    HLL_EXPORT(IsMotion, PE_IsMotion),
 	    HLL_EXPORT(SeekEndMotion, PE_SeekEndMotion),
 	    HLL_EXPORT(UpdateMotionTime, PE_UpdateMotionTime),
 	    HLL_EXPORT(BeginInput, PE_BeginInput),
 	    HLL_EXPORT(EndInput, PE_EndInput),
 	    HLL_EXPORT(GetClickPartsNumber, PE_GetClickPartsNumber),
-	    HLL_TODO_EXPORT(GetFocusPartsNumber, PartsEngine_GetFocusPartsNumber),
-	    HLL_TODO_EXPORT(SetFocusPartsNumber, PartsEngine_SetFocusPartsNumber),
+	    HLL_EXPORT(GetFocusPartsNumber, PE_GetFocusPartsNumber),
+	    HLL_EXPORT(SetFocusPartsNumber, PartsEngine_SetFocusPartsNumber),
+	    HLL_EXPORT(GetPartsTextFontProperty, PE_GetPartsTextFontProperty),
 	    HLL_TODO_EXPORT(PushGUIController, PartsEngine_PushGUIController),
 	    HLL_TODO_EXPORT(PopGUIController, PartsEngine_PopGUIController),
 	    HLL_EXPORT(SetPartsMagX, PE_SetPartsMagX),
@@ -1407,6 +1699,9 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(NumofChild, PartsEngine_NumofChild),
 	    HLL_EXPORT(GetChild, PartsEngine_GetChild),
 	    HLL_EXPORT(GetChildIndex, PartsEngine_GetChildIndex),
+	    HLL_EXPORT(SetEventID, PartsEngine_SetEventID),
+	    HLL_EXPORT(Parts_StopSwipe, PartsEngine_Parts_StopSwipe),
+	    HLL_EXPORT(Parts_SetComment, PartsEngine_Parts_SetComment),
 	    HLL_EXPORT(RemoveController, PE_RemoveController),
 	    HLL_EXPORT(UpdateComponent, PartsEngine_Update),
 	    HLL_EXPORT(Parts_SetThumbnailReductionSize, PE_SetThumbnailReductionSize),
@@ -1431,8 +1726,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetMessageVariableBool, PE_GetMessageVariableBool),
 	    HLL_EXPORT(GetMessageVariableString, PE_GetMessageVariableString),
 	    HLL_EXPORT(SetDelegateIndex, PE_SetDelegateIndex),
-	    HLL_TODO_EXPORT(SetFocus, PartsEngine_SetFocus),
-	    HLL_TODO_EXPORT(IsFocus, PartsEngine_IsFocus),
+	    HLL_EXPORT(SetFocus, PartsEngine_SetFocus),
+	    HLL_EXPORT(IsFocus, PE_IsFocus),
 	    HLL_EXPORT(SetComponentType, PE_SetComponentType),
 	    HLL_EXPORT(GetComponentType, PE_GetComponentType),
 	    HLL_EXPORT(SetComponentPos, PartsEngine_SetComponentPos),
@@ -1543,48 +1838,48 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(GetCheckBoxCGName, PartsEngine_GetCheckBoxCGName),
 	    HLL_TODO_EXPORT(SetCheckBoxText, PartsEngine_SetCheckBoxText),
 	    HLL_TODO_EXPORT(GetCheckBoxText, PartsEngine_GetCheckBoxText),
-	    HLL_TODO_EXPORT(SetVScrollbarOnCursorSoundNumber, PartsEngine_SetVScrollbarOnCursorSoundNumber),
-	    HLL_TODO_EXPORT(SetVScrollbarClickSoundNumber, PartsEngine_SetVScrollbarClickSoundNumber),
-	    HLL_TODO_EXPORT(GetVScrollbarOnCursorSoundNumber, PartsEngine_GetVScrollbarOnCursorSoundNumber),
-	    HLL_TODO_EXPORT(GetVScrollbarClickSoundNumber, PartsEngine_GetVScrollbarClickSoundNumber),
-	    HLL_TODO_EXPORT(SetVScrollbarSize, PartsEngine_SetVScrollbarSize),
-	    HLL_TODO_EXPORT(SetVScrollbarUpHeight, PartsEngine_SetVScrollbarUpHeight),
-	    HLL_TODO_EXPORT(SetVScrollbarDownHeight, PartsEngine_SetVScrollbarDownHeight),
-	    HLL_TODO_EXPORT(GetVScrollbarUpHeight, PartsEngine_GetVScrollbarUpHeight),
-	    HLL_TODO_EXPORT(GetVScrollbarDownHeight, PartsEngine_GetVScrollbarDownHeight),
-	    HLL_TODO_EXPORT(SetVScrollbarTotalSize, PartsEngine_SetVScrollbarTotalSize),
-	    HLL_TODO_EXPORT(SetVScrollbarViewSize, PartsEngine_SetVScrollbarViewSize),
-	    HLL_TODO_EXPORT(SetVScrollbarScrollPos, PartsEngine_SetVScrollbarScrollPos),
-	    HLL_TODO_EXPORT(SetVScrollbarScrollRate, PartsEngine_SetVScrollbarScrollRate),
-	    HLL_TODO_EXPORT(SetVScrollbarMoveSizeByButton, PartsEngine_SetVScrollbarMoveSizeByButton),
-	    HLL_TODO_EXPORT(GetVScrollbarTotalSize, PartsEngine_GetVScrollbarTotalSize),
-	    HLL_TODO_EXPORT(GetVScrollbarViewSize, PartsEngine_GetVScrollbarViewSize),
-	    HLL_TODO_EXPORT(GetVScrollbarScrollPos, PartsEngine_GetVScrollbarScrollPos),
-	    HLL_TODO_EXPORT(GetVScrollbarScrollRate, PartsEngine_GetVScrollbarScrollRate),
-	    HLL_TODO_EXPORT(GetVScrollbarMoveSizeByButton, PartsEngine_GetVScrollbarMoveSizeByButton),
-	    HLL_TODO_EXPORT(SetVScrollbarCGName, PartsEngine_SetVScrollbarCGName),
-	    HLL_TODO_EXPORT(GetVScrollbarCGName, PartsEngine_GetVScrollbarCGName),
-	    HLL_TODO_EXPORT(SetHScrollbarOnCursorSoundNumber, PartsEngine_SetHScrollbarOnCursorSoundNumber),
-	    HLL_TODO_EXPORT(SetHScrollbarClickSoundNumber, PartsEngine_SetHScrollbarClickSoundNumber),
-	    HLL_TODO_EXPORT(GetHScrollbarOnCursorSoundNumber, PartsEngine_GetHScrollbarOnCursorSoundNumber),
-	    HLL_TODO_EXPORT(GetHScrollbarClickSoundNumber, PartsEngine_GetHScrollbarClickSoundNumber),
-	    HLL_TODO_EXPORT(SetHScrollbarSize, PartsEngine_SetHScrollbarSize),
-	    HLL_TODO_EXPORT(SetHScrollbarLeftWidth, PartsEngine_SetHScrollbarLeftWidth),
-	    HLL_TODO_EXPORT(SetHScrollbarRightWidth, PartsEngine_SetHScrollbarRightWidth),
-	    HLL_TODO_EXPORT(GetHScrollbarLeftWidth, PartsEngine_GetHScrollbarLeftWidth),
-	    HLL_TODO_EXPORT(GetHScrollbarRightWidth, PartsEngine_GetHScrollbarRightWidth),
-	    HLL_TODO_EXPORT(SetHScrollbarTotalSize, PartsEngine_SetHScrollbarTotalSize),
-	    HLL_TODO_EXPORT(SetHScrollbarViewSize, PartsEngine_SetHScrollbarViewSize),
-	    HLL_TODO_EXPORT(SetHScrollbarScrollPos, PartsEngine_SetHScrollbarScrollPos),
+	    HLL_EXPORT(SetVScrollbarOnCursorSoundNumber, PartsEngine_SetVScrollbarOnCursorSoundNumber),
+	    HLL_EXPORT(SetVScrollbarClickSoundNumber, PartsEngine_SetVScrollbarClickSoundNumber),
+	    HLL_EXPORT(GetVScrollbarOnCursorSoundNumber, PartsEngine_GetVScrollbarOnCursorSoundNumber),
+	    HLL_EXPORT(GetVScrollbarClickSoundNumber, PartsEngine_GetVScrollbarClickSoundNumber),
+	    HLL_EXPORT(SetVScrollbarSize, PartsEngine_SetVScrollbarSize),
+	    HLL_EXPORT(SetVScrollbarUpHeight, PartsEngine_SetVScrollbarUpHeight),
+	    HLL_EXPORT(SetVScrollbarDownHeight, PartsEngine_SetVScrollbarDownHeight),
+	    HLL_EXPORT(GetVScrollbarUpHeight, PartsEngine_GetVScrollbarUpHeight),
+	    HLL_EXPORT(GetVScrollbarDownHeight, PartsEngine_GetVScrollbarDownHeight),
+	    HLL_EXPORT(SetVScrollbarTotalSize, PartsEngine_SetVScrollbarTotalSize),
+	    HLL_EXPORT(SetVScrollbarViewSize, PartsEngine_SetVScrollbarViewSize),
+	    HLL_EXPORT(SetVScrollbarScrollPos, PartsEngine_SetVScrollbarScrollPos),
+	    HLL_EXPORT(SetVScrollbarScrollRate, PartsEngine_SetVScrollbarScrollRate),
+	    HLL_EXPORT(GetVScrollbarTotalSize, PartsEngine_GetVScrollbarTotalSize),
+	    HLL_EXPORT(GetVScrollbarViewSize, PartsEngine_GetVScrollbarViewSize),
+	    HLL_EXPORT(GetVScrollbarScrollPos, PartsEngine_GetVScrollbarScrollPos),
+	    HLL_EXPORT(GetVScrollbarScrollRate, PartsEngine_GetVScrollbarScrollRate),
+	    HLL_EXPORT(SetVScrollbarCGName, PartsEngine_SetVScrollbarCGName),
+	    HLL_EXPORT(GetVScrollbarCGName, PartsEngine_GetVScrollbarCGName),
+	    HLL_EXPORT(SetVScrollbarFlatName, PartsEngine_SetVScrollbarFlatName),
+	    HLL_EXPORT(GetVScrollbarFlatName, PartsEngine_GetVScrollbarFlatName),
+	    HLL_EXPORT(SetHScrollbarOnCursorSoundNumber, PartsEngine_SetHScrollbarOnCursorSoundNumber),
+	    HLL_EXPORT(SetHScrollbarClickSoundNumber, PartsEngine_SetHScrollbarClickSoundNumber),
+	    HLL_EXPORT(GetHScrollbarOnCursorSoundNumber, PartsEngine_GetHScrollbarOnCursorSoundNumber),
+	    HLL_EXPORT(GetHScrollbarClickSoundNumber, PartsEngine_GetHScrollbarClickSoundNumber),
+	    HLL_EXPORT(SetHScrollbarSize, PartsEngine_SetHScrollbarSize),
+	    HLL_EXPORT(SetHScrollbarLeftWidth, PartsEngine_SetHScrollbarLeftWidth),
+	    HLL_EXPORT(SetHScrollbarRightWidth, PartsEngine_SetHScrollbarRightWidth),
+	    HLL_EXPORT(GetHScrollbarLeftWidth, PartsEngine_GetHScrollbarLeftWidth),
+	    HLL_EXPORT(GetHScrollbarRightWidth, PartsEngine_GetHScrollbarRightWidth),
+	    HLL_EXPORT(SetHScrollbarTotalSize, PartsEngine_SetHScrollbarTotalSize),
+	    HLL_EXPORT(SetHScrollbarViewSize, PartsEngine_SetHScrollbarViewSize),
+	    HLL_EXPORT(SetHScrollbarScrollPos, PartsEngine_SetHScrollbarScrollPos),
 	    HLL_EXPORT(SetHScrollbarScrollRate, PE_SetPartsHScrollbarScrollRate),
-	    HLL_TODO_EXPORT(SetHScrollbarMoveSizeByButton, PartsEngine_SetHScrollbarMoveSizeByButton),
-	    HLL_TODO_EXPORT(GetHScrollbarTotalSize, PartsEngine_GetHScrollbarTotalSize),
-	    HLL_TODO_EXPORT(GetHScrollbarViewSize, PartsEngine_GetHScrollbarViewSize),
-	    HLL_TODO_EXPORT(GetHScrollbarScrollPos, PartsEngine_GetHScrollbarScrollPos),
+	    HLL_EXPORT(GetHScrollbarTotalSize, PartsEngine_GetHScrollbarTotalSize),
+	    HLL_EXPORT(GetHScrollbarViewSize, PartsEngine_GetHScrollbarViewSize),
+	    HLL_EXPORT(GetHScrollbarScrollPos, PartsEngine_GetHScrollbarScrollPos),
 	    HLL_EXPORT(GetHScrollbarScrollRate, PE_GetPartsHScrollbarScrollRate),
-	    HLL_TODO_EXPORT(GetHScrollbarMoveSizeByButton, PartsEngine_GetHScrollbarMoveSizeByButton),
-	    HLL_TODO_EXPORT(SetHScrollbarCGName, PartsEngine_SetHScrollbarCGName),
-	    HLL_TODO_EXPORT(GetHScrollbarCGName, PartsEngine_GetHScrollbarCGName),
+	    HLL_EXPORT(SetHScrollbarCGName, PartsEngine_SetHScrollbarCGName),
+	    HLL_EXPORT(GetHScrollbarCGName, PartsEngine_GetHScrollbarCGName),
+	    HLL_EXPORT(SetHScrollbarFlatName, PartsEngine_SetHScrollbarFlatName),
+	    HLL_EXPORT(GetHScrollbarFlatName, PartsEngine_GetHScrollbarFlatName),
 	    HLL_TODO_EXPORT(SetTextBoxSize, PartsEngine_SetTextBoxSize),
 	    HLL_TODO_EXPORT(SetTextBoxFontProperty, PartsEngine_SetTextBoxFontProperty),
 	    HLL_TODO_EXPORT(GetTextBoxFontProperty, PartsEngine_GetTextBoxFontProperty),
@@ -1676,6 +1971,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetPartsFontEdgeWeight, PE_SetPartsFontEdgeWeight),
 	    HLL_EXPORT(Parts_SetTextCharSpace, PE_SetTextCharSpace),
 	    HLL_EXPORT(Parts_SetTextLineSpace, PE_SetTextLineSpace),
+	    HLL_EXPORT(Parts_GetTextCharSpace, PE_GetTextCharSpace),
+	    HLL_EXPORT(Parts_GetTextLineSpace, PE_GetTextLineSpace),
 	    HLL_EXPORT(Parts_SetHGaugeCG, PE_SetHGaugeCG),
 	    HLL_EXPORT(Parts_SetHGaugeRate, PE_SetHGaugeRate),
 	    HLL_EXPORT(Parts_SetVGaugeCG, PE_SetVGaugeCG),

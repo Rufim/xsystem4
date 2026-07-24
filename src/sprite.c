@@ -318,8 +318,13 @@ void sprite_init_custom(struct sact_sprite *sp)
 
 void sprite_set_pos(struct sact_sprite *sp, int x, int y)
 {
+	static int trace = -1;
+	if (trace < 0)
+		trace = getenv("XSYS4_TEXT_TRACE") ? 1 : 0;
 	sp->rect.x = x;
 	sp->rect.y = y;
+	if (trace)
+		NOTICE("SPPOS sp=%d pos=(%d,%d) size=%dx%d", sp->no, x, y, sp->rect.w, sp->rect.h);
 	sprite_dirty(sp);
 }
 
@@ -395,6 +400,8 @@ void sprite_set_text_pos(struct sact_sprite *sp, int x, int y)
 	if (sp->text.pos.y != y)
 		sp->text.current_line_height = 0;
 	sp->text.pos = (Point) { .x = x, .y = y };
+	if (getenv("XSYS4_TEXT_TRACE"))
+		NOTICE("SPTXT setpos sp=%d pos=(%d,%d)", sp->no, x, y);
 	sprite_dirty(sp);
 }
 
@@ -405,7 +412,12 @@ void sprite_text_draw(struct sact_sprite *sp, struct string *text, struct text_s
 	}
 
 	ts->font_spacing = sp->text.char_space;
-	sp->text.pos.x += gfx_render_text(&sp->text.texture, sp->text.pos.x, sp->text.pos.y, text->text, ts, false);
+	int adv = gfx_render_text(&sp->text.texture, sp->text.pos.x, sp->text.pos.y, text->text, ts, false);
+	if (getenv("XSYS4_TEXT_TRACE"))
+		NOTICE("SPTXT draw sp=%d spw=%d x=%d y=%d size=%.1f char_space=%d ret=%d text='%s'",
+		       sp->no, sp->rect.w, sp->text.pos.x, sp->text.pos.y, ts->size,
+		       sp->text.char_space, adv, display_sjis0(text->text));
+	sp->text.pos.x += adv;
 	if (sp->text.current_line_height < ts->size)
 		sp->text.current_line_height = ts->size;
 	sprite_dirty(sp);

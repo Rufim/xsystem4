@@ -330,6 +330,10 @@ void hll_call(int libno, int fno)
 	void *heap_ptrs[HLL_MAX_ARGS];
 	int heap_slots[HLL_MAX_ARGS];
 
+	if (getenv("XSYS4_HLL_TRACE"))
+		NOTICE("HLL %s.%s", ain->libraries[libno].name, f->name);
+
+	int ref_array_slot = -1;  // heap slot of the AIN_REF_ARRAY arg, for ref-element returns
 	int dbg_sp0 = stack_ptr;
 	bool dbg_arr = getenv("XSYS4_ARR_TRACE") && !strcmp(ain->libraries[libno].name, "Array");
 	if (dbg_arr) {
@@ -370,31 +374,20 @@ void hll_call(int libno, int fno)
 			args[i] = &heap[stack[stack_ptr].i].page;
 			break;
 		case AIN_REF_STRUCT:
+		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
+			// Ixseal's generic array-by-reference (AIN_REF_ARRAY) is passed the
+			// same way as a struct/typed-array ref: a single stack slot holding
+			// the array page's heap index (verified by stack-balance tracing —
+			// consuming two slots underflows the caller's stack).
 			stack_ptr--;
 			heap_slots[i] = stack[stack_ptr].i;
-			heap_ptrs[i] = heap[stack[stack_ptr].i].page;
+			heap_ptrs[i] = heap_index_valid(stack[stack_ptr].i) ? heap[stack[stack_ptr].i].page : NULL;
 			ptrs[i] = &heap_ptrs[i];
 			args[i] = &ptrs[i];
+			if (f->arguments[i].type.data == AIN_REF_ARRAY)
+				ref_array_slot = heap_slots[i];
 			break;
-		case AIN_REF_ARRAY: {
-			// Ixseal generic array-by-reference: a two-slot variable reference
-			// (containing-page heap index, variable index). Dereference it to
-			// the array page's own heap slot so the callee receives a
-			// `struct page **` to the array (and any reallocation is written
-			// back to that slot below).
-			stack_ptr -= 2;
-			int page_i = stack[stack_ptr].i;
-			int var_i = stack[stack_ptr + 1].i;
-			int arr_slot = (heap_index_valid(page_i) && heap[page_i].page &&
-					var_i >= 0 && var_i < heap[page_i].page->nr_vars)
-				? heap[page_i].page->values[var_i].i : -1;
-			heap_slots[i] = arr_slot;
-			heap_ptrs[i] = (arr_slot >= 0) ? heap[arr_slot].page : NULL;
-			ptrs[i] = &heap_ptrs[i];
-			args[i] = &ptrs[i];
-			break;
-		}
 		case AIN_HLL_PARAM:
 			// Generic container element: pass a pointer to the raw stack slot;
 			// the callee interprets it per the array's element type.
@@ -439,14 +432,11 @@ void hll_call(int libno, int fno)
 			heap[heap_slots[i]].s = heap_ptrs[i];
 			break;
 		case AIN_REF_STRUCT:
-		case AIN_REF_ARRAY_TYPE:
-			heap[heap_slots[i]].page = heap_ptrs[i];
-			break;
 		case AIN_REF_ARRAY:
-			// Write the (possibly reallocated) array page back to its slot.
-			if (heap_slots[i] >= 0)
+		case AIN_REF_ARRAY_TYPE:
+			// Write the (possibly reallocated) array/struct page back to its slot.
+			if (heap_index_valid(heap_slots[i]))
 				heap[heap_slots[i]].page = heap_ptrs[i];
-			j++;  // two-slot (page, var) reference
 			break;
 		case AIN_REF_FUNC_TYPE:
 		case AIN_HLL_FUNC:
@@ -481,6 +471,65 @@ void hll_call(int libno, int fno)
 		stack_push(*(bool*)&r);
 #pragma GCC diagnostic pop
 		break;
+	case AIN_REF_HLL_PARAM:
+	case AIN_WRAP: {
+		// A reference to a generic array element (Ixseal At/EmplaceBack/First/
+		// Last/... returning t75 or t82/WRAP). The callee returned the element
+		// index in r.i. The concrete on-stack reference depends on the element
+		// type: a heap-object element (struct/string/array/delegate) is itself a
+		// reference, so we push its own 1-value page slot; a scalar element
+		// (int/float/bool/...) needs a 2-value ref (array-page slot, index).
+		// Only applies when the call actually had a ref-array self argument;
+		// otherwise fall through to the plain single-value return.
+		struct page *ap = (ref_array_slot >= 0 && heap_index_valid(ref_array_slot))
+			? heap[ref_array_slot].page : NULL;
+		if (!ap) {
+			stack_push(r);
+			break;
+		}
+		int idx = r.i;
+		enum ain_data_type et = (idx >= 0 && idx < ap->nr_vars)
+			? variable_type(ap, idx, NULL, NULL) : AIN_INT;
+		// Классификация элемента: «объект» (собственный heap-слот, 1-значный
+		// ref) — это struct/string/delegate/iface и ВЛОЖЕННЫЙ массив (типизир.
+		// AIN_ARRAY_* или generic AIN_ARRAY/REF_ARRAY/WRAP/...). Всё остальное
+		// (int/float/BOOL/long_int/enum) — СКАЛЯР → 2-значный ref [array_slot, idx].
+		// ВАЖНО: нельзя использовать диапазон et∈[AIN_ARRAY_INT..AIN_ARRAY_DELEGATE]
+		// — он захватывает скаляры AIN_BOOL(47)/AIN_LONG_INT(55) (bool-массив
+		// createdFlagList в CASTimerManager давал 1-знач. ref вместо 2 → порча стека).
+		bool elem_is_object;
+		switch (et) {
+		case AIN_STRUCT:
+		case AIN_STRING:
+		case AIN_DELEGATE:
+		case AIN_IFACE:
+		case AIN_ARRAY_TYPE:      // типизированные вложенные массивы
+			elem_is_object = true;
+			break;
+		default:
+			elem_is_object = ain_is_array_data_type(et); // generic вложенные массивы
+			break;
+		}
+		if (elem_is_object && idx >= 0) {
+			// The reference is the element's own heap slot; the caller owns it
+			// and releases it with DELETE, so hand out a counted reference.
+			int es = ap->values[idx].i;
+			heap_ref(es);
+			stack_push(es);
+		} else {
+			// Scalar element: a (array-page slot, index) reference. A reference
+			// to an array element keeps the backing array alive, so bump its
+			// ref count — the caller balances this with a DELETE on the ref.
+			// This holds even for an out-of-range (index == -1) result: the
+			// caller still stores and later DELETEs the reference, unref-ing the
+			// array slot, so it must own a count regardless of the index.
+			if (heap_index_valid(ref_array_slot))
+				heap_ref(ref_array_slot);
+			stack_push(ref_array_slot);
+			stack_push(idx);
+		}
+		break;
+	}
 	default:
 		stack_push(r);
 		break;
@@ -576,6 +625,7 @@ extern struct static_library lib_Sound2ex;
 extern struct static_library lib_SoundFilePlayer;
 extern struct static_library lib_StoatSpriteEngine;
 extern struct static_library lib_StretchHelper;
+extern struct static_library lib_system;
 extern struct static_library lib_SystemService;
 extern struct static_library lib_SystemServiceEx;
 extern struct static_library lib_TextSurfaceManager;
@@ -700,6 +750,7 @@ static struct static_library *static_libraries[] = {
 	&lib_SoundFilePlayer,
 	&lib_StoatSpriteEngine,
 	&lib_StretchHelper,
+	&lib_system,
 	&lib_SystemService,
 	&lib_SystemServiceEx,
 	&lib_TextSurfaceManager,
@@ -770,6 +821,10 @@ static ffi_type *ain_to_ffi_type(enum ain_data_type type)
 	case AIN_HLL_PARAM:
 		return &ffi_type_pointer;
 	case AIN_HLL_FUNC:
+		return &ffi_type_sint32;
+	// A reference to a generic element (e.g. Array.At's return) is represented
+	// as the element's own value/heap-slot — a single integer slot.
+	case AIN_REF_HLL_PARAM:
 		return &ffi_type_sint32;
 	default:
 		ERROR("Unhandled type in HLL function: %s", ain_strtype(ain, type, -1));

@@ -50,6 +50,9 @@ struct config {
 	bool echo;
 	float text_x_scale;
 	bool manual_text_x_scale;
+	// Межбуквенный интервал для узких (пропорциональных) глифов,
+	// в долях от кегля. Полноширинные глифы (CJK и т.п.) не затрагивает.
+	float font_letter_spacing;
 	enum resume_save_format save_format;
 	int msgskip_delay;
 };

@@ -49,6 +49,24 @@ bool key_state[VK_NR_KEYCODES];
  */
 static bool test_input_enabled;
 static int test_mouse_x = -1, test_mouse_y = -1;
+// Mouse-wheel delivery: accumulate notch counts (forward = wheel up/away,
+// back = wheel down/toward) rather than storing a single last-direction value.
+// The old single-int `wheel_dir` was overwritten by each event, reduced to a
+// boolean on read, and lived only one frame, so notches were silently lost when
+// two arrived before a poll, when a game's per-frame ClearCount ran before its
+// GetCount, or when a fast scroll spanned several notches.
+//
+// There are TWO independent consumers of the wheel and they must not steal from
+// each other: (a) the game polls via IbisInputEngine.MouseWheel_GetCount etc. and
+// clears via MouseWheel_ClearCount; (b) the parts input path delivers a
+// PARTS_MSG_MOUSE_WHEEL to the hovered part (this is how Tsumamigui 3 opens the
+// BACK LOG — a full-screen part catches the notch). Sharing one counter meant
+// whichever ran first in a frame (usually the game's poll+clear) wiped it before
+// the other saw it. So we keep two separate accumulators fed by the same
+// wheel_add(): the poll pair (cleared by the game) and the parts pair (cleared by
+// the parts path itself). Each consumer reliably sees every notch.
+static int wheel_fwd = 0, wheel_back = 0;         // poll delta (game clears)
+static int wheel_pfwd = 0, wheel_pback = 0;       // parts-path delta (parts clears)
 static int test_input_fd = -2;
 // pending release events, fired once SDL_GetTicks() reaches deadline_ms
 static struct { uint32_t deadline_ms; SDL_Event ev; } test_pending[16];
@@ -65,7 +83,29 @@ static SDL_Scancode test_scancode(const char *name)
 	if (!strcasecmp(name, "DOWN")) return SDL_SCANCODE_DOWN;
 	if (!strcasecmp(name, "LEFT")) return SDL_SCANCODE_LEFT;
 	if (!strcasecmp(name, "RIGHT")) return SDL_SCANCODE_RIGHT;
+	if (!strcasecmp(name, "CTRL") || !strcasecmp(name, "LCTRL")) return SDL_SCANCODE_LCTRL;
+	if (!strcasecmp(name, "SHIFT") || !strcasecmp(name, "LSHIFT")) return SDL_SCANCODE_LSHIFT;
 	return SDL_SCANCODE_UNKNOWN;
+}
+
+// Single funnel for every wheel notch (real SDL_MOUSEWHEEL, touch scroll gesture,
+// and the deterministic test FIFO all call this) so the game processes injected
+// wheel input identically to a real mouse. `y` follows SDL: y>0 = forward
+// (up/away), y<0 = back (down/toward). Counts accumulate until consumed.
+static void wheel_add(int y)
+{
+	if (y > 0) {
+		wheel_fwd += y;
+		wheel_pfwd += y;
+	} else if (y < 0) {
+		wheel_back += -y;
+		wheel_pback += -y;
+	} else {
+		return;
+	}
+	if (getenv("XSYS4_WHEEL_DBG"))
+		NOTICE("WHEEL_DBG ADD y=%d -> poll(f=%d b=%d) parts(f=%d b=%d)",
+		       y, wheel_fwd, wheel_back, wheel_pfwd, wheel_pback);
 }
 
 static void test_queue_release(const SDL_Event *ev)
@@ -106,7 +146,27 @@ static void test_input_update(void)
 	char *save = NULL;
 	for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
 		char name[32]; int x = 0, y = 0;
-		if (sscanf(line, "key %31s", name) == 1) {
+		if (sscanf(line, "keydown %31s", name) == 1) {
+			SDL_Scancode sc = test_scancode(name);
+			if (sc == SDL_SCANCODE_UNKNOWN) { NOTICE("TEST_INPUT: unknown key '%s'", name); continue; }
+			SDL_Event down = {0};
+			down.type = SDL_KEYDOWN;
+			down.key.state = SDL_PRESSED;
+			down.key.keysym.scancode = sc;
+			down.key.keysym.sym = SDL_GetKeyFromScancode(sc);
+			SDL_PushEvent(&down);  // held until an explicit "keyup"
+			NOTICE("TEST_INPUT: keydown %s", name);
+		} else if (sscanf(line, "keyup %31s", name) == 1) {
+			SDL_Scancode sc = test_scancode(name);
+			if (sc == SDL_SCANCODE_UNKNOWN) { NOTICE("TEST_INPUT: unknown key '%s'", name); continue; }
+			SDL_Event up = {0};
+			up.type = SDL_KEYUP;
+			up.key.state = SDL_RELEASED;
+			up.key.keysym.scancode = sc;
+			up.key.keysym.sym = SDL_GetKeyFromScancode(sc);
+			SDL_PushEvent(&up);
+			NOTICE("TEST_INPUT: keyup %s", name);
+		} else if (sscanf(line, "key %31s", name) == 1) {
 			SDL_Scancode sc = test_scancode(name);
 			if (sc == SDL_SCANCODE_UNKNOWN) { NOTICE("TEST_INPUT: unknown key '%s'", name); continue; }
 			SDL_Event down = {0};
@@ -136,6 +196,22 @@ static void test_input_update(void)
 			NOTICE("TEST_INPUT: click %d,%d", x, y);
 		} else if (sscanf(line, "move %d %d", &x, &y) == 2) {
 			test_mouse_x = x; test_mouse_y = y;
+			// Also warp the real SDL cursor so game code that reads the raw SDL
+			// pointer position (not just our mouse_get_pos override) sees the same
+			// spot a real mouse would — e.g. the wheel/BACK LOG trigger, which
+			// behaves differently depending on where the cursor is.
+			mouse_set_pos(x, y);
+			NOTICE("TEST_INPUT: move %d,%d", x, y);
+		} else if (sscanf(line, "wheel %d", &x) == 1) {
+			// Deterministic mouse-wheel for testing scrollable UIs (BACK LOG).
+			// Route through wheel_add() — the exact funnel a real SDL_MOUSEWHEEL
+			// uses — instead of SDL_PushEvent(SDL_MOUSEWHEEL): under sdl2-compat
+			// (SDL3 backend) a pushed SDL2 wheel event round-trips SDL2->SDL3->SDL2
+			// and the integer wheel.y does not survive (arrives as 0). Calling
+			// wheel_add() makes injected notches indistinguishable from real ones
+			// for every consumer (poll + parts message).
+			wheel_add(x);
+			NOTICE("TEST_INPUT: wheel %d", x);
 		}
 	}
 }
@@ -351,17 +427,32 @@ void mouse_set_pos(int x, int y)
 	SDL_WarpMouseInWindow(sdl.window, wx, wy);
 }
 
-static int wheel_dir = 0;
-
 void mouse_get_wheel(int *forward, int *back)
 {
-	*forward = wheel_dir > 0;
-	*back = wheel_dir < 0;
+	*forward = wheel_fwd;
+	*back = wheel_back;
+	if ((wheel_fwd || wheel_back) && getenv("XSYS4_WHEEL_DBG"))
+		NOTICE("WHEEL_DBG GET  poll fwd=%d back=%d", wheel_fwd, wheel_back);
 }
 
 void mouse_clear_wheel(void)
 {
-	wheel_dir = 0;
+	if ((wheel_fwd || wheel_back) && getenv("XSYS4_WHEEL_DBG"))
+		NOTICE("WHEEL_DBG CLEAR poll (had fwd=%d back=%d)", wheel_fwd, wheel_back);
+	wheel_fwd = 0;
+	wheel_back = 0;
+}
+
+void mouse_get_parts_wheel(int *forward, int *back)
+{
+	*forward = wheel_pfwd;
+	*back = wheel_pback;
+}
+
+void mouse_clear_parts_wheel(void)
+{
+	wheel_pfwd = 0;
+	wheel_pback = 0;
 }
 
 bool mouse_show_cursor(bool show)
@@ -801,7 +892,7 @@ void handle_events(void)
 			}
 			break;
 		case SDL_MOUSEWHEEL:
-			wheel_dir = e.wheel.y;
+			wheel_add(e.wheel.y);
 			break;
 		case SDL_FINGERDOWN:
 			if (SDL_GetNumTouchFingers(e.tfinger.touchId) >= 2) {
@@ -840,7 +931,7 @@ void handle_events(void)
 					scroll_gesture_y = e.mgesture.y;
 				float dy = scroll_gesture_y - e.mgesture.y;
 				if (dy * dy > SCROLL_GESTURE_SENSITIVITY * SCROLL_GESTURE_SENSITIVITY) {
-					wheel_dir = dy < 0 ? 1 : -1;  // Swipe up to scroll down.
+					wheel_add(dy < 0 ? 1 : -1);  // Swipe up to scroll down.
 					scroll_gesture_y = e.mgesture.y;
 				}
 			}

@@ -16,6 +16,7 @@
 
 #include "hll.h"
 #include "vm/page.h"
+#include "vm/heap.h"
 
 static void check_array(struct page *array)
 {
@@ -300,8 +301,21 @@ static void ix_resize(struct page **self, int n)
 {
 	if (!self)
 		return;
+	// Тип запоминаем ДО realloc: при сжатии в 0 realloc_array освобождает
+	// страницу в NULL и тип элемента теряется. Для Ixseal-generic-контейнера
+	// пустой массив ДОЛЖЕН оставаться валидной 0-элементной ТИПИЗИРОВАННОЙ
+	// страницей — иначе последующий PushBack/EmplaceBack на NULL создаёт массив
+	// с дефолт-типом (int) и кладёт слот объекта как сырой int (без владения) →
+	// висячий слот → use-after-free (CPartsMessageManager: Clear/Free пула →
+	// затем NEW+PushBack элемента). Тот же принцип, что в Array_PopBack.
+	enum ain_data_type dt = ix_dtype(*self);
+	int st = ix_stype(*self);
+	int rank = ix_rank(*self);
 	union vm_value dim = { .i = n < 0 ? 0 : n };
-	*self = realloc_array(*self, ix_rank(*self), &dim, ix_dtype(*self), ix_stype(*self), true);
+	struct page *a = realloc_array(*self, rank, &dim, dt, st, true);
+	if (!a && dim.i == 0)
+		a = alloc_array(rank, &dim, dt, st, false);
+	*self = a;
 }
 
 static void Array_Alloc(struct page **self, int numof) { ix_resize(self, numof); }
@@ -311,19 +325,66 @@ static void Array_ix_Clear(struct page **self) { ix_resize(self, 0); }
 static int  Array_ix_Numof(struct page **self) { return self ? array_numof(*self, 1) : 0; }
 static bool Array_Empty(struct page **self) { return !self || array_numof(*self, 1) == 0; }
 
+// Элемент generic-контейнера — heap-объект (владеет счётчиком)?
+// struct/string/delegate/iface и вложенные массивы (типизир./generic).
+static bool ix_elem_is_object(enum ain_data_type array_dt)
+{
+	enum ain_data_type et = array_type(array_dt);
+	switch (et) {
+	case AIN_STRUCT:
+	case AIN_STRING:
+	case AIN_DELEGATE:
+	case AIN_IFACE:
+	case AIN_ARRAY_TYPE:
+		return true;
+	default:
+		return ain_is_array_data_type(et);
+	}
+}
+
 static void Array_PushBack(struct page **self, union vm_value *value)
 {
 	if (!self || !value)
 		return;
+	// Для объектного элемента контейнер берёт СВОЙ счётчик ссылок: вызывающий
+	// обычно NEW-ит объект, PushBack-ит и затем DELETE-ит свою временную ссылку
+	// (CPartsMessageManager@GetFunctionSet: `NEW 328; PushBack; DELETE local`).
+	// Без heap_ref DELETE уносил бы только что добавленный элемент (ref 1→0) →
+	// висячий слот в пуле → use-after-free при следующем чтении пула.
+	if (ix_elem_is_object(ix_dtype(*self)))
+		heap_ref(value->i);
 	*self = array_pushback(*self, *value, ix_dtype(*self), ix_stype(*self));
 }
 
-static void Array_PopBack(struct page **self) { if (self) *self = array_popback(*self); }
+static void Array_PopBack(struct page **self)
+{
+	if (!self || !*self)
+		return;
+	// Запоминаем тип ДО popback: если массив опустеет, array_popback
+	// освобождает страницу и возвращает NULL. Для Ixseal-generic-контейнера
+	// это недопустимо — тип элемента теряется, и следующий EmplaceBack/PushBack
+	// уходит в ветку `!*self`→return 0 (материализуется как ref со слотом 0 →
+	// receiver=0 → heap_unref глобальной страницы → порча кучи в CASTimerManager
+	// GC). Пустой контейнер должен оставаться валидной 0-элементной ТИПИЗИРОВАННОЙ
+	// страницей.
+	enum ain_data_type dt = ix_dtype(*self);
+	int st = ix_stype(*self);
+	int rank = ix_rank(*self);
+	struct page *a = array_popback(*self);
+	if (!a) {
+		union vm_value dim = { .i = 0 };
+		a = alloc_array(rank, &dim, dt, st, false);
+	}
+	*self = a;
+}
 
 static void Array_ix_Insert(struct page **self, int index, union vm_value *value)
 {
 	if (!self || !value)
 		return;
+	// см. Array_PushBack: объектный элемент — контейнер владеет своим счётчиком.
+	if (ix_elem_is_object(ix_dtype(*self)))
+		heap_ref(value->i);
 	*self = array_insert(*self, index, *value, ix_dtype(*self), ix_stype(*self));
 }
 
@@ -397,8 +458,70 @@ static struct page *Array_ix_DescSort(struct page **self)
 	return NULL;
 }
 
+// Append a default-constructed element and return a reference to it (its heap
+// slot for element types that live on the heap, e.g. structs). Used by Ixseal
+// constructors as `arr.EmplaceBack()` followed by member initialisation.
+static int Array_EmplaceBack(struct page **self)
+{
+	if (!self || !*self)
+		return 0;
+	struct page *a = *self;
+	enum ain_data_type dt = a->a_type;
+	int st = a->array.struct_type;
+	union vm_value v;
+	if (array_type(dt) == AIN_STRUCT)
+		create_struct(st, &v);
+	else
+		v = variable_initval(array_type(dt));
+	*self = array_pushback(a, v, dt, st);
+	a = *self;
+	// EmplaceBack returns a WRAP (ref) to the newly-added element; hll_call
+	// materialises the concrete reference from this element index (a struct
+	// element becomes a 1-value page-slot ref, a scalar a 2-value ref).
+	return (a && a->nr_vars > 0) ? a->nr_vars - 1 : -1;
+}
+
+// Return a reference to element `index` — its value/heap-slot (a struct element
+// is a heap page, so its slot is a usable reference).
+// Returns a reference to element `index`. The reference is a two-value stack
+// entity (array-page slot, element index); the C function returns only the
+// element index (or -1 when out of range, which callers compare against), and
+// hll_call() supplies the array slot for the AIN_REF_HLL_PARAM return.
+static int Array_At(struct page **self, int index)
+{
+	if (!self || !*self)
+		return -1;
+	struct page *a = *self;
+	if (index < 0 || index >= a->nr_vars)
+		return -1;
+	return index;
+}
+
+// First/Last: ссылка на первый/последний элемент (Ixseal). Как At с
+// фиксированным индексом; -1 на пустом массиве. hll_call() материализует
+// конкретный ref из индекса по типу элемента. Перегрузка с предикатом
+// (…, HLL_FUNC) НЕ применяет предикат — возвращаем простой первый/последний
+// (безопасно: лишний arg в cif игнорируется этой C-функцией).
+static int Array_First(struct page **self)
+{
+	if (!self || !*self)
+		return -1;
+	return (*self)->nr_vars > 0 ? 0 : -1;
+}
+
+static int Array_Last(struct page **self)
+{
+	if (!self || !*self)
+		return -1;
+	return (*self)->nr_vars > 0 ? (*self)->nr_vars - 1 : -1;
+}
+
 HLL_LIBRARY(Array,
 	    HLL_EXPORT(Alloc, Array_Alloc),
+	    HLL_EXPORT(EmplaceBack, Array_EmplaceBack),
+	    HLL_EXPORT(At, Array_At),
+	    HLL_EXPORT(First, Array_First),
+	    HLL_EXPORT(Last, Array_Last),
 	    HLL_EXPORT(Realloc, Array_Realloc),
 	    HLL_EXPORT(Free, Array_Free),
 	    HLL_EXPORT(Clear, Array_ix_Clear),

@@ -148,6 +148,12 @@ void mouse_get_pos(int *x, int *y);
 void mouse_set_pos(int x, int y);
 void mouse_get_wheel(int *forward, int *back);
 void mouse_clear_wheel(void);
+// Second, independent wheel accumulator for the parts input path (PARTS_MSG_MOUSE_WHEEL
+// to the hovered part). Fed by the same events as the poll counts but cleared by the
+// parts path itself, so the game's MouseWheel_ClearCount can't steal a notch from the
+// hovered part (and vice versa). See the comment in src/input.c.
+void mouse_get_parts_wheel(int *forward, int *back);
+void mouse_clear_parts_wheel(void);
 bool mouse_show_cursor(bool show);
 void register_input_handler(void(*handler)(const char*));
 void clear_input_handler(void);

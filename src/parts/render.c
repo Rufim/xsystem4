@@ -84,6 +84,14 @@ static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rec
 	glUniform1i(parts_shader.draw_filter, draw_filter);
 
 	struct parts *clipper = alpha_clipper ? parts_try_get(alpha_clipper) : NULL;
+	// Пустая маска-клиппер (у part-клиппера нет текстуры — например
+	// construction-process, «построенный» без операций, как у интерьера
+	// popup-меню Tsumamigui 3): семпл текстуры 0 дал бы alpha 0 по всей
+	// площади и полностью замаскировал бы содержимое. Отсутствующая маска
+	// = «не клипать», а не «заклипать всё». (Проверено: «шум» на кнопках
+	// Daiteikoku давал НЕ этот фикс, а декодер QNT-альфы в libsys4.)
+	if (clipper && !clipper->states[clipper->state].common.texture.handle)
+		clipper = NULL;
 	if (clipper) {
 		struct parts_common *c_common = &clipper->states[clipper->state].common;
 
@@ -601,10 +609,25 @@ void parts_render(struct parts *parts)
 {
 	if (getenv("XSYS4_RENDER_TRACE") && parts->no >= 90000000) {
 		struct parts_state *s = &parts->states[parts->state];
-		NOTICE("RENDER part %d: show=%d msgwin=%d state=%d type=%d tex=%u pos=%d,%d wh=%dx%d alpha=%d",
+		NOTICE("RENDER part %d: show=%d msgwin=%d state=%d type=%d tex=%u(%dx%d) pos=%d,%d wh=%dx%d alpha=%d scale=%.3f,%.3f orig=%d,%d sarea=%d,%d,%d,%d mul=%d,%d,%d add=%d,%d,%d filt=%d",
 		       parts->no, parts->global.show, parts->message_window, parts->state,
-		       s->type, s->common.texture.handle, parts->global.pos.x, parts->global.pos.y,
-		       s->common.w, s->common.h, parts->global.alpha);
+		       s->type, s->common.texture.handle, s->common.texture.w, s->common.texture.h,
+		       parts->global.pos.x, parts->global.pos.y,
+		       s->common.w, s->common.h, parts->global.alpha,
+		       parts->global.scale.x, parts->global.scale.y,
+		       s->common.origin_offset.x, s->common.origin_offset.y,
+		       s->common.surface_area.x, s->common.surface_area.y,
+		       s->common.surface_area.w, s->common.surface_area.h,
+		       parts->global.multiply_color.r, parts->global.multiply_color.g, parts->global.multiply_color.b,
+		       parts->global.add_color.r, parts->global.add_color.g, parts->global.add_color.b,
+		       parts->draw_filter);
+		if (parts->alpha_clipper_parts_no) {
+			struct parts *clp = parts_try_get(parts->alpha_clipper_parts_no);
+			NOTICE("   part %d alpha_clipper=%d clipper_tex=%u linked_to=%d parent=%d",
+			       parts->no, parts->alpha_clipper_parts_no,
+			       clp ? clp->states[clp->state].common.texture.handle : 9999,
+			       parts->linked_to, parts->parent ? parts->parent->no : -1);
+		}
 	}
 	if (!parts->global.show)
 		return;

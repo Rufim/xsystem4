@@ -682,6 +682,20 @@ bool _parts_cg_set(struct parts *parts, struct parts_cg *parts_cg, struct cg *cg
 {
 	if (!cg)
 		return false;
+	if (getenv("XSYS4_CG_TRACE") && parts->no >= 90000000) {
+		long nzc = 0, nza = 0; long n = (long)cg->metrics.w * cg->metrics.h;
+		if (cg->pixels) {
+			uint8_t *p = cg->pixels;
+			for (long i = 0; i < n; i++) {
+				if (p[i*4] || p[i*4+1] || p[i*4+2]) nzc++;
+				if (p[i*4+3]) nza++;
+			}
+		}
+		NOTICE("CGLOAD part=%d no=%d name='%s' type=%d %dx%d bpp=%d haspix=%d hasalpha=%d nonzeroRGB=%ld nonzeroA=%ld/%ld",
+		       parts->no, cg_no, name ? display_sjis0(name->text) : "(nil)",
+		       cg->type, cg->metrics.w, cg->metrics.h, cg->metrics.bpp,
+		       cg->metrics.has_pixel, cg->metrics.has_alpha, nzc, nza, n);
+	}
 	gfx_delete_texture(&parts_cg->common.texture);
 	gfx_init_texture_with_cg(&parts_cg->common.texture, cg);
 	parts_set_dims(parts, &parts_cg->common, cg->metrics.w, cg->metrics.h);
@@ -2013,6 +2027,8 @@ bool PE_save_thumbnail(struct string *filename, int reduction_factor)
 	Texture *src = gfx_main_surface();
 	int w = src->w / reduction_factor;
 	int h = src->h / reduction_factor;
+	bool thtrace = getenv("XSYS4_TH_TRACE");
+	if (thtrace) NOTICE("THUMB start: src=%dx%d rf=%d -> %dx%d", src->w, src->h, reduction_factor, w, h);
 
 	// Downscale by repeatedly halving until we are within a factor of two of
 	// the target size, then do the final stretch. This avoids the aliasing
@@ -2020,6 +2036,7 @@ bool PE_save_thumbnail(struct string *filename, int reduction_factor)
 	Texture tmp, *cur = src;
 	bool have_tmp = false;
 	while (cur->w / 2 > w && cur->h / 2 > h) {
+		if (thtrace) NOTICE("THUMB halve: cur=%dx%d target=%dx%d", cur->w, cur->h, w, h);
 		Texture next;
 		gfx_init_texture_blank(&next, cur->w / 2, cur->h / 2);
 		gfx_copy_stretch_with_alpha_map(&next, 0, 0, next.w, next.h, cur, 0, 0, cur->w, cur->h);
@@ -2037,7 +2054,9 @@ bool PE_save_thumbnail(struct string *filename, int reduction_factor)
 		gfx_delete_texture(&tmp);
 
 	char *path = savedir_path(filename->text);
+	if (thtrace) NOTICE("THUMB saving to %s", path);
 	int r = gfx_save_texture(&dst, path, ALCG_QNT);
+	if (thtrace) NOTICE("THUMB saved r=%d", r);
 	free(path);
 	gfx_delete_texture(&dst);
 	return !!r;
@@ -2059,6 +2078,8 @@ int PE_GetInputState(int parts_no)
 
 void PE_SetComponentType(int parts_no, int type, int state)
 {
+	if (getenv("XSYS4_BL_TRACE"))
+		NOTICE("SetComponentType part=%d type=%d state=%d", parts_no, type, state);
 	if (!parts_state_valid(--state))
 		return;
 	struct parts *parts = parts_get(parts_no);

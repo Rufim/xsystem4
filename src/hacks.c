@@ -190,6 +190,8 @@ static void apply_daibanchou_hacks(struct ain *ain)
 void apply_game_specific_hacks(struct ain *ain)
 {
 	char *game_name = sjis2utf(config.game_name, 0);
+	if (getenv("XSYS4_HACKS_TRACE"))
+		NOTICE("HACKS game_name utf8='%s' raw_len=%zu", game_name, strlen(config.game_name));
 	if (!strcmp(game_name, "大番長")) {
 		apply_daibanchou_hacks(ain);
 	} else if (!strcmp(game_name, "Rance 02")) {

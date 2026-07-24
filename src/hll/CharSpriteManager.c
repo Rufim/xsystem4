@@ -177,6 +177,9 @@ static void charsprite_render(struct charsprite *cs)
 	}
 
 	int w = ceilf(text_style_width(&cs->ts, ch));
+	if (getenv("XSYS4_HACKS_TRACE"))
+		NOTICE("charsprite ch='%s' face=%d size=%.1f -> sprite_w=%d",
+		       display_sjis0(ch), cs->ts.face, cs->ts.size, w);
 	int h = cs->ts.size + cs->ts.size/2;
 	sprite_init_color(&cs->sp, w, h, 0, 0, 0, 0);
 	sprite_get_texture(&cs->sp); // XXX: force initialization of texture

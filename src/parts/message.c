@@ -39,25 +39,15 @@ struct parts_message {
 static STAILQ_HEAD(, parts_message) msg_queue =
 		STAILQ_HEAD_INITIALIZER(msg_queue);
 
-void parts_msg_push(struct parts* parts, int type, const char *fmt, ...)
+static void msg_push_v(int parts_no, int delegate_index, int type,
+		const char *fmt, va_list ap)
 {
-	// Message system is introduced in Rance 9
-	if (!parts_multi_controller) {
-		if (getenv("XSYS4_MSG_TRACE"))
-			NOTICE("MSG DROP (no multi_controller) type=%d parts=%d", type, parts->no);
-		return;
-	}
-	if (getenv("XSYS4_MSG_TRACE") && type != 6 /*skip per-frame MOUSE_ON spam*/)
-		NOTICE("MSG PUSH type=%d parts=%d delegate=%d", type, parts->no, parts->delegate_index);
-
 	struct parts_message *msg = xmalloc(sizeof(*msg));
-	msg->parts_no = parts->no;
-	msg->delegate_index = parts->delegate_index;
+	msg->parts_no = parts_no;
+	msg->delegate_index = delegate_index;
 	msg->type = type;
 	msg->nr_variables = 0;
 
-	va_list ap;
-	va_start(ap, fmt);
 	for (const char *p = fmt; *p; p++) {
 		if (msg->nr_variables >= PARTS_MSG_MAX_VARS) {
 			VM_ERROR("parts_msg_push: too many variables");
@@ -70,9 +60,48 @@ void parts_msg_push(struct parts* parts, int type, const char *fmt, ...)
 			VM_ERROR("parts_msg_push: unsupported format '%c'", *p);
 		}
 	}
-	va_end(ap);
 
 	STAILQ_INSERT_TAIL(&msg_queue, msg, entry);
+}
+
+void parts_msg_push(struct parts* parts, int type, const char *fmt, ...)
+{
+	// Message system is introduced in Rance 9
+	if (!parts_multi_controller) {
+		if (getenv("XSYS4_MSG_TRACE"))
+			NOTICE("MSG DROP (no multi_controller) type=%d parts=%d", type, parts->no);
+		return;
+	}
+	if (getenv("XSYS4_MSG_TRACE") && type != 6 /*skip per-frame MOUSE_ON spam*/)
+		NOTICE("MSG PUSH type=%d parts=%d delegate=%d", type, parts->no, parts->delegate_index);
+
+	va_list ap;
+	va_start(ap, fmt);
+	msg_push_v(parts->no, parts->delegate_index, type, fmt, ap);
+	va_end(ap);
+}
+
+// Push a "whole" (global) message with parts_no == 0. The game's
+// CPartsMessageManager dispatches a parts_no==0 message to its m_WholeFunctionSet
+// (handlers registered via parts::AddWhole*Event, which key on parts_no 0), rather
+// than to a per-part delegate. Needed for whole mouse-wheel handlers: e.g.
+// backlog/save/load/CG/replay register CBackLogView@MouseWheelEvent etc. via
+// AddWholeMouseWheelEvent, so the notch only reaches them through a parts_no==0
+// message. If no whole handler is registered, the dispatcher consumes it harmlessly.
+void parts_msg_push_global(int type, const char *fmt, ...)
+{
+	if (!parts_multi_controller) {
+		if (getenv("XSYS4_MSG_TRACE"))
+			NOTICE("MSG DROP (no multi_controller) type=%d parts=0 (whole)", type);
+		return;
+	}
+	if (getenv("XSYS4_MSG_TRACE") && type != 6)
+		NOTICE("MSG PUSH type=%d parts=0 (whole)", type);
+
+	va_list ap;
+	va_start(ap, fmt);
+	msg_push_v(0, -1, type, fmt, ap);
+	va_end(ap);
 }
 
 void PE_ReleaseMessage(void)
@@ -111,7 +140,16 @@ int PE_GetMessagePartsNumber(void)
 int PE_GetMessageDelegateIndex(void)
 {
 	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
-	return msg ? msg->delegate_index : -1;
+	if (!msg)
+		return -1;
+	// Prefer the part's *current* delegate index: some messages (e.g. a Scroll
+	// posted from SetVScrollbarScrollPos during InitVScrollbar) are queued before
+	// the game registers the handler / assigns the delegate index, so the value
+	// captured at push time can be stale (-1).
+	struct parts *p = parts_try_get(msg->parts_no);
+	if (p && p->delegate_index >= 0)
+		return p->delegate_index;
+	return msg->delegate_index;
 }
 
 int PE_GetMessageVariableCount(void)

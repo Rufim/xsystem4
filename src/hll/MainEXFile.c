@@ -795,6 +795,38 @@ static bool MainEXFile_GetEXNameList(struct string *tree_path, struct page **out
 	return true;
 }
 
+// Healing Touch и др.: индекс колонки таблицы по её формат-имени (заголовку поля).
+static int MainEXFile_GetColAtFormatName(struct string *path, struct string *format_name, int exidx)
+{
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
+	if (!t)
+		return -1;
+	return ex_col_from_name(t, format_name->text);
+}
+
+// Вернуть имена всех колонок (полей) таблицы .ex в строковый массив.
+static bool MainEXFile_GetFormatNameList(struct string *path, struct page **out, int exidx)
+{
+	(void)exidx;
+	struct ex_table *t = handle_to_table(ex_key_handle(path));
+	if (!t)
+		return false;
+
+	int n = t->nr_fields;
+	union vm_value dim = { .i = n };
+	struct page *page = alloc_array(1, &dim, AIN_ARRAY_STRING, 0, false);
+	for (int i = 0; i < n; i++)
+		page->values[i].i = heap_alloc_string(string_ref(t->fields[i].name));
+
+	if (*out) {
+		delete_page_vars(*out);
+		free_page(*out);
+	}
+	*out = page;
+	return true;
+}
+
 /*
  * Handle-based accessor family. Legacy System 4 games (e.g. Escalayer Reboot)
  * pass a pre-resolved integer handle (obtained from Handle()/AHandle()/...) and
@@ -909,6 +941,8 @@ HLL_LIBRARY(MainEXFile,
 	    HLL_EXPORT(GetNodeName, MainEXFile_GetNodeName),
 	    HLL_EXPORT(GetNodeNameList, MainEXFile_GetNodeNameList),
 	    HLL_EXPORT(GetEXNameList, MainEXFile_GetEXNameList),
+	    HLL_EXPORT(GetColAtFormatName, MainEXFile_GetColAtFormatName),
+	    HLL_EXPORT(GetFormatNameList, MainEXFile_GetFormatNameList),
 	    HLL_EXPORT(GetEXName, MainEXFile_GetEXName));
 
 /*

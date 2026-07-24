@@ -141,7 +141,10 @@ static int NewFont_MeasureChar(int c1, int c2)
 {
 	struct font_size *size = NewFont_metrics.font_size;
 	//return lround(size->font->size_char_kerning(size, c1, c2));
-	return ceilf(size->font->size_char_kerning(size, c1, c2));
+	// узким (пропорциональным) глифам добавляем межбуквенный интервал,
+	// консистентно с font_size_char/gfx_size_char_kerning в text.c
+	float advance = size->font->size_char_kerning(size, c1, c2);
+	return ceilf(advance + gfx_letter_spacing_extra(size, c1, advance));
 }
 
 // XXX: not used
