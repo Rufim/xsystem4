@@ -644,13 +644,31 @@ static void method_call(int fno, int return_address)
 
 static void vm_execute(void);
 
+// Number of stack slots a delegate return value occupies. Ixseal (System 4
+// v14) option returns (AIN_OPTION, e.g. `DG_DeletedHandler?`) are TWO slots
+// [value, tag]; ordinary returns are one slot, void is zero. Older games never
+// use AIN_OPTION delegate returns, so this is identical to the previous
+// (void?0:1) behaviour for them — the two-slot case is naturally gated by the
+// return type itself. Getting this wrong shifts the delegate loop's dg_page/
+// dg_index peek offsets and leaks the extra return slot up the call chain,
+// which is what corrupted a ref far away in CSpriteParts@0's constructor.
+static int dg_return_slots(int dg_no)
+{
+	enum ain_data_type t = ain->delegates[dg_no].return_type.data;
+	if (t == AIN_VOID)
+		return 0;
+	if (t == AIN_OPTION)
+		return 2;
+	return 1;
+}
+
 static void delegate_call(int dg_no, int return_address)
 {
 	if (dg_no < 0 || dg_no >= ain->nr_delegates)
 		VM_ERROR("Invalid delegate index");
 
-	// stack: [arg0, ..., dg_page, dg_index, [return_value]]
-	int return_values = (ain->delegates[dg_no].return_type.data != AIN_VOID) ? 1 : 0;
+	// stack: [arg0, ..., dg_page, dg_index, [return_value(s)]]
+	int return_values = dg_return_slots(dg_no);
 	int dg_page = stack_peek(1 + return_values).i;
 	int dg_index = stack_peek(0 + return_values).i;
 	int obj, fun;
@@ -661,10 +679,9 @@ static void delegate_call(int dg_no, int return_address)
 		if (getenv("XSYS4_DG_TRACE"))
 			WARNING("DGALL dg_no=%d idx=%d -> fn %d (%s)", dg_no, dg_index, fun,
 				(fun >= 0 && fun < ain->nr_functions) ? ain->functions[fun].name : "?");
-		// pop previous return value
-		if (ain->delegates[dg_no].return_type.data != AIN_VOID) {
+		// pop previous return value(s) (2 slots for an AIN_OPTION delegate)
+		for (int i = 0; i < return_values; i++)
 			stack_pop();
-		}
 		// increment dg_index
 		stack[stack_ptr - 1].i++;
 
@@ -680,10 +697,9 @@ static void delegate_call(int dg_no, int return_address)
 		set_struct_page(obj);
 	} else {
 		// call finished: clean up stack and jump to return address
-		union vm_value r;
-		if (return_values) {
-			r = stack_pop();
-		}
+		union vm_value r[2];
+		for (int i = return_values - 1; i >= 0; i--)
+			r[i] = stack_pop();
 		stack_pop(); // dg_index
 		stack_pop(); // dg_page
 		for (int i = ain->delegates[dg_no].nr_variables - 1; i >= 0; i--) {
@@ -697,9 +713,8 @@ static void delegate_call(int dg_no, int return_address)
 				break;
 			}
 		}
-		if (return_values) {
-			stack_push(r);
-		}
+		for (int i = 0; i < return_values; i++)
+			stack_push(r[i]);
 		instr_ptr = get_argument(1);
 	}
 }
@@ -2753,9 +2768,16 @@ static enum opcode execute_instruction(enum opcode opcode)
 			} else {
 				dst->i = heap_alloc_page(delegate_plusa(NULL, add));
 			}
-			// Ixseal emits DG_PLUSA as a statement (no trailing POP), so it must
-			// be stack-neutral for its inputs and leave nothing behind — unlike
-			// the legacy form which pushes the added value back as an rvalue.
+			// `dg += x` is an expression: push the added value back as the
+			// rvalue, exactly like the legacy form (libsys4 types DG_PLUSA as
+			// (T_PAGE, T_PAGE) -> (T_PAGE)). Closures that wrap the result in an
+			// option rely on this slot: e.g. `... DG_PLUSA; PUSH 0; RETURN`
+			// builds a two-slot AIN_OPTION [added_delegate, tag]. Suppressing
+			// the push made such lambdas return one slot too few, which only
+			// surfaced as a corrupted ref much later (CSpriteParts@0 ctor). The
+			// added page is a caller-owned temporary (delegate_plusa copies from
+			// it without taking ownership), so the eventual DELETE frees it.
+			stack_push(add_i);
 			break;
 		}
 		int add_i = stack_pop().i;
@@ -2801,11 +2823,12 @@ static enum opcode execute_instruction(enum opcode opcode)
 		stack[stack_ptr-1].i = dg_page;
 		stack_push(0);
 
-		// XXX: If the delegate has a return value, we push a dummy value
-		//      so that DG_CALL can replace it
-		if (dg->return_type.data != AIN_VOID) {
+		// Push one dummy per return slot so DG_CALL can replace them. An
+		// AIN_OPTION return (Ixseal option, e.g. DG_DeletedHandler?) occupies
+		// two slots, so two dummies are needed; must stay in lock-step with the
+		// return_values count used by delegate_call.
+		for (int i = 0; i < dg_return_slots(dg_no); i++)
 			stack_push(0);
-		}
 		break;
 	}
 	case DG_NEW: {
