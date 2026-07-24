@@ -2158,6 +2158,35 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case SR_ASSIGN: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal (System 4 v11+): struct-member struct-copy assignment.
+			// The lvalue is expressed as a TWO-slot member reference
+			// (struct page + member index) — NOT a pre-resolved struct slot —
+			// and there is NO trailing struct-type slot. Codegen for an
+			// embedded-struct member `this.member[m] = src`:
+			//   PUSHSTRUCTPAGE; PUSH <m>; <src struct page>; SR_ASSIGN; DELETE
+			// Interpreting this with the legacy [lval,rval,struct_type] layout
+			// pops (src, m, this) and does heap_struct_assign(this, m), which
+			// overwrites the WHOLE parent struct (e.g. a CASFont) with a copy
+			// of some unrelated heap[m] page and drops the real value — that is
+			// what turned CASFont slot 53 into an empty int array and crashed
+			// CTextParts@Font::set with `323/2`. Resolve the destination as
+			// this.member[m] (an embedded struct slot) and copy src into it.
+			// The pushed src is the caller's temporary (A_REF/NEW) copy, which
+			// the following DELETE frees; heap_struct_assign deep-copies it, so
+			// there is no double free. Older releases still push
+			// [lval, rval, struct_type] with the lvalue pre-resolved via
+			// SR_REF/REF (handled below, unchanged — e.g. Escalayer v6).
+			int src = stack_pop().i;
+			int member = stack_pop().i;
+			int dst_page = stack_pop().i;
+			if (unlikely(!heap_index_valid(dst_page) || !heap[dst_page].page
+					|| member < 0 || member >= heap[dst_page].page->nr_vars))
+				VM_ERROR("SR_ASSIGN: bad member ref %d/%d", dst_page, member);
+			heap_struct_assign(heap[dst_page].page->values[member].i, src);
+			stack_push(src);
+			break;
+		}
 		if (ain->version > 1)
 			stack_pop(); // struct type
 		int rval = stack_pop().i;
