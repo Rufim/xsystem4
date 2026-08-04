@@ -72,13 +72,36 @@ static void TextSurfaceManager_SetFontEdgeColor(int nR, int nG, int nB)
 	ts.edge_color = (SDL_Color){ nR, nG, nB, 255 };
 }
 
-static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width)
+/*
+ * Ixseal (System 4 v14) передаёт всё описание шрифта прямо в аргументах вместо
+ * предварительных SetFont*-вызовов: GetFontWidth(Text, Width, nType, nSize,
+ * nR, nG, nB, fBoldWeight, fEdgeWeight, nEdgeR, nEdgeG, nEdgeB). Обе формы
+ * линкуются на эту функцию (сопоставление по имени), поэтому расширенные
+ * параметры читаем только когда они реально объявлены в .ain.
+ */
+static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width,
+					    int nType, int nSize, int nR, int nG, int nB,
+					    float fBoldWeight, float fEdgeWeight,
+					    int nEdgeR, int nEdgeG, int nEdgeB)
 {
+	if (!text || !width)
+		return false;
+
+	struct text_style style = ts;
+	if (hll_current_nr_args >= 12) {
+		style.face = nType;
+		style.size = nSize;
+		style.color = (SDL_Color){ nR, nG, nB, 255 };
+		style.bold_width = fBoldWeight;
+		style.edge_left = style.edge_up = style.edge_right = style.edge_down = fEdgeWeight;
+		style.edge_color = (SDL_Color){ nEdgeR, nEdgeG, nEdgeB, 255 };
+	}
+
 	float w = 0.0f;
 	const char *p = text->text;
 	while (*p) {
 		int len = SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
-		w += gfx_size_char(&ts, p);
+		w += gfx_size_char(&style, p);
 		p += len;
 	}
 	*width = (int)(w + 0.5f);

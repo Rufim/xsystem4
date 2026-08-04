@@ -313,6 +313,26 @@ static void trace_hll_call(struct ain_library *lib, struct ain_hll_function *f,
 //
 // Games whose CALLHLL has no third operand pass elem_class 0 and always push a
 // single slot, so they keep the old behaviour.
+/*
+ * Живёт ли значение обёрнутого типа в СОБСТВЕННОМ heap-слоте. От этого зависит
+ * форма ссылки на него — ровно как у обычных ref-типов движка: скаляр
+ * адресуется парой (страница, номер переменной), всё остальное — одним слотом
+ * с heap-индексом. Совпадает со списком двухслотовых AIN_REF_* в arg-цикле.
+ */
+static bool is_wrapped_object_type(enum ain_data_type t)
+{
+	switch (t) {
+	case AIN_INT:
+	case AIN_LONG_INT:
+	case AIN_BOOL:
+	case AIN_FLOAT:
+	case AIN_ENUM:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static int hll_param_slots(int elem_class)
 {
 	if ((elem_class & 0xffff) == 3 || (elem_class >> 16) == 3)
@@ -432,10 +452,32 @@ void hll_call(int libno, int fno, int elem_class)
 			stack_ptr--;
 			args[i] = &heap[stack[stack_ptr].i].page;
 			break;
+		case AIN_WRAP:
+			// Форма wrap-АРГУМЕНТА зависит от обёрнутого типа — ровно так же,
+			// как у wrap-ВОЗВРАТА (см. материализацию ссылки ниже):
+			//  • wrap<скаляр> (int/float/bool/…) — ссылка на ПЕРЕМЕННУЮ из ДВУХ
+			//    слотов (страница, номер переменной). Это out-параметр, callee
+			//    ждёт обычный указатель на значение: `TextSurfaceManager.
+			//    GetFontWidth(string, wrap<int> Width, …)` сайт кладёт
+			//    `PUSHLOCALPAGE; PUSH <локал>` без X_REF.
+			//  • wrap<объект> (массив/структура/строка) — ОДИН слот с heap-
+			//    индексом страницы (напр. источник Array.Duplicate); идёт ниже.
+			// Раньше двухслотовая форма разбирала аргументы со сдвигом: строка
+			// получала слот локальной страницы, и следующий X_REF падал.
+			if (f->arguments[i].type.array_type
+					&& !is_wrapped_object_type(f->arguments[i].type.array_type->data)) {
+				stack_ptr -= 2;
+				int pageno = stack[stack_ptr].i;
+				int varno  = stack[stack_ptr+1].i;
+				ptrs[i] = (heap_index_valid(pageno) && heap[pageno].page)
+					? &heap[pageno].page->values[varno] : NULL;
+				args[i] = &ptrs[i];
+				break;
+			}
+			/* fallthrough */
 		case AIN_REF_STRUCT:
 		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
-		case AIN_WRAP:
 			// Ixseal's generic array-by-reference (AIN_REF_ARRAY) is passed the
 			// same way as a struct/typed-array ref: a single stack slot holding
 			// the array page's heap index (verified by stack-balance tracing —
@@ -517,6 +559,15 @@ void hll_call(int libno, int fno, int elem_class)
 			// Write the (possibly reallocated) array/struct page back to its slot.
 			if (heap_index_valid(heap_slots[i]))
 				heap[heap_slots[i]].page = heap_ptrs[i];
+			break;
+		case AIN_WRAP:
+			// Двухслотовый wrap<скаляр> занял на стеке две ячейки — сдвигаем
+			// счётчик слотов. Обратная запись не нужна: callee получил
+			// указатель прямо в страницу. Однослотовый wrap<объект> — как
+			// раньше (variable_fini для типа 82 всё равно ничего не делает).
+			if (f->arguments[i].type.array_type
+					&& !is_wrapped_object_type(f->arguments[i].type.array_type->data))
+				j++;
 			break;
 		case AIN_REF_FUNC_TYPE:
 		case AIN_HLL_FUNC:
