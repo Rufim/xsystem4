@@ -106,6 +106,11 @@ union vm_value variable_initval(enum ain_data_type type);
 void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor);
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank);
 void variable_set(struct page *page, int varno, enum ain_data_type type, union vm_value val);
+// Ixseal: сколько слотов страницы занимает объявленная переменная — считается по
+// филлерам <void>, которые компилятор кладёт после многослотового значения.
+int decl_slots(struct ain_variable *vars, int nr_vars, int i);
+// Ixseal: инициализировать option-переменные страницы пустыми ([-1..., тег 1]).
+void init_option_vars(struct page *page, struct ain_variable *vars, int nr_vars, int from);
 
 // pages
 struct page *alloc_page(enum page_type type, int type_index, int nr_vars);

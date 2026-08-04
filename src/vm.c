@@ -418,6 +418,7 @@ static int alloc_scenario_page(const char *fname)
 	for (int i = 0; i < f->nr_vars; i++) {
 		heap[slot].page->values[i] = variable_initval(f->vars[i].type.data);
 	}
+	init_option_vars(heap[slot].page, f->vars, f->nr_vars, 0);
 	return slot;
 }
 
@@ -561,6 +562,8 @@ static int _function_call(int fno, int return_address)
 			create_struct(f->vars[i].type.struc, &heap[slot].page->values[i]);
 		}
 	}
+	// Ixseal: локальные option'ы — пустые (аргументы приходят со стека, их не трогаем)
+	init_option_vars(heap[slot].page, f->vars, f->nr_vars, f->nr_args);
 	// jump to function start
 	instr_ptr = ain->functions[fno].address;
 
@@ -671,6 +674,34 @@ static int dg_return_slots(int dg_no)
 	if (t == AIN_OPTION)
 		return 2;
 	return 1;
+}
+
+// Сколько слотов занимает ЗНАЧЕНИЕ внутри Ixseal-`option` (без тега). Операнд
+// X_OP_SET — «класс элемента», та же кодировка, что у 3-го операнда CALLHLL:
+// 1=int, 2=string, 0x10002=объект-хэндл — по одному слоту; 0x10003=wrap<интерфейс>
+// — два слота (объект, база интерфейса). Других значений в .ain Dohna/HT нет.
+static int x_option_value_slots(int elem_class)
+{
+	switch (elem_class) {
+	case 0x00001:
+	case 0x00002:
+	case 0x10002:
+		return 1;
+	case 0x10003:
+		return 2;
+	default:
+		WARNING("X_OP_SET: неизвестный класс элемента 0x%x — считаю значение однослотовым",
+			elem_class);
+		return 1;
+	}
+}
+
+// Является ли значение option'а ссылкой на heap-слот (нужен ли учёт ссылок).
+// Целые (класс 1) — нет; строки, объекты и wrap<интерфейс> — да (у wrap считается
+// нижний слот, верхний — целочисленная база интерфейса).
+static bool x_option_class_is_ref(int elem_class)
+{
+	return elem_class != 0x00001;
 }
 
 static void delegate_call(int dg_no, int return_address)
@@ -1292,9 +1323,46 @@ static enum opcode execute_instruction(enum opcode opcode)
 		stack_push(struct_page_slot());
 		break;
 	}
-	case X_SET:
-	case X_ICAST:
 	case X_OP_SET: {
+		// Ixseal: записать значение в `option<T>`. Стек: [ссылка (2 слота),
+		// v0..v(n-1), тег] — в память идут n слотов значения и СЛЕДОМ тег
+		// (0 = значение есть, 1 = пусто), после чего всё возвращается на стек
+		// (сайты снимают ровно n+1 POP'ов, как X_ASSIGN возвращает значение).
+		//
+		// Операнд — «класс элемента», тот же, что 3-й операнд CALLHLL:
+		// 1=int, 2=string, 0x10002=объект-хэндл (по 1 слоту значения),
+		// 0x10003=wrap<интерфейс> (2 слота: объект, база интерфейса).
+		// Формы сайтов: «PUSH val; PUSH 0» (Some) против
+		// «PUSH -1[; PUSH -1]; PUSH 1» (None).
+		int elem_class = get_argument(0);
+		int n = x_option_value_slots(elem_class);
+		union vm_value vals[n + 1];
+		for (int i = n; i >= 0; i--)
+			vals[i] = stack_pop();
+		union vm_value *ref = stack_pop_var();
+		if (getenv("XSYS4_OPT_TRACE")) {
+			WARNING("OPT set class=0x%x n=%d tag=%d val=%d (old tag=%d val=%d)",
+				elem_class, n, vals[n].i, vals[0].i, ref[n].i, ref[0].i);
+		}
+		for (int i = 0; i <= n; i++)
+			ref[i] = vals[i];
+		// Взять ВЛАДЕНИЕ значением. Дисциплина ссылок в Ixseal явная (SP_INC /
+		// DELETE), и X_OP_SET обязан считаться владельцем: возврат
+		// `AFL_Parts_CreateSprite` приходит с +1 (SP_INC перед RETURN), а сразу
+		// после X_OP_SET сайт освобождает временный локал («X_REF 1; DELETE») —
+		// без своей ссылки option оставался бы висячим.
+		// Прежнее содержимое НЕ освобождаем: сайты установки в None
+		// (`PUSH -1; PUSH -1; PUSH 1`) не делают этого сами, но семантика по
+		// байткоду не установлена — лишний unref дал бы double free, а лишняя
+		// ссылка только течёт.
+		if (x_option_class_is_ref(elem_class) && vals[n].i == 0 && vals[0].i != -1)
+			heap_ref(vals[0].i);
+		for (int i = 0; i <= n; i++)
+			stack[stack_ptr++] = vals[i];
+		break;
+	}
+	case X_SET:
+	case X_ICAST: {
 		// TODO: пока не реализованы — логируем контекст для реверса и падаем.
 		if (getenv("XSYS4_TRACE_X")) {
 			WARNING("X_TRACE op=0x%04x %s arg0=%d arg1=%d sp=%d top=[%d %d %d %d %d %d]",
@@ -3062,6 +3130,7 @@ int vm_execute_ain(struct ain *program)
 			heap[0].page->values[i] = variable_initval(ain->globals[i].type.data);
 		}
 	}
+	init_option_vars(heap[0].page, ain->globals, ain->nr_globals, 0);
 	for (int i = 0; i < ain->nr_initvals; i++) {
 		int32_t index;
 		struct ain_initval *v = &ain->global_initvals[i];

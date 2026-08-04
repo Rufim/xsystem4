@@ -93,6 +93,10 @@ union vm_value variable_initval(enum ain_data_type type)
 	// содержимое идиомой «X_REF 1; DELETE»; при инициализации нулём
 	// (default-ветка) этот DELETE уносил heap-слот 0 (глобальную
 	// страницу) → double free в CASTimerManager@CreateHandle.
+	// Ixseal `option<T>` (тип 86): значение занимает slots(T)+1 слотов, из них
+	// первый — сам T, а последний — ТЕГ (0 = значение есть, 1 = пусто). Пустое
+	// значение игра пишет как -1 (см. init_option_vars ниже).
+	case AIN_OPTION:
 	case AIN_WRAP:
 		return (union vm_value) { .i = -1 };
 	case AIN_ARRAY_TYPE:
@@ -105,6 +109,53 @@ union vm_value variable_initval(enum ain_data_type type)
 		return (union vm_value) { .i = slot };
 	default:
 		return (union vm_value) { .i = 0 };
+	}
+}
+
+/*
+ * Сколько слотов страницы занимает объявленная переменная (Ixseal).
+ *
+ * Компилятор System 4 v14 показывает это ЯВНО: после многослотового значения он
+ * кладёт ровно `slots-1` филлеров `<void>` (AIN_VOID) — и в списке членов
+ * структуры, и в локалах/глобалах функции (видно тулом `aintype`). Так
+ * `wrap<структура>` = 1 слот, `wrap<интерфейс>` = 2 (объект, база интерфейса),
+ * `option<wrap<интерфейс>>` = 3 (объект, база, тег). Гадать по типу не нужно.
+ */
+int decl_slots(struct ain_variable *vars, int nr_vars, int i)
+{
+	int n = 1;
+	while (i + n < nr_vars && vars[i + n].type.data == AIN_VOID)
+		n++;
+	return n;
+}
+
+/*
+ * Инициализировать все `option`-переменные страницы ПУСТЫМИ (Ixseal).
+ *
+ * Раскладка `option<T>` = [слоты T..., тег], тег 0 = значение есть, 1 = пусто.
+ * Полярность снята с байткода игры: `OptionalExtensions::HasValue<T&>` читает
+ * слот `+slots(T)` и при `тег >= 1` подменяет значение на -1 (и возвращает
+ * false), а сайты `X_OP_SET` пишут либо `<значение>, 0`, либо `-1[, -1], 1`.
+ *
+ * Без этого все слоты option'а оставались нулями, т.е. «тег 0» = «значение
+ * есть», и HasValue врал: `CModeMark@Create` считал спрайт уже созданным,
+ * пропускал ветку создания и диспатчил по мусорной паре (объект, база) →
+ * `Out of bounds page index: 1/33`.
+ *
+ * Вызывается ВТОРЫМ проходом: филлеры <void> идут ПОСЛЕ самой переменной, и
+ * основной цикл инициализации затёр бы записанный тег нулём.
+ */
+void init_option_vars(struct page *page, struct ain_variable *vars, int nr_vars, int from)
+{
+	for (int i = from; i < nr_vars; i++) {
+		if (vars[i].type.data != AIN_OPTION)
+			continue;
+		int slots = decl_slots(vars, nr_vars, i);
+		for (int k = 0; k < slots - 1; k++)
+			page->values[i + k].i = -1;
+		page->values[i + slots - 1].i = slots > 1 ? 1 : -1;
+		if (getenv("XSYS4_OPT_TRACE"))
+			WARNING("OPT init page-type=%d var=%d slots=%d", page->type, i, slots);
 	}
 }
 
@@ -287,6 +338,7 @@ int alloc_struct(int no)
 			heap[slot].page->values[i] = variable_initval(s->members[i].type.data);
 		}
 	}
+	init_option_vars(heap[slot].page, s->members, s->nr_members, 0);
 	return slot;
 }
 
