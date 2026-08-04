@@ -694,6 +694,49 @@ void hll_call(int libno, int fno, int elem_class)
 			elem_is_object = ain_is_array_data_type(et); // generic вложенные массивы
 			break;
 		}
+		/*
+		 * У ПУСТОГО массива типа элемента ещё НЕТ: страница создаётся
+		 * `variable_initval(AIN_ARRAY)` и её `a_type` остаётся заглушкой
+		 * AIN_ARRAY_INT(14), т.е. `et` выше — не факт, а догадка «int» → скаляр
+		 * → 2-слотовая ссылка. Но САЙТ знает настоящий класс элемента и
+		 * объявляет его третьим операндом CALLHLL (та же кодировка, что у
+		 * `hll_param_slots`): 1=int, 2=string, 0x10002=объект, 0x10003=wrap<
+		 * интерфейс>. Поэтому объявление сайта важнее догадки по странице.
+		 *
+		 * Проверено по всем сайтам Dohna: там, где тип массива РЕАЛЬНО известен,
+		 * elem_class и `et` всегда согласованы (a_type=50/et=47 bool → 0x1;
+		 * a_type=17/et=13 struct и a_type=16/et=12 string → 0x2), так что
+		 * приоритет ничего не меняет. Расходятся они ровно на пустом массиве:
+		 * `Array.At(arg, 0)` в `Motion::ParamAnalyzer@AnalyzeTime` (idx=-1,
+		 * elem_class=0x10002) получал 2-слотовую ссылку вместо 1-слотовой, и
+		 * каждый такой вызов оставлял на стеке лишний слот. Два вызова подряд
+		 * давали AnalyzeTime +2 (XSYS4_SP_CHECK), из-за чего у ВЫЗЫВАЮЩЕГО
+		 * `Motion::ParamCollection@Parse` ссылка `mp` уезжала на 2 слота и
+		 * X_ASSIGN бил по чужой странице.
+		 */
+		switch (elem_class) {
+		case 0x00001:               // int — скаляр, ссылка (страница, индекс)
+			elem_is_object = false;
+			break;
+		case 0x00002:               // string (и struct — тот же 1-слотовый хэндл)
+		case 0x10002:               // объект
+			elem_is_object = true;
+			break;
+		case 0x10003:
+			// wrap<интерфейс> — элемент 2-слотовый, его отдаёт ветка
+			// `eslots != 1` выше. Сюда можно попасть только у ПУСТОГО массива
+			// (stride ещё не выставлен); форма для этого случая по байткоду не
+			// установлена — сообщаем и оставляем прежнее поведение.
+			WARNING("Array.%s: elem_class=wrap<интерфейс> на массиве без stride "
+				"(a_type=%d) — форма ссылки не установлена", f->name, ap->a_type);
+			break;
+		default:
+			break;              // 0 — старые игры без третьего операнда
+		}
+		if (getenv("XSYS4_ELEMFORM_TRACE"))
+			WARNING("ELEMFORM libno=%d fn=%s a_type=%d et=%d eslots=%d idx=%d "
+				"elem_class=0x%x -> %s", libno, f->name, ap->a_type, et, eslots,
+				idx, elem_class, elem_is_object ? "объект(1)" : "скаляр(2)");
 		if (elem_is_object && idx < 0) {
 			// Элемента нет: отдаём null-ссылку одним слотом (форма та же, что
 			// у найденного объектного элемента, — иначе стек съедет).
