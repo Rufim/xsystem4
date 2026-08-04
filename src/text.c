@@ -297,15 +297,16 @@ float gfx_size_char_kerning(struct text_style *ts, uint32_t code, uint32_t code_
 float gfx_size_text(struct text_style *ts, const char *text)
 {
 	struct font_size *size = text_style_font_size(ts);
-	// NOTE: letter spacing / advance is our own mechanism — the glyph EDGE (outline)
-	// width must NOT enter it, or adding an outline would widen letter spacing. Only
-	// the bold width contributes here; the edge is drawn (gfx_render_textf) but never
-	// reserves advance.
-	float edge_advance = gfx_text_advance_edges ? ceilf(ts->bold_width) : 0.0f;
+	// Та же надбавка, что и в рисовании: до и после глифа (см.
+	// text_style_advance_padding). Раньше здесь учитывалась только жирность, и
+	// измеренная ширина строки выходила уже нарисованной — текст лога вылезал за
+	// текстуру бокса.
+	float pad = text_style_advance_padding(ts);
 	float x = 0.0f;
 	while (*text) {
-		x += font_size_char(size, char_to_code(text, size->font->charmap));
-		x += edge_advance;
+		// Шаг — как в _gfx_render_text: целый, с округлением вверх.
+		x += ceilf(font_size_char(size, char_to_code(text, size->font->charmap))
+				+ ts->font_spacing + 2.0f * pad);
 		text = sjis_skip_char(text);
 	}
 	return x;
@@ -367,12 +368,17 @@ float _gfx_render_text(Texture *dst, char *msg, struct text_render_metrics *tm)
 			gfx_draw_glyph_to_amap(dst, pos_x, pos_y, t, glyph->rect, config.text_x_scale);
 		}
 
-		// advance
-		pos_x += glyph->advance * scale_x * config.text_x_scale + tm->font_spacing;
-		// тот же межбуквенный интервал, что возвращает font_size_char,
-		// чтобы путь цельной строки был консистентен с поглифовым
-		pos_x += gfx_letter_spacing_extra(tm->font_size, code, glyph->advance);
-		pos_x += tm->edge_spacing;
+		// advance — ЦЕЛОЕ число пикселей, с округлением ВВЕРХ на каждый глиф.
+		// Advance у FNL = width/denominator и попадает на четверть пикселя;
+		// накапливая дробь, цельная строка выходит короче оригинала (замер по
+		// бэклогу Tsumamigui 3: 399 px против 420, т.е. ~0.5 px на символ).
+		// Ровно так же считает TextSurfaceManager.GetFontWidth — им игра двигает
+		// курсор в окне сообщений, и там округление вверх подтверждено
+		// попиксельной сверкой с оригиналом (FINDINGS §5f, §5j).
+		float step = glyph->advance * scale_x * config.text_x_scale + tm->font_spacing
+			+ gfx_letter_spacing_extra(tm->font_size, code, glyph->advance)
+			+ 2.0f * tm->edge_spacing;
+		pos_x += ceilf(step) - tm->edge_spacing;
 	}
 	return pos_x - tm->x;
 }
@@ -407,7 +413,8 @@ float gfx_render_textf(Texture *dst, float x, int y, char *msg, struct text_styl
 	// and — because a parts-text sizes the part from this return value while the glyph
 	// texture is sized by text_style_width (which DOES include the edge) — clipped the
 	// right side of wide capitals outright once letter spacing was small.
-	float edge_advance = gfx_text_advance_edges ? edge_width + ceilf(ts->bold_width) : 0.f;
+	// Величина — text_style_advance_padding (единая с gfx_size_text и TSM).
+	float edge_advance = text_style_advance_padding(ts);
 
 	enum text_render_mode mode = blend ? RENDER_BLENDED : RENDER_COPY;
 	if (edge_width > 0.01f) {

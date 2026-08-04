@@ -81,9 +81,9 @@ static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width)
 	// width), so omitting the edge term put every character 1px too close to the
 	// next one: identical glyph ink to the original but 1px inter-letter gaps
 	// instead of 2px, and a line 42px short. See FINDINGS §5f.
-	float edge_advance = gfx_text_advance_edges
-		? ts.edge_left + ts.edge_right + ceilf(ts.bold_width)
-		: 0.0f;
+	// Величина надбавки — та же, что в рисовании и gfx_size_text
+	// (text_style_advance_padding: до и после глифа).
+	float edge_advance = 2.0f * text_style_advance_padding(&ts);
 	// Per-glyph advance is integral, rounded UP: an .fnl advance is width/denominator
 	// and lands on a quarter pixel, and rounding to nearest lost 1px on every glyph
 	// whose fraction was .25 — measured as a line 12px short of the original over 42

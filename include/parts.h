@@ -287,7 +287,8 @@ bool PE_SetTextLineSpace(int parts_no, int line_space, int state);
 int PE_GetTextCharSpace(int parts_no, int state);
 int PE_GetTextLineSpace(int parts_no, int state);
 void PE_GetTextFontProps(int parts_no, int state, int *type, int *size,
-		int *r, int *g, int *b, float *weight);
+		int *r, int *g, int *b, float *weight, float *edge_weight,
+		int *edge_r, int *edge_g, int *edge_b);
 
 // flash.c
 bool PE_ExistsFlashFile(struct string *flash_filename);

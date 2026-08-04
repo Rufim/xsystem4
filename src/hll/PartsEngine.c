@@ -1261,10 +1261,6 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 	if (type) *type = 0;
 	if (size) *size = 16;
 	if (r) *r = 255; if (g) *g = 255; if (b) *b = 255;
-	// 太さ (bold) = 0 for Tsumamigui 3's message text (Tsumamigui3.ex, 全体 →
-	// メッセージテキスト), and the BACK LOG builds its text from this getter — a fake
-	// 1.0 fed ceilf(bold_width) into per-glyph advance (see gfx_render_textf), which
-	// showed up as large gaps between log characters.
 	if (weight) *weight = 0.0f;
 	if (er) *er = 0; if (eg) *eg = 0; if (eb) *eb = 0;
 	if (ew) *ew = 0.0f;
@@ -1276,29 +1272,36 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 	// expects, and feeding it back as `type` makes the game build the log in an
 	// unrenderable font (blank log). Type/color/weight stay at the safe defaults.
 	int real_size = 16;
-	PE_GetTextFontProps(a, state, NULL, &real_size, NULL, NULL, NULL, NULL);
-	// XXX diagnostics/knob: the log renders ~1.3x smaller than the original, which
-	// points at this size (we store 30 for parts 90000016/17 while the message window
-	// draws at 48 per .ex). Trace what is actually asked for, and allow overriding.
+	float real_weight = 0.0f, real_edge = 0.0f;
+	int real_er = 0, real_eg = 0, real_eb = 0;
+	PE_GetTextFontProps(a, state, NULL, &real_size, NULL, NULL, NULL,
+			&real_weight, &real_edge, &real_er, &real_eg, &real_eb);
+	// Размер отдаём как есть: у лога Tsumamigui 3 это 30 — значение テキストパーツ
+	// из バックログ.pactex, и оригинал рисует лог именно этим кеглем (сверено по
+	// ink-габаритам 【 】 и cap-height, FINDINGS §5j). Ручка для перебора кеглей
+	// при сверке с эталоном сохранена.
 	{
 		const char *s = getenv("XSYS4_LOG_SIZE");
 		if (s)
 			real_size = atoi(s);
 		if (getenv("XSYS4_BL_TRACE"))
-			NOTICE("FONTPROP part=%d state=%d -> size=%d", a, state, real_size);
+			NOTICE("FONTPROP part=%d state=%d -> size=%d bold=%.2f edge=%.2f",
+			       a, state, real_size, real_weight, real_edge);
 	}
 	if (size) *size = real_size;
-	// Text outline (обводка): Tsumamigui's message window draws a black glyph edge and
-	// the BACK LOG builds its text from THIS getter's font. 縁取り.幅 = 1 per
-	// Tsumamigui3.ex (全体 → メッセージテキスト → 縁取り). The earlier 2.5 was guessed
-	// visually back when the outline did not reserve advance; now that it does (see
-	// gfx_render_textf), 2.5 inflated the gap between log characters by 1.5px a side.
-	// Overridable via XSYS4_LOG_EDGE.
+	// Жирность и обводка: отдаём ФАКТИЧЕСКИЕ значения парта (у Tsumamigui 3 они
+	// приходят из テキストパーツ в .pactex активности: 太さ 0.5, 縁取り 2.0).
+	// Это не косметика: BACK LOG считает по ним высоту юнита —
+	// GetPixelHeight() = size + 2×max(ceil(太さ), ceil(縁取り)) (байткод FUNC 5558),
+	// т.е. 30 + 2×2 = 34, ровно как у оригинала. Прежние выдуманные 0.0/1.0
+	// (значения メッセージテキスト из .ex) давали бокс 32 и разъезжающиеся строки.
+	// Ручки XSYS4_LOG_BOLD / XSYS4_LOG_EDGE оставлены для A/B.
 	{
+		const char *b = getenv("XSYS4_LOG_BOLD");
 		const char *e = getenv("XSYS4_LOG_EDGE");
-		float def = e ? strtof(e, NULL) : 1.0f;  // .ex 縁取り.幅
-		if (er) *er = 0; if (eg) *eg = 0; if (eb) *eb = 0;  // black outline
-		if (ew) *ew = def;
+		if (weight) *weight = b ? strtof(b, NULL) : real_weight;
+		if (ew) *ew = e ? strtof(e, NULL) : real_edge;
+		if (er) *er = real_er; if (eg) *eg = real_eg; if (eb) *eb = real_eb;
 	}
 }
 // Фокус ввода (клавиатурная навигация по кнопкам) в движке не реализован —

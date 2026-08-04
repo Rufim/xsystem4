@@ -358,7 +358,8 @@ int PE_GetTextLineSpace(int parts_no, int state)
 // a hardcoded default) makes the log font match the message window. Only fills
 // non-NULL outputs that we actually track; leaves the caller's defaults otherwise.
 void PE_GetTextFontProps(int parts_no, int state, int *type, int *size,
-		int *r, int *g, int *b, float *weight)
+		int *r, int *g, int *b, float *weight, float *edge_weight,
+		int *edge_r, int *edge_g, int *edge_b)
 {
 	if (!parts_state_valid(--state))
 		return;
@@ -372,6 +373,17 @@ void PE_GetTextFontProps(int parts_no, int state, int *type, int *size,
 	if (g) *g = text->ts.color.g;
 	if (b) *b = text->ts.color.b;
 	if (weight) *weight = text->ts.weight / 1000.0f;
+	// Обводка/жирность нужны игре не только для рисования: BACK LOG считает
+	// высоту юнита как CASCharSpriteProperty@GetPixelHeight() =
+	// size(до чётного вверх) + 2×max(ceil(太さ), ceil(縁取り幅)) — байткод
+	// FUNC 5558 (разбор — FINDINGS §5j). У Tsumamigui 3 текст-парт лога
+	// в バックログ.pactex несёт
+	// 太さ 0.5 и 縁取り 2.0, что даёт ровно 30 + 2×2 = 34 — замеренную высоту
+	// бокса оригинала. Отдавать сюда выдуманные значения — ломать раскладку.
+	if (edge_weight) *edge_weight = text->ts.edge_left;
+	if (edge_r) *edge_r = text->ts.edge_color.r;
+	if (edge_g) *edge_g = text->ts.edge_color.g;
+	if (edge_b) *edge_b = text->ts.edge_color.b;
 }
 
 

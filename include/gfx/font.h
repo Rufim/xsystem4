@@ -134,6 +134,22 @@ static inline void text_style_set_edge_width(struct text_style *ts, float w)
 
 extern bool gfx_text_advance_edges;
 
+// Надбавка к шагу глифа за обводку — НА ОДНУ СТОРОНУ. Одна и та же величина
+// нужна в трёх местах: рисование (`_gfx_render_text` паддит pos_x до и после
+// глифа), `gfx_size_text` и `TextSurfaceManager.GetFontWidth` (им игра двигает
+// курсор в окне сообщений Tsumamigui 3). Пока они расходились, текст лога
+// рисовался шире, чем игра отвела текстуру, и вылезал за бокс.
+//
+// Замерено на оригинале (FINDINGS §5j): окно сообщений (縁取り 1, 太さ 0) —
+// попиксельное совпадение при 1 px на сторону; бэклог (縁取り 2, 太さ 0.5) —
+// ширины строк 420/431/522 у оригинала, что соответствует 2 px на сторону.
+// Жирность в шаг НЕ входит (иначе лог становится на 2 px/символ шире эталона):
+// 太さ работает только как дилатация штриха.
+static inline float text_style_advance_padding(struct text_style *ts)
+{
+	return gfx_text_advance_edges ? text_style_edge_width(ts) : 0.0f;
+}
+
 void gfx_font_init(void);
 void ft_font_init(void);
 struct font *ft_font_load(const char *path);
