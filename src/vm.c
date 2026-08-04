@@ -94,6 +94,11 @@ static int type_slots(struct ain_type *t)
 {
 	if (!t || t->data == AIN_VOID)
 		return 0;
+	// Ссылка на интерфейс — пара (объект, база интерфейса). Подтверждено тем же
+	// правилом филлеров: локал типа 89 всегда идёт с одним `<void>` за ним
+	// (напр. var[0]/var[1] в `Motion::ParamAnalyzer@Parse`).
+	if (t->data == AIN_IFACE || t->data == AIN_IFACE_WRAP)
+		return 2;
 	if ((t->data == AIN_WRAP || t->data == AIN_OPTION) && t->array_type) {
 		int inner = t->array_type->data == AIN_IFACE_WRAP
 			? 2 : type_slots(t->array_type);

@@ -664,8 +664,16 @@ void hll_call(int libno, int fno, int elem_class)
 			stack_push(idx >= 0 ? idx * eslots : idx);
 			break;
 		}
-		enum ain_data_type et = (idx >= 0 && idx < ap->nr_vars)
-			? variable_type(ap, idx, NULL, NULL) : AIN_INT;
+		// Тип элемента берём из САМОГО МАССИВА, а не из слота по индексу.
+		// Индекс бывает -1 (At/First/Find/Min/... ничего не нашли), и тогда
+		// прежний `variable_type(ap, idx)` давал AIN_INT: строковый элемент
+		// возвращался 2-слотовой скалярной ссылкой вместо 1-слотовой, и стек
+		// ВЫЗЫВАЮЩЕГО съезжал на слот. Так `Array.At(list, 1)` на массиве из
+		// одного элемента ломал следующий `S_ASSIGN` в
+		// `Motion::ParamAnalyzer@0` (`Out of bounds page index: 0/555`).
+		// Для валидного индекса результат тот же: variable_type() у ARRAY_PAGE
+		// и так возвращает array_type(a_type).
+		enum ain_data_type et = array_type(ap->a_type);
 		// Классификация элемента: «объект» (собственный heap-слот, 1-значный
 		// ref) — это struct/string/delegate/iface и ВЛОЖЕННЫЙ массив (типизир.
 		// AIN_ARRAY_* или generic AIN_ARRAY/REF_ARRAY/WRAP/...). Всё остальное
@@ -686,7 +694,11 @@ void hll_call(int libno, int fno, int elem_class)
 			elem_is_object = ain_is_array_data_type(et); // generic вложенные массивы
 			break;
 		}
-		if (elem_is_object && idx >= 0) {
+		if (elem_is_object && idx < 0) {
+			// Элемента нет: отдаём null-ссылку одним слотом (форма та же, что
+			// у найденного объектного элемента, — иначе стек съедет).
+			stack_push(-1);
+		} else if (elem_is_object) {
 			// The reference is the element's own heap slot; the caller owns it
 			// and releases it with DELETE, so hand out a counted reference.
 			int es = ap->values[idx].i;
