@@ -19,6 +19,7 @@
 #include "system4.h"
 #include "system4/cg.h"
 #include "system4/hashtable.h"
+#include "system4/instructions.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
@@ -2076,6 +2077,39 @@ int PE_GetInputState(int parts_no)
 	return parts_get(parts_no)->state + 1;
 }
 
+// System 4 v14 (Ixseal: Dohna Dohna, Healing Touch) extended the component-type
+// enum: eight new UI widget types (メッセージウィンドウ, スピンボックス,
+// 縦/横スライダーバー, パネル, フォーム, フォームグループ, ユーザコンポーネント)
+// were inserted at ids 10-17, shifting the parts family (低レベルパーツ ..
+// ムービーパーツ) from 10-22 up to 18-30. Ids 0-9 (button, checkbox, scrollbars,
+// textbox, listbox, combobox, multiline textbox, layout box, radio button box)
+// are unchanged. Verified against parts::detail::GetComponentTypeName in both
+// dohnadohna.ain (v14) and Tsumamigui3.ain (v7).
+#define COMPONENT_TYPE_SHIFT 8
+
+static bool shifted_component_types(void)
+{
+	return instructions[CALLMETHOD].args[0] == T_INT;
+}
+
+// Translate a component type id from the game's enum to the classic numbering
+// used by the switches below.
+static int component_type_to_classic(int type)
+{
+	if (!shifted_component_types() || type < 10)
+		return type;
+	if (type < 10 + COMPONENT_TYPE_SHIFT)
+		return -1;  // v14-only UI widget; no classic equivalent
+	return type - COMPONENT_TYPE_SHIFT;
+}
+
+static int component_type_from_classic(int type)
+{
+	if (!shifted_component_types() || type < 10)
+		return type;
+	return type + COMPONENT_TYPE_SHIFT;
+}
+
 void PE_SetComponentType(int parts_no, int type, int state)
 {
 	if (getenv("XSYS4_BL_TRACE"))
@@ -2084,7 +2118,7 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		return;
 	struct parts *parts = parts_get(parts_no);
 	enum parts_type pt = PARTS_UNINITIALIZED;
-	switch (type) {
+	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
 	case 12: pt = PARTS_ANIMATION; break;
@@ -2118,25 +2152,28 @@ int PE_GetComponentType(int parts_no, int state)
 	if (parts->is_button)
 		return 0;
 
+	int classic;
 	switch (parts->states[state].type) {
-	case PARTS_LAYOUT_BOX: return 8;
+	case PARTS_LAYOUT_BOX: classic = 8; break;
 	case PARTS_UNINITIALIZED:  // defaluts to CG
 	case PARTS_CG:
-		return 11;
-	case PARTS_ANIMATION: return 12;
-	case PARTS_TEXT: return 13;
-	case PARTS_HGAUGE: return 14;
-	case PARTS_VGAUGE: return 15;
-	case PARTS_NUMERAL: return 16;
-	case PARTS_RECT_DETECTION: return 17;
-	case PARTS_CONSTRUCTION_PROCESS: return 18;
-	case PARTS_FLAT: return 20;
-	case PARTS_3DLAYER: return 21;
-	case PARTS_MOVIE: return 22;
-	case PARTS_FLASH:
+		classic = 11;
 		break;
+	case PARTS_ANIMATION: classic = 12; break;
+	case PARTS_TEXT: classic = 13; break;
+	case PARTS_HGAUGE: classic = 14; break;
+	case PARTS_VGAUGE: classic = 15; break;
+	case PARTS_NUMERAL: classic = 16; break;
+	case PARTS_RECT_DETECTION: classic = 17; break;
+	case PARTS_CONSTRUCTION_PROCESS: classic = 18; break;
+	case PARTS_FLAT: classic = 20; break;
+	case PARTS_3DLAYER: classic = 21; break;
+	case PARTS_MOVIE: classic = 22; break;
+	case PARTS_FLASH:
+	default:
+		VM_ERROR("unsupported component type %d", parts->states[state].type);
 	}
-	VM_ERROR("unsupported component type %d", parts->states[state].type);
+	return component_type_from_classic(classic);
 }
 
 // Horizontal-scrollbar / slider. The part's CG is the knob; it slides along the
