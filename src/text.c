@@ -190,15 +190,24 @@ static void ls_init_from_env_once(void)
 {
 	if (ls_base >= 0.0f)
 		return; // уже задано (env или рантайм-сеттером)
-	// Flat 0.03 for all sizes. The message window has NO auto-wrap (proven: a long
-	// single message renders on one line and overruns the box); its line breaks are
-	// authored for native widths, so a large letter-spacing pushed wrapped lines
-	// past the right edge. 0.03 keeps glyphs from clumping (our FNL render needs a
-	// little spacing) while staying tight enough that the authored lines still fit.
+	// Default OFF. The original engine has no artificial letter spacing at all: the
+	// gap between glyphs comes from the .fnl side bearings plus the outline, which
+	// reserves advance (see gfx_size_text / FINDINGS §5f). This knob existed to
+	// compensate for glyphs that clumped — but that had two real causes, both since
+	// fixed at the root: the wrong .fnl face was picked (a small face upscaled, so
+	// latin/cyrillic ink was ~20% too wide for its advance) and the outline's advance
+	// was dropped. With those fixed, Tsumamigui 3's message window renders
+	// pixel-identical to the original at 0, and any positive value makes every line
+	// wider than the authored line breaks allow (there is NO auto-wrap: proven by
+	// injecting a long message, which overran the box on one line).
+	// Fan translations that reuse full-width .fnl cells for cyrillic (Daiteikoku)
+	// may still want a nudge — hence the knob (and the Android "Шрифт" screen).
+	// NOTE: gfx_letter_spacing_extra floors a non-zero result at 1px, so any ratio
+	// from ~0.001 up to 1/size behaves identically to exactly 1px.
 	const char *env = getenv("XSYS4_LETTER_SPACING");
-	ls_base = env ? strtof(env, NULL) : 0.03f;
+	ls_base = env ? strtof(env, NULL) : 0.0f;
 	env = getenv("XSYS4_LETTER_SPACING_LARGE");
-	ls_large = env ? strtof(env, NULL) : 0.03f;
+	ls_large = env ? strtof(env, NULL) : 0.0f;
 	env = getenv("XSYS4_LETTER_SPACING_SIZE");
 	ls_threshold = env ? strtof(env, NULL) : 25.0f;
 	ls_normalize();
@@ -391,9 +400,14 @@ float gfx_render_textf(Texture *dst, float x, int y, char *msg, struct text_styl
 	struct font_size *font_size = text_style_font_size(ts);
 	float edge_width = text_style_edge_width(ts);
 
-	// Edge (outline) width must NOT feed into advance (our letter-spacing mechanism);
-	// only bold width does. The outline is still drawn below when edge_width > 0.
-	float edge_advance = gfx_text_advance_edges ? ceilf(ts->bold_width) : 0.f;
+	// The outline MUST reserve advance (upstream behaviour, restored after FINDINGS
+	// §5f): _gfx_render_text pads pos_x by edge_spacing on both sides of every glyph,
+	// which is what keeps the outline inside the destination texture and makes the
+	// returned width cover it. Zeroing it clipped the outline's left column always,
+	// and — because a parts-text sizes the part from this return value while the glyph
+	// texture is sized by text_style_width (which DOES include the edge) — clipped the
+	// right side of wide capitals outright once letter spacing was small.
+	float edge_advance = gfx_text_advance_edges ? edge_width + ceilf(ts->bold_width) : 0.f;
 
 	enum text_render_mode mode = blend ? RENDER_BLENDED : RENDER_COPY;
 	if (edge_width > 0.01f) {

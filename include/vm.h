@@ -135,6 +135,10 @@ _Noreturn void _vm_error(const char *fmt, ...);
 _Noreturn void vm_exit(int code);
 _Noreturn void vm_reset(void);
 
+// HLL state that must not outlive a system.Reset (returning to the title screen).
+// The original engine drops its HLL state with the VM; ours lives in module statics.
+void adv_log_list_reset(void);
+
 extern bool vm_reset_once;
 
 #if defined(__ANDROID__) || defined(RELEASE)

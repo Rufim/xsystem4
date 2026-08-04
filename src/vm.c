@@ -2943,6 +2943,9 @@ static jmp_buf reset_buf;
 
 _Noreturn void vm_reset(void)
 {
+	// HLL module state does not die with the VM the way it does in the original
+	// engine, so drop what must not survive returning to the title screen.
+	adv_log_list_reset();
 	vm_free();
 	longjmp(reset_buf, 1);
 }

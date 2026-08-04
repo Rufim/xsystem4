@@ -105,6 +105,20 @@ void ADVLogList_Clear(void)
 	logs = NULL;
 }
 
+// Called from vm_reset() (system.Reset). Returning to the title screen resets the
+// whole VM — 「タイトルに戻る」 (Tsumamigui3.ain FUNC 31) is just
+// コンフィグセーブ + system.Reset — and the original engine's HLL state dies with it.
+// The game NEVER clears the replies log explicitly on that path: reverse of the
+// bytecode finds exactly one ADVLogList_Clear call site, inside
+// gamesave::detail::セーブ実行_ロード後復帰処理 (resume-after-load). Our module state
+// is static and survived the reset, so replies from the previous playthrough kept
+// showing up in the BACK LOG after starting a new game.
+void adv_log_list_reset(void)
+{
+	ADVLogList_Clear();
+	enabled = true;
+}
+
 static void advlog_add_text_impl(struct string *text)
 {
 	bridge_adv_add_text(text);

@@ -1261,7 +1261,11 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 	if (type) *type = 0;
 	if (size) *size = 16;
 	if (r) *r = 255; if (g) *g = 255; if (b) *b = 255;
-	if (weight) *weight = 1.0f;
+	// 太さ (bold) = 0 for Tsumamigui 3's message text (Tsumamigui3.ex, 全体 →
+	// メッセージテキスト), and the BACK LOG builds its text from this getter — a fake
+	// 1.0 fed ceilf(bold_width) into per-glyph advance (see gfx_render_textf), which
+	// showed up as large gaps between log characters.
+	if (weight) *weight = 0.0f;
 	if (er) *er = 0; if (eg) *eg = 0; if (eb) *eb = 0;
 	if (ew) *ew = 0.0f;
 	// Tsumamigui 3 reads THIS on the message-window text parts to pick the BACK LOG
@@ -1273,15 +1277,26 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 	// unrenderable font (blank log). Type/color/weight stay at the safe defaults.
 	int real_size = 16;
 	PE_GetTextFontProps(a, state, NULL, &real_size, NULL, NULL, NULL, NULL);
+	// XXX diagnostics/knob: the log renders ~1.3x smaller than the original, which
+	// points at this size (we store 30 for parts 90000016/17 while the message window
+	// draws at 48 per .ex). Trace what is actually asked for, and allow overriding.
+	{
+		const char *s = getenv("XSYS4_LOG_SIZE");
+		if (s)
+			real_size = atoi(s);
+		if (getenv("XSYS4_BL_TRACE"))
+			NOTICE("FONTPROP part=%d state=%d -> size=%d", a, state, real_size);
+	}
 	if (size) *size = real_size;
-	// Text outline (обводка): Tsumamigui's message window draws a black glyph edge;
-	// the BACK LOG builds its text from THIS getter's font, so return a black outline
-	// to match. The edge is drawn purely visually — gfx_render_text no longer feeds
-	// edge width into per-glyph advance (see text.c), so this does NOT change letter
-	// spacing. Weight overridable via XSYS4_LOG_EDGE (default 1).
+	// Text outline (обводка): Tsumamigui's message window draws a black glyph edge and
+	// the BACK LOG builds its text from THIS getter's font. 縁取り.幅 = 1 per
+	// Tsumamigui3.ex (全体 → メッセージテキスト → 縁取り). The earlier 2.5 was guessed
+	// visually back when the outline did not reserve advance; now that it does (see
+	// gfx_render_textf), 2.5 inflated the gap between log characters by 1.5px a side.
+	// Overridable via XSYS4_LOG_EDGE.
 	{
 		const char *e = getenv("XSYS4_LOG_EDGE");
-		float def = e ? strtof(e, NULL) : 2.5f;  // black outline, ~matches message window
+		float def = e ? strtof(e, NULL) : 1.0f;  // .ex 縁取り.幅
 		if (er) *er = 0; if (eg) *eg = 0; if (eb) *eb = 0;  // black outline
 		if (ew) *ew = def;
 	}
@@ -1506,13 +1521,22 @@ static int PartsEngine_GetVScrollbarScrollPos(int parts_no)
 		NOTICE("VScrollbar[%d] GetScrollPos -> %d", parts_no, p);
 	return p;
 }
+// GetVScrollbarScrollRate is the VISIBLE FRACTION (view/total), i.e. the knob's
+// size ratio — NOT the scroll position. Reverse of Tsumamigui3.ain:
+// backlog::detail::CBackLogView@SetLineIndex ends with
+//     m_ViewLastScene = (1.0 <= GetVScrollbarScrollRate(scrollbar))
+// and MouseWheelEvent closes the whole BACK LOG (AFL_Activity_End, the same path as
+// the SYS_戻る button) when `m_ViewLastScene && Back - Forward > 0`. So the rate MUST
+// reach 1.0 when everything fits, or wheel-down never closes a short log.
+// The knob's on-screen position is a separate quantity (PE_SetPartsVScrollbarRate,
+// fed with scroll_pos/max).
 static float PartsEngine_GetVScrollbarScrollRate(int parts_no)
 {
 	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, false);
-	if (!sb) return 0.0f;
-	int max = sb->total_size - sb->view_size;
-	if (max <= 0) return 0.0f;
-	return (float)sb->scroll_pos / (float)max;
+	if (!sb) return 1.0f;
+	if (sb->total_size <= 0 || sb->view_size >= sb->total_size)
+		return 1.0f;
+	return (float)sb->view_size / (float)sb->total_size;
 }
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarCGName, int a, struct string *b);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, GetVScrollbarCGName, int a, struct string **b);

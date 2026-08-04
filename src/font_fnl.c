@@ -14,6 +14,8 @@
  * along with this program; if not, see <http://gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
+
 #include "system4.h"
 #include "system4/fnl.h"
 #include "system4/hashtable.h"
@@ -52,6 +54,33 @@ struct font_fnl {
 	struct fnl_font_size *sizes;
 };
 
+// .fnl faces are 4x-supersampled bitmaps, so denominator 4 renders a face at its
+// native point size (face height == 4 * size). Any other denominator reproduces
+// the requested em size out of a *different* face, and the faces are NOT scaled
+// copies of each other: they are hand-tuned per point size. Measured on
+// Tsumamigui3Font.fnl, full-width kanji keep a constant ink/height ratio (0.625)
+// across all ten faces, but latin/cyrillic glyphs are optically scaled — ink
+// ratio 0.312 in the native-24 face vs 0.260 in the native-48 face. So
+// upscaling a small face (e.g. face_h=96 at denominator 2 for size 48) yields the
+// right em but latin/cyrillic ~20% too large, while kanji look identical. That is
+// invisible in Japanese and glaring in a translation.
+// Ranking: closest size first, then denominator nearest 4 (native), then the
+// larger denominator (downscaling a bigger face is sharper than upscaling).
+static bool fnl_size_is_better(const struct fnl_font_size *cand,
+		const struct fnl_font_size *best, float cand_diff, float best_diff)
+{
+	if (cand_diff < best_diff - 0.01f)
+		return true;
+	if (cand_diff > best_diff - 0.01f && cand_diff < best_diff + 0.01f) {
+		int cand_off = abs((int)cand->denominator - 4);
+		int best_off = abs((int)best->denominator - 4);
+		if (cand_off != best_off)
+			return cand_off < best_off;
+		return cand->denominator > best->denominator;
+	}
+	return false;
+}
+
 static struct font_size *fnl_font_get_size(struct font *_font, float size)
 {
 	struct font_fnl *font = (struct font_fnl*)_font;
@@ -60,13 +89,7 @@ static struct font_size *fnl_font_get_size(struct font *_font, float size)
 	struct fnl_font_size *closest = &font->sizes[0];
 	for (unsigned i = 0; i < font->nr_sizes; i++) {
 		float diff = fabsf(font->sizes[i].super.size - size);
-		// On a size tie, prefer the smallest denominator: a bitmap face whose
-		// native height is close to the requested size renders with far more ink
-		// (and crisper) than a large face downscaled by a big denominator, which
-		// looks thin/small. The default first-match kept the large downscaled
-		// face, so glyphs came out noticeably smaller than the original engine.
-		if (diff < min_diff - 0.01f ||
-		    (diff < min_diff + 0.01f && font->sizes[i].denominator < closest->denominator)) {
+		if (fnl_size_is_better(&font->sizes[i], closest, diff, min_diff)) {
 			min_diff = diff;
 			closest = &font->sizes[i];
 		}
@@ -141,8 +164,20 @@ static struct fnl_bitmap_glyph *fnl_get_bitmap_glyph(struct fnl_bitmap_size *bit
 
 // Downscale filter tuning (see comment in fnl_font_get_glyph); overridable
 // for A/B comparison via XSYS4_FNL_GAMMA=<float> and XSYS4_FNL_SHARP=0/1.
-static float fnl_gamma = 0.8f;
-static bool fnl_sharpen = true;
+//
+// Calibrated against the original engine (Tsumamigui 3 message window under Proton,
+// FINDINGS §5f): mean |pixel difference| over the text of one line, smaller = closer.
+//   smoothstep + 0.8  23.61      box + 0.6  22.34
+//   box + 0.7        *19.85*     box + 0.8  21.03
+//   box + 0.9         22.56      box + 1.0  24.16
+// A plain box average is what AliceSoft's engine does with the 4x supersamples, and
+// it reproduces the original's look: a slightly thinner ink core with a broader
+// partial-coverage fringe, which the outline pass then dilates into the heavier edge
+// the original has. The smoothstep was added to stop glyphs clumping, but that had
+// two real causes — the wrong .fnl face (ink ~20% too wide for its advance) and the
+// dropped outline advance — both since fixed, so the sharpening is no longer needed.
+static float fnl_gamma = 0.7f;
+static bool fnl_sharpen = false;
 static bool fnl_filter_initialized = false;
 
 static void fnl_filter_init(void)

@@ -483,13 +483,16 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 		       op->style.face, op->text ? display_sjis0(op->text->text) : "(nil)");
 	if (!op->text)
 		return true;
-	// Boldness of the log text. The game passes bold_weight (~1.0), but a full 1px
-	// MAX dilation merges thin FNL strokes at this size ("Ч" fuses with itself);
-	// bold_width 0 is too thin vs the reference. Use a gentle dilation by default,
-	// tunable via XSYS4_LOG_BOLD (0 = crisp/thin, ~1 = heavy/merges).
+	// Boldness comes from the game, which reads it back from our
+	// GetPartsTextFontProperty (.ex says 太さ = 0 for the message text, and the log
+	// uses the message font). The old 0.8 default was guessed against a reference
+	// rendered with the wrong .fnl face; it also fed ceilf(bold_width) = 1px a side
+	// into per-glyph advance once the outline advance was restored. Override for
+	// A/B comparison with XSYS4_LOG_BOLD.
 	{
 		const char *e = getenv("XSYS4_LOG_BOLD");
-		op->style.bold_width = e ? strtof(e, NULL) : 0.8f;
+		if (e)
+			op->style.bold_width = strtof(e, NULL);
 	}
 	// Multi-line text: the game joins a log message's wrapped lines with '\n' and
 	// sizes the texture for all of them (parts::detail::TextParts_CalcSize counts
@@ -498,33 +501,51 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 	// and ran off the right edge of the box (Tsumamigui 3 BACK LOG). '\n' (0x0A)
 	// never appears as a Shift-JIS trailing byte, so a byte-wise split is safe.
 	int h = ceilf(op->style.size + op->style.edge_up + op->style.edge_down);
-	// Per-line pitch: the game sized the texture as nlines × pixel-height
-	// (TextParts_CalcSize counts '\n' × GetPixelHeight), so derive the pitch from
-	// the allocated texture height — matching it exactly keeps every line inside the
-	// texture (no bottom clipping) and the spacing even. Fall back to the style
-	// height if the texture height is unknown.
-	int nlines = 1;
-	for (const char *p = op->text->text; *p; p++)
-		if (*p == '\n')
-			nlines++;
-	int line_h = (cproc->common.texture.h > 0 && nlines > 0)
-		? cproc->common.texture.h / nlines
-		: (int)ceilf(text_style_height(&op->style)) + op->line_space;
+	// Per-line pitch = one line's pixel height + line_space, which is exactly how the
+	// game sizes the texture: parts::detail::TextParts_CalcSize returns
+	// nlines*height + (nlines-1)*line_space. Confirmed by XSYS4_CP_TRACE at font 48 —
+	// the game allocates 675x50 for a one-line unit and 675x91 for a two-line one,
+	// i.e. 50 + (-9) + 50 with line_space = -9. Dividing the texture height by the
+	// line count instead (91/2 = 45) drifted every line after the first and clipped
+	// the last one at the texture border.
+	int line_h = (int)ceilf(text_style_height(&op->style)) + op->line_space;
 	// Reserve room for the outline: the edge extends edge_left px to the left of the
 	// first glyph and edge_up px above. Drawing at op->x/op->y clipped the first
 	// glyph's left outline at the texture border. Inset the text by the edge width.
 	int ex = (int)ceilf(op->style.edge_left);
 	int ey = (int)ceilf(op->style.edge_up);
 	char *buf = xstrdup(op->text->text);
+	// Clear the text area ONCE, before drawing. A per-line clear is wrong whenever
+	// line_h < h — which is the normal case here, since line_space is negative
+	// (-9 in Tsumamigui 3's log): consecutive lines overlap by h - line_h, so the
+	// next line's clear erased the bottom of the line above it. That chopped the
+	// 【 】 brackets around the speaker name in half, since they span nearly the
+	// whole em while latin/cyrillic does not.
+	int nlines = 1, maxw = 0;
+	for (char *line = buf, *p = buf; ; p++) {
+		if (*p != '\n' && *p != '\0')
+			continue;
+		bool end = (*p == '\0');
+		char saved = *p;
+		*p = '\0';
+		int lw = ceilf(gfx_size_text(&op->style, line));
+		if (lw > maxw)
+			maxw = lw;
+		*p = saved;
+		if (end)
+			break;
+		nlines++;
+		line = p + 1;
+	}
+	gfx_fill_with_alpha(&cproc->common.texture, op->x, op->y, maxw + 2 * ex,
+			(nlines - 1) * line_h + h,
+			op->style.edge_color.r, op->style.edge_color.g, op->style.edge_color.b, 0);
 	int y = op->y;
 	for (char *line = buf, *p = buf; ; p++) {
 		if (*p != '\n' && *p != '\0')
 			continue;
 		bool end = (*p == '\0');
 		*p = '\0';
-		int w = ceilf(gfx_size_text(&op->style, line));
-		gfx_fill_with_alpha(&cproc->common.texture, op->x, y, w + 2 * ex, h,
-				op->style.edge_color.r, op->style.edge_color.g, op->style.edge_color.b, 0);
 		gfx_render_text(&cproc->common.texture, op->x + ex, y + ey, line, &op->style, false);
 		if (end)
 			break;

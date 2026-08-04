@@ -17,6 +17,7 @@
 // and GetFontWidth for wrapping/layout. Without this the game aborts on the
 // first message (SetFontType -> unimplemented).
 
+#include <math.h>
 #include <stdbool.h>
 
 #include "system4/string.h"
@@ -74,14 +75,27 @@ static void TextSurfaceManager_SetFontEdgeColor(int nR, int nG, int nB)
 
 static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width)
 {
+	// The glyph outline reserves advance, exactly as in upstream's gfx_size_text.
+	// Tsumamigui 3's ADV loop draws the message one character per parts-text and
+	// advances its own cursor by this width (it never asks the engine for a parts
+	// width), so omitting the edge term put every character 1px too close to the
+	// next one: identical glyph ink to the original but 1px inter-letter gaps
+	// instead of 2px, and a line 42px short. See FINDINGS §5f.
+	float edge_advance = gfx_text_advance_edges
+		? ts.edge_left + ts.edge_right + ceilf(ts.bold_width)
+		: 0.0f;
+	// Per-glyph advance is integral, rounded UP: an .fnl advance is width/denominator
+	// and lands on a quarter pixel, and rounding to nearest lost 1px on every glyph
+	// whose fraction was .25 — measured as a line 12px short of the original over 42
+	// characters (~25% of them). Ceiling per glyph reproduces the original exactly.
 	float w = 0.0f;
 	const char *p = text->text;
 	while (*p) {
 		int len = SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
-		w += gfx_size_char(&ts, p);
+		w += ceilf(gfx_size_char(&ts, p) + edge_advance);
 		p += len;
 	}
-	*width = (int)(w + 0.5f);
+	*width = (int)w;
 	return true;
 }
 
