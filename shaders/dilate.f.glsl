@@ -22,11 +22,14 @@ in vec2 tex_coord;
 out vec4 frag_color;
 
 void main() {
-	// the fractional part of threshold becomes a weight value for the
-	// edge pixels
+	// Morphological dilation via MAX of neighbour coverage. (Summing instead
+	// spreads partial alpha across the kernel, which fattens AND softens the
+	// edges — the "мыло" on bold/outlined text.) MAX expands the shape by the
+	// threshold radius while keeping antialiased edges crisp. The fractional
+	// part of threshold weights the outermost ring for sub-pixel AA.
 	int size = int(floor(threshold));
 	int cutoff = size + 1;
-	float edge_weight = fract(threshold) / 4.0;
+	float edge_weight = fract(threshold);
 	vec2 tex_size = vec2(textureSize(tex, 0).xy);
 	float t = ceil(threshold);
 
@@ -40,7 +43,7 @@ void main() {
 			float a = texture(tex, tex_coord + vec2(x, y) / tex_size).r;
 			if (d > float(size))
 				a *= edge_weight;
-			a_out += a;
+			a_out = max(a_out, a);
 		}
 	}
 

@@ -431,6 +431,13 @@ struct parts {
 	int sb_length, sb_width;   // track length (x) and width (y)
 	int sb_total, sb_view;     // scroll amounts (for pos<->rate conversion)
 	int sb_base_x, sb_base_y;  // knob home position (track origin, from 座標)
+	// Vertical scrollbar (backlog/backscene, パーツタイプ=2). The part's CG is the
+	// draggable knob (＜base＞／バー／通常|オン|ダウン); geometry from .pactex 種類別情報.
+	// Track runs top->bottom; up/down arrow buttons (前サイズ/次サイズ) reserve space
+	// at the ends. rate is driven by the game via SetVScrollbarScrollPos (pos/total/view).
+	bool is_vscrollbar;
+	int sb_up_size, sb_down_size;  // heights of the ∧/∨ arrow buttons (前サイズ/次サイズ)
+	float vscroll_rate;
 	// Checkbox (パーツタイプ=1). The box CG has checked/unchecked variants
 	// ("<base>[／チェック]／通常|オン|ダウン"); clicking toggles checkbox_checked.
 	bool is_checkbox;
@@ -579,6 +586,8 @@ enum parts_message_type {
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);
 void parts_msg_push_global(int type, const char *fmt, ...);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
+void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y);
+void PE_OnVScrollbarDragged(int parts_no, float rate);
 void parts_checkbox_toggle(struct parts *parts);
 
 // construction.c

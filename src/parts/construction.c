@@ -346,7 +346,12 @@ static bool build_create(struct parts *parts, struct parts_construction_process 
 	int w = op->w > 0 ? op->w : 1;
 	int h = op->h > 0 ? op->h : 1;
 	gfx_delete_texture(&cproc->common.texture);
-	gfx_init_texture_rgba(&cproc->common.texture, w, h, (SDL_Color){0,0,0,255});
+	// Init transparent (was opaque black {0,0,0,255}). The BACK LOG separator is a
+	// created-but-never-filled unit; with an opaque-black init it composited as a
+	// solid black horizontal line (absent in the original). Text/fill ops overwrite
+	// this init, so transparent is safe for them. XSYS4_OPAQUE_CREATE restores.
+	SDL_Color init = getenv("XSYS4_OPAQUE_CREATE") ? (SDL_Color){0,0,0,255} : (SDL_Color){0,0,0,0};
+	gfx_init_texture_rgba(&cproc->common.texture, w, h, init);
 	if (!cproc->common.texture.handle)
 		return false;
 	parts_set_dims(parts, &cproc->common, w, h);
@@ -478,6 +483,14 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 		       op->style.face, op->text ? display_sjis0(op->text->text) : "(nil)");
 	if (!op->text)
 		return true;
+	// Boldness of the log text. The game passes bold_weight (~1.0), but a full 1px
+	// MAX dilation merges thin FNL strokes at this size ("Ч" fuses with itself);
+	// bold_width 0 is too thin vs the reference. Use a gentle dilation by default,
+	// tunable via XSYS4_LOG_BOLD (0 = crisp/thin, ~1 = heavy/merges).
+	{
+		const char *e = getenv("XSYS4_LOG_BOLD");
+		op->style.bold_width = e ? strtof(e, NULL) : 0.8f;
+	}
 	// Multi-line text: the game joins a log message's wrapped lines with '\n' and
 	// sizes the texture for all of them (parts::detail::TextParts_CalcSize counts
 	// '\n' × pixel-height). gfx_render_text draws a SINGLE line, so we split on '\n'
@@ -497,6 +510,11 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 	int line_h = (cproc->common.texture.h > 0 && nlines > 0)
 		? cproc->common.texture.h / nlines
 		: (int)ceilf(text_style_height(&op->style)) + op->line_space;
+	// Reserve room for the outline: the edge extends edge_left px to the left of the
+	// first glyph and edge_up px above. Drawing at op->x/op->y clipped the first
+	// glyph's left outline at the texture border. Inset the text by the edge width.
+	int ex = (int)ceilf(op->style.edge_left);
+	int ey = (int)ceilf(op->style.edge_up);
 	char *buf = xstrdup(op->text->text);
 	int y = op->y;
 	for (char *line = buf, *p = buf; ; p++) {
@@ -505,9 +523,9 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 		bool end = (*p == '\0');
 		*p = '\0';
 		int w = ceilf(gfx_size_text(&op->style, line));
-		gfx_fill_with_alpha(&cproc->common.texture, op->x, y, w, h,
+		gfx_fill_with_alpha(&cproc->common.texture, op->x, y, w + 2 * ex, h,
 				op->style.edge_color.r, op->style.edge_color.g, op->style.edge_color.b, 0);
-		gfx_render_text(&cproc->common.texture, op->x, y, line, &op->style, false);
+		gfx_render_text(&cproc->common.texture, op->x + ex, y + ey, line, &op->style, false);
 		if (end)
 			break;
 		y += line_h;

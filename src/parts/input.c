@@ -262,12 +262,18 @@ void PE_UpdateInputState(int passed_time)
 	// track rectangle for a forgiving grab + click-to-jump.
 	if (cur_clicking && !prev_clicking && !dragging_scrollbar) {
 		PARTS_LIST_FOREACH_REVERSE(parts) {
-			if (!parts->is_hscrollbar || !parts->global.show)
+			if (!parts->global.show)
+				continue;
+			if (!parts->is_hscrollbar && !parts->is_vscrollbar)
 				continue;
 			int px = parts->parent ? parts->parent->global.pos.x : 0;
 			int py = parts->parent ? parts->parent->global.pos.y : 0;
-			Rectangle track = { px + parts->sb_base_x, py + parts->sb_base_y,
-					parts->sb_length, parts->sb_width };
+			// h-bar track: length(x)×width(y); v-bar track: width(x)×length(y).
+			Rectangle track = parts->is_hscrollbar
+				? (Rectangle){ px + parts->sb_base_x, py + parts->sb_base_y,
+						parts->sb_length, parts->sb_width }
+				: (Rectangle){ px + parts->sb_base_x, py + parts->sb_base_y,
+						parts->sb_width, parts->sb_length };
 			if (SDL_PointInRect(&cur_pos, &track)) {
 				dragging_scrollbar = parts;
 				break;
@@ -275,10 +281,17 @@ void PE_UpdateInputState(int passed_time)
 		}
 	}
 	if (dragging_scrollbar) {
-		if (cur_clicking)
-			parts_hscrollbar_drag_to(dragging_scrollbar, cur_pos.x);
-		else
+		if (cur_clicking) {
+			if (dragging_scrollbar->is_hscrollbar) {
+				parts_hscrollbar_drag_to(dragging_scrollbar, cur_pos.x);
+			} else {
+				parts_vscrollbar_drag_to(dragging_scrollbar, cur_pos.y);
+				PE_OnVScrollbarDragged(dragging_scrollbar->no,
+						dragging_scrollbar->vscroll_rate);
+			}
+		} else {
 			dragging_scrollbar = NULL;
+		}
 	}
 
 	// Drag movement processing

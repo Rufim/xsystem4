@@ -2211,6 +2211,79 @@ float PE_GetPartsHScrollbarScrollRate(int parts_no)
 	return parts ? parts->hscroll_rate : 0.0f;
 }
 
+// Vertical scrollbar (パーツタイプ=2): mirror of the horizontal slider on the Y axis.
+// The knob (the part's CG) slides down the track between the ∧/∨ arrow buttons, which
+// reserve up_size/down_size at the top/bottom. rate 0 = top (newest scrolled away),
+// 1 = bottom.
+static void parts_vscrollbar_reposition(struct parts *parts)
+{
+	if (!parts->is_vscrollbar)
+		return;
+	struct parts_common *c = &parts->states[PARTS_STATE_DEFAULT].common;
+	int knob_w = c->w, knob_h = c->h;
+	float r = parts->vscroll_rate;
+	if (r < 0.0f) r = 0.0f;
+	if (r > 1.0f) r = 1.0f;
+	int track = parts->sb_length - parts->sb_up_size - parts->sb_down_size;
+	int travel = track - knob_h;
+	if (travel < 0) travel = 0;
+	int y = parts->sb_base_y + parts->sb_up_size + (int)(r * travel + 0.5f);
+	int x = parts->sb_base_x + (parts->sb_width - knob_w) / 2;
+	parts_set_pos(parts, (Point){ x, y });
+}
+
+void PE_InitPartsVScrollbar(int parts_no, int base_x, int base_y, int length, int width,
+		int up_size, int down_size, int total, int view, float rate)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	parts->is_vscrollbar = true;
+	parts->sb_base_x = base_x;
+	parts->sb_base_y = base_y;
+	parts->sb_length = length;
+	parts->sb_width = width;
+	parts->sb_up_size = up_size;
+	parts->sb_down_size = down_size;
+	parts->sb_total = total;
+	parts->sb_view = view;
+	parts->vscroll_rate = rate;
+	parts_vscrollbar_reposition(parts);
+}
+
+// Set the knob position from a rate (0..1); called when the game moves the scrollbar
+// via SetVScrollbarScrollPos (pos/total/view converted to a rate in PartsEngine).
+void PE_SetPartsVScrollbarRate(int parts_no, float rate)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts || !parts->is_vscrollbar)
+		return;
+	parts->vscroll_rate = rate;
+	parts_vscrollbar_reposition(parts);
+}
+
+// Drag the knob so its centre follows the cursor (absolute window y), clamped to the
+// track between the arrow buttons; update vscroll_rate (the game reads it back / we
+// feed it to SetVScrollbarScrollPos).
+void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y)
+{
+	if (!parts->is_vscrollbar)
+		return;
+	struct parts_common *c = &parts->states[PARTS_STATE_DEFAULT].common;
+	int knob_h = c->h;
+	int track = parts->sb_length - parts->sb_up_size - parts->sb_down_size;
+	int travel = track - knob_h;
+	if (travel <= 0)
+		return;
+	int parent_y = parts->parent ? parts->parent->global.pos.y : 0;
+	int knob_top = cursor_abs_y - parent_y - parts->sb_base_y - parts->sb_up_size - knob_h / 2;
+	float r = (float)knob_top / (float)travel;
+	if (r < 0.0f) r = 0.0f;
+	if (r > 1.0f) r = 1.0f;
+	parts->vscroll_rate = r;
+	parts_vscrollbar_reposition(parts);
+}
+
 // Solid white fill of w×h into every display state. Used for config colour
 // swatches: パーツタイプ=1 with an empty ＣＧ名 but a サイズ — the fill is tinted
 // by the checkbox "button colour" (multiply) to show the palette colour.

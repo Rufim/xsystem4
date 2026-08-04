@@ -188,9 +188,24 @@ static struct adv_log *log_entry(int log_no)
 	return &logs[(log_first + log_no) % LOG_BUFFER_SIZE];
 }
 
+// Number of lines excluding *trailing* empty lines. The ADV message window pads
+// short messages with blank lines, so a log page often ends in one or more empty
+// strings. The backlog builds one unit per line and TextParts_CalcSize returns
+// height 0 for "", so these trailing blanks consumed visible-window slots (ViewSize)
+// while rendering at zero height — the log underfilled at the bottom (the original
+// engine does not show them). Trim only trailing empties; leading/interior blanks
+// (intentional paragraph spacing) are preserved. Keep >=1 so a page never reports 0.
+static unsigned effective_nr_lines(struct adv_log *log)
+{
+	unsigned n = log->nr_lines;
+	while (n > 1 && log->lines[n-1]->size == 0)
+		n--;
+	return n;
+}
+
 int ADVLogList_GetNumofADVLogText(int log_no)
 {
-	int n = log_entry(log_no)->nr_lines;
+	int n = effective_nr_lines(log_entry(log_no));
 	if (getenv("XSYS4_ADVLOG_TRACE"))
 		NOTICE("ADVLog GetNumofADVLogText(log=%d) -> %d", log_no, n);
 	return n;

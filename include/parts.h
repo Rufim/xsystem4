@@ -184,6 +184,10 @@ void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate);
 float PE_GetPartsHScrollbarScrollRate(int parts_no);
 void PE_InitPartsHScrollbar(int parts_no, int base_x, int base_y,
 		int length, int width, int total, int view, float rate);
+void PE_InitPartsVScrollbar(int parts_no, int base_x, int base_y, int length, int width,
+		int up_size, int down_size, int total, int view, float rate);
+void PE_SetPartsVScrollbarRate(int parts_no, float rate);
+void PE_OnVScrollbarDragged(int parts_no, float rate);
 void PE_SetPartsCheckBoxChecked(int parts_no, bool checked);
 bool PE_GetPartsCheckBoxChecked(int parts_no);
 void PE_InitPartsCheckBox(int parts_no, struct string *cg_base, bool checked);

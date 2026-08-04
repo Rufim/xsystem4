@@ -147,8 +147,9 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 	struct string *cg_name = heap_get_string(strings[1].i);
 
 	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
-		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d str0slot=%d str0len=%d text='%s'",
+		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
 		       command, parts_no, dx, dy, font_type, font_size, font_r, font_g, font_b,
+		       edge_r, edge_g, edge_b, edge_weight, bold_weight,
 		       strings[0].i, text ? (int)text->size : -1, text ? display_sjis0(text->text) : "(null)");
 
 	switch (command) {
@@ -691,6 +692,30 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 static void PartsEngine_SetVScrollbarTotalSize(int parts_no, int size);
 static void PartsEngine_SetVScrollbarViewSize(int parts_no, int size);
 static void PartsEngine_SetVScrollbarScrollRate(int parts_no, float rate);
+struct pe_vscrollbar {
+	int parts_no;       // the knob part (its CG is ／バー)
+	int total_size;
+	int view_size;
+	int scroll_pos;
+	int up_no, down_no; // the ∧/∨ arrow decoration parts (-1 if none)
+	struct string *cg_base;  // base CG name for switching arrow 通常/無効
+	int enabled;        // -1 unknown, 0 disabled (nothing to scroll), 1 enabled
+};
+static struct pe_vscrollbar *pe_vscrollbar_get(int parts_no, bool create);
+static void pe_vscrollbar_apply_enabled(struct pe_vscrollbar *sb);
+
+// base CG name + UTF-8 suffix -> new SJIS string (caller frees). For composite
+// widgets whose sub-CGs are stored as "<base><suffix>" in the CG archive
+// (e.g. scrollbar "<base>／バー／通常", "<base>／背景", "<base>／上ボタン／通常").
+static struct string *act_cg_suffix(struct string *base, const char *utf8_suffix)
+{
+	char *sjis = utf2sjis(utf8_suffix, strlen(utf8_suffix));
+	struct string *suf = make_string(sjis, strlen(sjis));
+	struct string *full = string_concatenate(base, suf);
+	free_string(suf);
+	free(sjis);
+	return full;
+}
 
 // Returns the (top-level) parts number built for `node`, or -1 for a leaf/null.
 static int act_build_part(struct pe_activity *a, struct ex_tree *node, int parent_no)
@@ -798,27 +823,84 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			act_float(ti, "スクロールレート", 0.0f));
 		PE_SetClickable(no, true);
 	} else if (ptype == 2 && ti) {
-		// vertical scrollbar (パーツタイプ=2). Same 種類別情報 geometry as the
-		// horizontal slider (全体スクロール量/表示量/スクロールレート). There is no
-		// visual vertical-scrollbar compositor yet, but the BACK LOG viewer *reads*
-		// GetVScrollbarViewSize to decide how many log lines to instantiate
-		// (backlog::detail::CBackLogView@SetLineIndex loops i in 0..ViewSize). With
-		// the old no-op stub ViewSize was 0 → zero lines built → empty list. Register
-		// the track sizes so the getters return real values. TotalSize is overwritten
-		// by the game at runtime (InitVScrollbar sets it to NumofLine); ViewSize comes
-		// from the .pactex here.
+		// vertical scrollbar (パーツタイプ=2). Geometry from 種類別情報: 長さ=track
+		// length (Y), 幅=track width (X), 前/次サイズ=∧/∨ arrow-button heights,
+		// 全体スクロール量/表示量=scroll amounts (also drive how many log lines the
+		// BACK LOG viewer instantiates: SetLineIndex loops i in 0..ViewSize).
+		// ＣＧ名 is a *base* name; the draggable knob is stored per-state as
+		// "<base>／バー／通常|オン|ダウン" (like the horizontal slider). The groove
+		// "<base>／背景" and arrow buttons "<base>／上ボタン|下ボタン" are Cut 2.
+		static const char *const vbar_sfx[4] = { NULL, "／バー／通常", "／バー／オン", "／バー／ダウン" };
+		struct string *cg = act_str(ti, "ＣＧ名");
+		struct string *flat = act_str(ti, "フラット名");
+		int base_x = act_list_int(node, "座標", 0, 0);
+		int base_y = act_list_int(node, "座標", 1, 0);
+		int base_z = act_list_int(node, "座標", 2, 0);
+		int length = act_int(ti, "長さ", 0);
+		int width  = act_int(ti, "幅", 0);
+		int up_sz  = act_int(ti, "前サイズ", 0);
+		int down_sz = act_int(ti, "次サイズ", 0);
+		// The knob is the part's own CG (per-state ／バー).
+		if (cg && cg->size) {
+			for (int s = 1; s <= 3; s++) {
+				struct string *full = act_cg_suffix(cg, vbar_sfx[s]);
+				PE_SetPartsCG(no, full, 0, s);
+				free_string(full);
+			}
+		} else if (flat && flat->size) {
+			PE_SetPartsFlat(no, flat, 1);
+		}
 		int total = act_int(ti, "全体スクロール量", 0);
 		int view  = act_int(ti, "表示量", 1);
 		float rate = act_float(ti, "スクロールレート", 0.0f);
 		PartsEngine_SetVScrollbarTotalSize(no, total);
 		PartsEngine_SetVScrollbarViewSize(no, view);
 		PartsEngine_SetVScrollbarScrollRate(no, rate);
-		// Best-effort visual: load the base CG so the rail shows if present.
-		struct string *cg = act_str(ti, "ＣＧ名");
-		if (cg && cg->size)
-			PE_SetPartsCG(no, cg, 0, 1);
+		PE_InitPartsVScrollbar(no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
+		// Cut 2 — static sibling parts for the rail background and ∧/∨ arrow buttons.
+		// The knob (part `no`) renders above the rail; the arrow buttons sit at the
+		// top/bottom ends of the track (前サイズ/次サイズ tall). They are decorative
+		// (not registered in a->parts) — same pattern as the checkbox text label.
+		int up_no = -1, down_no = -1;
+		if (cg && cg->size) {
+			// Layout down the track: ∧ button (up_sz tall) at the top, the rail
+			// background (length−up−down tall) in the middle, ∨ button (down_sz)
+			// at the bottom. CG sizes confirm this: 60×60 / 60×300 / 60×60 = 420.
+			const struct { const char *sfx; int x, y, z; } deco[3] = {
+				{ "／上ボタン／通常", base_x, base_y,                     base_z     },
+				{ "／背景",           base_x, base_y + up_sz,             base_z - 1 },
+				{ "／下ボタン／通常", base_x, base_y + length - down_sz,  base_z     },
+			};
+			for (int d = 0; d < 3; d++) {
+				struct string *full = act_cg_suffix(cg, deco[d].sfx);
+				int dno = ++pe_act_part_seq;
+				bool ok = PE_SetPartsCG(dno, full, 0, 1);
+				free_string(full);
+				if (ok) {
+					PE_SetPos(dno, deco[d].x, deco[d].y);
+					PE_SetZ(dno, deco[d].z);
+					if (parent_no >= 0)
+						PE_SetParentPartsNumber(dno, parent_no);
+					PE_SetShow(dno, 1);
+					if (d == 0) up_no = dno;
+					else if (d == 2) down_no = dno;
+				}
+			}
+		}
+		// Record arrow parts + base CG so the scrollbar can switch enabled/disabled
+		// (通常/無効 arrows + knob shown/hidden) as the log grows/shrinks.
+		{
+			struct pe_vscrollbar *sb = pe_vscrollbar_get(no, true);
+			sb->up_no = up_no;
+			sb->down_no = down_no;
+			if (sb->cg_base)
+				free_string(sb->cg_base);
+			sb->cg_base = (cg && cg->size) ? string_ref(cg) : NULL;
+			pe_vscrollbar_apply_enabled(sb);
+		}
 		if (getenv("XSYS4_PT_TRACE"))
-			NOTICE("PT vscrollbar no=%d total=%d view=%d rate=%.3f", no, total, view, rate);
+			NOTICE("PT vscrollbar no=%d base=(%d,%d) len=%d w=%d up=%d down=%d total=%d view=%d rate=%.3f",
+			       no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
 		PE_SetClickable(no, true);
 	} else if (ptype == 1 && ti) {
 		// checkbox (パーツタイプ=1): ＣＧ名 is a base; the box has checked/unchecked
@@ -1192,6 +1274,17 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 	int real_size = 16;
 	PE_GetTextFontProps(a, state, NULL, &real_size, NULL, NULL, NULL, NULL);
 	if (size) *size = real_size;
+	// Text outline (обводка): Tsumamigui's message window draws a black glyph edge;
+	// the BACK LOG builds its text from THIS getter's font, so return a black outline
+	// to match. The edge is drawn purely visually — gfx_render_text no longer feeds
+	// edge width into per-glyph advance (see text.c), so this does NOT change letter
+	// spacing. Weight overridable via XSYS4_LOG_EDGE (default 1).
+	{
+		const char *e = getenv("XSYS4_LOG_EDGE");
+		float def = e ? strtof(e, NULL) : 2.5f;  // black outline, ~matches message window
+		if (er) *er = 0; if (eg) *eg = 0; if (eb) *eb = 0;  // black outline
+		if (ew) *ew = def;
+	}
 }
 // Фокус ввода (клавиатурная навигация по кнопкам) в движке не реализован —
 // косметика. Явные заглушки, видимые в исходнике.
@@ -1276,12 +1369,6 @@ struct parts *parts_try_get(int parts_no);
 void parts_msg_push(struct parts *parts, int type, const char *fmt, ...);
 #define PE_PARTS_MSG_SCROLL 20  // == PARTS_MSG_SCROLL (game CallDelegate case 19 + 1)
 
-struct pe_vscrollbar {
-	int parts_no;
-	int total_size;
-	int view_size;
-	int scroll_pos;
-};
 static struct pe_vscrollbar *pe_vscrollbars = NULL;
 static int nr_pe_vscrollbars = 0;
 
@@ -1295,19 +1382,50 @@ static struct pe_vscrollbar *pe_vscrollbar_get(int parts_no, bool create)
 	pe_vscrollbars = xrealloc_array(pe_vscrollbars, nr_pe_vscrollbars,
 			nr_pe_vscrollbars + 1, sizeof(*pe_vscrollbars));
 	struct pe_vscrollbar *sb = &pe_vscrollbars[nr_pe_vscrollbars++];
-	*sb = (struct pe_vscrollbar){ .parts_no = parts_no };
+	*sb = (struct pe_vscrollbar){ .parts_no = parts_no, .up_no = -1, .down_no = -1, .enabled = -1 };
 	return sb;
+}
+
+// Enable/disable the scrollbar visuals by whether there is anything to scroll
+// (max = total - view > 0). The original hides the knob and greys the arrows (無効)
+// when the log fits the view; shows the knob and 通常 arrows when it can scroll.
+static void pe_vscrollbar_apply_enabled(struct pe_vscrollbar *sb)
+{
+	int max = sb->total_size - sb->view_size;
+	int en = max > 0 ? 1 : 0;
+	if (en == sb->enabled)
+		return;
+	sb->enabled = en;
+	PE_SetShow(sb->parts_no, en);  // knob (／バー) visible only when scrollable
+	if (sb->cg_base) {
+		if (sb->up_no >= 0) {
+			struct string *f = act_cg_suffix(sb->cg_base,
+					en ? "／上ボタン／通常" : "／上ボタン／無効");
+			PE_SetPartsCG(sb->up_no, f, 0, 1);
+			free_string(f);
+		}
+		if (sb->down_no >= 0) {
+			struct string *f = act_cg_suffix(sb->cg_base,
+					en ? "／下ボタン／通常" : "／下ボタン／無効");
+			PE_SetPartsCG(sb->down_no, f, 0, 1);
+			free_string(f);
+		}
+	}
 }
 
 static void PartsEngine_SetVScrollbarTotalSize(int parts_no, int size)
 {
-	pe_vscrollbar_get(parts_no, true)->total_size = size;
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, true);
+	sb->total_size = size;
+	pe_vscrollbar_apply_enabled(sb);
 	if (getenv("XSYS4_BL_TRACE"))
 		NOTICE("VScrollbar[%d] TotalSize=%d", parts_no, size);
 }
 static void PartsEngine_SetVScrollbarViewSize(int parts_no, int size)
 {
-	pe_vscrollbar_get(parts_no, true)->view_size = size;
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, true);
+	sb->view_size = size;
+	pe_vscrollbar_apply_enabled(sb);
 	if (getenv("XSYS4_BL_TRACE"))
 		NOTICE("VScrollbar[%d] ViewSize=%d", parts_no, size);
 }
@@ -1331,6 +1449,8 @@ static void PartsEngine_SetVScrollbarScrollPos(int parts_no, int pos)
 	// the clamped pos stays 0 == old, so gating on change suppressed the initial
 	// render and the log stayed empty until enough lines accrued (>ViewSize). No feedback
 	// loop: SetLineIndex never calls back into SetVScrollbarScrollPos.
+	// Reposition the visual knob (if this scrollbar has one) to match the new pos.
+	PE_SetPartsVScrollbarRate(parts_no, max > 0 ? (float)sb->scroll_pos / (float)max : 0.0f);
 	struct parts *p = parts_try_get(parts_no);
 	if (p)
 		parts_msg_push(p, PE_PARTS_MSG_SCROLL, "ii", pos, sb->total_size);
@@ -1343,6 +1463,27 @@ static void PartsEngine_SetVScrollbarScrollRate(int parts_no, float rate)
 	if (rate < 0.0f) rate = 0.0f;
 	if (rate > 1.0f) rate = 1.0f;
 	sb->scroll_pos = (int)(rate * max + 0.5f);
+	// Keep the visual knob in sync with the rate.
+	PE_SetPartsVScrollbarRate(parts_no, rate);
+}
+
+// Called from the parts input layer when the user drags the vertical scrollbar knob.
+// Converts the visual rate to a scroll position and notifies the game's scroll
+// delegate (posts PARTS_MSG_SCROLL -> backlog SetLineIndex rebuilds the view). The
+// knob's own visual position is already updated by parts_vscrollbar_drag_to.
+void PE_OnVScrollbarDragged(int parts_no, float rate)
+{
+	struct pe_vscrollbar *sb = pe_vscrollbar_get(parts_no, false);
+	if (!sb)
+		return;
+	int max = sb->total_size - sb->view_size;
+	if (max < 0) max = 0;
+	if (rate < 0.0f) rate = 0.0f;
+	if (rate > 1.0f) rate = 1.0f;
+	sb->scroll_pos = (int)(rate * max + 0.5f);
+	struct parts *p = parts_try_get(parts_no);
+	if (p)
+		parts_msg_push(p, PE_PARTS_MSG_SCROLL, "ii", sb->scroll_pos, sb->total_size);
 }
 static int PartsEngine_GetVScrollbarTotalSize(int parts_no)
 {
