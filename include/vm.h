@@ -113,7 +113,10 @@ void vm_call(int fno, int struct_page);
 int vm_time(void);
 void vm_sleep(int ms);
 
-void hll_call(int libno, int fno);
+// elem_class: Ixseal's third CALLHLL operand (0 when the .ain doesn't have it).
+// It describes the element type of a generic container and, with it, how many
+// stack slots the call site pushed for an AIN_HLL_PARAM argument.
+void hll_call(int libno, int fno, int elem_class);
 bool library_exists(int libno);
 bool library_function_exists(int libno, int fno);
 void init_libraries(void);

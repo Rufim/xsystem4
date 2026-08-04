@@ -1473,7 +1473,10 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case CALLHLL: {
-		hll_call(get_argument(0), get_argument(1));
+		// Ixseal added a third operand describing the element type of a generic
+		// container (see hll_call). Older games emit only two.
+		int elem_class = instructions[CALLHLL].nr_args >= 3 ? get_argument(2) : 0;
+		hll_call(get_argument(0), get_argument(1), elem_class);
 		break;
 	}
 	case RETURN: {

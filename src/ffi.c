@@ -293,7 +293,30 @@ static void trace_hll_call(struct ain_library *lib, struct ain_hll_function *f,
 }
 #endif /* TRACE_HLL */
 
-void hll_call(int libno, int fno)
+// How many stack slots does a call site push for a generic (AIN_HLL_PARAM)
+// argument? It cannot be derived from the .ain signature: the very same
+// struct-element container is called both with a plain object handle (one slot)
+// and with a wrap reference (two slots — the object's heap slot followed by the
+// index within it). Ixseal's third CALLHLL operand tells the two apart. It packs
+// two 16-bit class codes, the argument form and the element type, in which class
+// 3 means "wrap reference"; the forms that occur in Dohna Dohna are
+//
+//   0x00001  int value                                1 slot
+//   0x00002  string handle                            1 slot
+//   0x10002  object handle into an object container    1 slot
+//   0x10003  wrap<T> element type   (heap slot, 0)     2 slots
+//   0x30002  wrap<T> argument form  (heap slot, 0)     2 slots
+//
+// Games whose CALLHLL has no third operand pass elem_class 0 and always push a
+// single slot, so they keep the old behaviour.
+static int hll_param_slots(int elem_class)
+{
+	if ((elem_class & 0xffff) == 3 || (elem_class >> 16) == 3)
+		return 2;
+	return 1;
+}
+
+void hll_call(int libno, int fno, int elem_class)
 {
 	struct ain_hll_function *f = &ain->libraries[libno].functions[fno];
 
@@ -341,6 +364,38 @@ void hll_call(int libno, int fno)
 			stack[stack_ptr-1].i, stack[stack_ptr-2].i, stack[stack_ptr-3].i, stack[stack_ptr-4].i);
 		for (int k = 0; k < f->nr_arguments; k++)
 			NOTICE("  arg[%d] type=%d", k, f->arguments[k].type.data);
+	}
+
+	// Diagnostic (XSYS4_HLLP_TRACE) for new generic-argument forms: locate the
+	// container argument under both slot counts and report which one actually
+	// lands on an array page, next to the element-class operand that decided it.
+	if (getenv("XSYS4_HLLP_TRACE")) {
+		int g = -1;
+		for (int i = 0; i < f->nr_arguments; i++) {
+			if (f->arguments[i].type.data == AIN_HLL_PARAM)
+				g = i;
+		}
+		if (g > 0 && f->arguments[0].type.data == AIN_REF_ARRAY) {
+			int after = 0;
+			for (int i = g + 1; i < f->nr_arguments; i++) {
+				int t = f->arguments[i].type.data;
+				after += (t == AIN_REF_INT || t == AIN_REF_LONG_INT
+					  || t == AIN_REF_BOOL || t == AIN_REF_FLOAT) ? 2 : 1;
+			}
+			int base = stack_ptr - after - 1;
+			int c1 = base - 1 >= 0 ? stack[base - 1].i : -1;
+			int c2 = base - 2 >= 0 ? stack[base - 2].i : -1;
+			#define PROBE_IS_ARRAY(x) (heap_index_valid(x) && heap[x].page \
+					&& heap[x].page->type == ARRAY_PAGE)
+			NOTICE("HLLP %s.%s elem_class=0x%x chose=%d slots1=%s(a_type=%d) slots2=%s(a_type=%d)",
+			       ain->libraries[libno].name, f->name, elem_class,
+			       hll_param_slots(elem_class),
+			       PROBE_IS_ARRAY(c1) ? "ARRAY" : "no",
+			       PROBE_IS_ARRAY(c1) ? heap[c1].page->index : -1,
+			       PROBE_IS_ARRAY(c2) ? "ARRAY" : "no",
+			       PROBE_IS_ARRAY(c2) ? heap[c2].page->index : -1);
+			#undef PROBE_IS_ARRAY
+		}
 	}
 
 	for (int i = f->nr_arguments - 1; i >= 0; i--) {
@@ -395,13 +450,21 @@ void hll_call(int libno, int fno)
 			if (f->arguments[i].type.data == AIN_REF_ARRAY)
 				ref_array_slot = heap_slots[i];
 			break;
-		case AIN_HLL_PARAM:
+		case AIN_HLL_PARAM: {
 			// Generic container element: pass a pointer to the raw stack slot;
-			// the callee interprets it per the array's element type.
-			stack_ptr--;
+			// the callee interprets it per the array's element type. A wrap
+			// reference occupies two slots — the object's heap slot plus the
+			// index within it — and the value the callee wants is the lower one.
+			int slots = hll_param_slots(elem_class);
+			stack_ptr -= slots;
+			if (slots == 2 && stack[stack_ptr + 1].i != 0) {
+				WARNING("%s.%s: generic wrap argument with non-zero element index %d",
+					ain->libraries[libno].name, f->name, stack[stack_ptr + 1].i);
+			}
 			ptrs[i] = &stack[stack_ptr];
 			args[i] = &ptrs[i];
 			break;
+		}
 		default:
 			stack_ptr--;
 			args[i] = &stack[stack_ptr];
