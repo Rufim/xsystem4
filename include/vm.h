@@ -110,6 +110,10 @@ union vm_value vm_copy(union vm_value v, enum ain_data_type type);
 
 int vm_execute_ain(struct ain *program);
 void vm_call(int fno, int struct_page);
+// Ixseal-лямбды (AIN_HLL_FUNC): пара (страница объекта, номер функции) со стека
+// сайта CALLHLL. См. src/vm.c — используются предикатами/компараторами Array.
+int vm_hll_func_nr_args(int fno);
+union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *argv, int argc);
 int vm_time(void);
 void vm_sleep(int ms);
 

@@ -43,6 +43,7 @@ static struct hll_function **libraries = NULL;
 // См. hll.h: число аргументов текущего HLL-вызова, чтобы реализация могла
 // отличить свои перегрузки (они делят один C-указатель).
 int hll_current_nr_args = 0;
+struct ain_hll_function *hll_current_fn = NULL;
 
 bool library_exists(int libno)
 {
@@ -377,6 +378,10 @@ void hll_call(int libno, int fno, int elem_class)
 	// reallocation during HLL calls.
 	void *heap_ptrs[HLL_MAX_ARGS];
 	int heap_slots[HLL_MAX_ARGS];
+	// Ixseal-лямбда (AIN_HLL_FUNC) — пара (страница объекта, номер функции).
+	// Держим КОПИЮ, а не указатель в стек VM: реализация зовёт VM обратно, и
+	// та затирает слоты стека ниже stack_ptr.
+	union vm_value func_pairs[HLL_MAX_ARGS][2];
 
 	if (getenv("XSYS4_HLL_TRACE"))
 		NOTICE("HLL %s.%s", ain->libraries[libno].name, f->name);
@@ -511,6 +516,20 @@ void hll_call(int libno, int fno, int elem_class)
 			args[i] = &ptrs[i];
 			break;
 		}
+		case AIN_HLL_FUNC:
+			// Ixseal: лямбда/предикат приходит ДВУМЯ слотами — (страница
+			// объекта, номер функции): сайт кладёт `PUSHSTRUCTPAGE; PUSH <fno>`
+			// (см. Array.EraseAll/Any/Where/Sort — 20 функций, ~740 сайтов).
+			// Реализация вызовет VM обратно, поэтому пару КОПИРУЕМ: указатель
+			// в стек VM затёрся бы аргументами вложенного вызова.
+			// Старые игры аргументов типа 95 не имеют вообще (0 у v6/v7),
+			// поэтому ветка структурно гейтится.
+			stack_ptr -= 2;
+			func_pairs[i][0] = stack[stack_ptr];
+			func_pairs[i][1] = stack[stack_ptr + 1];
+			ptrs[i] = func_pairs[i];
+			args[i] = &ptrs[i];
+			break;
 		default:
 			stack_ptr--;
 			args[i] = &stack[stack_ptr];
@@ -531,13 +550,16 @@ void hll_call(int libno, int fno, int elem_class)
 		// Сохраняем/восстанавливаем: HLL-функция может вызвать VM обратно,
 		// и вложенный HLL-вызов затрёт значение.
 		int saved_nr_args = hll_current_nr_args;
+		struct ain_hll_function *saved_fn = hll_current_fn;
 		hll_current_nr_args = f->nr_arguments;
+		hll_current_fn = f;
 #ifdef TRACE_HLL
 		trace_hll_call(&ain->libraries[libno], f, fun, &r, args);
 #else
 		ffi_call(&fun->cif, (void*)fun->fun, &r, args);
 #endif
 		hll_current_nr_args = saved_nr_args;
+		hll_current_fn = saved_fn;
 	}
 
 
@@ -965,8 +987,12 @@ static ffi_type *ain_to_ffi_type(enum ain_data_type type)
 	// function index.
 	case AIN_HLL_PARAM:
 		return &ffi_type_pointer;
+	// Ixseal-лямбда: реализация получает УКАЗАТЕЛЬ на пару (страница, fno) —
+	// см. AIN_HLL_FUNC в hll_call. Как тип ВОЗВРАТА тип 95 не встречается ни в
+	// одной библиотеке ни одной из игр (проверено ainliball), так что смена
+	// ffi-типа затрагивает только аргументы.
 	case AIN_HLL_FUNC:
-		return &ffi_type_sint32;
+		return &ffi_type_pointer;
 	// A reference to a generic element (e.g. Array.At's return) is represented
 	// as the element's own value/heap-slot — a single integer slot.
 	case AIN_REF_HLL_PARAM:

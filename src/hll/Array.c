@@ -14,6 +14,7 @@
  * along with this program; if not, see <http://gnu.org/licenses/>.
  */
 
+#include "vm.h"
 #include "hll.h"
 #include "vm/page.h"
 #include "vm/heap.h"
@@ -433,11 +434,93 @@ static int Array_ix_Fill(struct page **self, union vm_value *value)
 	return array_fill(*self, 0, array_numof(*self, 1), *value);
 }
 
+/*
+ * --- Предикаты и компараторы (Ixseal, тип аргумента AIN_HLL_FUNC) ---
+ *
+ * Сайт кладёт лямбду ДВУМЯ слотами — (страница объекта, номер функции), —
+ * и ffi отдаёт реализации указатель на эту пару (см. ffi.c). Сигнатуры лямбд
+ * взяты из .ain: предикат — ОДИН аргумент-элемент и возврат bool, компаратор —
+ * ДВА аргумента и тоже bool, т.е. `less(a, b)` как в std::sort.
+ *
+ * Перегрузки «по значению» и «по предикату» имеют ОДИНАКОВУЮ арность и
+ * одинаковый тип возврата (напр. `Find(self, 74)` и `Find(self, 95)`), поэтому
+ * различить их можно только по объявленным типам — через hll_current_fn.
+ */
+static bool ix_arg_is_func(int i)
+{
+	return hll_current_fn && i < (int)hll_current_fn->nr_arguments
+		&& hll_current_fn->arguments[i].type.data == AIN_HLL_FUNC;
+}
+
+// Позвать предикат для элемента `index`. Аргументы лямбды — слоты элемента
+// (у wrap<интерфейса> их два, и компилятор объявляет оба).
+static bool ix_pred(union vm_value *fn, struct page *a, int index)
+{
+	int slots = array_elem_slots(a);
+	int argc = vm_hll_func_nr_args(fn[1].i);
+	if (argc > slots)
+		argc = slots;
+	return vm_call_hll_func(fn, &a->values[index * slots], argc).i != 0;
+}
+
+// Компаратор `less(a, b)`: слоты обоих элементов подряд.
+static bool ix_less(union vm_value *fn, struct page *a, int i, int j)
+{
+	int slots = array_elem_slots(a);
+	union vm_value argv[4];
+	int argc = vm_hll_func_nr_args(fn[1].i);
+	if (argc > 2 * slots)
+		argc = 2 * slots;
+	for (int k = 0; k < slots && k < 2; k++) {
+		argv[k] = a->values[i * slots + k];
+		argv[slots + k] = a->values[j * slots + k];
+	}
+	return vm_call_hll_func(fn, argv, argc).i != 0;
+}
+
+// Индекс первого/последнего элемента, удовлетворяющего предикату (-1 если нет).
+static int ix_find_pred(struct page **self, union vm_value *fn, bool last)
+{
+	if (!self || !*self || !fn)
+		return -1;
+	int n = array_numof(*self, 1);
+	int found = -1;
+	for (int i = 0; i < n; i++) {
+		// Массив может быть перевыделен лямбдой — берём страницу каждый раз.
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		if (ix_pred(fn, *self, i)) {
+			found = i;
+			if (!last)
+				break;
+		}
+	}
+	return found;
+}
+
 static int Array_ix_Find(struct page **self, union vm_value *search)
 {
 	if (!self || !*self || !search)
 		return -1;
+	if (ix_arg_is_func(1))
+		return ix_find_pred(self, search, false);
 	return array_find(*self, 0, array_numof(*self, 1), *search, 0);
+}
+
+static int Array_ix_FindLast(struct page **self, union vm_value *search)
+{
+	if (!self || !*self || !search)
+		return -1;
+	if (ix_arg_is_func(1))
+		return ix_find_pred(self, search, true);
+	// Значение-перегрузка: ищем последнее вхождение перебором.
+	int n = array_numof(*self, 1);
+	int found = -1;
+	for (int i = 0; i < n; i++) {
+		if (array_find(*self, i, i + 1, *search, 0) >= 0)
+			found = i;
+	}
+	return found;
 }
 
 static bool Array_ix_IsExist(struct page **self, union vm_value *search)
@@ -445,14 +528,219 @@ static bool Array_ix_IsExist(struct page **self, union vm_value *search)
 	return Array_ix_Find(self, search) >= 0;
 }
 
+// bool Any(self) — «есть хоть один элемент»; bool Any(self, предикат) — «есть
+// подходящий». bool All(self, предикат) — «все подходят» (на пустом — true,
+// как принято у all_of).
+static bool Array_ix_Any(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		return ix_find_pred(self, fn, false) >= 0;
+	return self && *self && array_numof(*self, 1) > 0;
+}
+
+static bool Array_ix_All(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return true;
+	int n = array_numof(*self, 1);
+	for (int i = 0; i < n; i++) {
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		if (!ix_pred(fn, *self, i))
+			return false;
+	}
+	return true;
+}
+
+// int Numof/Count(self) — размер; с предикатом — сколько подходит.
+static int Array_ix_Count(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return 0;
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1))
+		return array_numof(*self, 1);
+	int n = array_numof(*self, 1), c = 0;
+	for (int i = 0; i < n; i++) {
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		if (ix_pred(fn, *self, i))
+			c++;
+	}
+	return c;
+}
+
+// bool EraseAll(self, предикат) / bool Erase(self, предикат) — удалить ВСЕ
+// подходящие элементы. Идём с конца, чтобы индексы не съезжали.
+static bool Array_ix_EraseAll(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return false;
+	bool any = false;
+	for (int i = array_numof(*self, 1) - 1; i >= 0; i--) {
+		if (!*self || i >= array_numof(*self, 1))
+			continue;
+		if (!ix_pred(fn, *self, i))
+			continue;
+		bool ok = false;
+		*self = array_erase(*self, i, &ok);
+		any = any || ok;
+	}
+	return any;
+}
+
+// bool Remain(self, предикат) — оставить только подходящие (инверсия EraseAll).
+static bool Array_ix_Remain(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return false;
+	bool any = false;
+	for (int i = array_numof(*self, 1) - 1; i >= 0; i--) {
+		if (!*self || i >= array_numof(*self, 1))
+			continue;
+		if (ix_pred(fn, *self, i))
+			continue;
+		bool ok = false;
+		*self = array_erase(*self, i, &ok);
+		any = any || ok;
+	}
+	return any;
+}
+
+// Min/Max по компаратору less: индекс наименьшего/наибольшего элемента.
+static int ix_extreme(struct page **self, union vm_value *fn, bool want_max)
+{
+	if (!self || !*self)
+		return -1;
+	int n = array_numof(*self, 1);
+	if (n == 0)
+		return -1;
+	int best = 0;
+	for (int i = 1; i < n; i++) {
+		bool i_less_best = ix_less(fn, *self, i, best);
+		if (want_max ? ix_less(fn, *self, best, i) : i_less_best)
+			best = i;
+	}
+	return best;
+}
+
+// int First/Last(self[, предикат]) — индекс; ffi материализует из него ссылку
+// на элемент по типу элемента (см. AIN_REF_HLL_PARAM в ffi.c).
+static int Array_ix_First(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return -1;
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		return ix_find_pred(self, fn, false);
+	return array_numof(*self, 1) > 0 ? 0 : -1;
+}
+
+static int Array_ix_Last(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return -1;
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		return ix_find_pred(self, fn, true);
+	int n = array_numof(*self, 1);
+	return n > 0 ? n - 1 : -1;
+}
+
+// int Min/Max(self, компаратор) — индекс крайнего элемента по `less`.
+// Форма БЕЗ компаратора в байт-коде обеих игр не встречается (все сайты кладут
+// лямбду), а «естественный» порядок для произвольного элемента не определён —
+// поэтому она сообщает о себе, а не тихо возвращает мусор.
+static int Array_ix_Min(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1)) {
+		WARNING("Array.Min без компаратора: форма не встречалась в байт-коде");
+		return -1;
+	}
+	return ix_extreme(self, fn, false);
+}
+
+static int Array_ix_Max(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1)) {
+		WARNING("Array.Max без компаратора: форма не встречалась в байт-коде");
+		return -1;
+	}
+	return ix_extreme(self, fn, true);
+}
+
+/*
+ * array<T> Where(self, предикат) — НОВЫЙ массив из подходящих элементов.
+ * Возврат типа 79 уходит на стек как есть (ffi: default-ветка), поэтому отдаём
+ * heap-СЛОТ страницы, а не сам указатель: сырой page* был бы прочитан как
+ * индекс слота. Вызывающий владеет слотом и освобождает его своим DELETE.
+ */
+static int Array_ix_Where(struct page **self, union vm_value *fn)
+{
+	int slot = heap_alloc_slot(VM_PAGE);
+	if (!self || !*self || !fn) {
+		heap_set_page(slot, NULL);
+		return slot;
+	}
+	struct page *src = *self;
+	enum ain_data_type dt = ix_dtype(src);
+	int st = ix_stype(src);
+	int eslots = array_elem_slots(src);
+	union vm_value dim = { .i = 0 };
+	struct page *out = alloc_array(ix_rank(src), &dim, dt, st, false);
+
+	int n = array_numof(src, 1);
+	for (int i = 0; i < n; i++) {
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		src = *self;
+		if (!ix_pred(fn, src, i))
+			continue;
+		// Элемент-объект попадает в новый контейнер по ссылке — он должен
+		// получить свой счётчик (как в Array_PushBack).
+		if (ix_elem_is_object(dt))
+			heap_ref(src->values[i * eslots].i);
+		out = array_pushback_n(out, &src->values[i * eslots], eslots, dt, st);
+	}
+	heap_set_page(slot, out);
+	return slot;
+}
+
+// Сортировка компаратором `less` (Ixseal). Вставками: устойчиво, не зависит от
+// согласованности лямбды (qsort с «плохим» компаратором может выйти за границы),
+// а списки здесь — интерфейсные, короткие.
+static void ix_swap_elems(struct page *a, int i, int j, int slots)
+{
+	for (int k = 0; k < slots; k++) {
+		union vm_value t = a->values[i * slots + k];
+		a->values[i * slots + k] = a->values[j * slots + k];
+		a->values[j * slots + k] = t;
+	}
+}
+
+static void ix_sort_pred(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return;
+	int slots = array_elem_slots(*self);
+	int n = array_numof(*self, 1);
+	for (int i = 1; i < n; i++) {
+		for (int j = i; j > 0 && ix_less(fn, *self, j, j - 1); j--)
+			ix_swap_elems(*self, j, j - 1, slots);
+	}
+}
+
 // These sort in place. The .ain declares an array/wrap return (for fluent
 // chaining), but a raw page pointer must never be pushed as a VM value (it would
 // be misread as a heap-slot index). Returning null is safe for the common
 // statement-style usage; callers that chain would need the real handle, which
 // isn't available here.
-static struct page *Array_ix_Sort(struct page **self)
+static struct page *Array_ix_Sort(struct page **self, union vm_value *fn)
 {
-	if (self)
+	if (!self)
+		return NULL;
+	// Sort/QuickSort(self, компаратор): лямбда — `less(a, b)` -> bool (взято из
+	// её сигнатуры в .ain: два аргумента-элемента, возврат 47).
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		ix_sort_pred(self, fn);
+	else
 		array_sort(*self, 0);
 	return NULL;
 }
@@ -512,37 +800,24 @@ static int Array_At(struct page **self, int index)
 	return index;
 }
 
-// First/Last: ссылка на первый/последний элемент (Ixseal). Как At с
-// фиксированным индексом; -1 на пустом массиве. hll_call() материализует
-// конкретный ref из индекса по типу элемента. Перегрузка с предикатом
-// (…, HLL_FUNC) НЕ применяет предикат — возвращаем простой первый/последний
-// (безопасно: лишний arg в cif игнорируется этой C-функцией).
-static int Array_First(struct page **self)
-{
-	if (!self || !*self)
-		return -1;
-	return array_numof(*self, 1) > 0 ? 0 : -1;
-}
-
-static int Array_Last(struct page **self)
-{
-	if (!self || !*self)
-		return -1;
-	int n = array_numof(*self, 1);
-	return n > 0 ? n - 1 : -1;
-}
-
 HLL_LIBRARY(Array,
 	    HLL_EXPORT(Alloc, Array_Alloc),
 	    HLL_EXPORT(EmplaceBack, Array_EmplaceBack),
 	    HLL_EXPORT(At, Array_At),
-	    HLL_EXPORT(First, Array_First),
-	    HLL_EXPORT(Last, Array_Last),
+	    HLL_EXPORT(First, Array_ix_First),
+	    HLL_EXPORT(Last, Array_ix_Last),
+	    HLL_EXPORT(Min, Array_ix_Min),
+	    HLL_EXPORT(Max, Array_ix_Max),
 	    HLL_EXPORT(Realloc, Array_Realloc),
 	    HLL_EXPORT(Free, Array_Free),
 	    HLL_EXPORT(Clear, Array_ix_Clear),
-	    HLL_EXPORT(Numof, Array_ix_Numof),
-	    HLL_EXPORT(Count, Array_ix_Numof),
+	    HLL_EXPORT(Numof, Array_ix_Count),
+	    HLL_EXPORT(Count, Array_ix_Count),
+	    HLL_EXPORT(Any, Array_ix_Any),
+	    HLL_EXPORT(All, Array_ix_All),
+	    HLL_EXPORT(Where, Array_ix_Where),
+	    HLL_EXPORT(EraseAll, Array_ix_EraseAll),
+	    HLL_EXPORT(Remain, Array_ix_Remain),
 	    HLL_EXPORT(Empty, Array_Empty),
 	    HLL_EXPORT(PushBack, Array_PushBack),
 	    HLL_EXPORT(Add, Array_PushBack),
@@ -556,7 +831,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Reverse, Array_Reverse),
 	    HLL_EXPORT(Fill, Array_ix_Fill),
 	    HLL_EXPORT(Find, Array_ix_Find),
-	    HLL_EXPORT(FindLast, Array_ix_Find),
+	    HLL_EXPORT(FindLast, Array_ix_FindLast),
 	    HLL_EXPORT(IsExist, Array_ix_IsExist),
 	    HLL_EXPORT(Sort, Array_ix_Sort),
 	    HLL_EXPORT(AscSort, Array_ix_Sort),

@@ -35,6 +35,16 @@ void static_library_replace(struct static_library *lib, const char *name, void *
  */
 extern int hll_current_nr_args;
 
+/*
+ * Текущая объявленная HLL-функция (та же перегрузка, что вызывается сейчас).
+ * Нужна там, где перегрузки отличаются ТИПАМИ аргументов при ОДИНАКОВОЙ арности
+ * и одинаковом типе возврата — hll_current_nr_args там бессилен, а декорация
+ * имени (HLL_EXPORT_F) различает только float-возврат. Пример: Ixseal объявляет
+ * `Array.Find(self, значение)` и `Array.Find(self, предикат)` — обе с двумя
+ * аргументами и int-возвратом, отличается лишь тип второго (74 против 95).
+ */
+extern struct ain_hll_function *hll_current_fn;
+
 #define HLL_WARN_UNIMPLEMENTED(rval, rtype, libname, fname, ...)	\
 	static rtype libname ## _ ## fname(__VA_ARGS__) {		\
 		WARNING("Unimplemented HLL function: " #libname "." #fname); \

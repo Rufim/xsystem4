@@ -787,6 +787,68 @@ static void delegate_call(int dg_no, int return_address)
 	}
 }
 
+/*
+ * Сколько слотов-аргументов объявлено у игровой функции. Для многослотового
+ * аргумента (напр. `wrap<интерфейс>`) компилятор объявляет и филлеры `<void>`,
+ * поэтому nr_args уже равен числу СЛОТОВ, которые нужно положить на стек.
+ */
+int vm_hll_func_nr_args(int fno)
+{
+	if (fno < 0 || fno >= ain->nr_functions)
+		return -1;
+	return ain->functions[fno].nr_args;
+}
+
+/*
+ * Синхронно вызвать игровую лямбду из реализации HLL-функции — механизм
+ * Ixseal-предикатов и компараторов (`Array.EraseAll/Any/Where/Sort/...`, тип
+ * аргумента AIN_HLL_FUNC). Сайт кладёт лямбду ДВУМЯ слотами — (страница
+ * объекта, номер функции), — они приходят сюда в `fn`.
+ *
+ * `argv`/`argc` — уже готовые слоты аргументов; argc обязан совпадать с
+ * `vm_hll_func_nr_args(fno)`. Порядок на стеке для метода: [ресивер, арг0..],
+ * т.е. ресивер ЛЕЖИТ ПОД аргументами (method_call сначала снимает аргументы,
+ * потом ресивер) — поэтому обычный vm_call() здесь не годится, он умеет только
+ * методы без аргументов.
+ *
+ * Возвращается первый слот результата (предикат/компаратор отдают bool).
+ */
+union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *argv, int argc)
+{
+	union vm_value ret = { .i = 0 };
+	if (!fn)
+		return ret;
+	int obj = fn[0].i;
+	int fno = fn[1].i;
+	int want = vm_hll_func_nr_args(fno);
+	if (want < 0) {
+		WARNING("vm_call_hll_func: неверный номер функции %d", fno);
+		return ret;
+	}
+	if (want != argc) {
+		WARNING("vm_call_hll_func: fn %d объявляет %d слотов аргументов, передано %d",
+			fno, want, argc);
+		return ret;
+	}
+
+	size_t saved_ip = instr_ptr;
+	bool method = heap_index_valid(obj) && heap[obj].page;
+	if (method)
+		stack_push(obj);
+	for (int i = 0; i < argc; i++)
+		stack[stack_ptr++] = argv[i];
+	if (method)
+		method_call(fno, VM_RETURN);
+	else
+		function_call(fno, VM_RETURN);
+	vm_execute();
+	instr_ptr = saved_ip;
+
+	if (ain->functions[fno].return_type.data != AIN_VOID)
+		ret = stack_pop();
+	return ret;
+}
+
 void vm_call(int fno, int struct_page)
 {
 	size_t saved_ip = instr_ptr;
