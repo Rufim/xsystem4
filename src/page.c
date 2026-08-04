@@ -98,6 +98,14 @@ union vm_value variable_initval(enum ain_data_type type)
 	// значение игра пишет как -1 (см. init_option_vars ниже).
 	case AIN_OPTION:
 	case AIN_WRAP:
+	// Ссылка на интерфейс (AIN_IFACE, тип 89) — такая же 2-слотовая ссылка
+	// (объект, база интерфейса) с null-значением -1. Что маркер именно -1,
+	// видно в самом байткоде: освободив временный `var[7]` типа 89, игра
+	// пишет туда `PUSH -1; X_ASSIGN 1` (напр. хвост
+	// `ArrayExtensions::Select<ref Motion::IArgument, string>`). При
+	// инициализации нулём первый же `X_REF 1; DELETE` на непроинициализированном
+	// временном уносил heap-слот 0 → double free.
+	case AIN_IFACE:
 		return (union vm_value) { .i = -1 };
 	case AIN_ARRAY_TYPE:
 	case AIN_DELEGATE:
