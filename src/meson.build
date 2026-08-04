@@ -5,6 +5,7 @@ version_h = vcs_tag(command : ['git', 'describe', 'HEAD'],
 
 # sources for xsystem4
 xsystem4 = [version_h,
+            'regex_ecma.cpp',
             'android_bridge.c',
             'audio.c',
             'audio_meta.c',
@@ -229,6 +230,7 @@ endif
 executable('xsystem4', xsystem4,
            dependencies : xsystem4_deps,
            c_args : ['-Wno-unused-parameter'],
+           cpp_args : ['-Wno-unused-parameter'],
            link_args : static_link_args,
            include_directories : incdir,
            win_subsystem : winsys,
