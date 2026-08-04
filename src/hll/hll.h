@@ -26,6 +26,15 @@
 
 void static_library_replace(struct static_library *lib, const char *name, void *fun);
 
+/*
+ * Число аргументов, объявленное в .ain для ВЫПОЛНЯЕМОГО СЕЙЧАС HLL-вызова.
+ * Линковка сопоставляет функции по имени, поэтому все перегрузки библиотеки
+ * (напр. `String.GetPart(index)` и `String.GetPart(index, len)`) делят один
+ * C-указатель, а cif у каждой свой. Читать параметр, которого нет в cif,
+ * нельзя — этот счётчик позволяет реализации узнать свою перегрузку.
+ */
+extern int hll_current_nr_args;
+
 #define HLL_WARN_UNIMPLEMENTED(rval, rtype, libname, fname, ...)	\
 	static rtype libname ## _ ## fname(__VA_ARGS__) {		\
 		WARNING("Unimplemented HLL function: " #libname "." #fname); \

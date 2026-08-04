@@ -169,6 +169,17 @@ bool PE_SetText(int parts_no, struct string *text, int state)
 	return true;
 }
 
+// Текст, ранее заданный SetText/AddPartsText. Ixseal-игры читают его обратно
+// (CTextParts@Text::get), напр. чтобы измерить ширину строки.
+struct string *PE_GetTextPartsText(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return string_ref(&EMPTY_STRING);
+
+	struct parts *parts = parts_get(parts_no);
+	return parts_text_get(parts_get_text(parts, state));
+}
+
 bool PE_AddPartsText(int parts_no, struct string *text, int state)
 {
 	if (!parts_state_valid(--state))

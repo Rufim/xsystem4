@@ -39,6 +39,10 @@ struct hll_function {
 
 static struct hll_function **libraries = NULL;
 
+// См. hll.h: число аргументов текущего HLL-вызова, чтобы реализация могла
+// отличить свои перегрузки (они делят один C-указатель).
+int hll_current_nr_args = 0;
+
 bool library_exists(int libno)
 {
 	return libraries[libno];
@@ -479,12 +483,19 @@ void hll_call(int libno, int fno, int elem_class)
 		r.i = 0;
 		if (f->return_type.data == AIN_STRING)
 			r.ref = string_ref(&EMPTY_STRING);
-	} else
+	} else {
+		// Сообщаем реализации её перегрузку (см. hll_current_nr_args в hll.h).
+		// Сохраняем/восстанавливаем: HLL-функция может вызвать VM обратно,
+		// и вложенный HLL-вызов затрёт значение.
+		int saved_nr_args = hll_current_nr_args;
+		hll_current_nr_args = f->nr_arguments;
 #ifdef TRACE_HLL
-	trace_hll_call(&ain->libraries[libno], f, fun, &r, args);
+		trace_hll_call(&ain->libraries[libno], f, fun, &r, args);
 #else
-	ffi_call(&fun->cif, (void*)fun->fun, &r, args);
+		ffi_call(&fun->cif, (void*)fun->fun, &r, args);
 #endif
+		hll_current_nr_args = saved_nr_args;
+	}
 
 
 	for (int i = 0, j = 0; i < f->nr_arguments; i++, j++) {
@@ -703,6 +714,7 @@ extern struct static_library lib_SealEngine;
 extern struct static_library lib_SengokuRanceFont;
 extern struct static_library lib_Sound2ex;
 extern struct static_library lib_SoundFilePlayer;
+extern struct static_library lib_String;
 extern struct static_library lib_StoatSpriteEngine;
 extern struct static_library lib_StretchHelper;
 extern struct static_library lib_system;
@@ -830,6 +842,7 @@ static struct static_library *static_libraries[] = {
 	&lib_SoundFilePlayer,
 	&lib_StoatSpriteEngine,
 	&lib_StretchHelper,
+	&lib_String,
 	&lib_system,
 	&lib_SystemService,
 	&lib_SystemServiceEx,
