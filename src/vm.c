@@ -1556,16 +1556,71 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case X_ICAST: {
-		// TODO: пока не реализованы — логируем контекст для реверса и падаем.
-		if (getenv("XSYS4_TRACE_X")) {
-			WARNING("X_TRACE op=0x%04x %s arg0=%d arg1=%d sp=%d top=[%d %d %d %d %d %d]",
-				opcode, instructions[opcode].name,
-				get_argument(0), get_argument(1), stack_ptr,
-				stack_ptr>0?stack[stack_ptr-1].i:0, stack_ptr>1?stack[stack_ptr-2].i:0,
-				stack_ptr>2?stack[stack_ptr-3].i:0, stack_ptr>3?stack[stack_ptr-4].i:0,
-				stack_ptr>4?stack[stack_ptr-5].i:0, stack_ptr>5?stack[stack_ptr-6].i:0);
+		/*
+		 * Приведение ссылки к типу-операнду (оператор «as»): снимает ОДИН слот
+		 * (хэндл объекта) и кладёт ТРИ — `[obj, base, тег]`:
+		 *   тег 0 = приведение удалось (та же конвенция, что у `option<T>`:
+		 *           0 = значение ЕСТЬ), >=1 = не удалось;
+		 *   base  = смещение методов целевого интерфейса в vtable объекта, т.е.
+		 *           вторая половина 2-слотовой пары `wrap<интерфейс>`;
+		 *   obj   = сам объект (на провале -1).
+		 *
+		 * Форма снята с байткода. Сайт с интерфейсной целью
+		 * (`activityeditor::detail::CInstanceItem@GetSprite` @0x5C50A,
+		 * цель 394=ISpriteParts) прямо показывает и число слотов, и смысл тега:
+		 *   X_ICAST 394; PUSH 1; GTE; IFNZ fail
+		 *   fail: POP; POP; PUSH -1; PUSH 0      // пара → null-интерфейс
+		 *   ok:   X_DUP 2 ...                    // пара идёт в дело
+		 * т.е. проверяется `тег >= 1` = НЕ удалось, а на успехе остаётся пара.
+		 * Сайт со структурной целью (`Motion::EasingArgumentAnalyzer@
+		 * AnalyzeEasingType` @0x597D4E, цель 623=Motion::ArgumentEasingType)
+		 * делает `X_ICAST 623; X_MOV 2 1; POP; POP` — отбрасывает base и тег и
+		 * оставляет obj, а провал ловит сравнением `obj != -1`; поэтому на
+		 * провале obj обязан быть -1. Оба варианта требуют ровно +2 слота к
+		 * входному — это же следует из баланса стека обеих функций.
+		 *
+		 * `base` берётся из .ain: у структуры есть список реализованных
+		 * интерфейсов `interfaces[] = {struct_type, vtable_offset}` (libsys4
+		 * его давно читает, движок не использовал). Проверено: у
+		 * Motion::ArgumentEasingType(623) и ArgumentDigit(621) — по одному
+		 * интерфейсу Motion::IArgument(620) с vtable_offset=0.
+		 */
+		int target = get_argument(0);
+		if (instructions[opcode].nr_args >= 2 && get_argument(1) != 0)
+			WARNING("X_ICAST: второй операнд %d != 0 — назначение не установлено",
+				get_argument(1));
+		int src = stack_pop().i;
+		int base = -1;
+		if (heap_index_valid(src) && heap[src].page
+		    && heap[src].page->type == STRUCT_PAGE) {
+			// index у STRUCT_PAGE — номер структуры объекта.
+			int st = heap[src].page->index;
+			if (st == target) {
+				// Приведение к собственному типу (в т.ч. обратное
+				// приведение интерфейс→конкретный класс): методы объекта
+				// лежат с начала его vtable.
+				base = 0;
+			} else if (st >= 0 && st < ain->nr_structures) {
+				struct ain_struct *s = &ain->structures[st];
+				for (int i = 0; i < s->nr_interfaces; i++) {
+					if (s->interfaces[i].struct_type == target) {
+						base = s->interfaces[i].vtable_offset;
+						break;
+					}
+				}
+			}
 		}
-		VM_ERROR("Unimplemented X_ opcode: 0x%04x (%s)", opcode, instructions[opcode].name);
+		if (base < 0) {
+			// Не удалось: null-объект и тег «пусто».
+			stack_push(-1);
+			stack_push(0);
+			stack_push(1);
+		} else {
+			stack_push(src);
+			stack_push(base);
+			stack_push(0);
+		}
+		break;
 	}
 	//
 	// --- Variables ---
