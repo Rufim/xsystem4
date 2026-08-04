@@ -689,22 +689,27 @@ static void method_call(int fno, int return_address)
 
 static void vm_execute(void);
 
-// Number of stack slots a delegate return value occupies. Ixseal (System 4
-// v14) option returns (AIN_OPTION, e.g. `DG_DeletedHandler?`) are TWO slots
-// [value, tag]; ordinary returns are one slot, void is zero. Older games never
-// use AIN_OPTION delegate returns, so this is identical to the previous
-// (void?0:1) behaviour for them — the two-slot case is naturally gated by the
-// return type itself. Getting this wrong shifts the delegate loop's dg_page/
-// dg_index peek offsets and leaks the extra return slot up the call chain,
-// which is what corrupted a ref far away in CSpriteParts@0's constructor.
+// Number of stack slots a delegate return value occupies — ровно та же мера,
+// что у возврата обычной функции, поэтому считаем её тем же `type_slots()`
+// (это и инвариант XSYS4_SP_CHECK). Ixseal возвращает из делегатов и
+// многослотовые значения: `option<T>` = слоты T плюс тег, `AIN_IFACE`(89) и
+// `wrap<интерфейс>`(100) = пара (объект, база интерфейса). Раньше здесь стояла
+// частная таблица (void→0, AIN_OPTION→2, иначе 1): она верна для void, скаляров
+// и всех 62 `option<delegate>`-делегатов Dohna, но недосчитывала 6 делегатов с
+// возвратом `AIN_IFACE` и 18 с `wrap<интерфейс>`.
+// Ошибка здесь сдвигает peek-смещения dg_page/dg_index в цикле делегата и
+// протаскивает лишний слот вверх по цепочке вызовов: на втором витке DG_CALL
+// вместо страницы делегата читался уже инкрементированный dg_index
+// (`Not a delegate page: 1` в `ArrayExtensions::Select<ref Motion::IArgument,
+// string>`), а до того так же портился ref далеко в конструкторе CSpriteParts@0.
+// Старые игры (v6/v7) многослотовых возвратов у делегатов не имеют вовсе, т.е.
+// гейт структурный — по самому типу возврата.
+// Самый широкий возврат, встречающийся у Ixseal: `option<wrap<интерфейс>>` = 3.
+#define DG_MAX_RETURN_SLOTS 4
+
 static int dg_return_slots(int dg_no)
 {
-	enum ain_data_type t = ain->delegates[dg_no].return_type.data;
-	if (t == AIN_VOID)
-		return 0;
-	if (t == AIN_OPTION)
-		return 2;
-	return 1;
+	return type_slots(&ain->delegates[dg_no].return_type);
 }
 
 // Сколько слотов занимает ЗНАЧЕНИЕ внутри Ixseal-`option` (без тега). Операнд
@@ -791,7 +796,11 @@ static void delegate_call(int dg_no, int return_address)
 		set_struct_page(obj);
 	} else {
 		// call finished: clean up stack and jump to return address
-		union vm_value r[2];
+		// Слотов у возврата столько, сколько скажет type_slots(): 2 у
+		// `option<T>`/`AIN_IFACE`/`wrap<интерфейс>`, 3 у `option<wrap<интерфейс>>`.
+		union vm_value r[DG_MAX_RETURN_SLOTS];
+		if (return_values > DG_MAX_RETURN_SLOTS)
+			VM_ERROR("Delegate return value too wide: %d slots", return_values);
 		for (int i = return_values - 1; i >= 0; i--)
 			r[i] = stack_pop();
 		stack_pop(); // dg_index
