@@ -586,11 +586,22 @@ void hll_call(int libno, int fno, int elem_class)
 		case AIN_WRAP:
 			// Двухслотовый wrap<скаляр> занял на стеке две ячейки — сдвигаем
 			// счётчик слотов. Обратная запись не нужна: callee получил
-			// указатель прямо в страницу. Однослотовый wrap<объект> — как
-			// раньше (variable_fini для типа 82 всё равно ничего не делает).
+			// указатель прямо в страницу.
 			if (f->arguments[i].type.array_type
-					&& !is_wrapped_object_type(f->arguments[i].type.array_type->data))
+					&& !is_wrapped_object_type(f->arguments[i].type.array_type->data)) {
 				j++;
+				break;
+			}
+			// wrap<объект> маршалится как страница по ссылке (см. ветку
+			// AIN_REF_ARRAY выше), и callee вправе её ПЕРЕВЫДЕЛИТЬ: `String.
+			// SearchAll(self, wrap<array<string>> matchList, regex)` дописывает
+			// найденные токены через array_pushback_n. Без обратной записи
+			// heap-слот оставался бы с указателем на освобождённую страницу →
+			// double free при разборе кадра (`Motion::Parser@SplitParams`).
+			// Раньше это не всплывало: все wrap<объект>-аргументы были
+			// ТОЛЬКО источниками (Array.Duplicate/Copy/Concat).
+			if (heap_index_valid(heap_slots[i]))
+				heap[heap_slots[i]].page = heap_ptrs[i];
 			break;
 		case AIN_REF_FUNC_TYPE:
 		case AIN_HLL_FUNC:

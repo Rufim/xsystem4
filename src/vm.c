@@ -722,6 +722,27 @@ static int x_option_value_slots(int elem_class)
 	}
 }
 
+/*
+ * Владеет ли значение этого типа heap-слотом (нужен ли ему счётчик ссылок).
+ * Набор ровно тот, который освобождает variable_fini(): если добавить сюда
+ * скаляр, heap_ref тронет чужой слот кучи.
+ */
+static bool slot_owns_heap_ref(enum ain_data_type t)
+{
+	switch (t) {
+	case AIN_STRING:
+	case AIN_STRUCT:
+	case AIN_DELEGATE:
+	case AIN_ARRAY_TYPE:
+	case AIN_ARRAY:
+	case AIN_REF_TYPE:
+	case AIN_IFACE:
+		return true;
+	default:
+		return ain_is_array_data_type(t);
+	}
+}
+
 // Является ли значение option'а ссылкой на heap-слот (нужен ли учёт ссылок).
 // Целые (класс 1) — нет; строки, объекты и wrap<интерфейс> — да (у wrap считается
 // нижний слот, верхний — целочисленная база интерфейса).
@@ -831,20 +852,27 @@ union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *
 		return ret;
 	}
 
+	// Кадр заполняем сами, как delegate_call: аргументы должны попасть в локалы
+	// КОПИЯМИ (`vm_copy`). Иначе объектное значение (строка, массив, структура)
+	// уходит в лямбду по «сырому» слоту, кадр лямбды при возврате освобождает
+	// его как свой, и элемент контейнера остаётся висячим: `Array.EraseAll` над
+	// `array<string>` в `Motion::Parser@SplitParams` так убивал строки, которыми
+	// владел массив (слот переиспользовался под страницу → бесконечная рекурсия
+	// в delete_page). Через function_call/method_call сделать это нельзя — они
+	// снимают аргументы со стека как есть.
 	size_t saved_ip = instr_ptr;
-	bool method = heap_index_valid(obj) && heap[obj].page;
-	if (method)
-		stack_push(obj);
+	int slot = _function_call(fno, VM_RETURN);
+	struct ain_function *f = &ain->functions[fno];
 	for (int i = 0; i < argc; i++)
-		stack[stack_ptr++] = argv[i];
-	if (method)
-		method_call(fno, VM_RETURN);
-	else
-		function_call(fno, VM_RETURN);
+		heap[slot].page->values[i] = vm_copy(argv[i], f->vars[i].type.data);
+	if (heap_index_valid(obj) && heap[obj].page) {
+		set_struct_page(obj);
+		heap[slot].page->local.struct_ptr = obj;
+	}
 	vm_execute();
 	instr_ptr = saved_ip;
 
-	if (ain->functions[fno].return_type.data != AIN_VOID)
+	if (f->return_type.data != AIN_VOID)
 		ret = stack_pop();
 	return ret;
 }
@@ -1481,7 +1509,38 @@ static enum opcode execute_instruction(enum opcode opcode)
 			stack[stack_ptr++] = vals[i];
 		break;
 	}
-	case X_SET:
+	case X_SET: {
+		// Ixseal: присваивание с ВЗЯТИЕМ ВЛАДЕНИЯ. Стек: [ссылка (2 слота),
+		// значение]; значение возвращается на стек (сайты снимают его POP'ом
+		// или DELETE'ом).
+		//
+		// От `X_ASSIGN 1` отличается именно владением. X_ASSIGN — сырая запись
+		// слота, счётчики ведёт сам компилятор (SP_INC/DELETE), и перед ним
+		// всегда стоит идиома освобождения старого значения
+		// («X_DUP 2; X_REF 1; DELETE»). У X_SET её нет, а значение — либо
+		// одалживаемый аргумент (`Params::set`: `X_REF 1; X_SET; POP`), либо
+		// свежая копия, которую сайт сразу освобождает
+		// (`A_REF; X_SET; DELETE`, `Array.Where(...); X_SET; DELETE`).
+		// Без своей ссылки член в обоих случаях остался бы висячим.
+		//
+		// Счётчик берём ТОЛЬКО для типов, которые владеют heap-слотом (набор
+		// тот же, что освобождает variable_fini): для int/float это затронуло
+		// бы чужой слот кучи. Тип берётся из ОБЪЯВЛЕНИЯ приёмника.
+		// Прежнее содержимое не освобождаем — как и в X_OP_SET: семантика по
+		// байт-коду не установлена, лишний unref дал бы double free.
+		int val = stack_pop().i;
+		int page_index = stack_pop().i;
+		int heap_index = stack_pop().i;
+		if (unlikely(!heap_index_valid(heap_index) || !heap[heap_index].page
+			    || page_index < 0 || page_index >= heap[heap_index].page->nr_vars))
+			VM_ERROR("X_SET: out of bounds page index: %d/%d", heap_index, page_index);
+		struct page *page = heap[heap_index].page;
+		if (val != -1 && slot_owns_heap_ref(variable_type(page, page_index, NULL, NULL)))
+			heap_ref(val);
+		page->values[page_index].i = val;
+		stack_push(val);
+		break;
+	}
 	case X_ICAST: {
 		// TODO: пока не реализованы — логируем контекст для реверса и падаем.
 		if (getenv("XSYS4_TRACE_X")) {

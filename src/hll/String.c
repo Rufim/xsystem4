@@ -35,9 +35,14 @@
  * UTF-8 (см. sjis_to_utf8_tmp) — в SJIS второй байт символа может совпасть,
  * например, с `[`, и шаблон бы «резал» строку внутри символа.
  *
- * `Split` пока НЕ реализован намеренно: смысл третьего аргумента
- * (`Split(ref string, string, int)`) по байт-коду не установлен, а тихая
- * заглушка врала бы вызывающему.
+ * `Split(ref string, string separators, int removeEmpty)` режет по НАБОРУ
+ * символов-разделителей, а не по строке-разделителю целиком: один из сайтов
+ * передаёт `"[]|"` (три символа), который как единый разделитель не встретился
+ * бы никогда. Третий аргумент — флаг «убрать пустые части»: сайт переноса строк
+ * бэклога (`AddWrappingLog`) зовёт `Split(text, " ", 1)`, т.е. режет на слова, и
+ * пустые куски от подряд идущих пробелов там недопустимы; остальные 42 сайта
+ * передают 0 и пустые части сохраняют (`Split(s, "[]|", 0)` в разборе
+ * motion-параметров, дальше `.Select(Trim)`).
  */
 
 #include <stdlib.h>
@@ -320,6 +325,55 @@ static struct string *String_TrimEnd(struct string **s, struct string *set)
 	return trim(self_or_empty(s), trim_set(set), false, true);
 }
 
+
+/*
+ * array<string> Split(ref string self, string separators, int removeEmpty)
+ *
+ * Разделители — НАБОР символов (SJIS-aware: двухбайтный символ считается одним
+ * разделителем). Возврат типа 79 уходит на стек как есть, поэтому отдаём
+ * heap-СЛОТ страницы, а не указатель (сырой page* прочитался бы как индекс
+ * слота); вызывающий владеет слотом и освобождает его своим DELETE.
+ */
+static bool is_separator(const char *sep, size_t sep_size, const char *p, int len)
+{
+	for (size_t i = 0; i < sep_size; ) {
+		int slen = SJIS_2BYTE(sep[i]) ? 2 : 1;
+		if (slen == len && !memcmp(sep + i, p, len))
+			return true;
+		i += slen;
+	}
+	return false;
+}
+
+static int String_Split(struct string **s, struct string *sep, int remove_empty)
+{
+	struct string *src = self_or_empty(s);
+	int slot = heap_alloc_slot(VM_PAGE);
+	union vm_value dim = { .i = 0 };
+	struct page *out = alloc_array(1, &dim, AIN_ARRAY_STRING, 0, false);
+
+	int start = 0, i = 0;
+	while (i <= src->size) {
+		int clen = (i < src->size && SJIS_2BYTE(src->text[i])) ? 2 : 1;
+		bool at_end = i >= src->size;
+		if (!at_end && (!sep || !is_separator(sep->text, sep->size, src->text + i, clen))) {
+			i += clen;
+			continue;
+		}
+		if (i > start || !remove_empty) {
+			struct string *part = make_string(src->text + start, i - start);
+			union vm_value v = { .i = heap_alloc_string(part) };
+			out = array_pushback_n(out, &v, 1, AIN_ARRAY_STRING, 0);
+		}
+		if (at_end)
+			break;
+		i += clen;
+		start = i;
+	}
+	heap_set_page(slot, out);
+	return slot;
+}
+
 /*
  * --- Регулярные выражения (см. src/regex_ecma.cpp) ---
  *
@@ -497,7 +551,5 @@ HLL_LIBRARY(String,
 	    HLL_EXPORT(SearchAll, String_SearchAll),
 	    HLL_EXPORT(Match, String_Match),
 	    HLL_EXPORT(ReplaceRegex, String_ReplaceRegex),
-	    // Смысл третьего аргумента (`Split(ref string, string, int)`) по
-	    // байт-коду не установлен — падаем явно, а не врём.
-	    HLL_TODO_EXPORT(Split, String_Split)
+	    HLL_EXPORT(Split, String_Split)
 	    );
