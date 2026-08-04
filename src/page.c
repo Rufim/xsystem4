@@ -158,10 +158,39 @@ enum ain_data_type array_type(enum ain_data_type type)
 	case AIN_ARRAY_DELEGATE:
 	case AIN_REF_ARRAY_DELEGATE:
 		return AIN_DELEGATE;
+	// Ixseal: массив, элемент которого — wrap<интерфейс>. Элемент занимает ДВА
+	// слота страницы, поэтому единого «типа элемента» у него нет: тип каждого
+	// слота даёт variable_type() по чётности. Маркер возвращаем как есть.
+	case AIN_IFACE_WRAP:
+		return AIN_IFACE_WRAP;
 	default:
 		WARNING("Unknown/invalid array type: %d", type);
 		return type;
 	}
+}
+
+/*
+ * Ixseal (System 4 v14): значение типа `wrap<интерфейс>` — «толстый указатель»
+ * из ДВУХ слотов: (heap-слот объекта, база интерфейса в таблице методов этого
+ * объекта). Поэтому в generic-массиве такого типа на ОДИН элемент приходится
+ * два слота страницы; сама страница помечена `a_type == AIN_IFACE_WRAP`.
+ * Байт-код так его и читает: `index*2`, затем ссылка (страница, 2k) —
+ * см. foreach в debug::detail::CDebugFPSGraph@SetFont.
+ *
+ * У всех остальных массивов — в том числе wrap<структура>, где ссылка это
+ * обычный heap-слот, — шаг равен одному слоту, так что для старых игр
+ * (у которых типа 100 в массивах нет вовсе) поведение не меняется.
+ */
+int array_elem_slots(struct page *page)
+{
+	if (!page || page->type != ARRAY_PAGE)
+		return 1;
+	return (page->array.rank == 1 && page->a_type == AIN_IFACE_WRAP) ? 2 : 1;
+}
+
+static int elem_slots_for_type(enum ain_data_type data_type, int rank)
+{
+	return (rank == 1 && data_type == AIN_IFACE_WRAP) ? 2 : 1;
 }
 
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank)
@@ -190,6 +219,12 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
 			*struct_type = page->array.struct_type;
 		if (array_rank)
 			*array_rank = page->array.rank - 1;
+		// Двухслотовый элемент wrap<интерфейс> (Ixseal): нижний слот — heap-слот
+		// объекта (владение и копирование как у struct-элемента), верхний —
+		// целочисленная база интерфейса. Благодаря этому delete_page_vars /
+		// copy_page / variable_set работают с такой страницей без изменений.
+		if (array_elem_slots(page) == 2)
+			return (varno & 1) ? AIN_INT : AIN_STRUCT;
 		return page->array.rank > 1 ? page->a_type : array_type(page->a_type);
 	case DELEGATE_PAGE:
 		// XXX: we return void here because objects in a delegate page aren't
@@ -294,7 +329,24 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 	case AIN_REF_ARRAY_LONG_INT:  return AIN_ARRAY_LONG_INT;
 	case AIN_REF_ARRAY_DELEGATE:  return AIN_ARRAY_DELEGATE;
 	case AIN_ARRAY_TYPE:          return type;
+	// Ixseal: маркер массива двухслотовых wrap<интерфейс>-элементов.
+	case AIN_IFACE_WRAP:          return AIN_IFACE_WRAP;
 	default: VM_ERROR("Attempt to array allocate non-array type");
+	}
+}
+
+// Инициализация одного элемента массива по его индексу (в ЭЛЕМЕНТАХ).
+static void init_array_elem(struct page *page, int elem, enum ain_data_type type,
+			    int struct_type, bool init_structs)
+{
+	if (array_elem_slots(page) == 2) {
+		// Пустая ссылка wrap<интерфейс>: объекта нет, база интерфейса 0.
+		page->values[elem*2].i = -1;
+		page->values[elem*2 + 1].i = 0;
+	} else if (type == AIN_STRUCT && init_structs) {
+		create_struct(struct_type, &page->values[elem]);
+	} else {
+		page->values[elem] = variable_initval(type);
 	}
 }
 
@@ -305,16 +357,16 @@ struct page *alloc_array(int rank, union vm_value *dimensions, enum ain_data_typ
 
 	data_type = unref_array_type(data_type);
 	enum ain_data_type type = array_type(data_type);
-	struct page *page = alloc_page(ARRAY_PAGE, data_type, max(0, dimensions->i));
+	// `dimensions` задаёт число ЭЛЕМЕНТОВ; слотов страницы может быть вдвое
+	// больше (Ixseal wrap<интерфейс> — см. array_elem_slots).
+	int slots = elem_slots_for_type(data_type, rank);
+	struct page *page = alloc_page(ARRAY_PAGE, data_type, max(0, dimensions->i) * slots);
 	page->array.struct_type = struct_type;
 	page->array.rank = rank;
 
 	for (int i = 0; i < dimensions->i; i++) {
 		if (rank == 1) {
-			if (type == AIN_STRUCT && init_structs)
-				create_struct(struct_type, &page->values[i]);
-			else
-				page->values[i] = variable_initval(type);
+			init_array_elem(page, i, type, struct_type, init_structs);
 		} else {
 			struct page *child = alloc_array(rank - 1, dimensions + 1, data_type, struct_type, init_structs);
 			int slot = heap_alloc_slot(VM_PAGE);
@@ -343,24 +395,29 @@ struct page *realloc_array(struct page *src, int rank, union vm_value *dimension
 		return NULL;
 	}
 
+	// `dimensions` — в ЭЛЕМЕНТАХ; переводим в слоты страницы (шаг берём из самой
+	// страницы, а не из data_type: вызывающие передают сюда и dst->a_type, и
+	// объявленный тип, а маркер wrap<интерфейс> надёжно хранится в странице).
+	int slots = array_elem_slots(src);
+	int old_vars = src->nr_vars;
+	int new_vars = dimensions->i * slots;
+
 	// if shrinking array, unref orphaned children
-	if (dimensions->i < src->nr_vars) {
-		for (int i = dimensions->i; i < src->nr_vars; i++) {
+	if (new_vars < old_vars) {
+		for (int i = new_vars; i < old_vars; i++) {
 			variable_fini(src->values[i], variable_type(src, i, NULL, NULL), true);
 		}
 	}
 
-	src = xrealloc(src, sizeof(struct page) + sizeof(union vm_value) * dimensions->i);
+	src = xrealloc(src, sizeof(struct page) + sizeof(union vm_value) * new_vars);
 
 	// if growing array, init new children
 	enum ain_data_type type = array_type(data_type);
-	if (dimensions->i > src->nr_vars) {
-		for (int i = src->nr_vars; i < dimensions->i; i++) {
+	if (new_vars > old_vars) {
+		src->nr_vars = new_vars;
+		for (int i = old_vars / slots; i < dimensions->i; i++) {
 			if (rank == 1) {
-				if (type == AIN_STRUCT && init_structs)
-					create_struct(struct_type, &src->values[i]);
-				else
-					src->values[i] = variable_initval(type);
+				init_array_elem(src, i, type, struct_type, init_structs);
 			} else {
 				struct page *child = alloc_array(rank - 1, dimensions + 1, data_type, struct_type, init_structs);
 				int slot = heap_alloc_slot(VM_PAGE);
@@ -370,7 +427,7 @@ struct page *realloc_array(struct page *src, int rank, union vm_value *dimension
 		}
 	}
 
-	src->nr_vars = dimensions->i;
+	src->nr_vars = new_vars;
 	return src;
 }
 
@@ -381,14 +438,15 @@ int array_numof(struct page *page, int rank)
 	if (rank < 1 || rank > page->array.rank)
 		return 0;
 	if (rank == 1) {
-		return page->nr_vars;
+		return page->nr_vars / array_elem_slots(page);
 	}
 	return array_numof(heap[page->values[0].i].page, rank - 1);
 }
 
+// `i` — индекс ЭЛЕМЕНТА (не слота страницы).
 static bool array_index_ok(struct page *array, int i)
 {
-	return i >= 0 && i < array->nr_vars;
+	return i >= 0 && i < array->nr_vars / array_elem_slots(array);
 }
 
 void array_copy(struct page *dst, int dst_i, struct page *src, int src_i, int n)
@@ -408,9 +466,13 @@ void array_copy(struct page *dst, int dst_i, struct page *src, int src_i, int n)
 	if (dst->a_type != src->a_type)
 		VM_ERROR("Array types do not match");
 
-	for (int i = 0; i < n; i++) {
-		enum ain_data_type type = array_type(dst->a_type);
-		variable_set(dst, dst_i+i, type, vm_copy(src->values[src_i+i], type));
+	// Копируем послотно: у двухслотового элемента тип слота зависит от чётности
+	// (объект / база интерфейса), variable_type() это учитывает.
+	int slots = array_elem_slots(dst);
+	for (int i = 0; i < n * slots; i++) {
+		int di = dst_i*slots + i, si = src_i*slots + i;
+		enum ain_data_type type = variable_type(dst, di, NULL, NULL);
+		variable_set(dst, di, type, vm_copy(src->values[si], type));
 	}
 }
 
@@ -420,6 +482,13 @@ int array_fill(struct page *dst, int dst_i, int n, union vm_value v)
 		return 0;
 	if (dst->type != ARRAY_PAGE)
 		VM_ERROR("Not an array");
+	if (array_elem_slots(dst) != 1) {
+		// Заполнение одним значением бессмысленно для двухслотового
+		// wrap<интерфейс>-элемента (нужна пара). Игра этого пути не использует;
+		// сообщаем явно, вместо того чтобы молча испортить пары.
+		WARNING("array_fill: не поддержано для массива wrap<интерфейс>");
+		return 0;
+	}
 
 	// clamp (dst_i, dst_i+n) to range of array
 	if (dst_i < 0) {
@@ -439,7 +508,24 @@ int array_fill(struct page *dst, int dst_i, int n, union vm_value v)
 	return n;
 }
 
-struct page *array_pushback(struct page *dst, union vm_value v, enum ain_data_type data_type, int struct_type)
+// Запись слотов одного элемента: `v[0..nvals-1]`, недостающие слоты — нулями.
+static void array_set_elem(struct page *page, int elem, const union vm_value *v, int nvals)
+{
+	int slots = array_elem_slots(page);
+	for (int k = 0; k < slots; k++) {
+		union vm_value val = k < nvals ? v[k] : (union vm_value) { .i = 0 };
+		int varno = elem*slots + k;
+		variable_set(page, varno, variable_type(page, varno, NULL, NULL), val);
+	}
+}
+
+/*
+ * Добавить элемент в конец. `v` указывает на `nvals` подряд идущих слотов
+ * значения: обычный элемент — один слот, Ixseal wrap<интерфейс> — два
+ * (объект, база интерфейса).
+ */
+struct page *array_pushback_n(struct page *dst, const union vm_value *v, int nvals,
+			      enum ain_data_type data_type, int struct_type)
 {
 	if (dst) {
 		if (dst->type != ARRAY_PAGE)
@@ -447,16 +533,21 @@ struct page *array_pushback(struct page *dst, union vm_value v, enum ain_data_ty
 		if (dst->array.rank != 1)
 			VM_ERROR("Tried pushing to a multi-dimensional array");
 
-		int index = dst->nr_vars;
+		int index = dst->nr_vars / array_elem_slots(dst);
 		union vm_value dims[1] = { (union vm_value) { .i = index + 1 } };
 		dst = realloc_array(dst, 1, dims, dst->a_type, dst->array.struct_type, false);
-		variable_set(dst, index, array_type(data_type), v);
+		array_set_elem(dst, index, v, nvals);
 	} else {
 		union vm_value dims[1] = { (union vm_value) { .i = 1 } };
 		dst = alloc_array(1, dims, data_type, struct_type, false);
-		variable_set(dst, 0, array_type(data_type), v);
+		array_set_elem(dst, 0, v, nvals);
 	}
 	return dst;
+}
+
+struct page *array_pushback(struct page *dst, union vm_value v, enum ain_data_type data_type, int struct_type)
+{
+	return array_pushback_n(dst, &v, 1, data_type, struct_type);
 }
 
 struct page *array_popback(struct page *dst)
@@ -468,7 +559,7 @@ struct page *array_popback(struct page *dst)
 	if (dst->array.rank != 1)
 		VM_ERROR("Tried popping from a multi-dimensional array");
 
-	union vm_value dims[1] = { (union vm_value) { .i = dst->nr_vars - 1 } };
+	union vm_value dims[1] = { (union vm_value) { .i = dst->nr_vars / array_elem_slots(dst) - 1 } };
 	dst = realloc_array(dst, 1, dims, dst->a_type, dst->array.struct_type, false);
 	return dst;
 }
@@ -485,49 +576,65 @@ struct page *array_erase(struct page *page, int i, bool *success)
 	if (!array_index_ok(page, i))
 		return page;
 
+	int slots = array_elem_slots(page);
+
 	// if array will be empty...
-	if (page->nr_vars == 1) {
+	if (page->nr_vars == slots) {
 		delete_page_vars(page);
 		free_page(page);
 		*success = true;
 		return NULL;
 	}
 
-	// delete variable, shift subsequent variables, then realloc page
-	variable_fini(page->values[i], array_type(page->a_type), true);
-	for (int j = i + 1; j < page->nr_vars; j++) {
-		page->values[j-1] = page->values[j];
+	// delete variable(s), shift subsequent variables, then realloc page
+	for (int k = 0; k < slots; k++) {
+		int varno = i*slots + k;
+		variable_fini(page->values[varno], variable_type(page, varno, NULL, NULL), true);
 	}
-	page->nr_vars--;
+	for (int j = (i + 1) * slots; j < page->nr_vars; j++) {
+		page->values[j-slots] = page->values[j];
+	}
+	page->nr_vars -= slots;
 	page = xrealloc(page, sizeof(struct page) + sizeof(union vm_value) * page->nr_vars);
 
 	*success = true;
 	return page;
 }
 
-struct page *array_insert(struct page *page, int i, union vm_value v, enum ain_data_type data_type, int struct_type)
+// `v` — `nvals` подряд идущих слотов значения (см. array_pushback_n).
+struct page *array_insert_n(struct page *page, int i, const union vm_value *v, int nvals,
+			    enum ain_data_type data_type, int struct_type)
 {
 	if (!page) {
-		return array_pushback(NULL, v, data_type, struct_type);
+		return array_pushback_n(NULL, v, nvals, data_type, struct_type);
 	}
 	if (page->type != ARRAY_PAGE)
 		VM_ERROR("Not an array");
 	if (page->array.rank != 1)
 		VM_ERROR("Tried inserting into a multi-dimensional array");
 
+	int slots = array_elem_slots(page);
+	int n = page->nr_vars / slots;
+
 	// NOTE: you cannot insert at the end of an array due to how i is clamped
-	if (i >= page->nr_vars)
-		i = page->nr_vars - 1;
+	if (i >= n)
+		i = n - 1;
 	if (i < 0)
 		i = 0;
 
-	page->nr_vars++;
+	page->nr_vars += slots;
 	page = xrealloc(page, sizeof(struct page) + sizeof(union vm_value) * page->nr_vars);
-	for (int j = page->nr_vars - 1; j > i; j--) {
-		page->values[j] = page->values[j-1];
+	for (int j = page->nr_vars - 1; j >= (i + 1) * slots; j--) {
+		page->values[j] = page->values[j-slots];
 	}
-	page->values[i] = v;
+	for (int k = 0; k < slots; k++)
+		page->values[i*slots + k] = k < nvals ? v[k] : (union vm_value) { .i = 0 };
 	return page;
+}
+
+struct page *array_insert(struct page *page, int i, union vm_value v, enum ain_data_type data_type, int struct_type)
+{
+	return array_insert_n(page, i, &v, 1, data_type, struct_type);
 }
 
 static int array_compare_int(const void *_a, const void *_b)
@@ -585,6 +692,12 @@ void array_sort(struct page *page, int compare_fno)
 {
 	if (!page)
 		return;
+	if (array_elem_slots(page) != 1) {
+		// Сортировка перемешала бы половинки двухслотовых элементов, а
+		// упорядочивать ссылки wrap<интерфейс> по heap-слоту бессмысленно.
+		WARNING("array_sort: пропущено для массива wrap<интерфейс>");
+		return;
+	}
 
 	if (compare_fno) {
 		struct sortable *values = xcalloc(page->nr_vars, sizeof(struct sortable));
@@ -671,8 +784,19 @@ int array_find(struct page *page, int start, int end, union vm_value v, int comp
 	if (!page)
 		return -1;
 
+	int slots = array_elem_slots(page);
 	start = max(start, 0);
-	end = min(end, page->nr_vars);
+	end = min(end, page->nr_vars / slots);
+
+	if (slots != 1) {
+		// Двухслотовый wrap<интерфейс>: сравниваем по heap-слоту объекта
+		// (нижний слот), база интерфейса у одного объекта постоянна.
+		for (int i = start; i < end; i++) {
+			if (page->values[i*slots].i == v.i)
+				return i;
+		}
+		return -1;
+	}
 
 	// if no compare function given, compare integer/string values
 	if (!compare_fno) {
@@ -707,10 +831,15 @@ void array_reverse(struct page *page)
 	if (!page)
 		return;
 
-	for (int start = 0, end = page->nr_vars-1; start < end; start++, end--) {
-		union vm_value tmp = page->values[start];
-		page->values[start] = page->values[end];
-		page->values[end] = tmp;
+	// Переворачиваем поэлементно: у двухслотового элемента пара слотов должна
+	// остаться в исходном порядке (объект, база интерфейса).
+	int slots = array_elem_slots(page);
+	for (int start = 0, end = page->nr_vars/slots - 1; start < end; start++, end--) {
+		for (int k = 0; k < slots; k++) {
+			union vm_value tmp = page->values[start*slots + k];
+			page->values[start*slots + k] = page->values[end*slots + k];
+			page->values[end*slots + k] = tmp;
+		}
 	}
 }
 

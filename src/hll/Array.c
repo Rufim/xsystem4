@@ -335,12 +335,18 @@ static bool ix_elem_is_object(enum ain_data_type array_dt)
 	case AIN_STRING:
 	case AIN_DELEGATE:
 	case AIN_IFACE:
+	// wrap<интерфейс>: нижний слот пары — heap-слот объекта, владение как у
+	// struct-элемента (верхний слот — просто индекс, ничем не владеет).
+	case AIN_IFACE_WRAP:
 	case AIN_ARRAY_TYPE:
 		return true;
 	default:
 		return ain_is_array_data_type(et);
 	}
 }
+
+// Сколько слотов значения кладёт вызывающий под элемент этого контейнера.
+static int ix_value_slots(struct page **self) { return self ? array_elem_slots(*self) : 1; }
 
 static void Array_PushBack(struct page **self, union vm_value *value)
 {
@@ -353,7 +359,9 @@ static void Array_PushBack(struct page **self, union vm_value *value)
 	// висячий слот в пуле → use-after-free при следующем чтении пула.
 	if (ix_elem_is_object(ix_dtype(*self)))
 		heap_ref(value->i);
-	*self = array_pushback(*self, *value, ix_dtype(*self), ix_stype(*self));
+	// `value` указывает на первый из слотов значения на стеке VM: у
+	// wrap<интерфейс> их два (объект, база интерфейса) — оба идут в элемент.
+	*self = array_pushback_n(*self, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
 }
 
 static void Array_PopBack(struct page **self)
@@ -385,7 +393,7 @@ static void Array_ix_Insert(struct page **self, int index, union vm_value *value
 	// см. Array_PushBack: объектный элемент — контейнер владеет своим счётчиком.
 	if (ix_elem_is_object(ix_dtype(*self)))
 		heap_ref(value->i);
-	*self = array_insert(*self, index, *value, ix_dtype(*self), ix_stype(*self));
+	*self = array_insert_n(*self, index, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
 }
 
 static bool Array_ix_Erase(struct page **self, int index, int length)
@@ -468,17 +476,24 @@ static int Array_EmplaceBack(struct page **self)
 	struct page *a = *self;
 	enum ain_data_type dt = a->a_type;
 	int st = a->array.struct_type;
-	union vm_value v;
-	if (array_type(dt) == AIN_STRUCT)
-		create_struct(st, &v);
-	else
-		v = variable_initval(array_type(dt));
-	*self = array_pushback(a, v, dt, st);
+	int slots = array_elem_slots(a);
+	union vm_value v[2];
+	if (slots == 2) {
+		// Пустая пара wrap<интерфейс>: объекта нет, база интерфейса 0.
+		v[0].i = -1;
+		v[1].i = 0;
+	} else if (array_type(dt) == AIN_STRUCT) {
+		create_struct(st, &v[0]);
+	} else {
+		v[0] = variable_initval(array_type(dt));
+	}
+	*self = array_pushback_n(a, v, slots, dt, st);
 	a = *self;
 	// EmplaceBack returns a WRAP (ref) to the newly-added element; hll_call
 	// materialises the concrete reference from this element index (a struct
 	// element becomes a 1-value page-slot ref, a scalar a 2-value ref).
-	return (a && a->nr_vars > 0) ? a->nr_vars - 1 : -1;
+	int n = array_numof(a, 1);
+	return n > 0 ? n - 1 : -1;
 }
 
 // Return a reference to element `index` — its value/heap-slot (a struct element
@@ -492,7 +507,7 @@ static int Array_At(struct page **self, int index)
 	if (!self || !*self)
 		return -1;
 	struct page *a = *self;
-	if (index < 0 || index >= a->nr_vars)
+	if (index < 0 || index >= array_numof(a, 1))
 		return -1;
 	return index;
 }
@@ -506,14 +521,15 @@ static int Array_First(struct page **self)
 {
 	if (!self || !*self)
 		return -1;
-	return (*self)->nr_vars > 0 ? 0 : -1;
+	return array_numof(*self, 1) > 0 ? 0 : -1;
 }
 
 static int Array_Last(struct page **self)
 {
 	if (!self || !*self)
 		return -1;
-	return (*self)->nr_vars > 0 ? (*self)->nr_vars - 1 : -1;
+	int n = array_numof(*self, 1);
+	return n > 0 ? n - 1 : -1;
 }
 
 HLL_LIBRARY(Array,

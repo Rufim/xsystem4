@@ -455,12 +455,11 @@ void hll_call(int libno, int fno, int elem_class)
 			// the callee interprets it per the array's element type. A wrap
 			// reference occupies two slots — the object's heap slot plus the
 			// index within it — and the value the callee wants is the lower one.
+			// Двухслотовая форма — значение wrap<интерфейс>: (heap-слот
+			// объекта, база интерфейса). Оба слота лежат на стеке подряд, и
+			// callee (Array.PushBack/Insert) читает их как value[0], value[1].
 			int slots = hll_param_slots(elem_class);
 			stack_ptr -= slots;
-			if (slots == 2 && stack[stack_ptr + 1].i != 0) {
-				WARNING("%s.%s: generic wrap argument with non-zero element index %d",
-					ain->libraries[libno].name, f->name, stack[stack_ptr + 1].i);
-			}
 			ptrs[i] = &stack[stack_ptr];
 			args[i] = &ptrs[i];
 			break;
@@ -558,6 +557,17 @@ void hll_call(int libno, int fno, int elem_class)
 			break;
 		}
 		int idx = r.i;
+		// Массив с элементом wrap<интерфейс>: элемент занимает ДВА слота
+		// страницы, поэтому ссылка на него — это всегда пара
+		// (слот массива, idx*2); «своего» heap-слота у такого элемента нет.
+		int eslots = array_elem_slots(ap);
+		if (eslots != 1) {
+			if (heap_index_valid(ref_array_slot))
+				heap_ref(ref_array_slot);
+			stack_push(ref_array_slot);
+			stack_push(idx >= 0 ? idx * eslots : idx);
+			break;
+		}
 		enum ain_data_type et = (idx >= 0 && idx < ap->nr_vars)
 			? variable_type(ap, idx, NULL, NULL) : AIN_INT;
 		// Классификация элемента: «объект» (собственный heap-слот, 1-значный

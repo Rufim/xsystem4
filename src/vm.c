@@ -463,7 +463,18 @@ static enum ain_data_type resolve_array_type(struct page *container, int varno, 
 		// и struct-пул (напр. CPartsMessageManager.m_functionSetList = WRAP<struct328>)
 		// создавался как int-массив → слоты структур хранились как сырые int без
 		// владения → преждевременный free и use-after-free (389/3).
-		if (et == AIN_WRAP || et == AIN_IFACE_WRAP || et == AIN_OPTION)
+		// ОДНАКО wrap<ИНТЕРФЕЙС> — это «толстый указатель» из ДВУХ слотов
+		// (объект, база интерфейса), и элемент такого массива занимает два
+		// слота страницы. Такой массив помечаем AIN_IFACE_WRAP — по этому
+		// маркеру array_elem_slots() даёт шаг 2 (см. page.c). Обёртку над
+		// обычной структурой (wrap<struct>, внутренний тип AIN_STRUCT) это не
+		// затрагивает — она остаётся одним heap-слотом.
+		if ((et == AIN_WRAP || et == AIN_OPTION) && vt->array_type->array_type
+				&& vt->array_type->array_type->data == AIN_IFACE_WRAP)
+			return AIN_IFACE_WRAP;
+		if (et == AIN_IFACE_WRAP)
+			return AIN_IFACE_WRAP;
+		if (et == AIN_WRAP || et == AIN_OPTION)
 			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
 		return array_type_from_elem(et);
 	}
@@ -1263,9 +1274,20 @@ static enum opcode execute_instruction(enum opcode opcode)
 		stack_push(env >= 0 ? env : struct_page_slot());
 		break;
 	}
-	case X_A_SIZE:
+	case X_A_SIZE: {
+		// Размер generic-массива (Ixseal). На стеке — ЗНАЧЕНИЕ переменной-массива
+		// (heap-слот страницы), т.е. сайт выглядит как `...; X_REF 1; X_A_SIZE`.
+		// Возвращается число ЭЛЕМЕНТОВ: у массива с элементом wrap<интерфейс>
+		// на элемент приходится два слота страницы, и array_numof это учитывает.
+		// Прежний стаб клал сюда struct_page_slot() — foreach получал мусорную
+		// границу и уходил за конец массива.
+		int slot = stack_pop().i;
+		struct page *p = heap_index_valid(slot) ? heap[slot].page : NULL;
+		stack_push((p && p->type == ARRAY_PAGE) ? array_numof(p, 1) : 0);
+		break;
+	}
 	case X_TO_STR: {
-		// TODO: пока не реализованы — временный совместимый стаб (как было).
+		// TODO: пока не реализован — временный совместимый стаб (как было).
 		stack_pop();
 		stack_push(struct_page_slot());
 		break;
