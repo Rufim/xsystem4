@@ -14,6 +14,7 @@
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 #include "android_bridge.h"
+#include "gfx/font.h"
 #include "mixer.h"
 #include "vm.h"
 #include "vm/heap.h"
@@ -484,6 +485,14 @@ Java_io_github_rufim_alice_NativeBridge_nativeSetTts(
 	(void)env; (void)self;
 	bridge_set_tts_enabled(on);
 	bridge_set_voice_muted(on);
+}
+
+JNIEXPORT void JNICALL
+Java_io_github_rufim_alice_NativeBridge_nativeSetLetterSpacing(
+		JNIEnv *env, jobject self, jfloat base, jfloat large, jfloat threshold)
+{
+	(void)env; (void)self;
+	gfx_set_letter_spacing(base, large, threshold);
 }
 
 JNIEXPORT void JNICALL

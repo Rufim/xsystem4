@@ -169,24 +169,53 @@ static struct glyph *font_get_glyph(struct font_size *size, uint32_t code, enum 
  * XSYS4_LETTER_SPACING_LARGE (деф. 0.10); порог — XSYS4_LETTER_SPACING_SIZE
  * (деф. 25: сообщения Daiteikoku 26 → крупный, Tsumamigui 24 → базовый).
  */
+// Межбуквенный интервал: base для обычного кегля, large для крупного (>= threshold).
+// −1 = ещё не инициализировано (ленивая инициализация из env при первом обращении).
+// На Android переопределяется в рантайме через gfx_set_letter_spacing (настройка «Шрифт»).
+static float ls_base = -1.0f, ls_large = -1.0f, ls_threshold = -1.0f;
+
+// Нормализация: отрицательная база → 0; база 0 = полное отключение (large тоже 0);
+// large не может быть меньше базы.
+static void ls_normalize(void)
+{
+	if (ls_base < 0.0f)
+		ls_base = 0.0f;
+	if (ls_base <= 0.0f)
+		ls_large = 0.0f;
+	else if (ls_large < ls_base)
+		ls_large = ls_base;
+}
+
+static void ls_init_from_env_once(void)
+{
+	if (ls_base >= 0.0f)
+		return; // уже задано (env или рантайм-сеттером)
+	// Flat 0.03 for all sizes. The message window has NO auto-wrap (proven: a long
+	// single message renders on one line and overruns the box); its line breaks are
+	// authored for native widths, so a large letter-spacing pushed wrapped lines
+	// past the right edge. 0.03 keeps glyphs from clumping (our FNL render needs a
+	// little spacing) while staying tight enough that the authored lines still fit.
+	const char *env = getenv("XSYS4_LETTER_SPACING");
+	ls_base = env ? strtof(env, NULL) : 0.03f;
+	env = getenv("XSYS4_LETTER_SPACING_LARGE");
+	ls_large = env ? strtof(env, NULL) : 0.03f;
+	env = getenv("XSYS4_LETTER_SPACING_SIZE");
+	ls_threshold = env ? strtof(env, NULL) : 25.0f;
+	ls_normalize();
+}
+
+void gfx_set_letter_spacing(float base, float large, float threshold)
+{
+	ls_base = base;
+	ls_large = large;
+	ls_threshold = threshold;
+	ls_normalize();
+}
+
 static float letter_spacing_ratio(float size)
 {
-	static float base = -1.0f, large = -1.0f, threshold = -1.0f;
-	if (base < 0.0f) {
-		const char *env = getenv("XSYS4_LETTER_SPACING");
-		base = env ? strtof(env, NULL) : config.font_letter_spacing;
-		if (base < 0.0f)
-			base = 0.0f;
-		env = getenv("XSYS4_LETTER_SPACING_LARGE");
-		large = env ? strtof(env, NULL) : 0.10f;
-		if (base <= 0.0f)
-			large = 0.0f; // база 0 = полное отключение
-		else if (large < base)
-			large = base;
-		env = getenv("XSYS4_LETTER_SPACING_SIZE");
-		threshold = env ? strtof(env, NULL) : 25.0f;
-	}
-	return size >= threshold ? large : base;
+	ls_init_from_env_once();
+	return size >= ls_threshold ? ls_large : ls_base;
 }
 
 // Письменности, которым добавляем интервал: латиница и кириллица.
@@ -259,9 +288,11 @@ float gfx_size_char_kerning(struct text_style *ts, uint32_t code, uint32_t code_
 float gfx_size_text(struct text_style *ts, const char *text)
 {
 	struct font_size *size = text_style_font_size(ts);
-	float edge_advance = gfx_text_advance_edges
-		? ts->edge_left + ts->edge_right + ceilf(ts->bold_width)
-		: 0.0f;
+	// NOTE: letter spacing / advance is our own mechanism — the glyph EDGE (outline)
+	// width must NOT enter it, or adding an outline would widen letter spacing. Only
+	// the bold width contributes here; the edge is drawn (gfx_render_textf) but never
+	// reserves advance.
+	float edge_advance = gfx_text_advance_edges ? ceilf(ts->bold_width) : 0.0f;
 	float x = 0.0f;
 	while (*text) {
 		x += font_size_char(size, char_to_code(text, size->font->charmap));
@@ -360,9 +391,9 @@ float gfx_render_textf(Texture *dst, float x, int y, char *msg, struct text_styl
 	struct font_size *font_size = text_style_font_size(ts);
 	float edge_width = text_style_edge_width(ts);
 
-	float edge_advance = gfx_text_advance_edges
-		? edge_width + ceilf(ts->bold_width)
-		: 0.f;
+	// Edge (outline) width must NOT feed into advance (our letter-spacing mechanism);
+	// only bold width does. The outline is still drawn below when edge_width > 0.
+	float edge_advance = gfx_text_advance_edges ? ceilf(ts->bold_width) : 0.f;
 
 	enum text_render_mode mode = blend ? RENDER_BLENDED : RENDER_COPY;
 	if (edge_width > 0.01f) {

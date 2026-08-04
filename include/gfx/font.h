@@ -172,6 +172,9 @@ float gfx_size_text(struct text_style *ts, const char *text);
 // Добавочный межбуквенный интервал для узких (пропорциональных) глифов;
 // 0 для полноширинных. См. комментарий в src/text.c.
 float gfx_letter_spacing_extra(struct font_size *size, uint32_t code, float advance);
+// Задать межбуквенный интервал в рантайме (Android-настройка «Шрифт»): base/large —
+// доли кегля, threshold — размер, с которого действует large. Переопределяет env-дефолты.
+void gfx_set_letter_spacing(float base, float large, float threshold);
 float gfx_get_actual_font_size(unsigned face, float size);
 float gfx_get_actual_font_size_round_down(unsigned face, float size);
 

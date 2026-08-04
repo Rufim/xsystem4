@@ -330,9 +330,6 @@ void hll_call(int libno, int fno)
 	void *heap_ptrs[HLL_MAX_ARGS];
 	int heap_slots[HLL_MAX_ARGS];
 
-	if (getenv("XSYS4_HLL_TRACE"))
-		NOTICE("HLL %s.%s", ain->libraries[libno].name, f->name);
-
 	int ref_array_slot = -1;  // heap slot of the AIN_REF_ARRAY arg, for ref-element returns
 	int dbg_sp0 = stack_ptr;
 	bool dbg_arr = getenv("XSYS4_ARR_TRACE") && !strcmp(ain->libraries[libno].name, "Array");
