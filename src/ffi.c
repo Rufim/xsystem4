@@ -376,10 +376,17 @@ void hll_call(int libno, int fno)
 		case AIN_REF_STRUCT:
 		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
+		case AIN_WRAP:
 			// Ixseal's generic array-by-reference (AIN_REF_ARRAY) is passed the
 			// same way as a struct/typed-array ref: a single stack slot holding
 			// the array page's heap index (verified by stack-balance tracing —
 			// consuming two slots underflows the caller's stack).
+			// AIN_WRAP arguments (wrap<array<T>>, e.g. the four arrays of
+			// PartsEngine.AddPartsConstructionProcess or Array.Duplicate's
+			// source) are pushed the same way — the call site reads the member
+			// with X_REF 1. They used to fall through to the default case, which
+			// handed the callee the address of the stack slot instead of the page
+			// (a garbage pointer).
 			stack_ptr--;
 			heap_slots[i] = stack[stack_ptr].i;
 			heap_ptrs[i] = heap_index_valid(stack[stack_ptr].i) ? heap[stack[stack_ptr].i].page : NULL;

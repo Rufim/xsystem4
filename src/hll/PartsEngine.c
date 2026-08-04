@@ -445,6 +445,71 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 	PartsEngine_add_construction_process(ints, floats, strings);
 }
 
+// Ixseal (System 4 v14) form of the batch construction interface. The classic
+// call packs everything into three arrays and carries the part number and state
+// in ints[0..1]; v14 passes both explicitly, adds a fourth array (ArrayPos: the
+// point list of the new vector-shape commands) and grew ArrayInt from 32 to 40
+// entries. Layout read from CASConstructionProcess::ArrayIntIndex::ToString:
+//
+//   0 Command, 1 InterpolationType, 2-5 Src{X,Y,Width,Height},
+//   6-9 Dest{X,Y,X2,Y2}, 10-11 Dest{Width,Height}, 12-15 RGBA, 16-19 RGBA2,
+//   20 CharSpace, 21 LineSpace, 22 FontType, 23 FontSize, 24-26 FontColorRGB,
+//   27-29 EdgeColorRGB, 30 FullSize, 31 Blur, 32-33 Radius{X,Y}, 34 LineWidth,
+//   35 RoundEdge, 36 RoundCorner, 37 Angle, 38 StartAngle, 39 SweepAngle
+//
+// The classic layout is the same sequence shifted by two, without A2 (new in
+// v14) and without the nine trailing shape fields. ArrayFloat (BoldWeight,
+// EdgeWeight) and ArrayString (Text, CGName) are unchanged.
+//
+// The command ids themselves did NOT change: 0..24 mean the same as in v7
+// (verified against the Command constant each CASConstructionProcess@Set*
+// method writes). v14 appended new ones (25.. : alpha-map gradations, blur and
+// inverse filters, whole-CG blend and the line/polygon/circle/ellipse/arc/pie
+// families), which the classic dispatcher below has no handler for.
+#define IX_NR_CONSTRUCTION_INTS 40
+#define NR_CLASSIC_CONSTRUCTION_COMMANDS 25
+
+static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, struct page **af,
+		struct page **as, struct page **ap, int state)
+{
+	(void)ap;  // point list: only the v14-only vector-shape commands use it
+	bool trace = !!getenv("XSYS4_CP_TRACE");
+	int nr_ints    = (ai && *ai) ? (*ai)->nr_vars : 0;
+	int nr_floats  = (af && *af) ? (*af)->nr_vars : 0;
+	int nr_strings = (as && *as) ? (*as)->nr_vars : 0;
+	if (nr_ints < IX_NR_CONSTRUCTION_INTS || nr_floats < 2 || nr_strings < 2) {
+		if (trace)
+			NOTICE("AddPartsConstructionProcess(ix): unexpected arg sizes i=%d f=%d s=%d",
+			       nr_ints, nr_floats, nr_strings);
+		return;
+	}
+	union vm_value *src = (*ai)->values;
+	int command = src[0].i;
+	if (command < 0 || command >= NR_CLASSIC_CONSTRUCTION_COMMANDS) {
+		if (trace)
+			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d)",
+			       command, parts_no);
+		return;
+	}
+
+	union vm_value ints[32] = {0};
+	ints[0].i = parts_no;
+	ints[1].i = state;
+	ints[2].i = command;
+	for (int i = 3; i <= 20; i++)   // InterpolationType .. B2
+		ints[i] = src[i - 2];
+	for (int i = 21; i <= 31; i++)  // CharSpace .. FullSize (A2 has no classic slot)
+		ints[i] = src[i - 1];
+
+	if (trace)
+		NOTICE("AddPartsConstructionProcess(ix) part=%d state=%d cmd=%d src=(%d,%d %dx%d) dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
+		       parts_no, state, command,
+		       ints[4].i, ints[5].i, ints[6].i, ints[7].i,
+		       ints[8].i, ints[9].i, ints[12].i, ints[13].i,
+		       ints[14].i, ints[15].i, ints[16].i, ints[17].i);
+	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values);
+}
+
 // --- Подсистема Activity (именованные наборы parts) ---
 // Новые игры System 4 группируют parts в именованные «активности». В движке её
 // не было; минимальный реестр: имя -> список (имя_parts, номер_parts) + EX-текст.
@@ -2073,6 +2138,14 @@ static void PartsEngine_PreLink(void)
 	if (fun && fun->nr_arguments == 12) {
 		static_library_replace(&lib_PartsEngine, "AddCopyCutCGToPartsConstructionProcess",
 				PE_AddCopyCutCGToPartsConstructionProcess);
+	}
+	// Ixseal passes the part number, state and a fourth (point list) array
+	// explicitly: AddPartsConstructionProcess(int, ArrayInt, ArrayFloat,
+	// ArrayString, ArrayPos, int) instead of the classic three arrays.
+	fun = get_fun(libno, "AddPartsConstructionProcess");
+	if (fun && fun->nr_arguments == 6) {
+		static_library_replace(&lib_PartsEngine, "AddPartsConstructionProcess",
+				PE_AddPartsConstructionProcess_ix);
 	}
 	fun = get_fun(libno, "Update");
 	if (fun && fun->nr_arguments == 5) {
