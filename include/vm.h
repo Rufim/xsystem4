@@ -158,6 +158,11 @@ struct function_call {
 	uint32_t return_address;
 	int32_t page_slot;
 	int32_t struct_page;
+	// Диагностика XSYS4_SP_CHECK: stack_ptr сразу после установки кадра, чтобы
+	// на RETURN поймать функцию, которая оставила на стеке лишние слоты
+	// (типичный симптом неверно реализованной инструкции — краш случается
+	// далеко от причины).
+	int32_t entry_sp;
 };
 
 extern struct function_call call_stack[4096];

@@ -47,6 +47,15 @@ extern int hll_current_nr_args;
 	}
 
 #define HLL_EXPORT(fname, funptr) { .name = #fname, .fun = funptr }
+/*
+ * Перегрузка, которая отличается от одноимённой ТИПОМ, а не числом аргументов
+ * (hll_current_nr_args тут не помогает — арность у них совпадает, а cif строится
+ * по .ain, так что int- и float-вариант нельзя обслужить одной C-функцией).
+ * Ixseal объявляет такие пары в Math: `Abs(int)->int` и `Abs(float)->float`,
+ * `Min/Max/Clamp` в обоих типах. Линковка (ffi.c) для функции, ВОЗВРАЩАЮЩЕЙ
+ * float, сначала ищет декорированное имя `Имя@f` и только потом обычное.
+ */
+#define HLL_EXPORT_F(fname, funptr) { .name = #fname "@f", .fun = funptr }
 #define HLL_TODO_EXPORT(fname, funptr) { .name = #fname, .fun = NULL }
 
 #define HLL_LIBRARY(lname, ...)				\

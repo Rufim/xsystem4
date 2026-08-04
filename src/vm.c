@@ -79,6 +79,28 @@ bool vm_reset_once = false;
 // XSYS4_FN_TRACE=<comma-separated fn numbers>. Env-gated, harmless.
 static int fn_trace_list[32];
 static int fn_trace_count = -1;
+// Diagnostic: XSYS4_SP_CHECK — проверять баланс стека на каждом RETURN.
+static bool sp_check = false;
+static uint8_t sp_check_reported[65536];
+
+/*
+ * Сколько слотов стека занимает значение объявленного типа (Ixseal). Для
+ * ПЕРЕМЕННЫХ это же число видно по филлерам <void> (decl_slots), но у типа
+ * возврата филлеров нет — считаем по структуре типа:
+ *   wrap<интерфейс> (82 → 100) — два слота (объект, база интерфейса);
+ *   option<T>                  — слоты T плюс тег.
+ */
+static int type_slots(struct ain_type *t)
+{
+	if (!t || t->data == AIN_VOID)
+		return 0;
+	if ((t->data == AIN_WRAP || t->data == AIN_OPTION) && t->array_type) {
+		int inner = t->array_type->data == AIN_IFACE_WRAP
+			? 2 : type_slots(t->array_type);
+		return t->data == AIN_OPTION ? inner + 1 : inner;
+	}
+	return 1;
+}
 // Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr> logs every entered
 // function whose name contains <substr>. Env-gated, harmless.
 static const char *fn_trace_ns = (const char *)1; // 1 = not-yet-resolved
@@ -554,6 +576,8 @@ static int _function_call(int fno, int return_address)
 		.return_address = return_address,
 		.page_slot = slot,
 		.struct_page = -1,
+		// уточняется после снятия аргументов/ресивера (см. function_call/method_call)
+		.entry_sp = stack_ptr,
 	};
 	// initialize local variables
 	for (int i = f->nr_args; i < f->nr_vars; i++) {
@@ -635,6 +659,7 @@ static void function_call(int fno, int return_address)
 			break;
 		}
 	}
+	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	if (fn_trace_count != 0) {
 		for (int i = 0; i < fn_trace_count; i++) {
 			if (fn_trace_list[i] == fno) {
@@ -652,6 +677,7 @@ static void method_call(int fno, int return_address)
 {
 	function_call(fno, return_address);
 	int struct_page = stack_pop().i;
+	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	set_struct_page(struct_page);
 	heap[call_stack[call_stack_ptr-1].page_slot].page->local.struct_ptr = struct_page;
 }
@@ -784,6 +810,21 @@ static void function_return(void)
 					stack_ptr > 0 ? stack[stack_ptr-1].i : -999);
 				break;
 			}
+		}
+	}
+	// XSYS4_SP_CHECK: функция обязана вернуться со стеком «кадр + возвращаемые
+	// слоты». Лишний слот сам по себе не падает — он смещает ссылки у ВЫЗЫВАЮЩЕГО,
+	// и краш случается далеко от причины (так дважды: S_ASSIGN и X_ASSIGN 0).
+	// Печатаем ПЕРВОЕ расхождение по каждой функции, чтобы не залить лог.
+	if (sp_check) {
+		struct function_call *fc = &call_stack[call_stack_ptr-1];
+		struct ain_function *f = &ain->functions[fc->fno];
+		int expect = fc->entry_sp + type_slots(&f->return_type);
+		if (stack_ptr != expect && !sp_check_reported[fc->fno & 0xffff]) {
+			sp_check_reported[fc->fno & 0xffff] = 1;
+			WARNING("SPCHECK fn %d (%s) вернулась sp=%d, ожидалось %d (разница %+d)",
+				fc->fno, display_sjis0(f->name), stack_ptr, expect,
+				stack_ptr - expect);
 		}
 	}
 	unref_call_frame(&call_stack[call_stack_ptr-1]);
@@ -1346,6 +1387,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// «PUSH -1[; PUSH -1]; PUSH 1» (None).
 		int elem_class = get_argument(0);
 		int n = x_option_value_slots(elem_class);
+		if (getenv("XSYS4_OPT_TRACE")) {
+			WARNING("OPT pre-set class=0x%x n=%d sp=%d top=[%d %d %d %d %d %d]",
+				elem_class, n, stack_ptr,
+				stack_ptr>0?stack[stack_ptr-1].i:0, stack_ptr>1?stack[stack_ptr-2].i:0,
+				stack_ptr>2?stack[stack_ptr-3].i:0, stack_ptr>3?stack[stack_ptr-4].i:0,
+				stack_ptr>4?stack[stack_ptr-5].i:0, stack_ptr>5?stack[stack_ptr-6].i:0);
+		}
 		union vm_value vals[n + 1];
 		for (int i = n; i >= 0; i--)
 			vals[i] = stack_pop();
@@ -2890,6 +2938,30 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case DG_ASSIGN: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal: как у DG_PLUSA/S_ASSIGN/SR_ASSIGN, lvalue — ДВУСЛОТОВАЯ
+			// ссылка (страница, член), а не разыменованный слот делegate-страницы
+			// (все 51 сайт Dohna: `...X_REF 1; PUSH <член>; ...; A_REF;
+			// DG_ASSIGN; DELETE`; у v7 перед DG_ASSIGN всегда классический REF).
+			// Классический путь снимал (rval, член), т.е. считал НОМЕР ЧЛЕНА
+			// heap-слотом страницы, и оставлял лишний слот на стеке: цепочка
+			// AddPartsUpdateEvent → AddEndUpdateEvent → RCASTimerManager@0
+			// возвращалась с +1, и X_OP_SET в RCASTimerManager::Instance читал
+			// сдвинутую ссылку (`Out of bounds page index: 210/528`).
+			// Пустой делегат-lvalue хранит 0 и страницы ещё не имеет.
+			int set_i = stack_pop().i;
+			union vm_value *dst = stack_pop_var();
+			struct page *new_dg = copy_page(heap_get_delegate_page(set_i));
+			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
+			    heap[dst->i].page->type == DELEGATE_PAGE) {
+				delete_page(dst->i);
+				heap_set_page(dst->i, new_dg);
+			} else {
+				dst->i = heap_alloc_page(new_dg);
+			}
+			stack_push(set_i);
+			break;
+		}
 		int set_i = stack_pop().i;
 		int dst_i = stack_pop().i;
 		struct page *set = heap_get_delegate_page(set_i);
@@ -3042,8 +3114,10 @@ void vm_optrace_dump(void)
 
 static void vm_execute(void)
 {
-	if (optrace_on < 0)
+	if (optrace_on < 0) {
 		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
+		sp_check = getenv("XSYS4_SP_CHECK") != NULL;
+	}
 	for (;;) {
 		uint16_t opcode;
 		if (instr_ptr == VM_RETURN)

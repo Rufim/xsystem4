@@ -16,6 +16,7 @@
 
 #define VM_PRIVATE
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ffi.h>
@@ -990,6 +991,15 @@ static void link_static_library_function(struct hll_function *dst, struct ain_hl
 		ERROR("Failed to link HLL function");
 }
 
+static void *static_library_lookup(struct static_library *lib, const char *name)
+{
+	for (int j = 0; lib->functions[j].name; j++) {
+		if (!strcmp(name, lib->functions[j].name))
+			return lib->functions[j].fun;
+	}
+	return NULL;
+}
+
 /*
  * "Link" a library that has been compiled into the xsystem4 executable.
  */
@@ -998,12 +1008,20 @@ static struct hll_function *link_static_library(struct ain_library *ainlib, stru
 	struct hll_function *dst = xcalloc(ainlib->nr_functions, sizeof(struct hll_function));
 
 	for (int i = 0; i < ainlib->nr_functions; i++) {
-		for (int j = 0; lib->functions[j].name; j++) {
-			if (!strcmp(ainlib->functions[i].name, lib->functions[j].name)) {
-				link_static_library_function(&dst[i], &ainlib->functions[i], lib->functions[j].fun);
-				break;
-			}
+		struct ain_hll_function *f = &ainlib->functions[i];
+		void *fun = NULL;
+		// Перегрузка по ТИПУ (см. HLL_EXPORT_F в hll.h): для функции,
+		// возвращающей float, сначала пробуем декорированное имя `Имя@f`.
+		// Если библиотека такого не экспортирует — обычное имя, как раньше.
+		if (f->return_type.data == AIN_FLOAT) {
+			char decorated[256];
+			snprintf(decorated, sizeof(decorated), "%s@f", f->name);
+			fun = static_library_lookup(lib, decorated);
 		}
+		if (!fun)
+			fun = static_library_lookup(lib, f->name);
+		if (fun)
+			link_static_library_function(&dst[i], f, fun);
 		if (!dst[i].fun) {
 			if (getenv("XSYS4_LIST_UNIMPL"))
 				WARNING("UNIMPL: %s.%s", ainlib->name, ainlib->functions[i].name);
