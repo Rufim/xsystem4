@@ -1231,7 +1231,17 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// снять ссылку, записать N значений в ref[0..N-1], вернуть их на стек
 		// (как обычный ASSIGN возвращает значение). N=1 эквивалентно ASSIGN.
 		int n = get_argument(0);
-		union vm_value vals[n > 0 ? n : 1];
+		// n == 0 — пакетная инициализация ПУСТОГО массива
+		// (`PUSH 0; X_A_INIT; PUSH 0; X_ASSIGN 0`, все 12 сайтов такие):
+		// писать нечего, а разыменовывать ссылку НЕЛЬЗЯ — у массива нулевой
+		// длины индекс 0 уже вне границ (`Out of bounds page index: 223/0`
+		// в CASCommonData@2). Просто снимаем ссылку.
+		if (n == 0) {
+			stack_pop();
+			stack_pop();
+			break;
+		}
+		union vm_value vals[n];
 		for (int i = n - 1; i >= 0; i--)
 			vals[i] = stack_pop();
 		union vm_value *ref = stack_pop_var();
@@ -2050,6 +2060,24 @@ static enum opcode execute_instruction(enum opcode opcode)
 	}
 	//case S_REFREF: // ???: why/how is this different from regular REFREF?
 	case S_ASSIGN: { // A = B
+		// Ixseal (v11+) сменил ФОРМУ lvalue, как и у SR_ASSIGN: вместо
+		// разыменованного слота строки на стеке лежит ДВУСЛОТОВАЯ ссылка
+		// (страница, индекс) — сайты выглядят как `PUSHSTRUCTPAGE; PUSH <член>;
+		// S_PUSH ...; S_ASSIGN; DELETE` или `...X_REF 1; PUSH <элемент>;
+		// ...; A_REF; S_ASSIGN; DELETE`, т.е. БЕЗ классического REF/S_REF
+		// (в v6/v7 он всегда есть — сверено xscan'ом по трём .ain).
+		// Классический обработчик снимал (rval, index) и писал строку в
+		// heap[index] — то есть в ЧУЖОЙ слот кучи (порча!), да ещё оставлял
+		// на стеке лишний слот: конструктор структуры 418 возвращался с
+		// перекошенным стеком, и следующий `X_ASSIGN` в глобальной
+		// инициализации падал с `Out of bounds page index: 125/186`.
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			int rval = stack_pop().i;
+			union vm_value *ref = stack_pop_var();
+			heap_string_assign(ref->i, heap_get_string(rval));
+			stack_push(rval); // оставить B: сайт освобождает его DELETE'ом
+			break;
+		}
 		int rval = stack_peek(0).i;
 		int lval = stack_peek(1).i;
 		heap_string_assign(lval, heap_get_string(rval));
