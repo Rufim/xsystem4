@@ -936,6 +936,31 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 
 	PE_SetPos(no, act_list_int(node, "座標", 0, 0), act_list_int(node, "座標", 1, 0));
 	PE_SetZ(no, act_list_int(node, "座標", 2, 0));
+	// 原点座標モード (origin/anchor mode): which point of the part 座標 refers to, on
+	// the 1-9 grid (1=top-left ... 5=middle-center ... 9=bottom-right) — the same
+	// numbering as the engine's calculate_offset() and as the flat layer origin_mode.
+	// Must be applied AFTER the CG/flat/panel is loaded above, because the offset is
+	// derived from the state's width/height. Dropping it drew every centre-anchored
+	// part with its top-left corner at the anchor point: Dohna's SceneLogo anchors the
+	// AliceSoft 30th badge at its centre (原点座標モード=5), so the logo landed half a
+	// texture down-right of where it belongs. Absent field -> 1, which is the engine
+	// default (parts.c parts_alloc), so layouts that predate it are unaffected.
+	// Counts (tool: alice ex dump over every .pactex): Dohna 1942×mode1 + 766 non-1
+	// across 195 layouts; Tsumamigui 3 614×mode1 + 15 non-1 across 25 layouts.
+	PE_SetPartsOriginPosMode(no, act_int(node, "原点座標モード", 1));
+	// 原点座標 (explicit origin coordinate) is (0,0) in all 2708 parts of all 195 Dohna
+	// layouts and absent entirely in Tsumamigui 3, so its meaning is not established —
+	// check the assumption instead of silently ignoring a non-zero value.
+	if (act_list_int(node, "原点座標", 0, 0) || act_list_int(node, "原点座標", 1, 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("act_build_part: part '%s' has non-zero 原点座標 (%d,%d) — meaning not established, ignored",
+			        display_sjis0(node->name->text),
+			        act_list_int(node, "原点座標", 0, 0),
+			        act_list_int(node, "原点座標", 1, 0));
+		}
+	}
 	PE_SetAlpha(no, act_int(node, "アルファ", 255));
 	// 拡大縮小 (scale x,y): e.g. the config sample-window system icons are 0.5.
 	float sx = act_list_float(node, "拡大縮小", 0, 1.0f);
