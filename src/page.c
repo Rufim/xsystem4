@@ -1080,6 +1080,37 @@ void array_reverse(struct page *page)
 	}
 }
 
+// Array.Shuffle(array, seed) — тасовка Фишера-Йетса. Имя второго аргумента взято из
+// .ain (`ainfnsig` по обёртке `ArrayExtensions::GetShuffle<T>`): это именно `seed`,
+// а не количество; 18 из 23 сайтов у Dohna передают литерал -1 = «без фиксированного
+// сида». Состояние генератора ЛОКАЛЬНОЕ: игровой поток rand() (Math.SetSeed → srand)
+// сбивать нельзя, поэтому при seed < 0 берём из него ровно одно значение на затравку.
+// Меняем местами ЭЛЕМЕНТЫ, а не слоты: у двухслотового элемента пара слотов должна
+// остаться в исходном порядке (как в array_reverse).
+void array_shuffle(struct page *page, int seed)
+{
+	if (!page)
+		return;
+	int slots = array_elem_slots(page);
+	int n = page->nr_vars / slots;
+	if (n < 2)
+		return;
+	uint32_t st = seed >= 0 ? (uint32_t)seed : (uint32_t)rand();
+	if (!st)
+		st = 0x9e3779b9u;  // xorshift не выходит из нуля
+	for (int i = n - 1; i > 0; i--) {
+		st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+		int j = (int)(st % (uint32_t)(i + 1));
+		if (j == i)
+			continue;
+		for (int k = 0; k < slots; k++) {
+			union vm_value tmp = page->values[i*slots + k];
+			page->values[i*slots + k] = page->values[j*slots + k];
+			page->values[j*slots + k] = tmp;
+		}
+	}
+}
+
 struct page *delegate_new_from_method(int obj, int fun)
 {
 	if (fun < 1)

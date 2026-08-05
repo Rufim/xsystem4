@@ -502,6 +502,7 @@ static int Array_ix_Copy(struct page **self, struct page **src)
 }
 
 static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
+static void Array_Shuffle(struct page **self, int seed) { if (self) array_shuffle(*self, seed); }
 
 static int Array_ix_Fill(struct page **self, union vm_value *value)
 {
@@ -1115,6 +1116,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Concat, Array_ix_Copy),
 	    HLL_EXPORT(AddRange, Array_ix_Copy),
 	    HLL_EXPORT(Reverse, Array_Reverse),
+	    HLL_EXPORT(Shuffle, Array_Shuffle),
 	    HLL_EXPORT(Fill, Array_ix_Fill),
 	    HLL_EXPORT(Find, Array_ix_Find),
 	    HLL_EXPORT(FindLast, Array_ix_FindLast),

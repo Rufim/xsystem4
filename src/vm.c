@@ -774,6 +774,20 @@ static void delegate_call(int dg_no, int return_address)
 	int dg_page = stack_peek(1 + return_values).i;
 	int dg_index = stack_peek(0 + return_values).i;
 	int obj, fun;
+	// XSYS4_DG_RUNAWAY=<порог>: одноразовый диагноз «DG_CALL не заканчивается».
+	// Печатает страницу делегата, ТЕКУЩЕЕ число элементов и стек VM — так видно,
+	// растёт ли список во время обхода (обработчик дописывает в тот же делегат).
+	{
+		static bool warned = false;
+		const char *lim = getenv("XSYS4_DG_RUNAWAY");
+		if (lim && !warned && dg_index > atoi(lim)) {
+			warned = true;
+			WARNING("DG RUNAWAY dg_no=%d page=%d idx=%d numof=%d",
+				dg_no, dg_page,	dg_index,
+				delegate_numof(heap_get_delegate_page(dg_page)));
+			vm_stack_trace();
+		}
+	}
 	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun)) {
 		if (fn_trace_count != 0)
 			vm_fn_trace(fun, "DG_CALL");

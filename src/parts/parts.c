@@ -1971,7 +1971,20 @@ int PE_GetParentPartsNumber(int parts_no)
 	struct parts *parts = parts_get(parts_no);
 	if (parts->parent)
 		return parts->parent->no;
-	return -1;
+	// «Родителя нет» = 0, а НЕ -1. Внутри движка -1 (pending_parent, RemoveChild) —
+	// своя конвенция, но НАРУЖУ games ждут 0, и это доказано байткодом обеих версий:
+	//   Dohna v14 `AFL_Parts_GetLayerIDByParts` (@0x2b316c) идёт вверх по родителям
+	//     циклом `while (no != 0) { p = GetParent(no); if (p == 0) return no; no = p; }`;
+	//   Tsumamigui v7 `パーツ親メッセージウィンドウ設定取得` (@0x15fa34) —
+	//     `if (GetParent(GetParent(x)) == 0) return 0`.
+	// Номер части 0 не бывает валидным ни у одной из игр, поэтому 0 и есть «нет».
+	// С прежним -1 цикл Dohna не завершался НИКОГДА: `-1 != 0`, дальше
+	// `AFL_Parts_Wrap(-1)` (а parts_get(-1) ещё и СОЗДАВАЛ часть с номером -1),
+	// её родитель снова -1 — вечный цикл на 100% CPU с аллокацией обёртки
+	// CSpriteParts на каждом витке (RSS рос ~13 МБ/с, до 3.8 ГБ). Именно так
+	// зависал уход с титула Dohna: клик по «Start Game» → SceneTitle@TitleClose →
+	// EraseLayer → CallErasingLayerEvent → CModeMark@Init-лямбда → GetLayerIDByParts.
+	return 0;
 }
 
 bool PE_SetPartsGroupNumber(possibly_unused int PartsNumber, possibly_unused int GroupNumber)
