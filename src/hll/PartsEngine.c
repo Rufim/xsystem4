@@ -1636,6 +1636,22 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_StopSwipe, void);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_SetComment, int a, struct string *b);
 
 /*
+ * `Parts_GetPartsSize(no, wrap<int> w, wrap<int> h, state)` — ширина и высота
+ * состояния одним вызовом, через два out-параметра. Обычные `Parts_GetParts{Width,
+ * Height}` у движка уже есть и реально считают размер по состоянию; не хватало
+ * только парной формы, которой пользуется `parts::detail::CParts@Size::get`
+ * (через `AFL_Parts_GetSize`) — на ней вставал `SceneTitle@FadeInButton`.
+ * `wrap<скаляр>` ffi отдаёт как обычный указатель на значение (см. ffi.c).
+ */
+static void PE_Parts_GetPartsSize(int parts_no, int *w, int *h, int state)
+{
+	if (w)
+		*w = PE_GetPartsWidth(parts_no, state);
+	if (h)
+		*h = PE_GetPartsHeight(parts_no, state);
+}
+
+/*
  * Покомпонентные геттеры сложения/умножения цвета части. Сеттеры
  * (`SetComponentAddColor`/`SetComponentMulColor` → `PE_SetAddColor`/
  * `PE_SetMultiplyColor`) хранят значения по-настоящему, и агрегатные
@@ -2127,6 +2143,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentOriginPosMode, PE_GetPartsOriginPosMode),
 	    HLL_TODO_EXPORT(GetComponentWidth, PartsEngine_GetComponentWidth),
 	    HLL_TODO_EXPORT(GetComponentHeight, PartsEngine_GetComponentHeight),
+	    HLL_EXPORT(Parts_GetPartsSize, PE_Parts_GetPartsSize),
 	    HLL_EXPORT(Parts_GetPartsWidth, PE_GetPartsWidth),
 	    HLL_EXPORT(Parts_GetPartsHeight, PE_GetPartsHeight),
 	    HLL_EXPORT(SetComponentShow, PE_SetShow),
@@ -2144,16 +2161,16 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentMulColorG, PE_GetComponentMulColorG),
 	    HLL_EXPORT(GetComponentMulColorB, PE_GetComponentMulColorB),
 	    HLL_EXPORT(SetComponentDrawFilter, PE_SetPartsDrawFilter),
-	    HLL_TODO_EXPORT(GetComponentDrawFilter, PartsEngine_GetComponentDrawFilter),
+	    HLL_EXPORT(GetComponentDrawFilter, PE_GetPartsDrawFilter),
 	    HLL_EXPORT(SetComponentMagX, PE_SetPartsMagX),
 	    HLL_EXPORT(SetComponentMagY, PE_SetPartsMagY),
-	    HLL_TODO_EXPORT(GetComponentMagX, PartsEngine_GetComponentMagX),
-	    HLL_TODO_EXPORT(GetComponentMagY, PartsEngine_GetComponentMagY),
+	    HLL_EXPORT(GetComponentMagX, PE_GetPartsMagX),
+	    HLL_EXPORT(GetComponentMagY, PE_GetPartsMagY),
 	    HLL_EXPORT(SetComponentRotateX, PE_SetPartsRotateX),
 	    HLL_EXPORT(SetComponentRotateY, PE_SetPartsRotateY),
 	    HLL_EXPORT(SetComponentRotateZ, PE_SetPartsRotateZ),
-	    HLL_TODO_EXPORT(GetComponentRotateX, PartsEngine_GetComponentRotateX),
-	    HLL_TODO_EXPORT(GetComponentRotateY, PartsEngine_GetComponentRotateY),
+	    HLL_EXPORT(GetComponentRotateX, PE_GetPartsRotateX),
+	    HLL_EXPORT(GetComponentRotateY, PE_GetPartsRotateY),
 	    HLL_EXPORT(GetComponentRotateZ, PE_GetPartsRotateZ),
 	    HLL_EXPORT(SetComponentMargin, PE_SetComponentMargin),
 	    HLL_EXPORT(GetComponentMarginTop, PE_GetComponentMarginTop),
@@ -2161,7 +2178,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentMarginLeft, PE_GetComponentMarginLeft),
 	    HLL_EXPORT(GetComponentMarginRight, PE_GetComponentMarginRight),
 	    HLL_EXPORT(SetComponentAlphaClipper, PE_SetPartsAlphaClipperPartsNumber),
-	    HLL_TODO_EXPORT(GetComponentAlphaClipper, PartsEngine_GetComponentAlphaClipper),
+	    HLL_EXPORT(GetComponentAlphaClipper, PE_GetPartsAlphaClipperPartsNumber),
 	    HLL_TODO_EXPORT(SetComponentTextureFilterType, PartsEngine_SetComponentTextureFilterType),
 	    HLL_TODO_EXPORT(GetComponentTextureFilterType, PartsEngine_GetComponentTextureFilterType),
 	    HLL_TODO_EXPORT(SetComponentMipmap, PartsEngine_SetComponentMipmap),
@@ -2445,7 +2462,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(Parts_GetPartsDrag, PartsEngine_Parts_GetPartsDrag),
 	    HLL_TODO_EXPORT(Parts_GetParentPartsNumber, PartsEngine_Parts_GetParentPartsNumber),
 	    HLL_EXPORT(Parts_GetInputState, PE_GetInputState),
-	    HLL_TODO_EXPORT(Parts_GetOnCursorShowLinkPartsNumber, PartsEngine_Parts_GetOnCursorShowLinkPartsNumber),
+	    HLL_EXPORT(Parts_GetOnCursorShowLinkPartsNumber, PE_GetOnCursorShowLinkPartsNumber),
 	    HLL_TODO_EXPORT(Parts_GetSoundNumber, PartsEngine_Parts_GetSoundNumber),
 	    HLL_TODO_EXPORT(Parts_IsPartsPixelDecide, PartsEngine_Parts_IsPartsPixelDecide),
 	    HLL_EXPORT(Parts_IsCursorIn, PE_IsCursorIn),

@@ -2003,6 +2003,32 @@ float PE_GetPartsRotateZ(int parts_no)
 	return parts_get(parts_no)->local.rotation.z;
 }
 
+/*
+ * Поворот по X/Y и номер части-альфа-клиппера читаются обратно.
+ *
+ * Сеттеры уже хранят и то и другое (`local.rotation.x/y`,
+ * `alpha_clipper_parts_no`), геттеры же были `HLL_TODO_EXPORT` (`.fun = NULL`).
+ * Нужны они не «для полноты»: motion-движок Ixseal читает ТЕКУЩЕЕ значение как
+ * НАЧАЛО интерполяции (`CSpriteParts@<свойство>::get` ←
+ * `Motion::Executer@GetValue<float>` ← `InitializeParams`), поэтому без геттера
+ * первый же анимируемый поворот/клиппер валит движок в REPL. Ровно тот же
+ * случай, что покомпонентные геттеры Add/Mul-цвета. Форма одинакова у v7 и v14.
+ */
+float PE_GetPartsRotateX(int parts_no)
+{
+	return parts_get(parts_no)->local.rotation.x;
+}
+
+float PE_GetPartsRotateY(int parts_no)
+{
+	return parts_get(parts_no)->local.rotation.y;
+}
+
+int PE_GetPartsAlphaClipperPartsNumber(int parts_no)
+{
+	return parts_get(parts_no)->alpha_clipper_parts_no;
+}
+
 void PE_SetPartsAlphaClipperPartsNumber(int parts_no, int alpha_clipper_parts_no)
 {
 	struct parts *parts = parts_get(parts_no);

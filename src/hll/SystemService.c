@@ -722,6 +722,43 @@ static void SystemService_XXX(struct string **text) {
 	*text = cstr_to_string("FORMAT HDD ERASE 578205024758284076520478254092784789752384758204687293");
 }
 
+/*
+ * Масштаб игрового вида внутри окна. Пара сеттер/геттер (`SetGameViewScaleRate`
+ * fn11 / `GetGameViewScaleRate` fn12), у v6/v7 её нет вовсе (проверено
+ * ainliball по трём .ain), обёртки игры — прямые проходные
+ * (`view::detail::SetGameViewScaleRate` @0x4ae814,
+ * `AFL_View_GetGameViewScaleRate` @0x4ae098).
+ *
+ * Зачем геттер игре: `AFL_View_CalcGameViewPos` (@0x4ae0ea) пересчитывает
+ * координату из оконной в видовую и при rate == 1.0f возвращает её КАК ЕСТЬ,
+ * иначе делит. Через него идёт `input::detail::GetMousePos`, то есть без
+ * геттера вставал каждый кадр титула (`TitleCharacterView@UpdateCharacterPos`).
+ *
+ * Движок рисует вид 1:1 в окно того же размера, поэтому честное значение — 1.0,
+ * и пересчёт мыши становится тождественным. Само масштабирование вида не
+ * реализовано: если игра выставит не 1.0, координаты разойдутся — вместо тихого
+ * дефолта стоит проверка допущения.
+ */
+static float sys_game_view_scale_rate = 1.0f;
+
+static void SystemService_SetGameViewScaleRate(float rate)
+{
+	if (rate != 1.0f) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("SetGameViewScaleRate(%f): масштабирование игрового вида "
+				"не реализовано, координаты мыши не пересчитываются", rate);
+		}
+	}
+	sys_game_view_scale_rate = rate;
+}
+
+static float SystemService_GetGameViewScaleRate(void)
+{
+	return sys_game_view_scale_rate;
+}
+
 static void SystemService_PreLink(void);
 
 static void SystemService_ModuleInit(void)
@@ -758,6 +795,8 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(ChangeFullScreen, SystemService_ChangeFullScreen),
 	    HLL_EXPORT(InitMainWindowPosAndSize, SystemService_InitMainWindowPosAndSize),
 	    HLL_EXPORT(UpdateView, SystemService_UpdateView),
+	    HLL_EXPORT(SetGameViewScaleRate, SystemService_SetGameViewScaleRate),
+	    HLL_EXPORT(GetGameViewScaleRate, SystemService_GetGameViewScaleRate),
 	    HLL_EXPORT(GetViewWidth, SystemService_GetViewWidth),
 	    HLL_EXPORT(GetViewHeight, SystemService_GetViewHeight),
 	    HLL_EXPORT(GetDefaultViewWidth, SystemService_GetDefaultViewWidth),
