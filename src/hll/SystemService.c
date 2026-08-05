@@ -58,17 +58,99 @@ static int SystemService_GetGameVersion(void)
 	return ain->game_version;
 }
 
+/*
+ * Анти-тамппер: `main` сверяет строку версии рантайма System4 по фиксированным
+ * позициям — склеивает несколько `String.GetPart(v, index, len)` и сравнивает со
+ * своей строковой константой, а рядом требует `ToInt(v[i]) == ToInt(v[j])`. Не
+ * сошлось — `main` уходит в пустой цикл (чёрный экран).
+ *
+ * Строка у каждой сборки рантайма СВОЯ, поэтому один водяной знак на все игры
+ * невозможен (у Dohna `[0:3]`=="sd4", у Healing Touch — "fea"). Ниже — снятые с
+ * байткода наборы ограничений; нужный выбирается по наличию ожидаемой константы
+ * в строковой таблице .ain, а сама строка синтезируется из ограничений.
+ */
+struct version_check {
+	const char *expect;                    // константа, с которой сверяет main
+	struct { int index, len; } frag[4];     // фрагменты в порядке конкатенации
+	int eq_a, eq_b;                        // требование ToInt(v[a]) == ToInt(v[b])
+};
+
+static const struct version_check version_checks[] = {
+	// Tsumamigui 3 (v7), main: [6:9] + [13:16] + [20:25], плюс [5] == [32].
+	{ "]:77d66sadc", { {6,3}, {13,3}, {20,5} }, 5, 32 },
+	// Dohna Dohna (v14), main @0x49a26c: [6:9] + [0:3] + [16:20]; @0x49a08a: [2] == [24].
+	{ "6sdsd48f63", { {6,3}, {0,3}, {16,4} }, 2, 24 },
+	// Healing Touch (v14, оба маршрута — проверки идентичны), main @0x49a7a0:
+	// [5:8] + [13:16] + [0:3]; @0x49a5be: [16] == [3].
+	{ "b544iofea", { {5,3}, {13,3}, {0,3} }, 16, 3 },
+};
+
+static const char *game_version_text(void)
+{
+	static char buf[64];
+	static bool built = false;
+	if (built)
+		return buf;
+	built = true;
+	memset(buf, '0', sizeof(buf));
+	// Длина 33 — как у строки, на которой проверка Tsumamigui 3 уже проверена
+	// работающей; самый большой нужный индекс — 32 (её же `[5]==[32]`).
+	buf[33] = '\0';
+
+	for (size_t v = 0; v < sizeof(version_checks) / sizeof(*version_checks); v++) {
+		const struct version_check *vc = &version_checks[v];
+		bool found = false;
+		for (int i = 0; i < ain->nr_strings && !found; i++)
+			found = !strcmp(ain->strings[i]->text, vc->expect);
+		if (!found)
+			continue;
+		bool covered[sizeof(buf)];
+		memset(covered, 0, sizeof(covered));
+		const char *p = vc->expect;
+		for (int f = 0; f < 4 && vc->frag[f].len; f++) {
+			for (int k = 0; k < vc->frag[f].len; k++) {
+				int at = vc->frag[f].index + k;
+				if (at < 0 || at >= 33 || !*p)
+					break;
+				buf[at] = *p++;
+				covered[at] = true;
+			}
+		}
+		// `ToInt(v[a]) == ToInt(v[b])`: подгоняем ту позицию, которую фрагменты
+		// не задали (если не задана ни одна, обе уже равны — там наполнитель).
+		if (buf[vc->eq_a] != buf[vc->eq_b]) {
+			if (!covered[vc->eq_b])
+				buf[vc->eq_b] = buf[vc->eq_a];
+			else if (!covered[vc->eq_a])
+				buf[vc->eq_a] = buf[vc->eq_b];
+			else
+				WARNING("версия рантайма: ограничения [%d]==[%d] и фрагменты "
+					"противоречивы", vc->eq_a, vc->eq_b);
+		}
+		return buf;
+	}
+	WARNING("анти-тамппер: набор ограничений для этой игры не известен — "
+		"main может уйти в пустой цикл");
+	return buf;
+}
+
+// v7-форма: out-параметр `ref string`, возвращает bool.
 static bool SystemService_GetGameVersionByText(struct string **text)
 {
-	// Анти-тамппер: игра сверяет строку версии рантайма System4 по фиксированным
-	// позициям (Tsumamigui 3: [6:9]"]:7" + [13:16]"7d6" + [20:25]"6sadc" == её
-	// строковая константа, плюс [5]==[32]). Иначе main крутит пустой цикл (чёрный
-	// экран). Возвращаем строку-водяной знак, удовлетворяющую этой проверке.
-	static const char watermark[] = "000000]:700007d600006sadc00000000";
 	if (*text)
 		free_string(*text);
-	*text = cstr_to_string(watermark);
+	*text = cstr_to_string(game_version_text());
 	return true;
+}
+
+// Ixseal-форма (v14): без аргументов, строка — это ВОЗВРАТ (`ret=12 ()`).
+// Прежде она линковалась на v7-функцию: cif собирался по объявлению .ain, т.е.
+// без аргументов и с указателем-возвратом, а C-функция читала `text` из
+// неинициализированного регистра и отдавала `true` — движок оборачивал 1 как
+// `struct string *` и падал в `sjis_count_char(0x9)` при первом же GetPart.
+static struct string *SystemService_GetGameVersionByText_ix(void)
+{
+	return cstr_to_string(game_version_text());
 }
 
 static void SystemService_GetGameName(struct string **game_name)
@@ -604,5 +686,12 @@ static void SystemService_PreLink(void)
 	if (fun && fun->nr_arguments == 1) {
 		static_library_replace(&lib_SystemService, "IsResetOnce",
 				SystemService_IsResetOnce_Drapeko);
+	}
+
+	// Ixseal отдаёт строку версии ВОЗВРАТОМ, а не через out-параметр.
+	fun = get_fun(libno, "GetGameVersionByText");
+	if (fun && fun->nr_arguments == 0) {
+		static_library_replace(&lib_SystemService, "GetGameVersionByText",
+				SystemService_GetGameVersionByText_ix);
 	}
 }
