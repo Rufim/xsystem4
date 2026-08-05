@@ -430,6 +430,14 @@ struct parts {
 	// Such parts render as CG (hover/click state-switch) but must report component
 	// type 0 to the game, which enables click handlers only on type-0 parts.
 	bool is_button;
+	// Часть, чьё состояние — `構築パーツ` (construction part): её содержимое
+	// строит «процедура построения» (список операций из раскладки), которую
+	// движок не выполняет. Загрузчик кладёт вместо результата НЕПРОЗРАЧНУЮ
+	// заливку прямоугольника процедуры — она годится только как маска
+	// альфа-клиппера (прямоугольного отсечения) для соседей, но не как то, что
+	// видно на экране. Флаг убирает такую часть из отрисовки, оставляя текстуру
+	// доступной клипперу (он читает её напрямую, независимо от show).
+	bool construction_mask;
 	// Widget state for config-style screens (scrollbars/sliders and checkboxes).
 	// Not yet rendered as interactive widgets, but the game reads these back, so
 	// we store what it sets to keep the config UI logic consistent.

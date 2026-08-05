@@ -818,8 +818,22 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		if (step1) {
 			int w = act_list_int(step1, "先矩形", 4, 0);
 			int h = act_list_int(step1, "先矩形", 5, 0);
-			if (w > 0 && h > 0)
+			if (w > 0 && h > 0) {
 				PE_SetPartsColorFill(no, w, h);
+				// Заливка — ТОЛЬКО маска: сама часть не рисуется, иначе
+				// непрозрачный прямоугольник закрывает экран (титул Dohna
+				// объявляет такую часть `表示 = 1, アルファ = 255`, z=29,
+				// 1480x920 поверх всего, а по её процедуре поверхность
+				// прозрачная). Клипперы Tsumamigui 3 и так `表示 = 0`.
+				PE_SetPartsConstructionMask(no);
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					WARNING("構築パーツ: процедура построения не выполняется, "
+						"часть используется только как прямоугольная маска "
+						"альфа-клиппера и не рисуется");
+				}
+			}
 		}
 		return;
 	}

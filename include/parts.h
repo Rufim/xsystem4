@@ -126,6 +126,7 @@ int PE_GetComponentClipAreaPosY(int parts_no);
 int PE_GetComponentClipAreaPosWidth(int parts_no);
 int PE_GetComponentClipAreaPosHeight(int parts_no);
 int PE_GetInputState(int parts_no);
+void PE_SetPartsConstructionMask(int parts_no);
 void PE_EnsureParts(int parts_no);
 bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state);
 bool PE_SetPartsCGDetectionSize(int parts_no, struct string *cg_name, int state);

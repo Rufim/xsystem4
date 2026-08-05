@@ -631,6 +631,15 @@ void parts_render(struct parts *parts)
 	}
 	if (!parts->global.show)
 		return;
+	// Содержимое `構築パーツ` не построено — рисовать вместо него заливку нельзя
+	// (см. construction_mask в parts_internal.h). У Dohna такая часть на титуле
+	// объявлена `表示 = 1, アルファ = 255` поверх всего (z=29, 1480x920), и
+	// заглушка-заливка закрывала экран белым; по самой процедуре поверхность
+	// прозрачная (コマンド 0 создаёт её цветом (0,0,0,0), コマンド 5 заливает тем
+	// же). Клипперы Tsumamigui 3 (`サンプル表示範囲`/`アンケート表示範囲`) и так
+	// объявлены `表示 = 0`, поэтому визуально его это не задевает.
+	if (parts->construction_mask)
+		return;
 	if (parts->message_window && !parts_message_window_show)
 		return;
 	if (parts->linked_to >= 0) {

@@ -2506,6 +2506,16 @@ int PE_GetPartsCheckBoxB(int parts_no)
  * (`parts_try_get`, HLL-семантика: на несуществующий номер вернуть false),
  * поэтому загрузчику нужен явный способ её создать.
  */
+// Пометить часть как маску построения (см. construction_mask в parts_internal.h):
+// содержимое `構築パーツ` не построено, поэтому заливка-заглушка годится только
+// как прямоугольная маска альфа-клиппера, но не как то, что видно на экране.
+void PE_SetPartsConstructionMask(int parts_no)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->construction_mask = true;
+	parts_dirty(parts);
+}
+
 void PE_EnsureParts(int parts_no)
 {
 	parts_get(parts_no);
