@@ -448,6 +448,23 @@ struct parts {
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
 	bool pass_cursor;
+	// PartsEngine.SetEnableInputProcess/IsEnableInputProcess: участвует ли часть в
+	// обработке ввода вообще. Отличается от clickable (право на клик) — это ГЛОБАЛЬНЫЙ
+	// выключатель hit-теста и сообщений. Игра гасит им ввод на время анимации:
+	// `Motion::Join → InputDisabler@SetPartsParam → CSpriteParts@EnableInputProcess::set`.
+	// Дефолт — true (см. parts_init).
+	bool enable_input_process;
+	// PartsEngine.Parts_SetWheelable: принимает ли часть нотчи колеса. Геттера в
+	// библиотеке НЕТ (только сеттер fn203), поэтому смысл взят из имени и сайта
+	// `CParts@MouseWheelEvent::add` — подписка на колесо включает приём. Дефолт true =
+	// прежнее поведение движка (Tsumamigui 3 и Escalayer этой функции не объявляют
+	// вовсе — тул ainliball, — так что у них флаг всегда true и скролл BACK LOG цел).
+	bool wheelable;
+	// クリップ領域: SetComponentClipArea/GetComponentClipAreaPos{X,Y,Width,Height} +
+	// SetComponentEnableClipArea/IsComponentEnableClipArea. Хранится и возвращается;
+	// отсечение при рендере пока не реализовано (см. PE_SetComponentEnableClipArea).
+	bool clip_area_enabled;
+	Rectangle clip_area;
 	bool lock_input_state;
 	bool want_save;
 	bool draggable;

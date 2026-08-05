@@ -65,6 +65,8 @@ static void parts_init(struct parts *parts)
 	parts->global = PARTS_PARAMS_INITIALIZER;
 	parts->delegate_index = -1;
 	parts->want_save = true;
+	parts->enable_input_process = true;
+	parts->wheelable = true;
 	parts->on_cursor_sound = -1;
 	parts->on_click_sound = -1;
 	parts->origin_mode = 1;
@@ -2080,6 +2082,66 @@ void PE_SetInputState(int parts_no, int state)
 int PE_GetInputState(int parts_no)
 {
 	return parts_get(parts_no)->state + 1;
+}
+
+/*
+ * Область отсечения компонента (クリップ領域) — прямоугольник + флаг включения.
+ * Все четыре ГЕТТЕРА в библиотеке есть (fn136-139) плюс IsComponentEnableClipArea
+ * (fn134), т.е. игра читает значения обратно и no-op отличим: значения обязаны
+ * храниться. Dohna анимирует их через motion — `Motion::Executer@SetPartsValue` →
+ * `CSpriteParts@ClipWidth::set` → `CParts@ClipWidth::set` читает ClipX и пишет
+ * ширину, так что без хранения ломается сама анимация, а не только вид.
+ *
+ * САМО отсечение при рендере пока НЕ применяется (у движка есть только
+ * альфа-клиппер по части, прямоугольного scissor'а нет) — поэтому на включённую
+ * непустую область один раз печатается WARNING, чтобы допущение было видно, а не
+ * пряталось за тихим дефолтом.
+ */
+void PE_SetComponentEnableClipArea(int parts_no, bool enable)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->clip_area_enabled = !!enable;
+	if (enable && (parts->clip_area.w > 0 || parts->clip_area.h > 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("PartsEngine: часть %d включила クリップ領域 (%d,%d %dx%d) — "
+			        "значения хранятся, но отсечение при рендере не реализовано",
+			        parts_no, parts->clip_area.x, parts->clip_area.y,
+			        parts->clip_area.w, parts->clip_area.h);
+		}
+	}
+}
+
+bool PE_IsComponentEnableClipArea(int parts_no)
+{
+	return parts_get(parts_no)->clip_area_enabled;
+}
+
+void PE_SetComponentClipArea(int parts_no, int x, int y, int w, int h)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->clip_area = (Rectangle) { .x = x, .y = y, .w = w, .h = h };
+}
+
+int PE_GetComponentClipAreaPosX(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.x;
+}
+
+int PE_GetComponentClipAreaPosY(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.y;
+}
+
+int PE_GetComponentClipAreaPosWidth(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.w;
+}
+
+int PE_GetComponentClipAreaPosHeight(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.h;
 }
 
 // System 4 v14 (Ixseal: Dohna Dohna, Healing Touch) extended the component-type

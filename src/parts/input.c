@@ -89,6 +89,13 @@ void parts_input_reset_drag(struct parts *parts)
 static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clicking,
 		int passed_time, bool *hover_consumed, bool *click_consumed)
 {
+	// SetEnableInputProcess(false) выключает часть из обработки ввода целиком: ни
+	// hit-теста, ни сообщений, и курсор она НЕ перехватывает у частей за собой.
+	// Сбрасываем is_hovered, иначе «залипший» hover выстрелит MOUSE_LEAVE позже.
+	if (!parts->enable_input_process) {
+		parts->is_hovered = false;
+		return;
+	}
 	// Always use DEFAULT state hitbox regardless of the current display state.
 	bool is_hovered = parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos)
 		&& !*hover_consumed;
@@ -242,7 +249,7 @@ void PE_UpdateInputState(int passed_time)
 			parts_msg_push_global(PARTS_MSG_MOUSE_WHEEL, "ii", wheel_fwd, wheel_back);
 			bool delivered = false;
 			PARTS_LIST_FOREACH_REVERSE(parts) {
-				if (parts->is_hovered) {
+				if (parts->is_hovered && parts->wheelable) {
 					parts_msg_push(parts, PARTS_MSG_MOUSE_WHEEL, "ii",
 							wheel_fwd, wheel_back);
 					delivered = true;
@@ -368,6 +375,21 @@ void PE_SetClickable(int parts_no, bool clickable)
 void PE_SetPartsIsButton(int parts_no, bool is_button)
 {
 	parts_get(parts_no)->is_button = !!is_button;
+}
+
+void PE_SetEnableInputProcess(int parts_no, bool enable)
+{
+	parts_get(parts_no)->enable_input_process = !!enable;
+}
+
+bool PE_IsEnableInputProcess(int parts_no)
+{
+	return parts_get(parts_no)->enable_input_process;
+}
+
+void PE_SetPartsWheelable(int parts_no, bool wheelable)
+{
+	parts_get(parts_no)->wheelable = !!wheelable;
 }
 
 bool PE_GetPartsClickable(int parts_no)
