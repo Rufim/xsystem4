@@ -484,6 +484,13 @@ void hll_call(int libno, int fno, int elem_class)
 		case AIN_REF_STRUCT:
 		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
+		// Ixseal: `ref delegate` — тоже страница по ссылке, один слот с heap-
+		// индексом (сайт кладёт `X_REF 1`). Обязательно с обратной записью:
+		// delegate_append() ПЕРЕВЫДЕЛЯЕТ страницу. Раньше тип 67 уходил в
+		// `default` и callee получал адрес слота стека вместо страницы.
+		// Аргументов типа 67 у v6/v7 нет вообще (0 против 9 у Dohna — все в
+		// библиотеке `Delegate`), так что ветка структурно гейтится.
+		case AIN_REF_DELEGATE:
 			// Ixseal's generic array-by-reference (AIN_REF_ARRAY) is passed the
 			// same way as a struct/typed-array ref: a single stack slot holding
 			// the array page's heap index (verified by stack-balance tracing —
@@ -579,7 +586,9 @@ void hll_call(int libno, int fno, int elem_class)
 		case AIN_REF_STRUCT:
 		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
-			// Write the (possibly reallocated) array/struct page back to its slot.
+		case AIN_REF_DELEGATE:
+			// Write the (possibly reallocated) array/struct/delegate page back
+			// to its slot.
 			if (heap_index_valid(heap_slots[i]))
 				heap[heap_slots[i]].page = heap_ptrs[i];
 			break;
@@ -794,6 +803,7 @@ extern struct static_library lib_DALKDemo;
 extern struct static_library lib_DALKEDemo;
 extern struct static_library lib_Data;
 extern struct static_library lib_DataFile;
+extern struct static_library lib_Delegate;
 extern struct static_library lib_Discord;
 extern struct static_library lib_DrawDungeon;
 extern struct static_library lib_DrawDungeon2;
@@ -920,6 +930,7 @@ static struct static_library *static_libraries[] = {
 	&lib_DALKEDemo,
 	&lib_Data,
 	&lib_DataFile,
+	&lib_Delegate,
 	&lib_Discord,
 	&lib_DrawDungeon,
 	&lib_DrawDungeon2,
