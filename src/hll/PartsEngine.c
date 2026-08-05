@@ -1622,6 +1622,16 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetAddColor, PE_SetAddColor),
 	    HLL_EXPORT(SetMultiplyColor, PE_SetMultiplyColor),
 	    HLL_EXPORT(SetPassCursor, PE_SetPassCursor),
+	    HLL_EXPORT(Parts_SetWheelable, PE_SetPartsWheelable),
+	    HLL_EXPORT(SetComponentEnableClipArea, PE_SetComponentEnableClipArea),
+	    HLL_EXPORT(IsComponentEnableClipArea, PE_IsComponentEnableClipArea),
+	    HLL_EXPORT(SetComponentClipArea, PE_SetComponentClipArea),
+	    HLL_EXPORT(GetComponentClipAreaPosX, PE_GetComponentClipAreaPosX),
+	    HLL_EXPORT(GetComponentClipAreaPosY, PE_GetComponentClipAreaPosY),
+	    HLL_EXPORT(GetComponentClipAreaPosWidth, PE_GetComponentClipAreaPosWidth),
+	    HLL_EXPORT(GetComponentClipAreaPosHeight, PE_GetComponentClipAreaPosHeight),
+	    HLL_EXPORT(SetEnableInputProcess, PE_SetEnableInputProcess),
+	    HLL_EXPORT(IsEnableInputProcess, PE_IsEnableInputProcess),
 	    HLL_EXPORT(SetClickable, PE_SetClickable),
 	    HLL_EXPORT(SetSpeedupRateByMessageSkip, PE_SetSpeedupRateByMessageSkip),
 	    HLL_TODO_EXPORT(SetResetTimerByChangeInputStatus, PartsEngine_SetResetTimerByChangeInputStatus),
@@ -2195,5 +2205,10 @@ static void PartsEngine_PreLink(void)
 	}
 	if (get_fun(libno, "AddController")) {
 		PE_enable_multi_controller();
+	}
+	// В новом message-API «сообщений больше нет» = GetMessageType() == -1, а не 0
+	// (см. src/parts/message.c). SeekMessage объявлена только этим API.
+	if (get_fun(libno, "SeekMessage")) {
+		PE_set_message_empty_type_minus_one();
 	}
 }

@@ -24,6 +24,7 @@ struct string;
 
 // parts.c
 void PE_enable_multi_controller(void);
+void PE_set_message_empty_type_minus_one(void);
 bool PE_Init(void);
 void PE_Reset(void);
 void PE_Update(int passed_time, bool message_window_show);
@@ -114,6 +115,13 @@ bool PE_SetThumbnailMode(bool Mode);
 void PE_SetComponentType(int parts_no, int type, int state);
 int PE_GetComponentType(int parts_no, int state);
 void PE_SetInputState(int parts_no, int state);
+void PE_SetComponentEnableClipArea(int parts_no, bool enable);
+bool PE_IsComponentEnableClipArea(int parts_no);
+void PE_SetComponentClipArea(int parts_no, int x, int y, int w, int h);
+int PE_GetComponentClipAreaPosX(int parts_no);
+int PE_GetComponentClipAreaPosY(int parts_no);
+int PE_GetComponentClipAreaPosWidth(int parts_no);
+int PE_GetComponentClipAreaPosHeight(int parts_no);
 int PE_GetInputState(int parts_no);
 bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state);
 bool PE_SetPartsCGDetectionSize(int parts_no, struct string *cg_name, int state);
@@ -180,6 +188,9 @@ void PE_SetPassCursor(int parts_no, bool pass);
 bool PE_GetPartsPassCursor(int parts_no);
 void PE_SetClickable(int parts_no, bool clickable);
 void PE_SetPartsIsButton(int parts_no, bool is_button);
+void PE_SetEnableInputProcess(int parts_no, bool enable);
+bool PE_IsEnableInputProcess(int parts_no);
+void PE_SetPartsWheelable(int parts_no, bool wheelable);
 void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate);
 float PE_GetPartsHScrollbarScrollRate(int parts_no);
 void PE_InitPartsHScrollbar(int parts_no, int base_x, int base_y,
