@@ -24,6 +24,9 @@
 
 #define CURRENT_SAVE_VERSION 3
 
+// Насколько глубоко уводится снимок бэк-сцены под UI вьювера (см. load_parts).
+#define BACK_SCENE_Z_SHIFT 1000000
+
 static void save_parts_params(struct iarray_writer *w, struct parts_params *params)
 {
 	iarray_write(w, params->z);
@@ -597,10 +600,24 @@ static void save_parts(struct iarray_writer *w, struct parts *parts)
 	iarray_write_at(w, motion_count_pos, motion_count);
 }
 
-static void load_parts(struct iarray_reader *r, int version)
+// back_scene: загрузка снимка «画面保管» в ОТДЕЛЬНОЕ ПРОСТРАНСТВО НОМЕРОВ
+// (+BACK_SCENE_PARTS_OFFSET). Именно так устроено у AliceSoft — снимок живёт отдельной
+// библиотекой партов, сосуществующей с живой, и потому всё семейство `*ForBackScene`
+// дублирует обычные сеттеры: они адресуют копию парта с тем же игровым номером.
+// Попытка обойтись одной библиотекой провалилась на партах, чьи номера СОВПАДАЮТ с живыми
+// (у Tsumamigui 3 таких 9 — фон сцены и подложки): снимок перезаписывал живой парт, а
+// закрытие вьювера (`RemoveController` сносит парты своего слоя) убивало его насовсем —
+// после выхода из бэк-сцены пропадал игровой фон. С отдельным пространством живые парты
+// вообще не затрагиваются, и никакой бэкап живой библиотеки не нужен.
+static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 {
 	int no = iarray_read(r);
+	if (back_scene)
+		no += BACK_SCENE_PARTS_OFFSET;
 	struct parts *parts = parts_get(no);
+	parts->back_scene_copy = back_scene;
+	if (getenv("XSYS4_BS_TRACE"))
+		NOTICE("BS load part=%d%s", no, back_scene ? " (копия бэк-сцены)" : "");
 	parts->state = iarray_read(r);
 	for (int i = 0; i < PARTS_NR_STATES; i++) {
 		load_parts_state(r, parts, &parts->states[i]);
@@ -609,6 +626,9 @@ static void load_parts(struct iarray_reader *r, int version)
 	load_parts_params(r, &parts->local);
 	load_parts_params(r, &parts->global);
 	parts->pending_parent = iarray_read(r);
+	// Ссылки на другие парты живут в том же пространстве, что и сам парт.
+	if (back_scene && parts->pending_parent >= 0)
+		parts->pending_parent += BACK_SCENE_PARTS_OFFSET;
 	parts->delegate_index = iarray_read(r);
 	parts->sprite_deform = iarray_read(r);
 	parts->clickable = iarray_read(r);
@@ -617,15 +637,27 @@ static void load_parts(struct iarray_reader *r, int version)
 	parts->origin_mode = iarray_read(r);
 	parts->linked_to = iarray_read(r);
 	parts->linked_from = iarray_read(r);
+	if (back_scene) {
+		if (parts->linked_to >= 0)
+			parts->linked_to += BACK_SCENE_PARTS_OFFSET;
+		if (parts->linked_from >= 0)
+			parts->linked_from += BACK_SCENE_PARTS_OFFSET;
+	}
 	parts->draw_filter = iarray_read(r);
 	if (version > 0)
 		parts->message_window = iarray_read(r);
-	if (version > 2)
+	if (version > 2) {
 		parts->alpha_clipper_parts_no = iarray_read(r);
+		if (back_scene && parts->alpha_clipper_parts_no >= 0)
+			parts->alpha_clipper_parts_no += BACK_SCENE_PARTS_OFFSET;
+	}
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
 	if (parts_multi_controller) {
-		parts->controller_no = iarray_read(r);
+		int saved_controller = iarray_read(r);
+		// Копия бэк-сцены живёт в слое ВЬЮВЕРА: слои игры на это время погашены
+		// (`HideAllFrontScene`), а закрытие вьювера снесёт копию вместе со слоем.
+		parts->controller_no = back_scene ? ctrl_stack.active : saved_controller;
 		parts->pass_cursor = iarray_read(r);
 		parts->lock_input_state = iarray_read(r);
 		parts->margin_top = iarray_read(r);
@@ -640,6 +672,17 @@ static void load_parts(struct iarray_reader *r, int version)
 		struct parts_motion *motion = load_parts_motion(r);
 		parts_add_motion(parts, motion);
 	}
+
+	// Снимок бэк-сцены уводится ПОД UI вьювера по глубине. Парты сцены несут игровые z
+	// (у Tsumamigui 3 10010…10159), а вьювер свои — 0…12, поэтому без сдвига сцена
+	// накрывала кнопки собой (экран сцены без единой кнопки). У AliceSoft снимок —
+	// отдельная библиотека партов, которая рисуется под вьювером; тот же результат даёт
+	// сдвиг КОРНЕВЫХ партов сцены: детям он достаётся через global.z родителя. Именно
+	// `parts_set_z`, а не запись в local.z: у корневого парта (parent == NULL)
+	// `parts_update_component` global из local НЕ пересчитывает. Подложка вьювера
+	// (`SYS_下地`) — пустой парт 0×0, ничего под сценой не закрывает.
+	if (back_scene && parts->pending_parent < 0)
+		parts_set_z(parts, parts->local.z - BACK_SCENE_Z_SHIFT);
 
 	parts_list_resort(parts);
 	parts_component_dirty(parts);
@@ -718,6 +761,9 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 			continue;
 		if (back_scene ? !parts->want_save_back_scene : !parts->want_save)
 			continue;
+		if (getenv("XSYS4_BS_TRACE"))
+			NOTICE("BS save[%s] part=%d show=%d", back_scene ? "back" : "game",
+			       parts->no, parts->global.show);
 		save_parts(&w, parts);
 		count++;
 	}
@@ -762,7 +808,7 @@ bool PE_SaveBackScene(struct page **buffer)
 // SetActiveController(1) then died with "Invalid controller number: 1" (VM_ERROR → REPL,
 // i.e. the game froze right after browsing a back scene). The values still have to be READ
 // to keep the stream in sync — just not applied.
-static bool parts_engine_load(struct page **buffer, bool restore_globals)
+static bool parts_engine_load(struct page **buffer, bool restore_globals, bool back_scene)
 {
 	if (!(*buffer)) {
 		WARNING("savedata array is empty");
@@ -808,7 +854,7 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals)
 	}
 
 	for (int i = 0; i < nr_parts; i++) {
-		load_parts(&r, version);
+		load_parts(&r, version, back_scene);
 	}
 
 	parts_engine_clean();
@@ -817,34 +863,52 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals)
 
 bool PE_Load(struct page **buffer)
 {
-	return parts_engine_load(buffer, true);
+	return parts_engine_load(buffer, true, false);
 }
 
 // AliceSoft keeps the stored screen in a SEPARATE parts library — that is why the whole
-// Set*ForBackScene family is duplicated: those setters address the back-scene copy of a
-// part, which coexists with the live part of the same number. We have one parts library,
-// so a back-scene load overwrites the live parts instead. To keep that reversible, the
-// live library is snapshotted on the first load and put back by ClearBackScene, which
-// backscene::detail::CBackSceneView@Execute calls right after the viewer closes and just
-// before ShowAllFrontScene. Without it the browsed scene stayed on top of the restored
-// game (two message texts drawn over each other).
-static struct page *back_scene_live_backup = NULL;
+// Set*ForBackScene family is duplicated: those setters address the back-scene COPY of a part,
+// which coexists with the live part of the same number. Мы делаем то же самое дешёвым
+// способом: копия живёт в той же таблице, но под номером `no + BACK_SCENE_PARTS_OFFSET`.
+// Так живые парты вообще не затрагиваются просмотром сцены — ни бэкапа, ни восстановления
+// не нужно, а закрытие вьювера (`RemoveController` сносит парты своего слоя) убирает копию.
+// Снести пространство бэк-сцены целиком.
+static int release_back_scene_copies(void)
+{
+	int n = 0;
+	struct parts *parts = TAILQ_FIRST(&parts_list);
+	while (parts) {
+		struct parts *next = TAILQ_NEXT(parts, parts_list_entry);
+		if (parts->back_scene_copy) {
+			parts_release(parts->no);
+			n++;
+		}
+		parts = next;
+	}
+	return n;
+}
 
+// Библиотека бэк-сцены ЗАМЕНЯЕТСЯ целиком, а не пополняется: `CBackSceneView@SetSceneIndex`
+// зовёт LoadBackScene на КАЖДОЕ переключение сцены (前へ/次へ), и без сноса прежних копий
+// сцены накапливались друг на друге — при листании текст новой реплики ложился на текст
+// предыдущей (заметил пользователь). Сцены различаются составом партов, поэтому одной
+// перезаписью по номеру не обойтись: лишние парты прошлой сцены остались бы на экране.
 bool PE_LoadBackScene(struct page **buffer)
 {
-	// Тем же фильтром, что и снимок сцены: возвращать надо ровно те парты, которые
-	// загрузка бэк-сцены перезапишет.
-	if (!back_scene_live_backup)
-		parts_engine_save(&back_scene_live_backup, true, true);
-	return parts_engine_load(buffer, false);
+	int dropped = release_back_scene_copies();
+	if (getenv("XSYS4_BS_TRACE"))
+		NOTICE("BS === LoadBackScene (снято копий прошлой сцены: %d) ===", dropped);
+	return parts_engine_load(buffer, false, true);
 }
 
+// Игра зовёт это в `CBackSceneView@Execute` сразу после закрытия вьювера, перед
+// ShowAllFrontScene. Сносим всё пространство бэк-сцены: обычно его уже унёс
+// RemoveController вместе со слоем вьювера, но если игра закрыла сцену иначе, копия не
+// должна остаться на экране.
 void PE_ClearBackScene(void)
 {
-	if (!back_scene_live_backup)
-		return;
-	parts_engine_load(&back_scene_live_backup, false);
-	delete_page_vars(back_scene_live_backup);
-	free_page(back_scene_live_backup);
-	back_scene_live_backup = NULL;
+	int n = release_back_scene_copies();
+	if (getenv("XSYS4_BS_TRACE"))
+		NOTICE("BS === ClearBackScene: снято копий %d ===", n);
 }
+

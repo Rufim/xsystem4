@@ -437,6 +437,13 @@ struct parts {
 	// at the ends. rate is driven by the game via SetVScrollbarScrollPos (pos/total/view).
 	bool is_vscrollbar;
 	int sb_up_size, sb_down_size;  // heights of the ∧/∨ arrow buttons (前サイズ/次サイズ)
+	// На сколько сдвигается позиция за одно нажатие кнопки-стрелки (.pactex
+	// `ボタンクリック移動量`, у бэк-сцены = 1). Именно этим листаются сцены: обработчики
+	// `CBackSceneView@PressNextButton/PressPrevButton` берут шаг через
+	// GetVScrollbarMoveSizeByButton и прибавляют его к позиции. Пока геттер был
+	// заглушкой-нулём, кнопки 前へ/次へ не делали НИЧЕГО (колесо работало — оно идёт
+	// другим путём).
+	int sb_move_by_button;
 	float vscroll_rate;
 	// Checkbox (パーツタイプ=1). The box CG has checked/unchecked variants
 	// ("<base>[／チェック]／通常|オン|ダウン"); clicking toggles checkbox_checked.
@@ -450,6 +457,9 @@ struct parts {
 	// mode-CG, отладочные тексты), и если исключить их ещё и из ИГРОВОГО сейва, после
 	// resume-загрузки они не вернутся — конструкторы вьюх повторно не выполняются.
 	bool want_save_back_scene;
+	// Парт — КОПИЯ из снимка бэк-сцены (создан LoadBackScene в своём пространстве номеров).
+	// По этому флагу ClearBackScene сносит снимок, не гадая по диапазону номеров.
+	bool back_scene_copy;
 	bool draggable;
 	int on_cursor_sound;
 	int on_click_sound;
@@ -485,6 +495,12 @@ extern struct parts_list parts_list;
 struct parts_controller_stack {
 	int nr_controllers;
 	int active;  // stack index or PARTS_CONTROLLER_SYSTEM_OVERLAY
+	// Видимость СЛОЯ (см. parts_controller_set_show). Игра прячет и показывает целые
+	// слои: `CBackSceneView@HideAllFrontScene` перебирает GetControllerID(i) и гасит
+	// каждый видимый слой через SetComponentShow — так экран игры убирается на время
+	// просмотра бэк-сцены. Флаг слоя ОТДЕЛЬНЫЙ от `show` партов, иначе обратный
+	// ShowAllFrontScene засветил бы парты, спрятанные игрой поимённо.
+	bool hidden[PARTS_CONTROLLER_STACK_MAX + 1];
 };
 extern struct parts_controller_stack ctrl_stack;
 extern bool parts_multi_controller;
@@ -504,6 +520,7 @@ struct parts_movie *parts_get_movie(struct parts *parts, int state);
 struct parts_layout_box *parts_get_layout_box(struct parts *parts);
 struct parts_3dlayer *parts_get_3dlayer(struct parts *parts, int state);
 void parts_set_pos(struct parts *parts, Point pos);
+void parts_set_z(struct parts *parts, int z);
 void parts_set_global_pos(Point pos);
 void parts_set_dims(struct parts *parts, struct parts_common *common, int w, int h);
 void parts_set_scale_x(struct parts *parts, float mag);
@@ -513,6 +530,7 @@ void parts_set_alpha(struct parts *parts, int alpha);
 void parts_set_state(struct parts *parts, enum parts_state_type state);
 void parts_release(int parts_no);
 void parts_release_all(void);
+bool parts_hidden_by_layer(struct parts *parts);
 void parts_set_surface_area(struct parts *parts, struct parts_common *common, int x, int y, int w, int h);
 extern bool parts_message_window_show;
 
@@ -580,6 +598,14 @@ enum parts_message_type {
 	PARTS_MSG_DROP_LEAVE     = 13,
 	PARTS_MSG_KEY_TRIGGER    = 14,
 	PARTS_MSG_KEY_DOWN       = 15,
+	// Номер 16 у нас ОТСУТСТВОВАЛ, и это ломало все кнопки, повешенные игрой через
+	// `AddKeyPressEvent`: у Tsumamigui 3 так привязаны стрелки скроллбара, то есть
+	// 前へ/次へ бэк-сцены (`CBackSceneView@PressPrevButton/PressNextButton`) — клик
+	// доходил до парта, но сообщение этого типа никто не отправлял. Таблица типов взята
+	// из диспетчера игры (`CPartsMessageManager@CallDelegate`, SWITCH по MessageType):
+	// 1 MouseEnter, 2 MouseMove, 3 MouseLeave, 4 MouseWheel, 5 MouseClick,
+	// 6 MouseOnCursor, 7..13 drag/drop, 14 KeyTrigger, 15 KeyDown, 16 KeyPress, 17 KeyUp.
+	PARTS_MSG_KEY_PRESS      = 16,
 	PARTS_MSG_KEY_UP         = 17,
 	// Engine message type = game CallDelegate case + 1 (see CPartsMessageManager).
 	// Scroll (game case 19) delivers (ScrollPos, Total) to a scrollbar's registered

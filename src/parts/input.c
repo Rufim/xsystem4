@@ -99,7 +99,11 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		int passed_time, bool *hover_consumed, bool *click_consumed)
 {
 	// Always use DEFAULT state hitbox regardless of the current display state.
-	bool is_hovered = parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos)
+	// Парты погашенного СЛОЯ невидимы и не должны ловить курсор: пока открыта бэк-сцена,
+	// экран игры спрятан целиком (SetComponentShow с ID контроллера), и его кнопки не
+	// должны перехватывать клики у вьювера.
+	bool is_hovered = !parts_hidden_by_layer(parts)
+		&& parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos)
 		&& !*hover_consumed;
 
 	bool was_hovered = parts->is_hovered;
@@ -158,8 +162,12 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		drag_initial_pos = parts->local.pos;
 		drag_start_cursor = cur_pos;
 
-		// KEY_TRIGGER message fires on press transition
+		// KEY_TRIGGER — момент нажатия. KEY_PRESS (16) шлём тем же кадром: на него игра
+		// вешает кнопки-стрелки скроллбара (AddKeyPressEvent), и одно нажатие должно
+		// давать один шаг. Отдельно от KEY_DOWN, который идёт каждый кадр удержания —
+		// на нём листание было бы бесконечным.
 		parts_msg_push(parts, PARTS_MSG_KEY_TRIGGER, "i", VK_LBUTTON);
+		parts_msg_push(parts, PARTS_MSG_KEY_PRESS, "i", VK_LBUTTON);
 	}
 
 	// KEY_DOWN message fires every frame while held (not first frame)

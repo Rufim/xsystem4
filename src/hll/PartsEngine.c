@@ -406,6 +406,26 @@ static void PE_Parts_GetSoundName(int parts_no, struct string **out, int state) 
 // ВАЖНО: флаг СВОЙ, а не upstream-овский want_save, по которому фильтруется ИГРОВОЙ сейв.
 // Исключив оверлеи и оттуда, мы потеряли бы их после resume-загрузки: конструкторы вьюх
 // (CSystemButtonView и пр.) повторно не выполняются, пересоздавать парты некому.
+// «Компонент» адресует и парт, и СЛОЙ (контроллер) — см. parts_controller_is_layer.
+// Игра гасит слоями весь экран игры на время просмотра бэк-сцены
+// (`CBackSceneView@HideAllFrontScene`: для каждого GetControllerID(i) с
+// IsComponentShow == true зовётся SetComponentShow(id, false)), а ShowAllFrontScene
+// возвращает ровно эти слои.
+static void PE_SetComponentShow(int no, bool show)
+{
+	if (parts_controller_is_layer(no))
+		parts_controller_set_show(no, show);
+	else
+		PE_SetShow(no, show);
+}
+
+static bool PE_IsComponentShow(int no)
+{
+	if (parts_controller_is_layer(no))
+		return parts_controller_get_show(no);
+	return PE_GetPartsShow(no);
+}
+
 static void PE_SetWantSaveBackScene(int parts_no, int enable)
 {
 	if (getenv("XSYS4_BS_TRACE"))
@@ -420,18 +440,24 @@ static bool PE_IsWantSaveBackScene(int parts_no)
 // экран, ставит цвет шрифта окна сообщений и скрывает лишние парты. У AliceSoft снимок,
 // судя по имени, живёт отдельной библиотекой партов; у нас LoadBackScene восстанавливает
 // его в живые парты (см. parts_engine_load), поэтому это ровно обычные сеттеры.
-static void PE_SetAlphaForBackScene(int parts_no, int alpha) { PE_SetAlpha(parts_no, alpha); }
-static void PE_SetShowForBackScene(int parts_no, bool show) { PE_SetShow(parts_no, show); }
+// Эти сеттеры адресуют КОПИЮ парта в пространстве бэк-сцены — ту, что создала LoadBackScene.
+static void PE_SetAlphaForBackScene(int parts_no, int alpha)
+{
+	PE_SetAlpha(parts_no + BACK_SCENE_PARTS_OFFSET, alpha);
+}
+static void PE_SetShowForBackScene(int parts_no, bool show)
+{
+	PE_SetShow(parts_no + BACK_SCENE_PARTS_OFFSET, show);
+}
 static void PE_SetMulColorForBackScene(int parts_no, int r, int g, int b)
 {
-	PE_SetMultiplyColor(parts_no, r, g, b);
+	PE_SetMultiplyColor(parts_no + BACK_SCENE_PARTS_OFFSET, r, g, b);
 }
 static void PE_SetFontColorForBackScene(int parts_no, int r, int g, int b, int state)
 {
-	PE_SetPartsFontColor(parts_no, r, g, b, state);
+	PE_SetPartsFontColor(parts_no + BACK_SCENE_PARTS_OFFSET, r, g, b, state);
 }
-// PE_ClearBackScene — в src/parts/save.c: он возвращает живые парты, подменённые загрузкой
-// бэк-сцены (у нас одна библиотека партов, а не две, как у AliceSoft).
+// PE_ClearBackScene — в src/parts/save.c: он сносит пространство номеров бэк-сцены.
 // Direct SaveThumbnail(filename, width) export. Newer games (Tsumamigui 3) call this via
 // AutoSave when opening the town map; without it the unimplemented-HLL error dropped into
 // the debugger REPL and the map never became interactive. Второй аргумент — ШИРИНА превью
@@ -534,6 +560,12 @@ static bool PE_ReleaseActivity(struct string *name, struct page **out)
 {
 	struct pe_activity *a = pe_act_find(name);
 	int n = a ? a->nr_parts : 0;
+	if (getenv("XSYS4_BS_TRACE")) {
+		NOTICE("BS ReleaseActivity('%s'): %d партов", display_sjis0(name->text), n);
+		for (int i = 0; i < n; i++)
+			NOTICE("BS   act part=%d '%s'", a->parts[i].number,
+			       display_sjis1(a->parts[i].name->text));
+	}
 	union vm_value dim = { .i = n };
 	struct page *page = alloc_array(1, &dim, AIN_ARRAY_INT, 0, false);
 	for (int i = 0; i < n; i++)
@@ -687,6 +719,26 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 			}
 			PE_SetText(no, txt, state);
 		}
+		return;
+	}
+	// Numeral state (パーツタイプ=16): цифры рисуются набором CG по шаблону имени
+	// (`ＣＧ名 = "バックシーン／数字／%02d"` → …／00…／11, где 10 = минус, 11 = запятая).
+	// Так устроен счётчик страниц BACK SCENE (`シーン数 ００３／００３`): числитель и
+	// знаменатель — numeral-парты с 桁数=3 и ゼロパディング=1, между ними отдельный
+	// CG-парт со слэшем. Загрузчик активности этот тип состояния не разбирал вовсе,
+	// поэтому цифр не было ни одной. `フォント*`-поля тут для варианта «цифры текстом»
+	// (全角=0, у Tsumamigui 3 используется именно CG-вариант).
+	if (act_int(st, "パーツタイプ", -1) == 16) {
+		struct string *cg = act_str(st, "ＣＧ名");
+		if (cg && cg->size)
+			PE_SetNumeralCG(no, cg, state);
+		PE_SetNumeralSpace(no, act_int(st, "字間隔", 0), state);
+		PE_SetNumeralShowComma(no, act_int(st, "コンマ表示", 0), state);
+		// 桁数 задаёт разрядность, но дополнять нулями можно только с ゼロパディング=1:
+		// иначе движок сам допишет ведущие нули там, где игра их не ждёт.
+		if (act_int(st, "ゼロパディング", 0))
+			PE_SetNumeralLength(no, act_int(st, "桁数", 0), state);
+		PE_SetNumeralNumber(no, act_int(st, "数値", 0), state);
 		return;
 	}
 	// Construction-process viewport (パーツタイプ=18): used as a clip region for
@@ -875,6 +927,8 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		int total = act_int(ti, "全体スクロール量", 0);
 		int view  = act_int(ti, "表示量", 1);
 		float rate = act_float(ti, "スクロールレート", 0.0f);
+		// Шаг кнопок-стрелок: без него 前へ/次へ не листают (см. sb_move_by_button).
+		PE_SetVScrollbarMoveSizeByButton(no, act_int(ti, "ボタンクリック移動量", 1));
 		PartsEngine_SetVScrollbarTotalSize(no, total);
 		PartsEngine_SetVScrollbarViewSize(no, view);
 		PartsEngine_SetVScrollbarScrollRate(no, rate);
@@ -973,6 +1027,13 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		act_set_state_cg(no, ti, "キーダウン状態", 3);
 	}
 
+	// 原点座標モード — к какому углу/краю парта привязаны его координаты (1 = левый верх,
+	// 9 = правый низ; таблица в calculate_offset). Загрузчик активности его НЕ читал, и
+	// все парты вставали как левый-верх. У большинства в .pactex и стоит 1, поэтому
+	// расхождение было незаметно — пока не нашёлся счётчик страниц BACK SCENE: у его
+	// трёх партов モード = 9, из-за чего слэш «／» уезжал вправо-вниз на свою ширину и
+	// высоту (замер: наш x 965..976 против 939..954 у оригинала).
+	PE_SetPartsOriginPosMode(no, act_int(node, "原点座標モード", 1));
 	PE_SetPos(no, act_list_int(node, "座標", 0, 0), act_list_int(node, "座標", 1, 0));
 	PE_SetZ(no, act_list_int(node, "座標", 2, 0));
 	PE_SetAlpha(no, act_int(node, "アルファ", 255));
@@ -1382,8 +1443,6 @@ HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetCheckBoxButtonWidth, int a);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetCheckBoxButtonHeight, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetCheckBoxButtonMode, int a, bool b);
 HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, IsCheckBoxButtonMode, int a);
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetVScrollbarMoveSizeByButton, int a, int b);
-HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetVScrollbarMoveSizeByButton, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetHScrollbarMoveSizeByButton, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetHScrollbarMoveSizeByButton, int a);
 // Скроллбары (BACK LOG и пр.): вертикального скроллбара в parts пока нет
@@ -1880,8 +1939,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetCheckBoxButtonHeight, PartsEngine_GetCheckBoxButtonHeight),
 	    HLL_EXPORT(SetCheckBoxButtonMode, PartsEngine_SetCheckBoxButtonMode),
 	    HLL_EXPORT(IsCheckBoxButtonMode, PartsEngine_IsCheckBoxButtonMode),
-	    HLL_EXPORT(SetVScrollbarMoveSizeByButton, PartsEngine_SetVScrollbarMoveSizeByButton),
-	    HLL_EXPORT(GetVScrollbarMoveSizeByButton, PartsEngine_GetVScrollbarMoveSizeByButton),
+	    HLL_EXPORT(SetVScrollbarMoveSizeByButton, PE_SetVScrollbarMoveSizeByButton),
+	    HLL_EXPORT(GetVScrollbarMoveSizeByButton, PE_GetVScrollbarMoveSizeByButton),
 	    HLL_EXPORT(SetHScrollbarMoveSizeByButton, PartsEngine_SetHScrollbarMoveSizeByButton),
 	    HLL_EXPORT(GetHScrollbarMoveSizeByButton, PartsEngine_GetHScrollbarMoveSizeByButton),
 	    HLL_EXPORT(IsRadioButtonBoxExistGUI, PartsEngine_IsRadioButtonBoxExistGUI),
@@ -1942,8 +2001,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(GetComponentHeight, PartsEngine_GetComponentHeight),
 	    HLL_EXPORT(Parts_GetPartsWidth, PE_GetPartsWidth),
 	    HLL_EXPORT(Parts_GetPartsHeight, PE_GetPartsHeight),
-	    HLL_EXPORT(SetComponentShow, PE_SetShow),
-	    HLL_EXPORT(IsComponentShow, PE_GetPartsShow),
+	    HLL_EXPORT(SetComponentShow, PE_SetComponentShow),
+	    HLL_EXPORT(IsComponentShow, PE_IsComponentShow),
 	    HLL_EXPORT(SetComponentMessageWindowShowLink, PE_SetPartsMessageWindowShowLink),
 	    HLL_EXPORT(IsComponentMessageWindowShowLink, PE_GetPartsMessageWindowShowLink),
 	    HLL_EXPORT(SetComponentAlpha, PE_SetAlpha),

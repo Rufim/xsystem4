@@ -134,8 +134,25 @@ bool PE_IsExist(int parts_no);
 // PartsFunc interface
 void PE_set_active_controller(int controller_no);
 int PE_get_active_controller(void);
+void PE_SetVScrollbarMoveSizeByButton(int parts_no, int size);
+int PE_GetVScrollbarMoveSizeByButton(int parts_no);
 int PE_get_controller_length(void);
 int PE_get_controller_id(int index);
+// Снимок бэк-сцены («画面保管») живёт КОПИЯМИ партов в своём пространстве номеров: у AliceSoft
+// это отдельная библиотека партов, сосуществующая с живой (отсюда всё семейство
+// `*ForBackScene` — те сеттеры адресуют копию).
+// ★ЛОВУШКА, СТОИВШАЯ ПРОГОНА: смещение НЕ МОЖЕТ быть 1e9 — System4 сам нумерует парты от
+// 1 000 000 000 (у Tsumamigui 3 подложка окна сообщений = 1000000002, посимвольные парты
+// текста = 1000001xxx). При offset 1e9 снос «пространства бэк-сцены» уносил живую подложку
+// окна сообщений: после выхода из сцены текст висел без плашки. Отсюда 1.1e9 — выше всего
+// живого диапазона и ниже INT_MAX даже для самого большого номера (1.1e9 + 1.0000013e9 =
+// 2.1000013e9 < 2.147e9). Плюс снос идёт по ЯВНОМУ флагу `back_scene_copy`, а не по диапазону.
+#define BACK_SCENE_PARTS_OFFSET 1100000000
+
+// «Компонент» в HLL адресует и парт, и слой-контроллер; различение по диапазону ID.
+bool parts_controller_is_layer(int id);
+void parts_controller_set_show(int id, bool show);
+bool parts_controller_get_show(int id);
 int PE_get_system_controller(void);
 void PE_parts_set_want_save(int parts_no, bool want_save);
 void PE_parts_set_want_save_back_scene(int parts_no, bool want);

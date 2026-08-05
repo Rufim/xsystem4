@@ -339,18 +339,25 @@ bool PE_AddCopyTextToPartsConstructionProcess(int parts_no, int x, int y, struct
 static bool build_create(struct parts *parts, struct parts_construction_process *cproc,
 		struct parts_cp_create *op)
 {
-	// Clamp to at least 1x1: the backlog builds an empty/separator line as a
-	// Width×0 texture (Tsumamigui 3). A 0-dimension GL texture has handle==0 and
-	// makes gfx_set_framebuffer report "Incomplete framebuffer" (fatal) when the
-	// part is later composited. A 1px texture renders nothing visible but is valid.
+	// ВЫРОДИВШАЯСЯ поверхность (нулевая ширина или высота) — единственный случай, когда
+	// инициализация должна быть ПРОЗРАЧНОЙ. Бэклог просит разделитель как Width×0, у
+	// оригинала он поэтому не виден вовсе; мы обязаны кламповать до 1×1 (текстура с
+	// нулевым измерением имеет handle == 0 и валит `gfx_set_framebuffer` фаталом
+	// «Incomplete framebuffer» при композиции), и вот этот 1 px и рисовался сплошной
+	// чёрной линией.
+	bool degenerate = op->w <= 0 || op->h <= 0;
 	int w = op->w > 0 ? op->w : 1;
 	int h = op->h > 0 ? op->h : 1;
 	gfx_delete_texture(&cproc->common.texture);
-	// Init transparent (was opaque black {0,0,0,255}). The BACK LOG separator is a
-	// created-but-never-filled unit; with an opaque-black init it composited as a
-	// solid black horizontal line (absent in the original). Text/fill ops overwrite
-	// this init, so transparent is safe for them. XSYS4_OPAQUE_CREATE restores.
-	SDL_Color init = getenv("XSYS4_OPAQUE_CREATE") ? (SDL_Color){0,0,0,255} : (SDL_Color){0,0,0,0};
+	// ★Обычная поверхность создаётся НЕПРОЗРАЧНОЙ (как upstream). Прежняя правка гасила
+	// альфу у ВСЕХ созданных поверхностей — так лечили те самые чёрные полосы бэклога, —
+	// и заодно убила белую заливку под логотипом игры: команды заливки идут парой
+	// «SetCreate(1024×768) → SetFill(255,255,255)», а `SetFill` по семантике красит только
+	// RGB и альфу не трогает (`gfx_fill`), поэтому белое оставалось с alpha = 0 и экран
+	// логотипа выходил чёрным вместо белого. Ручка XSYS4_TRANSPARENT_CREATE возвращает
+	// прежнее поведение целиком.
+	SDL_Color init = (degenerate || getenv("XSYS4_TRANSPARENT_CREATE"))
+		? (SDL_Color){0,0,0,0} : (SDL_Color){0,0,0,255};
 	gfx_init_texture_rgba(&cproc->common.texture, w, h, init);
 	if (!cproc->common.texture.handle)
 		return false;

@@ -631,6 +631,11 @@ void parts_render(struct parts *parts)
 	}
 	if (!parts->global.show)
 		return;
+	// Слой парта мог быть погашен целиком (SetComponentShow с ID контроллера — так игра
+	// убирает экран на время просмотра бэк-сцены). Проверяем ЗДЕСЬ, а не сворачиваем в
+	// global.show, чтобы поимённая видимость партов внутри слоя не потерялась.
+	if (parts_hidden_by_layer(parts))
+		return;
 	if (parts->message_window && !parts_message_window_show)
 		return;
 	if (parts->linked_to >= 0) {

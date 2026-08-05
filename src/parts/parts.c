@@ -2241,6 +2241,23 @@ static void parts_vscrollbar_reposition(struct parts *parts)
 	parts_set_pos(parts, (Point){ x, y });
 }
 
+// Шаг позиции за одно нажатие кнопки-стрелки скроллбара (.pactex `ボタンクリック移動量`).
+// Им листаются сцены бэк-сцены и строки бэклога: `PressNextButton`/`PressPrevButton`
+// прибавляют этот шаг к текущей позиции и ставят её обратно.
+void PE_SetVScrollbarMoveSizeByButton(int parts_no, int size)
+{
+	parts_get(parts_no)->sb_move_by_button = size;
+}
+
+int PE_GetVScrollbarMoveSizeByButton(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	// Дефолт 1, а не 0: нулевой шаг = кнопки-стрелки не делают ничего.
+	if (!parts || parts->sb_move_by_button == 0)
+		return 1;
+	return parts->sb_move_by_button;
+}
+
 void PE_InitPartsVScrollbar(int parts_no, int base_x, int base_y, int length, int width,
 		int up_size, int down_size, int total, int view, float rate)
 {
@@ -2486,6 +2503,7 @@ int PE_AddController(int index)
 
 	int no = ctrl_stack.nr_controllers++;
 	ctrl_stack.active = no;
+	ctrl_stack.hidden[no] = false;  // индекс мог остаться погашенным от прошлого слоя
 	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController -> ctrl %d (nr=%d)", no, ctrl_stack.nr_controllers);
 	return no;
 }
@@ -2557,6 +2575,50 @@ int PE_get_controller_id(int index)
 int PE_get_system_controller(void)
 {
 	return PARTS_CONTROLLER_SYSTEM_OVERLAY;
+}
+
+// «Компонент» у AliceSoft — это и парт, и СЛОЙ (контроллер): `Ｐ＿表示設定` (=
+// PartsEngine.SetComponentShow) игра зовёт как с номерами партов (у Tsumamigui 3 они
+// всегда большие: 90000000+, 100000000+, 1000001xxx), так и с ID слоя из
+// GetControllerID — а это индекс стека, т.е. МАЛОЕ число. Различаем по диапазону:
+// валидный индекс контроллера, для которого парта с таким номером не существует.
+// Без этого `HideAllFrontScene` прятал парт №0 (которого нет — parts_get его тут же
+// и создавал пустышкой), экран игры оставался под сценой, и текст бэк-сцены ложился
+// поверх живого (FINDINGS §5q).
+bool parts_controller_is_layer(int id)
+{
+	if (id < 0 || id >= ctrl_stack.nr_controllers)
+		return false;
+	return parts_try_get(id) == NULL;
+}
+
+void parts_controller_set_show(int id, bool show)
+{
+	if (id < 0 || id > PARTS_CONTROLLER_STACK_MAX)
+		return;
+	ctrl_stack.hidden[id] = !show;
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("CTRL слой %d -> show=%d", id, show);
+	struct parts *parts;
+	PARTS_LIST_FOREACH(parts) {
+		if (parts->controller_no == id)
+			parts_dirty(parts);
+	}
+}
+
+bool parts_controller_get_show(int id)
+{
+	if (id < 0 || id > PARTS_CONTROLLER_STACK_MAX)
+		return false;
+	return !ctrl_stack.hidden[id];
+}
+
+bool parts_hidden_by_layer(struct parts *parts)
+{
+	int no = parts->controller_no;
+	if (no < 0 || no > PARTS_CONTROLLER_STACK_MAX)
+		return false;
+	return ctrl_stack.hidden[no];
 }
 
 void PE_parts_set_want_save(int parts_no, bool want_save)
