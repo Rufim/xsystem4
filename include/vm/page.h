@@ -126,9 +126,12 @@ void delete_struct(int no, int slot);
 void create_struct(int no, union vm_value *var);
 
 // arrays
+// Тип элемента — ссылка на интерфейс (пара «объект, база интерфейса»)?
+// Это `ref <интерфейс>` (AIN_IFACE) и `wrap<интерфейс>` (AIN_IFACE_WRAP).
+bool array_iface_pair_type(enum ain_data_type a_type);
 // Число слотов страницы на ОДИН элемент массива: 1 для всех обычных массивов и
-// 2 для Ixseal-массива с элементом wrap<интерфейс> (пара «объект, база
-// интерфейса»). Индексы элементов во всех array_*-функциях — в ЭЛЕМЕНТАХ.
+// 2 для Ixseal-массива с интерфейсным элементом (см. выше).
+// Индексы элементов во всех array_*-функциях — в ЭЛЕМЕНТАХ.
 int array_elem_slots(struct page *page);
 enum ain_data_type array_type(enum ain_data_type type);
 struct page *alloc_array(int rank, union vm_value *dimensions, enum ain_data_type data_type, int struct_type, bool init_structs);

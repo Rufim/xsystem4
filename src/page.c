@@ -217,11 +217,13 @@ enum ain_data_type array_type(enum ain_data_type type)
 	case AIN_ARRAY_DELEGATE:
 	case AIN_REF_ARRAY_DELEGATE:
 		return AIN_DELEGATE;
-	// Ixseal: массив, элемент которого — wrap<интерфейс>. Элемент занимает ДВА
-	// слота страницы, поэтому единого «типа элемента» у него нет: тип каждого
-	// слота даёт variable_type() по чётности. Маркер возвращаем как есть.
+	// Ixseal: массив, элемент которого — ссылка на интерфейс (`ref <интерфейс>`
+	// = AIN_IFACE, либо `wrap<интерфейс>` = AIN_IFACE_WRAP). Элемент занимает
+	// ДВА слота страницы, поэтому единого «типа элемента» у него нет: тип
+	// каждого слота даёт variable_type() по чётности. Маркер возвращаем как есть.
+	case AIN_IFACE:
 	case AIN_IFACE_WRAP:
-		return AIN_IFACE_WRAP;
+		return type;
 	default:
 		WARNING("Unknown/invalid array type: %d", type);
 		return type;
@@ -229,27 +231,38 @@ enum ain_data_type array_type(enum ain_data_type type)
 }
 
 /*
- * Ixseal (System 4 v14): значение типа `wrap<интерфейс>` — «толстый указатель»
- * из ДВУХ слотов: (heap-слот объекта, база интерфейса в таблице методов этого
- * объекта). Поэтому в generic-массиве такого типа на ОДИН элемент приходится
- * два слота страницы; сама страница помечена `a_type == AIN_IFACE_WRAP`.
- * Байт-код так его и читает: `index*2`, затем ссылка (страница, 2k) —
- * см. foreach в debug::detail::CDebugFPSGraph@SetFont.
+ * Ixseal (System 4 v14): ссылка на интерфейс — «толстый указатель» из ДВУХ
+ * слотов: (heap-слот объекта, база интерфейса в таблице методов этого объекта).
+ * Так выглядят ОБА интерфейсных типа — `ref <интерфейс>` (AIN_IFACE, 89) и
+ * `wrap<интерфейс>` (AIN_IFACE_WRAP, 100), см. type_slots() в vm.c. Поэтому в
+ * generic-массиве такого типа на ОДИН элемент приходится два слота страницы;
+ * сама страница помечена своим `a_type` (89 или 100).
+ *
+ * Байт-код так его и читает: `index*2`, затем ссылка (страница, 2k) — см.
+ * foreach в `debug::detail::CDebugFPSGraph@SetFont` (элемент wrap<интерфейс>)
+ * и в `ArrayExtensions::Select<…, ref Motion::IParam>` @0x9cb17a, где
+ * `local[5] = local[3] * 2` кладёт смещение элемента `array<ref IParam>`
+ * во второй слот 2-слотового локала `value`.
  *
  * У всех остальных массивов — в том числе wrap<структура>, где ссылка это
  * обычный heap-слот, — шаг равен одному слоту, так что для старых игр
- * (у которых типа 100 в массивах нет вовсе) поведение не меняется.
+ * (у которых типов 89/100 в массивах нет вовсе) поведение не меняется.
  */
+bool array_iface_pair_type(enum ain_data_type a_type)
+{
+	return a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
+}
+
 int array_elem_slots(struct page *page)
 {
 	if (!page || page->type != ARRAY_PAGE)
 		return 1;
-	return (page->array.rank == 1 && page->a_type == AIN_IFACE_WRAP) ? 2 : 1;
+	return (page->array.rank == 1 && array_iface_pair_type(page->a_type)) ? 2 : 1;
 }
 
 static int elem_slots_for_type(enum ain_data_type data_type, int rank)
 {
-	return (rank == 1 && data_type == AIN_IFACE_WRAP) ? 2 : 1;
+	return (rank == 1 && array_iface_pair_type(data_type)) ? 2 : 1;
 }
 
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank)
@@ -389,8 +402,9 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 	case AIN_REF_ARRAY_LONG_INT:  return AIN_ARRAY_LONG_INT;
 	case AIN_REF_ARRAY_DELEGATE:  return AIN_ARRAY_DELEGATE;
 	case AIN_ARRAY_TYPE:          return type;
-	// Ixseal: маркер массива двухслотовых wrap<интерфейс>-элементов.
-	case AIN_IFACE_WRAP:          return AIN_IFACE_WRAP;
+	// Ixseal: маркер массива двухслотовых интерфейсных элементов (89/100).
+	case AIN_IFACE:
+	case AIN_IFACE_WRAP:          return type;
 	default: VM_ERROR("Attempt to array allocate non-array type");
 	}
 }
@@ -400,7 +414,7 @@ static void init_array_elem(struct page *page, int elem, enum ain_data_type type
 			    int struct_type, bool init_structs)
 {
 	if (array_elem_slots(page) == 2) {
-		// Пустая ссылка wrap<интерфейс>: объекта нет, база интерфейса 0.
+		// Пустая ссылка на интерфейс: объекта нет, база интерфейса 0.
 		page->values[elem*2].i = -1;
 		page->values[elem*2 + 1].i = 0;
 	} else if (type == AIN_STRUCT && init_structs) {

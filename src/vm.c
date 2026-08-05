@@ -491,17 +491,26 @@ static enum ain_data_type resolve_array_type(struct page *container, int varno, 
 		// и struct-пул (напр. CPartsMessageManager.m_functionSetList = WRAP<struct328>)
 		// создавался как int-массив → слоты структур хранились как сырые int без
 		// владения → преждевременный free и use-after-free (389/3).
-		// ОДНАКО wrap<ИНТЕРФЕЙС> — это «толстый указатель» из ДВУХ слотов
+		// ОДНАКО ссылка на ИНТЕРФЕЙС — это «толстый указатель» из ДВУХ слотов
 		// (объект, база интерфейса), и элемент такого массива занимает два
-		// слота страницы. Такой массив помечаем AIN_IFACE_WRAP — по этому
-		// маркеру array_elem_slots() даёт шаг 2 (см. page.c). Обёртку над
+		// слота страницы. Так выглядят ОБА интерфейсных типа: `wrap<интерфейс>`
+		// (AIN_IFACE_WRAP, 100) и `ref <интерфейс>` (AIN_IFACE, 89) — у обоих
+		// type_slots()==2. Такой массив помечаем этим же типом элемента: по
+		// маркеру array_iface_pair_type() шаг равен 2 (см. page.c). Обёртку над
 		// обычной структурой (wrap<struct>, внутренний тип AIN_STRUCT) это не
 		// затрагивает — она остаётся одним heap-слотом.
+		//
+		// Тип 89 сюда попадал через `array_type_from_elem` в дефолт
+		// AIN_ARRAY_INT: `array<ref Motion::IParam>` создавался int-массивом с
+		// шагом 1 и БЕЗ владения элементами. Отсюда `Array.Where/First/Any` над
+		// такими массивами передавали предикату 1 слот вместо 2, арность не
+		// совпадала и лямбда не вызывалась вовсе (вся Motion-аналитика Dohna
+		// «ничего не находила»).
 		if ((et == AIN_WRAP || et == AIN_OPTION) && vt->array_type->array_type
-				&& vt->array_type->array_type->data == AIN_IFACE_WRAP)
-			return AIN_IFACE_WRAP;
-		if (et == AIN_IFACE_WRAP)
-			return AIN_IFACE_WRAP;
+				&& array_iface_pair_type(vt->array_type->array_type->data))
+			return vt->array_type->array_type->data;
+		if (array_iface_pair_type(et))
+			return et;
 		if (et == AIN_WRAP || et == AIN_OPTION)
 			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
 		return array_type_from_elem(et);
