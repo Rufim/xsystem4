@@ -870,6 +870,7 @@ extern struct static_library lib_StretchHelper;
 extern struct static_library lib_system;
 extern struct static_library lib_SystemService;
 extern struct static_library lib_Sys43VM;
+extern struct static_library lib_TextFile;
 extern struct static_library lib_SystemServiceEx;
 extern struct static_library lib_TextSurfaceManager;
 extern struct static_library lib_TapirEngine;
@@ -998,6 +999,7 @@ static struct static_library *static_libraries[] = {
 	&lib_system,
 	&lib_SystemService,
 	&lib_Sys43VM,
+	&lib_TextFile,
 	&lib_SystemServiceEx,
 	&lib_TextSurfaceManager,
 	&lib_TapirEngine,
