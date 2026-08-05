@@ -3418,12 +3418,38 @@ int vm_execute_ain(struct ain *program)
 	heap_init();
 	init_libraries();
 
+	/*
+	 * Ixseal (System 4 v11+) сам конструирует struct-глобалы: функция "0"
+	 * (`ain->alloc`) для КАЖДОГО из них выполняет `DELETE old; NEW <s>;
+	 * X_ASSIGN 1` (проверено по всем 78 struct-глобалам Dohna — четыре из них
+	 * получают объект из вызова, напр. `DamageNumber::CreateFont`, но идиома та
+	 * же). Поэтому легаси-схема «alloc_struct до, init_struct после» здесь ломает
+	 * сразу две вещи:
+	 *   - `DELETE old` уносит ПРЕДварительно выделенную страницу, вызывая её
+	 *     ДЕСТРУКТОР на объекте, чей конструктор никогда не работал: `CASTimer@1`
+	 *     звал `CASTimerManager@ReleaseHandle(handle=0)` до первого CreateHandle
+	 *     → 53 игровых ассерта «CASTimerManager - Bundle Error» и путаница в
+	 *     учёте хэндлов (ReleaseHandle вызывался чаще CreateHandle);
+	 *   - `init_struct` после функции "0" вызывает конструктор ВТОРОЙ раз, уже на
+	 *     объекте, построенном игрой: `CGlobalObject@0` проверяет
+	 *     `assert( ! m_Created )` (global[141]) и падает.
+	 * Легаси-игры (v6/v7) в функции "0" struct-глобалы не конструируют — там
+	 * обе фазы обязательны, поэтому гейт структурный (v11+).
+	 */
+	bool ix_globals_self_ctor = instructions[CALLMETHOD].args[0] == T_INT;
+
 	// Initialize globals
 	heap[0].ref = 1;
 	heap[0].seq = heap_next_seq++;
 	heap_set_page(0, alloc_page(GLOBAL_PAGE, 0, ain->nr_globals));
 	for (int i = 0; i < ain->nr_globals; i++) {
 		if (ain->globals[i].type.data == AIN_STRUCT) {
+			// Ixseal: объекта ещё нет — null-маркер -1 (DELETE его игнорирует;
+			// ноль здесь означал бы heap-слот 0, т.е. саму глобальную страницу).
+			if (ix_globals_self_ctor) {
+				heap[0].page->values[i].i = -1;
+				continue;
+			}
 			// XXX: need to allocate storage for global structs BEFORE calling
 			//      constructors.
 			heap[0].page->values[i].i = alloc_struct(ain->globals[i].type.struc);
@@ -3450,11 +3476,29 @@ int vm_execute_ain(struct ain *program)
 	if (ain->alloc >= 0)
 		vm_call(ain->alloc, -1); // function "0": allocate global arrays
 
-	// XXX: global constructors must be called AFTER initializing non-struct variables
-	//      otherwise a global set in a constructor will be clobbered by its initval
-	for (int i = 0; i < ain->nr_globals; i++) {
-		if (ain->globals[i].type.data == AIN_STRUCT)
-			init_struct(ain->globals[i].type.struc, heap[0].page->values[i].i);
+	if (ix_globals_self_ctor) {
+		// Конструкторы уже отработали внутри функции "0". Здесь только проверяем
+		// допущение: если какой-то struct-глобал остался null, значит функция "0"
+		// его НЕ построила и схема для этой игры другая — молчать нельзя.
+		int unbuilt = 0;
+		for (int i = 0; i < ain->nr_globals; i++) {
+			if (ain->globals[i].type.data != AIN_STRUCT)
+				continue;
+			if (heap[0].page->values[i].i >= 0)
+				continue;
+			if (++unbuilt <= 4)
+				WARNING("struct-глобал g[%d] %s не построен функцией \"0\"",
+					i, display_sjis0(ain->globals[i].name));
+		}
+		if (unbuilt > 4)
+			WARNING("...и ещё %d непостроенных struct-глобалов", unbuilt - 4);
+	} else {
+		// XXX: global constructors must be called AFTER initializing non-struct variables
+		//      otherwise a global set in a constructor will be clobbered by its initval
+		for (int i = 0; i < ain->nr_globals; i++) {
+			if (ain->globals[i].type.data == AIN_STRUCT)
+				init_struct(ain->globals[i].type.struc, heap[0].page->values[i].i);
+		}
 	}
 
 	vm_call(ain->main, -1);
