@@ -172,6 +172,99 @@ static struct string *SystemService_GetGameName_ix(void)
 	return cstr_to_string(config.game_name);
 }
 
+
+/*
+ * Хранилища именованных строковых переменных (Ixseal): `SystemVariable_*` и
+ * `GameVariable_*` — два независимых словаря ключ→значение с одинаковым API
+ * (IsExist/Set/Get/NumofKey/GetKey/Erase). У v6/v7 этих функций нет вообще
+ * (проверено ainliball по трём .ain), так что ветка Ixseal-only.
+ *
+ * Зачем они игре, видно по единственному потребителю — `ResetLoadManager`:
+ * перед перезапуском VM он кладёт `ResetLoadTargetIndex`/`ResetLoadType`
+ * (`Run` @0x61c448), а после — читает и СТИРАЕТ их (`LoadObject` @0x61c516,
+ * ключа нет → сразу `return 0`). То есть требуется пережить vm-reset, а не
+ * перезапуск процесса; сохранение на диск ни одним сайтом не подтверждается,
+ * поэтому словари живут в памяти. Порядок ключей — порядок вставки: его
+ * задаёт пара NumofKey/GetKey, другого способа перечислить ключи нет.
+ */
+struct sv_entry {
+	struct string *key;
+	struct string *value;
+};
+
+struct sv_store {
+	struct sv_entry *entries;
+	int nr_entries;
+	int cap;
+};
+
+static struct sv_store sv_system, sv_game;
+
+static int sv_find(struct sv_store *st, struct string *key)
+{
+	for (int i = 0; i < st->nr_entries; i++) {
+		if (!strcmp(st->entries[i].key->text, key->text))
+			return i;
+	}
+	return -1;
+}
+
+static void sv_set(struct sv_store *st, struct string *key, struct string *value)
+{
+	int i = sv_find(st, key);
+	if (i >= 0) {
+		free_string(st->entries[i].value);
+		st->entries[i].value = string_ref(value);
+		return;
+	}
+	if (st->nr_entries == st->cap) {
+		st->cap = st->cap ? st->cap * 2 : 8;
+		st->entries = xrealloc(st->entries, st->cap * sizeof(struct sv_entry));
+	}
+	st->entries[st->nr_entries].key = string_ref(key);
+	st->entries[st->nr_entries].value = string_ref(value);
+	st->nr_entries++;
+}
+
+static struct string *sv_get(struct sv_store *st, struct string *key)
+{
+	int i = sv_find(st, key);
+	return string_ref(i >= 0 ? st->entries[i].value : &EMPTY_STRING);
+}
+
+static struct string *sv_get_key(struct sv_store *st, int index)
+{
+	if (index < 0 || index >= st->nr_entries)
+		return string_ref(&EMPTY_STRING);
+	return string_ref(st->entries[index].key);
+}
+
+static void sv_erase(struct sv_store *st, struct string *key)
+{
+	int i = sv_find(st, key);
+	if (i < 0)
+		return;
+	free_string(st->entries[i].key);
+	free_string(st->entries[i].value);
+	memmove(&st->entries[i], &st->entries[i + 1],
+		(st->nr_entries - i - 1) * sizeof(struct sv_entry));
+	st->nr_entries--;
+}
+
+static bool SystemService_SystemVariable_IsExist(struct string *key) { return sv_find(&sv_system, key) >= 0; }
+static void SystemService_SystemVariable_Set(struct string *key, struct string *value) { sv_set(&sv_system, key, value); }
+static struct string *SystemService_SystemVariable_Get(struct string *key) { return sv_get(&sv_system, key); }
+static int SystemService_SystemVariable_NumofKey(void) { return sv_system.nr_entries; }
+static struct string *SystemService_SystemVariable_GetKey(int index) { return sv_get_key(&sv_system, index); }
+static void SystemService_SystemVariable_Erase(struct string *key) { sv_erase(&sv_system, key); }
+
+static bool SystemService_GameVariable_IsExist(struct string *key) { return sv_find(&sv_game, key) >= 0; }
+static void SystemService_GameVariable_Set(struct string *key, struct string *value) { sv_set(&sv_game, key, value); }
+static struct string *SystemService_GameVariable_Get(struct string *key) { return sv_get(&sv_game, key); }
+static int SystemService_GameVariable_NumofKey(void) { return sv_game.nr_entries; }
+static struct string *SystemService_GameVariable_GetKey(int index) { return sv_get_key(&sv_game, index); }
+static void SystemService_GameVariable_Erase(struct string *key) { sv_erase(&sv_game, key); }
+
 HLL_WARN_UNIMPLEMENTED(false, bool, SystemService, AddURLMenu, struct string *title, struct string *url);
 
 static bool SystemService_IsFullScreen(void)
@@ -682,6 +775,18 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(GetMouseCursorConfig, SystemService_GetMouseCursorConfig),
 	    HLL_TODO_EXPORT(RunProgram, SystemService_RunProgram),
 	    HLL_TODO_EXPORT(IsOpenedMutex, SystemService_IsOpenedMutex),
+	    HLL_EXPORT(SystemVariable_IsExist, SystemService_SystemVariable_IsExist),
+	    HLL_EXPORT(SystemVariable_Set, SystemService_SystemVariable_Set),
+	    HLL_EXPORT(SystemVariable_Get, SystemService_SystemVariable_Get),
+	    HLL_EXPORT(SystemVariable_NumofKey, SystemService_SystemVariable_NumofKey),
+	    HLL_EXPORT(SystemVariable_GetKey, SystemService_SystemVariable_GetKey),
+	    HLL_EXPORT(SystemVariable_Erase, SystemService_SystemVariable_Erase),
+	    HLL_EXPORT(GameVariable_IsExist, SystemService_GameVariable_IsExist),
+	    HLL_EXPORT(GameVariable_Set, SystemService_GameVariable_Set),
+	    HLL_EXPORT(GameVariable_Get, SystemService_GameVariable_Get),
+	    HLL_EXPORT(GameVariable_NumofKey, SystemService_GameVariable_NumofKey),
+	    HLL_EXPORT(GameVariable_GetKey, SystemService_GameVariable_GetKey),
+	    HLL_EXPORT(GameVariable_Erase, SystemService_GameVariable_Erase),
 	    HLL_EXPORT(GetGameFolderPath, SystemService_GetGameFolderPath),
 	    HLL_EXPORT(GetDate, get_date),
 	    HLL_EXPORT(GetTime, SystemService_GetTime),
