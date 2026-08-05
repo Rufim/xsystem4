@@ -388,6 +388,18 @@ static void save_parts_state(struct iarray_writer *w, struct parts_state *state)
 	case PARTS_RECT_DETECTION:
 	case PARTS_3DLAYER:
 		break;
+	case PARTS_PANEL:
+		iarray_write(w, state->panel.w);
+		iarray_write(w, state->panel.h);
+		iarray_write(w, state->panel.color.r);
+		iarray_write(w, state->panel.color.g);
+		iarray_write(w, state->panel.color.b);
+		iarray_write(w, state->panel.color.a);
+		iarray_write(w, state->panel.grad_top);
+		iarray_write(w, state->panel.grad_bottom);
+		iarray_write(w, state->panel.grad_left);
+		iarray_write(w, state->panel.grad_right);
+		break;
 	case PARTS_CG:
 		save_parts_cg(w, &state->cg);
 		break;
@@ -434,6 +446,20 @@ static void load_parts_state(struct iarray_reader *r, struct parts *parts,
 	case PARTS_RECT_DETECTION:
 	case PARTS_3DLAYER:
 		break;
+	case PARTS_PANEL: {
+		int w_ = iarray_read(r), h_ = iarray_read(r);
+		int cr = iarray_read(r), cg_ = iarray_read(r);
+		int cb = iarray_read(r), ca = iarray_read(r);
+		state->panel.grad_top = 0; state->panel.grad_bottom = 0;
+		state->panel.grad_left = 0; state->panel.grad_right = 0;
+		PE_SetPanelColor(parts->no, cr, cg_, cb, ca);
+		PE_SetPanelSize(parts->no, w_, h_);
+		state->panel.grad_top = iarray_read(r);
+		state->panel.grad_bottom = iarray_read(r);
+		state->panel.grad_left = iarray_read(r);
+		state->panel.grad_right = iarray_read(r);
+		break;
+	}
 	case PARTS_CG:
 		load_parts_cg(r, parts, &state->cg);
 		break;

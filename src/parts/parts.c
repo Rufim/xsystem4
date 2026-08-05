@@ -194,6 +194,7 @@ static void parts_state_free(struct parts_state *state)
 		free(state->anim.frames);
 		break;
 	case PARTS_NUMERAL:
+	case PARTS_PANEL:
 		gfx_delete_texture(&state->common.texture);
 		break;
 	case PARTS_HGAUGE:
@@ -282,6 +283,10 @@ void parts_state_reset(struct parts_state *state, enum parts_type type)
 	case PARTS_LAYOUT_BOX:
 		state->layout_box.layout_type = PARTS_LAYOUT_VERTICAL;
 		state->layout_box.align = 1;
+		break;
+	case PARTS_PANEL:
+		// Непрозрачный чёрный до первого SetPanelColor.
+		state->panel.color = (SDL_Color) { 0, 0, 0, 255 };
 		break;
 	}
 }
@@ -2118,6 +2123,14 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		return;
 	struct parts *parts = parts_get(parts_no);
 	enum parts_type pt = PARTS_UNINITIALIZED;
+	// Виджеты, добавленные в v14 (id 10-17), классического аналога не имеют и
+	// потому обрабатываются ДО перевода в классическую нумерацию. Из них движок
+	// пока умеет только панель (14, `パネル`) — см. src/parts/panel.c.
+	if (shifted_component_types() && type == 14) {
+		if (parts->states[state].type != PARTS_PANEL)
+			parts_state_reset(&parts->states[state], PARTS_PANEL);
+		return;
+	}
 	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
@@ -2151,6 +2164,11 @@ int PE_GetComponentType(int parts_no, int state)
 	// handlers only on type-0 parts).
 	if (parts->is_button)
 		return 0;
+
+	// Панель — виджет из v14-части перечисления: её id 14 НЕ сдвигается
+	// (сдвиг касается только классического семейства パーツ, id 18+).
+	if (parts->states[state].type == PARTS_PANEL)
+		return 14;
 
 	int classic;
 	switch (parts->states[state].type) {

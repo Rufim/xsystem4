@@ -276,6 +276,14 @@ static cJSON *parts_state_to_json(struct parts_state *state, bool verbose)
 		cJSON_AddNumberToObject(obj, "layout_type", state->layout_box.layout_type);
 		cJSON_AddNumberToObject(obj, "align", state->layout_box.align);
 		break;
+	case PARTS_PANEL:
+		cJSON_AddNumberToObject(obj, "width", state->panel.w);
+		cJSON_AddNumberToObject(obj, "height", state->panel.h);
+		cJSON_AddNumberToObject(obj, "r", state->panel.color.r);
+		cJSON_AddNumberToObject(obj, "g", state->panel.color.g);
+		cJSON_AddNumberToObject(obj, "b", state->panel.color.b);
+		cJSON_AddNumberToObject(obj, "a", state->panel.color.a);
+		break;
 	case PARTS_3DLAYER:
 		cJSON_AddNumberToObject(obj, "plugin", state->layer3d.plugin);
 		cJSON_AddNumberToObject(obj, "sprite_no", state->layer3d.sprite_no);
@@ -491,6 +499,11 @@ static void parts_list_print(struct parts *parts, int indent)
 	switch (state->type) {
 	case PARTS_UNINITIALIZED:
 		sys_message("(uninitialized)");
+		break;
+	case PARTS_PANEL:
+		sys_message("(panel %dx%d #%02x%02x%02x%02x)", state->panel.w, state->panel.h,
+			    state->panel.color.r, state->panel.color.g,
+			    state->panel.color.b, state->panel.color.a);
 		break;
 	case PARTS_CG:
 		if (state->cg.name)
