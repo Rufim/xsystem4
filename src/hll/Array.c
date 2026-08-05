@@ -800,8 +800,46 @@ static int Array_At(struct page **self, int index)
 	return index;
 }
 
+/*
+ * array SYSTEMONLY_GetStructPageList(self) — «сырые» страницы объектов из
+ * контейнера интерфейсных ссылок. Служебная функция сериализации: единственный
+ * сайт — `AFL_GameSave_StructLoad` (@0x227e56), который собирает
+ * `array<wrap<интерфейс>>` из одного элемента (`dest`) и передаёт результат в
+ * `system.DeserializeStruct(fileName, <этот список>, 1)`; та объявлена как
+ * `(string, array, bool)`, т.е. ждёт именно список СТРАНИЦ, а не пар.
+ *
+ * Поэтому берём нижний слот каждого элемента (heap-слот объекта) и отбрасываем
+ * верхний (базу интерфейса) — ровно обратное тому, что делает X_ICAST. Новый
+ * контейнер владеет своей ссылкой на объект (как Array_PushBack/Where).
+ *
+ * Возврат — heap-СЛОТ страницы (тип 79 уходит на стек как есть, см. Where).
+ * Сайт его не освобождает, так что слот на вызов утекает; DeserializeStruct
+ * пока заглушка, так что цена нулевая, но это стоит помнить.
+ */
+static int Array_SYSTEMONLY_GetStructPageList(struct page **self)
+{
+	int slot = heap_alloc_slot(VM_PAGE);
+	if (!self || !*self) {
+		heap_set_page(slot, NULL);
+		return slot;
+	}
+	struct page *src = *self;
+	int eslots = array_elem_slots(src);
+	int n = array_numof(src, 1);
+	union vm_value dim = { .i = 0 };
+	struct page *out = alloc_array(1, &dim, AIN_ARRAY_STRUCT, ix_stype(src), false);
+	for (int i = 0; i < n; i++) {
+		union vm_value obj = src->values[i * eslots];
+		heap_ref(obj.i);
+		out = array_pushback_n(out, &obj, 1, AIN_ARRAY_STRUCT, ix_stype(src));
+	}
+	heap_set_page(slot, out);
+	return slot;
+}
+
 HLL_LIBRARY(Array,
 	    HLL_EXPORT(Alloc, Array_Alloc),
+	    HLL_EXPORT(SYSTEMONLY_GetStructPageList, Array_SYSTEMONLY_GetStructPageList),
 	    HLL_EXPORT(EmplaceBack, Array_EmplaceBack),
 	    HLL_EXPORT(At, Array_At),
 	    HLL_EXPORT(First, Array_ix_First),
