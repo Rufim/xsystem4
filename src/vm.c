@@ -242,7 +242,55 @@ struct page *get_struct_page(int frame_no)
 // the lambda's lexically-enclosing function (encoded in the mangled name as
 // `...<lambda : PARENT(args)(line, col)>`) and walking down the call stack for
 // the nearest matching frame.
-static int get_function_by_name(const char *name);
+// Extract the lexically-enclosing function's name from a lambda's mangled name,
+// or NULL if `name` is not a lambda. Returns a malloc'd string.
+//
+// The payload of the outer `<lambda : ...>` is `PARENT(args)(line, col)`, and
+// PARENT may ITSELF be a lambda name, so the form nests:
+//   `Foo@<lambda : Foo@<lambda : Foo@Bar(string)(160, 23)>(int)(160, 48)>`
+// Cutting at the first `(` therefore loses the parent of every nested lambda
+// (221 of Dohna's 4031) — they silently fell back to the `this` page. Take the
+// payload with `<`/`>` balancing, then strip the two trailing parenthesised
+// groups (the argument list and the line/column pair).
+static char *lambda_parent_name(const char *name)
+{
+	const char *lm = name ? strstr(name, "<lambda : ") : NULL;
+	if (!lm)
+		return NULL;
+	const char *begin = lm + strlen("<lambda : ");
+	const char *end = begin;
+	for (int depth = 1; *end; end++) {
+		if (*end == '<') {
+			depth++;
+		} else if (*end == '>') {
+			if (--depth == 0)
+				break;
+		}
+	}
+	if (*end != '>' || end == begin)
+		return NULL;
+	for (int i = 0; i < 2; i++) {
+		if (end - begin < 2 || end[-1] != ')')
+			return NULL;
+		int depth = 0;
+		do {
+			end--;
+			if (*end == ')')
+				depth++;
+			else if (*end == '(')
+				depth--;
+		} while (depth > 0 && end > begin);
+		if (depth != 0)
+			return NULL;
+	}
+	if (end == begin)
+		return NULL;
+	size_t len = end - begin;
+	char *pname = xmalloc(len + 1);
+	memcpy(pname, begin, len);
+	pname[len] = '\0';
+	return pname;
+}
 
 static int lambda_parent_fno(int fno)
 {
@@ -258,19 +306,33 @@ static int lambda_parent_fno(int fno)
 		return cache[fno];
 
 	int result = -2;
-	const char *name = ain->functions[fno].name;
-	const char *lm = name ? strstr(name, "<lambda : ") : NULL;
-	if (lm) {
-		lm += strlen("<lambda : ");
-		const char *paren = strchr(lm, '(');
-		if (paren && paren > lm) {
-			size_t len = paren - lm;
-			char *pname = xmalloc(len + 1);
-			memcpy(pname, lm, len);
-			pname[len] = '\0';
-			result = get_function_by_name(pname);
-			free(pname);
+	char *pname = lambda_parent_name(ain->functions[fno].name);
+	if (pname) {
+		// The parent name is NOT unique: OVERLOADS share it, and taking the
+		// first match by index picks the wrong one for 153 of Dohna's lambdas.
+		// A lambda's body is emitted INSIDE its enclosing function's body, so
+		// among same-named candidates the parent is the one with the greatest
+		// address BELOW the lambda's own. (Checked over all 4031 lambdas: the
+		// 153 ambiguous names all belong to regular functions and all have a
+		// candidate below; where the parent is itself a lambda the name is
+		// unique — it carries a line/column — and its body may well sit AFTER
+		// the child's, so the address rule must not apply there.)
+		int32_t self = ain->functions[fno].address;
+		int32_t best = 0;
+		for (int i = 0; i < ain->nr_functions; i++) {
+			if (i == fno || !ain->functions[i].name
+					|| strcmp(pname, ain->functions[i].name))
+				continue;
+			int32_t addr = ain->functions[i].address;
+			if (result < 0) {
+				result = i;
+				best = addr;
+			} else if (addr < self && (best >= self || addr > best)) {
+				result = i;
+				best = addr;
+			}
 		}
+		free(pname);
 	}
 	cache[fno] = result;
 	return result;
