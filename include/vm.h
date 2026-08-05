@@ -110,10 +110,17 @@ union vm_value vm_copy(union vm_value v, enum ain_data_type type);
 
 int vm_execute_ain(struct ain *program);
 void vm_call(int fno, int struct_page);
+// Ixseal-лямбды (AIN_HLL_FUNC): пара (страница объекта, номер функции) со стека
+// сайта CALLHLL. См. src/vm.c — используются предикатами/компараторами Array.
+int vm_hll_func_nr_args(int fno);
+union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *argv, int argc);
 int vm_time(void);
 void vm_sleep(int ms);
 
-void hll_call(int libno, int fno);
+// elem_class: Ixseal's third CALLHLL operand (0 when the .ain doesn't have it).
+// It describes the element type of a generic container and, with it, how many
+// stack slots the call site pushed for an AIN_HLL_PARAM argument.
+void hll_call(int libno, int fno, int elem_class);
 bool library_exists(int libno);
 bool library_function_exists(int libno, int fno);
 void init_libraries(void);
@@ -159,6 +166,11 @@ struct function_call {
 	uint32_t return_address;
 	int32_t page_slot;
 	int32_t struct_page;
+	// Диагностика XSYS4_SP_CHECK: stack_ptr сразу после установки кадра, чтобы
+	// на RETURN поймать функцию, которая оставила на стеке лишние слоты
+	// (типичный симптом неверно реализованной инструкции — краш случается
+	// далеко от причины).
+	int32_t entry_sp;
 };
 
 extern struct function_call call_stack[4096];

@@ -19,6 +19,7 @@
 #include "system4.h"
 #include "system4/cg.h"
 #include "system4/hashtable.h"
+#include "system4/instructions.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
@@ -66,6 +67,8 @@ static void parts_init(struct parts *parts)
 	parts->want_save = true;
 	// Игра зовёт SetWantSaveBackScene только с enable=0 (пять мест в байткоде) ⇒ дефолт «да».
 	parts->want_save_back_scene = true;
+	parts->enable_input_process = true;
+	parts->wheelable = true;
 	parts->on_cursor_sound = -1;
 	parts->on_click_sound = -1;
 	parts->origin_mode = 1;
@@ -195,6 +198,7 @@ static void parts_state_free(struct parts_state *state)
 		free(state->anim.frames);
 		break;
 	case PARTS_NUMERAL:
+	case PARTS_PANEL:
 		gfx_delete_texture(&state->common.texture);
 		break;
 	case PARTS_HGAUGE:
@@ -283,6 +287,10 @@ void parts_state_reset(struct parts_state *state, enum parts_type type)
 	case PARTS_LAYOUT_BOX:
 		state->layout_box.layout_type = PARTS_LAYOUT_VERTICAL;
 		state->layout_box.align = 1;
+		break;
+	case PARTS_PANEL:
+		// Непрозрачный чёрный до первого SetPanelColor.
+		state->panel.color = (SDL_Color) { 0, 0, 0, 255 };
 		break;
 	}
 }
@@ -1998,6 +2006,32 @@ float PE_GetPartsRotateZ(int parts_no)
 	return parts_get(parts_no)->local.rotation.z;
 }
 
+/*
+ * Поворот по X/Y и номер части-альфа-клиппера читаются обратно.
+ *
+ * Сеттеры уже хранят и то и другое (`local.rotation.x/y`,
+ * `alpha_clipper_parts_no`), геттеры же были `HLL_TODO_EXPORT` (`.fun = NULL`).
+ * Нужны они не «для полноты»: motion-движок Ixseal читает ТЕКУЩЕЕ значение как
+ * НАЧАЛО интерполяции (`CSpriteParts@<свойство>::get` ←
+ * `Motion::Executer@GetValue<float>` ← `InitializeParams`), поэтому без геттера
+ * первый же анимируемый поворот/клиппер валит движок в REPL. Ровно тот же
+ * случай, что покомпонентные геттеры Add/Mul-цвета. Форма одинакова у v7 и v14.
+ */
+float PE_GetPartsRotateX(int parts_no)
+{
+	return parts_get(parts_no)->local.rotation.x;
+}
+
+float PE_GetPartsRotateY(int parts_no)
+{
+	return parts_get(parts_no)->local.rotation.y;
+}
+
+int PE_GetPartsAlphaClipperPartsNumber(int parts_no)
+{
+	return parts_get(parts_no)->alpha_clipper_parts_no;
+}
+
 void PE_SetPartsAlphaClipperPartsNumber(int parts_no, int alpha_clipper_parts_no)
 {
 	struct parts *parts = parts_get(parts_no);
@@ -2085,6 +2119,99 @@ int PE_GetInputState(int parts_no)
 	return parts_get(parts_no)->state + 1;
 }
 
+/*
+ * Область отсечения компонента (クリップ領域) — прямоугольник + флаг включения.
+ * Все четыре ГЕТТЕРА в библиотеке есть (fn136-139) плюс IsComponentEnableClipArea
+ * (fn134), т.е. игра читает значения обратно и no-op отличим: значения обязаны
+ * храниться. Dohna анимирует их через motion — `Motion::Executer@SetPartsValue` →
+ * `CSpriteParts@ClipWidth::set` → `CParts@ClipWidth::set` читает ClipX и пишет
+ * ширину, так что без хранения ломается сама анимация, а не только вид.
+ *
+ * САМО отсечение при рендере пока НЕ применяется (у движка есть только
+ * альфа-клиппер по части, прямоугольного scissor'а нет) — поэтому на включённую
+ * непустую область один раз печатается WARNING, чтобы допущение было видно, а не
+ * пряталось за тихим дефолтом.
+ */
+void PE_SetComponentEnableClipArea(int parts_no, bool enable)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->clip_area_enabled = !!enable;
+	if (enable && (parts->clip_area.w > 0 || parts->clip_area.h > 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("PartsEngine: часть %d включила クリップ領域 (%d,%d %dx%d) — "
+			        "значения хранятся, но отсечение при рендере не реализовано",
+			        parts_no, parts->clip_area.x, parts->clip_area.y,
+			        parts->clip_area.w, parts->clip_area.h);
+		}
+	}
+}
+
+bool PE_IsComponentEnableClipArea(int parts_no)
+{
+	return parts_get(parts_no)->clip_area_enabled;
+}
+
+void PE_SetComponentClipArea(int parts_no, int x, int y, int w, int h)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->clip_area = (Rectangle) { .x = x, .y = y, .w = w, .h = h };
+}
+
+int PE_GetComponentClipAreaPosX(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.x;
+}
+
+int PE_GetComponentClipAreaPosY(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.y;
+}
+
+int PE_GetComponentClipAreaPosWidth(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.w;
+}
+
+int PE_GetComponentClipAreaPosHeight(int parts_no)
+{
+	return parts_get(parts_no)->clip_area.h;
+}
+
+// System 4 v14 (Ixseal: Dohna Dohna, Healing Touch) extended the component-type
+// enum: eight new UI widget types (メッセージウィンドウ, スピンボックス,
+// 縦/横スライダーバー, パネル, フォーム, フォームグループ, ユーザコンポーネント)
+// were inserted at ids 10-17, shifting the parts family (低レベルパーツ ..
+// ムービーパーツ) from 10-22 up to 18-30. Ids 0-9 (button, checkbox, scrollbars,
+// textbox, listbox, combobox, multiline textbox, layout box, radio button box)
+// are unchanged. Verified against parts::detail::GetComponentTypeName in both
+// dohnadohna.ain (v14) and Tsumamigui3.ain (v7).
+#define COMPONENT_TYPE_SHIFT 8
+
+static bool shifted_component_types(void)
+{
+	return instructions[CALLMETHOD].args[0] == T_INT;
+}
+
+// Translate a component type id from the game's enum to the classic numbering
+// used by the switches below.
+static int component_type_to_classic(int type)
+{
+	if (!shifted_component_types() || type < 10)
+		return type;
+	if (type < 10 + COMPONENT_TYPE_SHIFT)
+		return -1;  // v14-only UI widget; no classic equivalent
+	return type - COMPONENT_TYPE_SHIFT;
+}
+
+static int component_type_from_classic(int type)
+{
+	if (!shifted_component_types() || type < 10)
+		return type;
+	return type + COMPONENT_TYPE_SHIFT;
+}
+
 void PE_SetComponentType(int parts_no, int type, int state)
 {
 	if (getenv("XSYS4_BL_TRACE"))
@@ -2093,7 +2220,27 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		return;
 	struct parts *parts = parts_get(parts_no);
 	enum parts_type pt = PARTS_UNINITIALIZED;
-	switch (type) {
+	// Виджеты, добавленные в v14 (id 10-17), классического аналога не имеют и
+	// потому обрабатываются ДО перевода в классическую нумерацию. Из них движок
+	// пока умеет только панель (14, `パネル`) — см. src/parts/panel.c.
+	if (shifted_component_types() && type == 14) {
+		if (parts->states[state].type != PARTS_PANEL)
+			parts_state_reset(&parts->states[state], PARTS_PANEL);
+		return;
+	}
+	// Кнопка (id 0 в обеих нумерациях): у движка это не отдельный вид рендера, а
+	// ФЛАГ на CG-части (`is_button`), который и отдаёт обратно PE_GetComponentType,
+	// — так же её помечает загрузчик раскладок. Состояние сбрасывать НЕЛЬЗЯ:
+	// parts_state_reset затёр бы CG, уже загруженный из раскладки.
+	// Ixseal конструирует кнопку сама: `parts::detail::CButtonParts@0` (@0x2f0aaa)
+	// завершается вызовом `SetComponentType(no, 0, 1)`, и без этой ветки первая же
+	// кнопка титула валила движок («unknown component type 0»). У v6/v7 тип 0 тоже
+	// означал кнопку, но они его не выставляли — ветка ничего не меняет для них.
+	if (type == 0) {
+		parts->is_button = true;
+		return;
+	}
+	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
 	case 12: pt = PARTS_ANIMATION; break;
@@ -2127,25 +2274,33 @@ int PE_GetComponentType(int parts_no, int state)
 	if (parts->is_button)
 		return 0;
 
+	// Панель — виджет из v14-части перечисления: её id 14 НЕ сдвигается
+	// (сдвиг касается только классического семейства パーツ, id 18+).
+	if (parts->states[state].type == PARTS_PANEL)
+		return 14;
+
+	int classic;
 	switch (parts->states[state].type) {
-	case PARTS_LAYOUT_BOX: return 8;
+	case PARTS_LAYOUT_BOX: classic = 8; break;
 	case PARTS_UNINITIALIZED:  // defaluts to CG
 	case PARTS_CG:
-		return 11;
-	case PARTS_ANIMATION: return 12;
-	case PARTS_TEXT: return 13;
-	case PARTS_HGAUGE: return 14;
-	case PARTS_VGAUGE: return 15;
-	case PARTS_NUMERAL: return 16;
-	case PARTS_RECT_DETECTION: return 17;
-	case PARTS_CONSTRUCTION_PROCESS: return 18;
-	case PARTS_FLAT: return 20;
-	case PARTS_3DLAYER: return 21;
-	case PARTS_MOVIE: return 22;
-	case PARTS_FLASH:
+		classic = 11;
 		break;
+	case PARTS_ANIMATION: classic = 12; break;
+	case PARTS_TEXT: classic = 13; break;
+	case PARTS_HGAUGE: classic = 14; break;
+	case PARTS_VGAUGE: classic = 15; break;
+	case PARTS_NUMERAL: classic = 16; break;
+	case PARTS_RECT_DETECTION: classic = 17; break;
+	case PARTS_CONSTRUCTION_PROCESS: classic = 18; break;
+	case PARTS_FLAT: classic = 20; break;
+	case PARTS_3DLAYER: classic = 21; break;
+	case PARTS_MOVIE: classic = 22; break;
+	case PARTS_FLASH:
+	default:
+		VM_ERROR("unsupported component type %d", parts->states[state].type);
 	}
-	VM_ERROR("unsupported component type %d", parts->states[state].type);
+	return component_type_from_classic(classic);
 }
 
 // Horizontal-scrollbar / slider. The part's CG is the knob; it slides along the
@@ -2437,6 +2592,32 @@ int PE_GetPartsCheckBoxB(int parts_no)
 {
 	struct parts *parts = parts_try_get(parts_no);
 	return parts ? parts->checkbox_b : 0;
+}
+
+/*
+ * Создать часть с дефолтами движка, если её ещё нет.
+ *
+ * Загрузчик раскладок нумерует части сам, а РЕАЛЬНО часть появляется как
+ * побочный эффект первого сеттера, который пользуется `parts_get`
+ * (PE_SetPartsCG/PE_SetPartsFlat/...). Состоянию «прямоугольная часть»
+ * (`矩形パーツ`) грузить нечего — это чистая область попадания, — а
+ * `PE_SetPartsRectangleDetectionSize` намеренно НЕ создаёт часть
+ * (`parts_try_get`, HLL-семантика: на несуществующий номер вернуть false),
+ * поэтому загрузчику нужен явный способ её создать.
+ */
+// Пометить часть как маску построения (см. construction_mask в parts_internal.h):
+// содержимое `構築パーツ` не построено, поэтому заливка-заглушка годится только
+// как прямоугольная маска альфа-клиппера, но не как то, что видно на экране.
+void PE_SetPartsConstructionMask(int parts_no)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->construction_mask = true;
+	parts_dirty(parts);
+}
+
+void PE_EnsureParts(int parts_no)
+{
+	parts_get(parts_no);
 }
 
 bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state)

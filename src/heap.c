@@ -77,6 +77,18 @@ void heap_init(void)
 	heap_next_seq = 1;
 }
 
+// Точечная диагностика владения: XSYS4_HEAP_WATCH=<slot> печатает каждое
+// событие жизненного цикла слота вместе с адресом инструкции VM.
+static int heap_watch_slot = -2;
+static bool heap_watched(int32_t slot)
+{
+	if (heap_watch_slot == -2) {
+		const char *s = getenv("XSYS4_HEAP_WATCH");
+		heap_watch_slot = s ? atoi(s) : -1;
+	}
+	return slot == heap_watch_slot;
+}
+
 int32_t heap_alloc_slot(enum vm_pointer_type type)
 {
 	if (heap_free_ptr >= heap_size) {
@@ -95,6 +107,8 @@ int32_t heap_alloc_slot(enum vm_pointer_type type)
 	heap[slot].deref_nr = 0;
 	heap[slot].free_addr = 0;
 #endif
+	if (unlikely(heap_watched(slot)))
+		WARNING("HEAPWATCH %d ALLOC type=%d @%X", slot, type, instr_ptr);
 	return slot;
 }
 
@@ -107,9 +121,16 @@ static void heap_free_slot(int32_t slot)
 static void heap_double_free(int32_t slot)
 {
 #ifdef DEBUG_HEAP
-		WARNING("double free of slot %d (%s)\nOriginally allocated at %X\nOriginally freed at %X",
-			 slot, vm_ptrtype_string(heap[slot].type),
+		WARNING("double free of slot %d (%s) ref=%d seq=%u\nOriginally allocated at %X\nOriginally freed at %X",
+			 slot, vm_ptrtype_string(heap[slot].type), heap[slot].ref, heap[slot].seq,
 			 heap[slot].alloc_addr, heap[slot].free_addr);
+		sys_message("  refs(%d):", heap[slot].ref_nr);
+		for (int i = 0; i < heap[slot].ref_nr && i < 16; i++)
+			sys_message(" %X", heap[slot].ref_addr[i]);
+		sys_message("\n  derefs(%d):", heap[slot].deref_nr);
+		for (int i = 0; i < heap[slot].deref_nr && i < 16; i++)
+			sys_message(" %X", heap[slot].deref_addr[i]);
+		sys_message("\n");
 #else
 		WARNING("double free of slot %d (%s)", slot, vm_ptrtype_string(heap[slot].type));
 #endif
@@ -120,6 +141,8 @@ void heap_ref(int32_t slot)
 	if (slot == -1)
 		return;
 	heap[slot].ref++;
+	if (unlikely(heap_watched(slot)))
+		WARNING("HEAPWATCH %d REF -> %d @%X", slot, heap[slot].ref, instr_ptr);
 #ifdef DEBUG_HEAP
 	heap[slot].ref_addr[heap[slot].ref_nr++ % 16] = instr_ptr;
 #endif
@@ -127,6 +150,8 @@ void heap_ref(int32_t slot)
 
 void heap_unref(int slot)
 {
+	if (unlikely(heap_watched(slot)))
+		WARNING("HEAPWATCH %d UNREF (ref=%d) @%X", slot, heap[slot].ref, instr_ptr);
 	if (unlikely(heap[slot].ref <= 0)) {
 		heap_double_free(slot);
 		VM_ERROR("double free");
@@ -158,6 +183,10 @@ void heap_unref(int slot)
 // XXX: special version of heap_unref which avoids calling destructors
 void exit_unref(int slot)
 {
+	if (unlikely(heap_watched(slot))) {
+		WARNING("HEAPWATCH %d EXIT_UNREF (ref=%d) @%X", slot, heap[slot].ref, instr_ptr);
+		vm_stack_trace();
+	}
 	if (slot < 0 || (size_t)slot >= heap_size) {
 		WARNING("out of bounds heap index: %d", slot);
 		return;
@@ -258,7 +287,9 @@ void heap_string_assign(int slot, struct string *string)
 {
 #ifdef DEBUG_HEAP
 	if (unlikely(!string_index_valid(slot)))
-		VM_ERROR("Tried to assign string to non-string slot");
+		VM_ERROR("Tried to assign string to non-string slot %d (type=%s ref=%d)",
+			 slot, slot >= 0 && (size_t)slot < heap_size ? vm_ptrtype_string(heap[slot].type) : "OOB",
+			 slot >= 0 && (size_t)slot < heap_size ? heap[slot].ref : -1);
 #endif
 	if (heap[slot].s) {
 		free_string(heap[slot].s);

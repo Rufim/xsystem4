@@ -494,6 +494,71 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 	PartsEngine_add_construction_process(ints, floats, strings);
 }
 
+// Ixseal (System 4 v14) form of the batch construction interface. The classic
+// call packs everything into three arrays and carries the part number and state
+// in ints[0..1]; v14 passes both explicitly, adds a fourth array (ArrayPos: the
+// point list of the new vector-shape commands) and grew ArrayInt from 32 to 40
+// entries. Layout read from CASConstructionProcess::ArrayIntIndex::ToString:
+//
+//   0 Command, 1 InterpolationType, 2-5 Src{X,Y,Width,Height},
+//   6-9 Dest{X,Y,X2,Y2}, 10-11 Dest{Width,Height}, 12-15 RGBA, 16-19 RGBA2,
+//   20 CharSpace, 21 LineSpace, 22 FontType, 23 FontSize, 24-26 FontColorRGB,
+//   27-29 EdgeColorRGB, 30 FullSize, 31 Blur, 32-33 Radius{X,Y}, 34 LineWidth,
+//   35 RoundEdge, 36 RoundCorner, 37 Angle, 38 StartAngle, 39 SweepAngle
+//
+// The classic layout is the same sequence shifted by two, without A2 (new in
+// v14) and without the nine trailing shape fields. ArrayFloat (BoldWeight,
+// EdgeWeight) and ArrayString (Text, CGName) are unchanged.
+//
+// The command ids themselves did NOT change: 0..24 mean the same as in v7
+// (verified against the Command constant each CASConstructionProcess@Set*
+// method writes). v14 appended new ones (25.. : alpha-map gradations, blur and
+// inverse filters, whole-CG blend and the line/polygon/circle/ellipse/arc/pie
+// families), which the classic dispatcher below has no handler for.
+#define IX_NR_CONSTRUCTION_INTS 40
+#define NR_CLASSIC_CONSTRUCTION_COMMANDS 25
+
+static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, struct page **af,
+		struct page **as, struct page **ap, int state)
+{
+	(void)ap;  // point list: only the v14-only vector-shape commands use it
+	bool trace = !!getenv("XSYS4_CP_TRACE");
+	int nr_ints    = (ai && *ai) ? (*ai)->nr_vars : 0;
+	int nr_floats  = (af && *af) ? (*af)->nr_vars : 0;
+	int nr_strings = (as && *as) ? (*as)->nr_vars : 0;
+	if (nr_ints < IX_NR_CONSTRUCTION_INTS || nr_floats < 2 || nr_strings < 2) {
+		if (trace)
+			NOTICE("AddPartsConstructionProcess(ix): unexpected arg sizes i=%d f=%d s=%d",
+			       nr_ints, nr_floats, nr_strings);
+		return;
+	}
+	union vm_value *src = (*ai)->values;
+	int command = src[0].i;
+	if (command < 0 || command >= NR_CLASSIC_CONSTRUCTION_COMMANDS) {
+		if (trace)
+			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d)",
+			       command, parts_no);
+		return;
+	}
+
+	union vm_value ints[32] = {0};
+	ints[0].i = parts_no;
+	ints[1].i = state;
+	ints[2].i = command;
+	for (int i = 3; i <= 20; i++)   // InterpolationType .. B2
+		ints[i] = src[i - 2];
+	for (int i = 21; i <= 31; i++)  // CharSpace .. FullSize (A2 has no classic slot)
+		ints[i] = src[i - 1];
+
+	if (trace)
+		NOTICE("AddPartsConstructionProcess(ix) part=%d state=%d cmd=%d src=(%d,%d %dx%d) dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
+		       parts_no, state, command,
+		       ints[4].i, ints[5].i, ints[6].i, ints[7].i,
+		       ints[8].i, ints[9].i, ints[12].i, ints[13].i,
+		       ints[14].i, ints[15].i, ints[16].i, ints[17].i);
+	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values);
+}
+
 // --- Подсистема Activity (именованные наборы parts) ---
 // Новые игры System 4 группируют parts в именованные «активности». В движке её
 // не было; минимальный реестр: имя -> список (имя_parts, номер_parts) + EX-текст.
@@ -647,6 +712,82 @@ static struct string *act_str(struct ex_tree *t, const char *utf8)
 	return NULL;
 }
 
+/*
+ * ★У IXSEAL `パーツタイプ` В РАСКЛАДКЕ — СТРОКА, А НЕ ЧИСЛО.
+ *
+ * Tsumamigui 3 хранит тип части числом (`パーツタイプ = 0`), Dohna — ИМЕНЕМ
+ * (`パーツタイプ = "ボタン"`), и `act_int` на строковом узле честно отдавал
+ * дефолт -1. Из-за этого весь разбор типа у Dohna молча не работал: ни одна
+ * часть не опознавалась кнопкой, поэтому `parts::detail::GetComponentType` не
+ * отдавал 0, а `activity::detail::CActivityWrap@CompParts` (@0x1fd54) сравнивает
+ * его с запрошенным типом и при несовпадении заставляет `GetButton` вернуть
+ * ПУСТОЙ wrap `(-1, 0)`. Титул строит список кнопок как
+ * `ArrayExtensions::Select(имена, name => activity.GetButton(name))`, то есть
+ * получал 8 пустых элементов. Проверялось: части НАХОДЯТСЯ
+ * (`ButtonOmake -> 90000021` … `ButtonExit -> 90000025`), ломался только гейт
+ * по типу. Логотип рисовался, потому что CG-части и панели и без разбора типа
+ * уходят в общую ветку состояний.
+ *
+ * Порядок имён — не догадка: снят с SWITCH-таблицы самой игры в
+ * `parts::detail::GetComponentTypeName` (@0x2edf18, switch 312, 31 ветка),
+ * значение case = id типа.
+ *
+ * Нумерация v14 отличается от классической: у классического семейства (id 18+,
+ * собственно `パーツ`) сдвиг на 8, а виджеты 10-17 классического аналога не
+ * имеют — тот же перевод, что `component_type_to_classic` в src/parts/parts.c.
+ * Возвращаем КЛАССИЧЕСКИЙ id, потому что именно им пользуются ветки ниже
+ * (0/1/2/3 у виджетов совпадают в обеих нумерациях; テキストパーツ 21→13 и
+ * 構築パーツ 26→18 совпадают с проверками в act_set_state_cg).
+ */
+static const char *const act_component_type_names[] = {
+	"ボタン", "チェックボックス", "縦スクロールバー", "横スクロールバー",
+	"テキストボックス", "リストボックス", "コンボボックス",
+	"マルチラインテキストボックス", "レイアウトボックス", "ラジオボタンボックス",
+	"メッセージウィンドウ", "スピンボックス", "縦スライダーバー",
+	"横スライダーバー", "パネル", "フォーム", "フォームグループ",
+	"ユーザコンポーネント", "低レベルパーツ", "ＣＧパーツ", "ループＣＧパーツ",
+	"テキストパーツ", "横ゲージパーツ", "縦ゲージパーツ", "数字パーツ",
+	"矩形パーツ", "構築パーツ", "ＣＧ判定パーツ", "フラットパーツ",
+	"３Ｄレイヤパーツ", "ムービーパーツ",
+};
+#define ACT_COMPONENT_TYPE_SHIFT 8
+
+static int act_parts_type(struct ex_tree *t)
+{
+	struct ex_tree *c = act_child(t, "パーツタイプ");
+	if (!c || !c->is_leaf)
+		return -1;
+	if (c->leaf.value.type == EX_INT)
+		return c->leaf.value.i;  // v6/v7: тип уже число классической нумерации
+	if (c->leaf.value.type != EX_STRING || !c->leaf.value.s)
+		return -1;
+	const char *name = c->leaf.value.s->text;
+	int v14 = -1;
+	for (unsigned i = 0; i < sizeof(act_component_type_names) / sizeof(*act_component_type_names); i++) {
+		char *sjis = utf2sjis(act_component_type_names[i], strlen(act_component_type_names[i]));
+		bool hit = !strcmp(name, sjis);
+		free(sjis);
+		if (hit) {
+			v14 = i;
+			break;
+		}
+	}
+	if (v14 < 0) {
+		// Имя вне таблицы игры — не молчаливый дефолт, а проверка допущения.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("act_parts_type: неизвестный パーツタイプ '%s'", display_sjis0(name));
+		}
+		return -1;
+	}
+	if (v14 < 10)
+		return v14;                              // виджеты: нумерация общая
+	if (v14 < 10 + ACT_COMPONENT_TYPE_SHIFT)
+		return -1;                               // виджет только v14 (напр. パネル)
+	return v14 - ACT_COMPONENT_TYPE_SHIFT;       // классическое семейство パーツ
+}
+
 // nth element of a list-valued child, as int (floats truncated)
 static int act_list_int(struct ex_tree *t, const char *utf8, int idx, int dflt)
 {
@@ -696,7 +837,7 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	}
 	// Text state: テキスト + テキスト装飾 (font). Used e.g. by the config sample
 	// message ("サンプル") whose 通常状態 is a パーツタイプ=13 text sub-node.
-	if (act_int(st, "パーツタイプ", -1) == 13) {
+	if (act_parts_type(st) == 13) {
 		struct string *txt = act_str(st, "テキスト");
 		if (txt && txt->size) {
 			struct ex_tree *fd = act_child(st, "テキスト装飾");
@@ -728,7 +869,10 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// CG-парт со слэшем. Загрузчик активности этот тип состояния не разбирал вовсе,
 	// поэтому цифр не было ни одной. `フォント*`-поля тут для варианта «цифры текстом»
 	// (全角=0, у Tsumamigui 3 используется именно CG-вариант).
-	if (act_int(st, "パーツタイプ", -1) == 16) {
+	// act_parts_type, а не act_int: у Ixseal/Dohna тип состояния в .pactex — СТРОКА
+	// («数字パーツ»), и act_int молча отдавал бы -1, из-за чего 112 numeral-состояний
+	// Dohna не создавались бы вовсе.
+	if (act_parts_type(st) == 16) {
 		struct string *cg = act_str(st, "ＣＧ名");
 		if (cg && cg->size)
 			PE_SetNumeralCG(no, cg, state);
@@ -746,14 +890,73 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// full compositing procedure; we only need an opaque mask of the viewport
 	// rect so it can serve as an alpha-clipper (rectangular clip) for siblings.
 	// The 手順1 create op's 先矩形 gives the size [.,.,.,.,w,h].
-	if (act_int(st, "パーツタイプ", -1) == 18) {
+	if (act_parts_type(st) == 18) {
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
 		if (step1) {
 			int w = act_list_int(step1, "先矩形", 4, 0);
 			int h = act_list_int(step1, "先矩形", 5, 0);
-			if (w > 0 && h > 0)
+			if (w > 0 && h > 0) {
 				PE_SetPartsColorFill(no, w, h);
+				// Заливка — ТОЛЬКО маска: сама часть не рисуется, иначе
+				// непрозрачный прямоугольник закрывает экран (титул Dohna
+				// объявляет такую часть `表示 = 1, アルファ = 255`, z=29,
+				// 1480x920 поверх всего, а по её процедуре поверхность
+				// прозрачная). Клипперы Tsumamigui 3 и так `表示 = 0`.
+				PE_SetPartsConstructionMask(no);
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					WARNING("構築パーツ: процедура построения не выполняется, "
+						"часть используется только как прямоугольная маска "
+						"альфа-клиппера и не рисуется");
+				}
+			}
+		}
+		return;
+	}
+	/*
+	 * Прямоугольная часть (`矩形パーツ`, классический id 17) — не картинка, а
+	 * область определения попадания, заданная ЧЕТЫРЬМЯ УГЛАМИ
+	 * (左上/右上/左下/右下), а не парой ширина-высота.
+	 *
+	 * Без этой ветки состояние оставалось «CG», и игра, которая гейтится по типу
+	 * компонента (`activity::detail::CActivityWrap@GetRect` → `CompParts(имя, 25, 1)`
+	 * → сравнение с `parts::detail::GetComponentType`), получала из `GetRect`
+	 * ПУСТОЙ wrap: так падал `ArrayExtensions::Select<IRectParts&, string>` в
+	 * `TitleCharacterView@Attach`.
+	 *
+	 * Данные по всем 195 раскладкам Dohna: 216 таких состояний, у ВСЕХ
+	 * `矩形モード = 1` и `左上 = (0,0)`. Смысл режима и ненулевого начала координат
+	 * не установлен — вместо тихого дефолта стоит проверка допущения.
+	 */
+	if (act_parts_type(st) == 17) {
+		int x0 = act_list_int(st, "左上", 0, 0);
+		int y0 = act_list_int(st, "左上", 1, 0);
+		int w = act_list_int(st, "右上", 0, 0) - x0;
+		int h = act_list_int(st, "左下", 1, 0) - y0;
+		int mode = act_int(st, "矩形モード", 1);
+		if (mode != 1) {
+			static bool warned_mode = false;
+			if (!warned_mode) {
+				warned_mode = true;
+				WARNING("矩形パーツ: 矩形モード=%d, смысл не установлен "
+					"(во всех раскладках Dohna было 1)", mode);
+			}
+		}
+		if (x0 || y0) {
+			static bool warned_org = false;
+			if (!warned_org) {
+				warned_org = true;
+				WARNING("矩形パーツ: 左上=(%d,%d) не в начале координат, "
+					"смещение не учитывается", x0, y0);
+			}
+		}
+		if (w > 0 && h > 0) {
+			// Часть ещё не существует: у прямоугольного состояния нет
+			// картинки, а значит и сеттера, который создал бы её попутно.
+			PE_EnsureParts(no);
+			PE_SetPartsRectangleDetectionSize(no, w, h, state);
 		}
 		return;
 	}
@@ -829,7 +1032,7 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 	}
 
 	struct ex_tree *ti = act_child(node, "種類別情報");
-	int ptype = ti ? act_int(ti, "パーツタイプ", -1) : -1;
+	int ptype = ti ? act_parts_type(ti) : -1;
 	if (getenv("XSYS4_PT_TRACE")) {
 		struct string *dcg = ti ? act_str(ti, "ＣＧ名") : NULL;
 		NOTICE("PT part '%s' no=%d ptype=%d cg='%s'", display_sjis0(node->name->text),
@@ -1027,15 +1230,37 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		act_set_state_cg(no, ti, "キーダウン状態", 3);
 	}
 
-	// 原点座標モード — к какому углу/краю парта привязаны его координаты (1 = левый верх,
-	// 9 = правый низ; таблица в calculate_offset). Загрузчик активности его НЕ читал, и
-	// все парты вставали как левый-верх. У большинства в .pactex и стоит 1, поэтому
-	// расхождение было незаметно — пока не нашёлся счётчик страниц BACK SCENE: у его
-	// трёх партов モード = 9, из-за чего слэш «／» уезжал вправо-вниз на свою ширину и
-	// высоту (замер: наш x 965..976 против 939..954 у оригинала).
-	PE_SetPartsOriginPosMode(no, act_int(node, "原点座標モード", 1));
 	PE_SetPos(no, act_list_int(node, "座標", 0, 0), act_list_int(node, "座標", 1, 0));
 	PE_SetZ(no, act_list_int(node, "座標", 2, 0));
+	// 原点座標モード (origin/anchor mode): which point of the part 座標 refers to, on
+	// the 1-9 grid (1=top-left ... 5=middle-center ... 9=bottom-right) — the same
+	// numbering as the engine's calculate_offset() and as the flat layer origin_mode.
+	// Must be applied AFTER the CG/flat/panel is loaded above, because the offset is
+	// derived from the state's width/height. Dropping it drew every centre-anchored
+	// part with its top-left corner at the anchor point: Dohna's SceneLogo anchors the
+	// AliceSoft 30th badge at its centre (原点座標モード=5), so the logo landed half a
+	// texture down-right of where it belongs. Absent field -> 1, which is the engine
+	// default (parts.c parts_alloc), so layouts that predate it are unaffected.
+	// Counts (tool: alice ex dump over every .pactex): Dohna 1942×mode1 + 766 non-1
+	// across 195 layouts; Tsumamigui 3 614×mode1 + 15 non-1 across 25 layouts.
+	// То же по Tsumamigui 3: у трёх партов счётчика страниц BACK SCENE モード = 9, и без
+	// этого вызова слэш «／» уезжал вправо-вниз ровно на свою ширину и высоту (замер:
+	// x 965..976 против 939..954 у оригинала) — FINDINGS §5t. Вызов ЕДИНСТВЕННЫЙ: при
+	// слиянии ветвей он задваивался (идемпотентно, но это мусор).
+	PE_SetPartsOriginPosMode(no, act_int(node, "原点座標モード", 1));
+	// 原点座標 (explicit origin coordinate) is (0,0) in all 2708 parts of all 195 Dohna
+	// layouts and absent entirely in Tsumamigui 3, so its meaning is not established —
+	// check the assumption instead of silently ignoring a non-zero value.
+	if (act_list_int(node, "原点座標", 0, 0) || act_list_int(node, "原点座標", 1, 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("act_build_part: part '%s' has non-zero 原点座標 (%d,%d) — meaning not established, ignored",
+			        display_sjis0(node->name->text),
+			        act_list_int(node, "原点座標", 0, 0),
+			        act_list_int(node, "原点座標", 1, 0));
+		}
+	}
 	PE_SetAlpha(no, act_int(node, "アルファ", 255));
 	// 拡大縮小 (scale x,y): e.g. the config sample-window system icons are 0.5.
 	float sx = act_list_float(node, "拡大縮小", 0, 1.0f);
@@ -1063,7 +1288,7 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				continue;
 			struct ex_tree *cti = act_child(&kids->children[i], "種類別情報");
 			struct ex_tree *cnorm = cti ? act_child(cti, "通常状態") : NULL;
-			bool is_viewport = cnorm && act_int(cnorm, "パーツタイプ", -1) == 18;
+			bool is_viewport = cnorm && act_parts_type(cnorm) == 18;
 			if (is_viewport)
 				clip_viewport_no = cno;
 			else if (clip_viewport_no >= 0)
@@ -1673,6 +1898,184 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_StopSwipe, void);
 // Purely diagnostic metadata — safe no-op for reaching the screen.
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_SetComment, int a, struct string *b);
 
+/*
+ * `Parts_GetPartsSize(no, wrap<int> w, wrap<int> h, state)` — ширина и высота
+ * состояния одним вызовом, через два out-параметра. Обычные `Parts_GetParts{Width,
+ * Height}` у движка уже есть и реально считают размер по состоянию; не хватало
+ * только парной формы, которой пользуется `parts::detail::CParts@Size::get`
+ * (через `AFL_Parts_GetSize`) — на ней вставал `SceneTitle@FadeInButton`.
+ * `wrap<скаляр>` ffi отдаёт как обычный указатель на значение (см. ffi.c).
+ */
+static void PE_Parts_GetPartsSize(int parts_no, int *w, int *h, int state)
+{
+	if (w)
+		*w = PE_GetPartsWidth(parts_no, state);
+	if (h)
+		*h = PE_GetPartsHeight(parts_no, state);
+}
+
+/*
+ * Покомпонентные геттеры сложения/умножения цвета части. Сеттеры
+ * (`SetComponentAddColor`/`SetComponentMulColor` → `PE_SetAddColor`/
+ * `PE_SetMultiplyColor`) хранят значения по-настоящему, и агрегатные
+ * `PE_GetAddColor`/`PE_GetMultiplyColor` их читают — не хватало только
+ * покомпонентной формы, которой объявлены эти функции в .ain (одинаково у v7 и
+ * v14: `ret=10 (int)`, сдвига формы тут нет, просто были `HLL_TODO_EXPORT`).
+ *
+ * Нужны именно как геттеры: motion-движок читает ТЕКУЩЕЕ значение как начало
+ * интерполяции (`Motion::Executer@InitializeParams` ← `GetValue<float>` ←
+ * `CSpriteParts@MulColorR::get`), поэтому без них не работает ни один
+ * цветовой фейд. Дефолт части — (255,255,255), нейтральное умножение.
+ */
+static int PE_GetComponentAddColorR(int parts_no)
+{
+	int r, g, b;
+	PE_GetAddColor(parts_no, &r, &g, &b);
+	return r;
+}
+static int PE_GetComponentAddColorG(int parts_no)
+{
+	int r, g, b;
+	PE_GetAddColor(parts_no, &r, &g, &b);
+	return g;
+}
+static int PE_GetComponentAddColorB(int parts_no)
+{
+	int r, g, b;
+	PE_GetAddColor(parts_no, &r, &g, &b);
+	return b;
+}
+static int PE_GetComponentMulColorR(int parts_no)
+{
+	int r, g, b;
+	PE_GetMultiplyColor(parts_no, &r, &g, &b);
+	return r;
+}
+static int PE_GetComponentMulColorG(int parts_no)
+{
+	int r, g, b;
+	PE_GetMultiplyColor(parts_no, &r, &g, &b);
+	return g;
+}
+static int PE_GetComponentMulColorB(int parts_no)
+{
+	int r, g, b;
+	PE_GetMultiplyColor(parts_no, &r, &g, &b);
+	return b;
+}
+
+/*
+ * Имя SE «клик мимо» — глобальное (не по части) имя звука, который парт-движок
+ * играет, когда клик не попал ни в одну часть. Хранится по-настоящему, потому
+ * что у сеттера ЕСТЬ геттер (`GetClickMissSoundName`), то есть no-op отличим:
+ * `parts::detail::WaitForClick` ставит своё имя на время ожидания и обязано
+ * вернуть прежнее. Само воспроизведение здесь не появляется — движок не играет
+ * ни одного parts-звука (`Parts_SetSoundName`/`Parts_PlaySound` тоже no-op),
+ * это отдельный слой.
+ */
+static struct string *pe_click_miss_sound = NULL;
+
+static void PE_SetClickMissSoundName(struct string *name)
+{
+	if (pe_click_miss_sound)
+		free_string(pe_click_miss_sound);
+	pe_click_miss_sound = string_ref(name ? name : &EMPTY_STRING);
+}
+
+static struct string *pe_click_miss_sound_get(void)
+{
+	return string_ref(pe_click_miss_sound ? pe_click_miss_sound : &EMPTY_STRING);
+}
+
+static void PE_GetClickMissSoundName(struct string **out)
+{
+	if (*out)
+		free_string(*out);
+	*out = pe_click_miss_sound_get();
+}
+
+static struct string *PE_GetClickMissSoundName_ix(void)
+{
+	return pe_click_miss_sound_get();
+}
+
+/*
+ * ★СТРОКОВЫЕ ГЕТТЕРЫ СМЕНИЛИ ФОРМУ (тот же класс, что `GetGameVersionByText`
+ * в SystemService): v6/v7 объявляют `ret=0 (..., ref string out, ...)`, а
+ * Ixseal — `ret=12 (...)`, то есть строку ВОЗВРАТОМ. Линковка идёт по ИМЕНИ, а
+ * cif строится по .ain, поэтому C-функция с out-параметром получает мусорный
+ * указатель, пишет по нему и возвращает мусор → слот строки с `s = NULL` и SEGV
+ * в `string_ref(NULL)`, а НЕ понятная ошибка.
+ *
+ * Расхождение посчитано тулом (`ainliball <ain> <libno PartsEngine>` против
+ * C-сигнатур этого файла): у Dohna 81 функция с `ret=12`, из них движок реально
+ * экспортирует 13; 12 были в форме v7 (остальные 68 — либо `HLL_TODO_EXPORT`
+ * с `.fun = NULL`, то есть честная ошибка вместо SEGV, либо не экспортируются
+ * вовсе). Форма каждой сверена по трём .ain: Dohna `ret=12`, Tsumamigui 3 и
+ * Escalayer — `ret=0` с `ref string`.
+ *
+ * Гейт структурный: подмена в `_PreLink` только если .ain объявил возврат
+ * строкой (`return_type.data == AIN_STRING`), поэтому у v6/v7 остаётся прежняя
+ * форма с out-параметром.
+ */
+static struct string *PE_GetActivityPartsName_ix(struct string *act, int number)
+{
+	struct string *out = NULL;
+	PE_GetActivityPartsName(&out, act, number);
+	return out;
+}
+
+static struct string *PE_GetActivityEXText_ix(struct string *act)
+{
+	struct string *out = NULL;
+	PE_GetActivityEXText(act, &out);
+	return out;
+}
+
+static struct string *PE_GetMessageVariableString_ix(int index)
+{
+	struct string *out = NULL;
+	PE_GetMessageVariableString(index, &out);
+	return out;
+}
+
+static struct string *PE_Parts_GetSoundName_ix(int parts_no, int state)
+{
+	struct string *out = NULL;
+	PE_Parts_GetSoundName(parts_no, &out, state);
+	return out;
+}
+
+static struct string *PE_GetPartsCGName_ix(int parts_no, int state)
+{
+	// v7-форма НЕ пишет out, когда у состояния нет CG (и оставляет прежнее
+	// значение вызывающего); возвратной форме нужна пустая строка.
+	struct string *out = NULL;
+	PE_GetPartsCGName(parts_no, &out, state);
+	return out ? out : string_ref(&EMPTY_STRING);
+}
+
+// Заглушки-геттеры (у движка нет хранилища этих имён): пустая строка вместо
+// мусора. Смысл — тот же, что у прежней out-формы, менялась только форма.
+static struct string *PE_empty_string_ix(void)
+{
+	return string_ref(&EMPTY_STRING);
+}
+
+/*
+ * ЗЕРКАЛЬНЫЙ СЛУЧАЙ: `GetTextPartsText` реализован СРАЗУ в Ixseal-форме
+ * (`struct string *PE_GetTextPartsText(int, int)`), а v6/v7 объявляют её
+ * `ret=0 (ref string, int, int)` — значит для СТАРЫХ игр она была сломана тем
+ * же способом. Подставляем out-форму, когда .ain объявил возврат не строкой.
+ */
+static void PE_GetTextPartsText_v7(struct string **out, int parts_no, int state)
+{
+	struct string *s = PE_GetTextPartsText(parts_no, state);
+	if (*out)
+		free_string(*out);
+	*out = s;
+}
+
 static void PartsEngine_PreLink(void);
 
 HLL_LIBRARY(PartsEngine,
@@ -1711,6 +2114,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetLoopCGSurfaceArea, PE_SetLoopCGSurfaceArea),
 	    HLL_EXPORT(SetText, PE_SetText),
 	    HLL_EXPORT(AddPartsText, PE_AddPartsText),
+	    HLL_EXPORT(GetTextPartsText, PE_GetTextPartsText),
 	    HLL_TODO_EXPORT(DeletePartsTopTextLine, PartsEngine_DeletePartsTopTextLine),
 	    HLL_EXPORT(SetPartsTextSurfaceArea, PE_SetPartsTextSurfaceArea),
 	    HLL_TODO_EXPORT(SetPartsTextHighlight, PartsEngine_SetPartsTextHighlight),
@@ -1789,6 +2193,16 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetAddColor, PE_SetAddColor),
 	    HLL_EXPORT(SetMultiplyColor, PE_SetMultiplyColor),
 	    HLL_EXPORT(SetPassCursor, PE_SetPassCursor),
+	    HLL_EXPORT(Parts_SetWheelable, PE_SetPartsWheelable),
+	    HLL_EXPORT(SetComponentEnableClipArea, PE_SetComponentEnableClipArea),
+	    HLL_EXPORT(IsComponentEnableClipArea, PE_IsComponentEnableClipArea),
+	    HLL_EXPORT(SetComponentClipArea, PE_SetComponentClipArea),
+	    HLL_EXPORT(GetComponentClipAreaPosX, PE_GetComponentClipAreaPosX),
+	    HLL_EXPORT(GetComponentClipAreaPosY, PE_GetComponentClipAreaPosY),
+	    HLL_EXPORT(GetComponentClipAreaPosWidth, PE_GetComponentClipAreaPosWidth),
+	    HLL_EXPORT(GetComponentClipAreaPosHeight, PE_GetComponentClipAreaPosHeight),
+	    HLL_EXPORT(SetEnableInputProcess, PE_SetEnableInputProcess),
+	    HLL_EXPORT(IsEnableInputProcess, PE_IsEnableInputProcess),
 	    HLL_EXPORT(SetClickable, PE_SetClickable),
 	    HLL_EXPORT(SetSpeedupRateByMessageSkip, PE_SetSpeedupRateByMessageSkip),
 	    HLL_TODO_EXPORT(SetResetTimerByChangeInputStatus, PartsEngine_SetResetTimerByChangeInputStatus),
@@ -1965,10 +2379,11 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetThumbnailReductionSize, PE_SetThumbnailReductionSize),
 	    HLL_EXPORT(Parts_SetThumbnailMode, PE_SetThumbnailMode),
 	    HLL_EXPORT(GetClickNumber, PE_GetClickPartsNumber),
+	    HLL_EXPORT(SetClickMissSoundName, PE_SetClickMissSoundName),
+	    HLL_EXPORT(GetClickMissSoundName, PE_GetClickMissSoundName),
 	    HLL_EXPORT(StopSoundWithoutSystemSound, PartsEngine_StopSoundWithoutSystemSound),
 	    HLL_EXPORT(Parts_SetSoundName, PE_Parts_SetSoundName),
 	    HLL_EXPORT(Parts_GetSoundName, PE_Parts_GetSoundName),
-	    HLL_TODO_EXPORT(ReleaseActivity, PartsEngine_ReleaseActivity),
 	    HLL_TODO_EXPORT(CrateActivityBinary, PartsEngine_CrateActivityBinary),
 	    HLL_TODO_EXPORT(ReadActivityBinary, PartsEngine_ReadActivityBinary),
 	    HLL_EXPORT(ReleaseMessage, PE_ReleaseMessage),
@@ -1999,6 +2414,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentOriginPosMode, PE_GetPartsOriginPosMode),
 	    HLL_TODO_EXPORT(GetComponentWidth, PartsEngine_GetComponentWidth),
 	    HLL_TODO_EXPORT(GetComponentHeight, PartsEngine_GetComponentHeight),
+	    HLL_EXPORT(Parts_GetPartsSize, PE_Parts_GetPartsSize),
 	    HLL_EXPORT(Parts_GetPartsWidth, PE_GetPartsWidth),
 	    HLL_EXPORT(Parts_GetPartsHeight, PE_GetPartsHeight),
 	    HLL_EXPORT(SetComponentShow, PE_SetComponentShow),
@@ -2008,24 +2424,24 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetComponentAlpha, PE_SetAlpha),
 	    HLL_EXPORT(GetComponentAlpha, PE_GetPartsAlpha),
 	    HLL_EXPORT(SetComponentAddColor, PE_SetAddColor),
-	    HLL_TODO_EXPORT(GetComponentAddColorR, PartsEngine_GetComponentAddColorR),
-	    HLL_TODO_EXPORT(GetComponentAddColorG, PartsEngine_GetComponentAddColorG),
-	    HLL_TODO_EXPORT(GetComponentAddColorB, PartsEngine_GetComponentAddColorB),
+	    HLL_EXPORT(GetComponentAddColorR, PE_GetComponentAddColorR),
+	    HLL_EXPORT(GetComponentAddColorG, PE_GetComponentAddColorG),
+	    HLL_EXPORT(GetComponentAddColorB, PE_GetComponentAddColorB),
 	    HLL_EXPORT(SetComponentMulColor, PE_SetMultiplyColor),
-	    HLL_TODO_EXPORT(GetComponentMulColorR, PartsEngine_GetComponentMulColorR),
-	    HLL_TODO_EXPORT(GetComponentMulColorG, PartsEngine_GetComponentMulColorG),
-	    HLL_TODO_EXPORT(GetComponentMulColorB, PartsEngine_GetComponentMulColorB),
+	    HLL_EXPORT(GetComponentMulColorR, PE_GetComponentMulColorR),
+	    HLL_EXPORT(GetComponentMulColorG, PE_GetComponentMulColorG),
+	    HLL_EXPORT(GetComponentMulColorB, PE_GetComponentMulColorB),
 	    HLL_EXPORT(SetComponentDrawFilter, PE_SetPartsDrawFilter),
-	    HLL_TODO_EXPORT(GetComponentDrawFilter, PartsEngine_GetComponentDrawFilter),
+	    HLL_EXPORT(GetComponentDrawFilter, PE_GetPartsDrawFilter),
 	    HLL_EXPORT(SetComponentMagX, PE_SetPartsMagX),
 	    HLL_EXPORT(SetComponentMagY, PE_SetPartsMagY),
-	    HLL_TODO_EXPORT(GetComponentMagX, PartsEngine_GetComponentMagX),
-	    HLL_TODO_EXPORT(GetComponentMagY, PartsEngine_GetComponentMagY),
+	    HLL_EXPORT(GetComponentMagX, PE_GetPartsMagX),
+	    HLL_EXPORT(GetComponentMagY, PE_GetPartsMagY),
 	    HLL_EXPORT(SetComponentRotateX, PE_SetPartsRotateX),
 	    HLL_EXPORT(SetComponentRotateY, PE_SetPartsRotateY),
 	    HLL_EXPORT(SetComponentRotateZ, PE_SetPartsRotateZ),
-	    HLL_TODO_EXPORT(GetComponentRotateX, PartsEngine_GetComponentRotateX),
-	    HLL_TODO_EXPORT(GetComponentRotateY, PartsEngine_GetComponentRotateY),
+	    HLL_EXPORT(GetComponentRotateX, PE_GetPartsRotateX),
+	    HLL_EXPORT(GetComponentRotateY, PE_GetPartsRotateY),
 	    HLL_EXPORT(GetComponentRotateZ, PE_GetPartsRotateZ),
 	    HLL_EXPORT(SetComponentMargin, PE_SetComponentMargin),
 	    HLL_EXPORT(GetComponentMarginTop, PE_GetComponentMarginTop),
@@ -2033,7 +2449,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentMarginLeft, PE_GetComponentMarginLeft),
 	    HLL_EXPORT(GetComponentMarginRight, PE_GetComponentMarginRight),
 	    HLL_EXPORT(SetComponentAlphaClipper, PE_SetPartsAlphaClipperPartsNumber),
-	    HLL_TODO_EXPORT(GetComponentAlphaClipper, PartsEngine_GetComponentAlphaClipper),
+	    HLL_EXPORT(GetComponentAlphaClipper, PE_GetPartsAlphaClipperPartsNumber),
 	    HLL_TODO_EXPORT(SetComponentTextureFilterType, PartsEngine_SetComponentTextureFilterType),
 	    HLL_TODO_EXPORT(GetComponentTextureFilterType, PartsEngine_GetComponentTextureFilterType),
 	    HLL_TODO_EXPORT(SetComponentMipmap, PartsEngine_SetComponentMipmap),
@@ -2056,27 +2472,14 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SuspendBuildView, PartsEngine_SuspendBuildView),
 	    HLL_TODO_EXPORT(SuspendBuildViewAt, PartsEngine_SuspendBuildViewAt),
 	    HLL_TODO_EXPORT(ResumeBuildView, PartsEngine_ResumeBuildView),
-	    HLL_TODO_EXPORT(SetButtonSize, PartsEngine_SetButtonSize),
 	    HLL_TODO_EXPORT(SetButtonDrag, PartsEngine_SetButtonDrag),
 	    HLL_TODO_EXPORT(IsButtonDrag, PartsEngine_IsButtonDrag),
-	    HLL_TODO_EXPORT(SetButtonEnable, PartsEngine_SetButtonEnable),
-	    HLL_TODO_EXPORT(IsButtonEnable, PartsEngine_IsButtonEnable),
 	    HLL_TODO_EXPORT(SetButtonPixelDecide, PartsEngine_SetButtonPixelDecide),
 	    HLL_TODO_EXPORT(IsButtonPixelDecide, PartsEngine_IsButtonPixelDecide),
-	    HLL_TODO_EXPORT(SetButtonColor, PartsEngine_SetButtonColor),
-	    HLL_TODO_EXPORT(GetButtonR, PartsEngine_GetButtonR),
-	    HLL_TODO_EXPORT(GetButtonG, PartsEngine_GetButtonG),
-	    HLL_TODO_EXPORT(GetButtonB, PartsEngine_GetButtonB),
-	    HLL_TODO_EXPORT(SetButtonFontProperty, PartsEngine_SetButtonFontProperty),
-	    HLL_TODO_EXPORT(GetButtonFontProperty, PartsEngine_GetButtonFontProperty),
 	    HLL_TODO_EXPORT(SetButtonOnCursorSoundNumber, PartsEngine_SetButtonOnCursorSoundNumber),
 	    HLL_TODO_EXPORT(SetButtonClickSoundNumber, PartsEngine_SetButtonClickSoundNumber),
 	    HLL_TODO_EXPORT(GetButtonOnCursorSoundNumber, PartsEngine_GetButtonOnCursorSoundNumber),
 	    HLL_TODO_EXPORT(GetButtonClickSoundNumber, PartsEngine_GetButtonClickSoundNumber),
-	    HLL_TODO_EXPORT(SetButtonCGName, PartsEngine_SetButtonCGName),
-	    HLL_TODO_EXPORT(GetButtonCGName, PartsEngine_GetButtonCGName),
-	    HLL_TODO_EXPORT(SetButtonText, PartsEngine_SetButtonText),
-	    HLL_TODO_EXPORT(GetButtonText, PartsEngine_GetButtonText),
 	    HLL_TODO_EXPORT(SetCheckBoxSize, PartsEngine_SetCheckBoxSize),
 	    HLL_TODO_EXPORT(SetCheckBoxDrag, PartsEngine_SetCheckBoxDrag),
 	    HLL_TODO_EXPORT(IsCheckBoxDrag, PartsEngine_IsCheckBoxDrag),
@@ -2205,6 +2608,21 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(IsLayoutBoxReturn, PE_IsLayoutBoxReturn),
 	    HLL_EXPORT(GetLayoutBoxReturnSize, PE_GetLayoutBoxReturnSize),
 	    HLL_EXPORT(SetLayoutBoxAlign, PE_SetLayoutBoxAlign),
+	    // Панель (Ixseal, component type 14) — src/parts/panel.c
+	    HLL_EXPORT(SetPanelSize, PE_SetPanelSize),
+	    HLL_EXPORT(SetPanelColor, PE_SetPanelColor),
+	    HLL_EXPORT(GetPanelR, PE_GetPanelR),
+	    HLL_EXPORT(GetPanelG, PE_GetPanelG),
+	    HLL_EXPORT(GetPanelB, PE_GetPanelB),
+	    HLL_EXPORT(GetPanelA, PE_GetPanelA),
+	    HLL_EXPORT(SetPanelAlphaGradationTop, PE_SetPanelAlphaGradationTop),
+	    HLL_EXPORT(SetPanelAlphaGradationBottom, PE_SetPanelAlphaGradationBottom),
+	    HLL_EXPORT(SetPanelAlphaGradationLeft, PE_SetPanelAlphaGradationLeft),
+	    HLL_EXPORT(SetPanelAlphaGradationRight, PE_SetPanelAlphaGradationRight),
+	    HLL_EXPORT(GetPanelAlphaGradationTop, PE_GetPanelAlphaGradationTop),
+	    HLL_EXPORT(GetPanelAlphaGradationBottom, PE_GetPanelAlphaGradationBottom),
+	    HLL_EXPORT(GetPanelAlphaGradationLeft, PE_GetPanelAlphaGradationLeft),
+	    HLL_EXPORT(GetPanelAlphaGradationRight, PE_GetPanelAlphaGradationRight),
 	    HLL_EXPORT(GetLayoutBoxAlign, PE_GetLayoutBoxAlign),
 	    HLL_EXPORT(Parts_SetPartsCG, PE_SetPartsCG),
 	    HLL_EXPORT(Parts_GetPartsCGName, PE_GetPartsCGName),
@@ -2300,9 +2718,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_GetPartsClickable, PE_GetPartsClickable),
 	    HLL_TODO_EXPORT(Parts_GetResetTimerByChangeInputStatus, PartsEngine_Parts_GetResetTimerByChangeInputStatus),
 	    HLL_TODO_EXPORT(Parts_GetPartsDrag, PartsEngine_Parts_GetPartsDrag),
-	    HLL_TODO_EXPORT(Parts_GetParentPartsNumber, PartsEngine_Parts_GetParentPartsNumber),
 	    HLL_EXPORT(Parts_GetInputState, PE_GetInputState),
-	    HLL_TODO_EXPORT(Parts_GetOnCursorShowLinkPartsNumber, PartsEngine_Parts_GetOnCursorShowLinkPartsNumber),
+	    HLL_EXPORT(Parts_GetOnCursorShowLinkPartsNumber, PE_GetOnCursorShowLinkPartsNumber),
 	    HLL_TODO_EXPORT(Parts_GetSoundNumber, PartsEngine_Parts_GetSoundNumber),
 	    HLL_TODO_EXPORT(Parts_IsPartsPixelDecide, PartsEngine_Parts_IsPartsPixelDecide),
 	    HLL_EXPORT(Parts_IsCursorIn, PE_IsCursorIn),
@@ -2332,6 +2749,14 @@ static void PartsEngine_PreLink(void)
 		static_library_replace(&lib_PartsEngine, "AddCopyCutCGToPartsConstructionProcess",
 				PE_AddCopyCutCGToPartsConstructionProcess);
 	}
+	// Ixseal passes the part number, state and a fourth (point list) array
+	// explicitly: AddPartsConstructionProcess(int, ArrayInt, ArrayFloat,
+	// ArrayString, ArrayPos, int) instead of the classic three arrays.
+	fun = get_fun(libno, "AddPartsConstructionProcess");
+	if (fun && fun->nr_arguments == 6) {
+		static_library_replace(&lib_PartsEngine, "AddPartsConstructionProcess",
+				PE_AddPartsConstructionProcess_ix);
+	}
 	fun = get_fun(libno, "Update");
 	if (fun && fun->nr_arguments == 5) {
 		static_library_replace(&lib_PartsEngine, "Update",
@@ -2339,5 +2764,45 @@ static void PartsEngine_PreLink(void)
 	}
 	if (get_fun(libno, "AddController")) {
 		PE_enable_multi_controller();
+	}
+	// В новом message-API «сообщений больше нет» = GetMessageType() == -1, а не 0
+	// (см. src/parts/message.c). SeekMessage объявлена только этим API.
+	if (get_fun(libno, "SeekMessage")) {
+		PE_set_message_empty_type_minus_one();
+	}
+
+	// Строковые геттеры: Ixseal отдаёт строку ВОЗВРАТОМ, v6/v7 — через
+	// out-параметр `ref string` (см. большой комментарий выше). Гейт — форма,
+	// объявленная в .ain, а не версия движка.
+	static const struct { const char *name; void *ix; } str_getters[] = {
+		{ "GetClickMissSoundName",  PE_GetClickMissSoundName_ix },
+		{ "GetActivityPartsName",   PE_GetActivityPartsName_ix },
+		{ "GetActivityEXText",      PE_GetActivityEXText_ix },
+		{ "GetMessageVariableString", PE_GetMessageVariableString_ix },
+		{ "Parts_GetSoundName",     PE_Parts_GetSoundName_ix },
+		{ "GetPartsCGName",         PE_GetPartsCGName_ix },
+		{ "Parts_GetPartsCGName",   PE_GetPartsCGName_ix },
+		{ "GetButtonCGName",        PE_empty_string_ix },
+		{ "GetButtonFlatName",      PE_empty_string_ix },
+		{ "GetButtonText",          PE_empty_string_ix },
+		{ "GetVScrollbarCGName",    PE_empty_string_ix },
+		{ "GetVScrollbarFlatName",  PE_empty_string_ix },
+		{ "GetHScrollbarCGName",    PE_empty_string_ix },
+		{ "GetHScrollbarFlatName",  PE_empty_string_ix },
+	};
+	for (unsigned i = 0; i < sizeof(str_getters) / sizeof(*str_getters); i++) {
+		fun = get_fun(libno, str_getters[i].name);
+		if (fun && fun->return_type.data == AIN_STRING) {
+			static_library_replace(&lib_PartsEngine, str_getters[i].name,
+					str_getters[i].ix);
+		}
+	}
+
+	// Зеркально: GetTextPartsText реализована в Ixseal-форме, поэтому старым
+	// играм нужна форма с out-параметром.
+	fun = get_fun(libno, "GetTextPartsText");
+	if (fun && fun->return_type.data != AIN_STRING) {
+		static_library_replace(&lib_PartsEngine, "GetTextPartsText",
+				PE_GetTextPartsText_v7);
 	}
 }

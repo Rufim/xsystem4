@@ -108,7 +108,9 @@ enum parts_type {
 	PARTS_RECT_DETECTION,
 	PARTS_LAYOUT_BOX,
 	PARTS_3DLAYER,
-#define PARTS_NR_TYPES (PARTS_3DLAYER+1)
+	// System 4 v14 (Ixseal): сплошной цветной прямоугольник (`パネル`).
+	PARTS_PANEL,
+#define PARTS_NR_TYPES (PARTS_PANEL+1)
 };
 
 struct parts_common {
@@ -361,6 +363,15 @@ struct parts_layout_box {
 	int padding_right;
 };
 
+// Панель (Ixseal): размер + сплошной цвет; альфа-градиенты по краям хранятся,
+// но не рисуются — см. src/parts/panel.c.
+struct parts_panel {
+	struct parts_common common;
+	int w, h;
+	SDL_Color color;
+	int grad_top, grad_bottom, grad_left, grad_right;
+};
+
 struct parts_3dlayer {
 	struct parts_common common;
 	int plugin;    // ReignEngine plugin handle (-1 = none)
@@ -382,6 +393,7 @@ struct parts_state {
 		struct parts_movie movie;
 		struct parts_layout_box layout_box;
 		struct parts_3dlayer layer3d;
+		struct parts_panel panel;
 	};
 };
 
@@ -418,6 +430,14 @@ struct parts {
 	// Such parts render as CG (hover/click state-switch) but must report component
 	// type 0 to the game, which enables click handlers only on type-0 parts.
 	bool is_button;
+	// Часть, чьё состояние — `構築パーツ` (construction part): её содержимое
+	// строит «процедура построения» (список операций из раскладки), которую
+	// движок не выполняет. Загрузчик кладёт вместо результата НЕПРОЗРАЧНУЮ
+	// заливку прямоугольника процедуры — она годится только как маска
+	// альфа-клиппера (прямоугольного отсечения) для соседей, но не как то, что
+	// видно на экране. Флаг убирает такую часть из отрисовки, оставляя текстуру
+	// доступной клипперу (он читает её напрямую, независимо от show).
+	bool construction_mask;
 	// Widget state for config-style screens (scrollbars/sliders and checkboxes).
 	// Not yet rendered as interactive widgets, but the game reads these back, so
 	// we store what it sets to keep the config UI logic consistent.
@@ -450,6 +470,23 @@ struct parts {
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
 	bool pass_cursor;
+	// PartsEngine.SetEnableInputProcess/IsEnableInputProcess: участвует ли часть в
+	// обработке ввода вообще. Отличается от clickable (право на клик) — это ГЛОБАЛЬНЫЙ
+	// выключатель hit-теста и сообщений. Игра гасит им ввод на время анимации:
+	// `Motion::Join → InputDisabler@SetPartsParam → CSpriteParts@EnableInputProcess::set`.
+	// Дефолт — true (см. parts_init).
+	bool enable_input_process;
+	// PartsEngine.Parts_SetWheelable: принимает ли часть нотчи колеса. Геттера в
+	// библиотеке НЕТ (только сеттер fn203), поэтому смысл взят из имени и сайта
+	// `CParts@MouseWheelEvent::add` — подписка на колесо включает приём. Дефолт true =
+	// прежнее поведение движка (Tsumamigui 3 и Escalayer этой функции не объявляют
+	// вовсе — тул ainliball, — так что у них флаг всегда true и скролл BACK LOG цел).
+	bool wheelable;
+	// クリップ領域: SetComponentClipArea/GetComponentClipAreaPos{X,Y,Width,Height} +
+	// SetComponentEnableClipArea/IsComponentEnableClipArea. Хранится и возвращается;
+	// отсечение при рендере пока не реализовано (см. PE_SetComponentEnableClipArea).
+	bool clip_area_enabled;
+	Rectangle clip_area;
 	bool lock_input_state;
 	bool want_save;
 	// Отдельный флаг для снимка «画面保管»/BACK SCENE (PartsEngine.SetWantSaveBackScene).
@@ -518,6 +555,7 @@ struct parts_flash *parts_get_flash(struct parts *parts, int state);
 struct parts_flat *parts_get_flat(struct parts *parts, int state);
 struct parts_movie *parts_get_movie(struct parts *parts, int state);
 struct parts_layout_box *parts_get_layout_box(struct parts *parts);
+struct parts_panel *parts_get_panel(struct parts *parts, int state);
 struct parts_3dlayer *parts_get_3dlayer(struct parts *parts, int state);
 void parts_set_pos(struct parts *parts, Point pos);
 void parts_set_z(struct parts *parts, int z);

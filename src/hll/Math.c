@@ -69,24 +69,67 @@ static void Math_SetSeedByCurrentTime(void)
 	srand(time(NULL));
 }
 
-static int Math_Min(int a, int b)
+/*
+ * Min/Max/Clamp в Ixseal (System 4 v14) — перегрузки: int и float, по 2, 3 и 4
+ * аргумента (`<Math>::Min(int,int)` … `Min(float,float,float,float)`). Арность
+ * берём из `hll_current_nr_args` (лишние параметры cif не объявляет — читать их
+ * НЕЛЬЗЯ), а тип различает линковщик через декорированное имя `Имя@f`
+ * (HLL_EXPORT_F). Старые игры объявляют только 2-аргументные Min/MinF/Max/MaxF,
+ * для них поведение прежнее.
+ */
+static int Math_Min(int a, int b, int c, int d)
 {
-	return a < b ? a : b;
+	int r = a < b ? a : b;
+	if (hll_current_nr_args >= 3 && c < r)
+		r = c;
+	if (hll_current_nr_args >= 4 && d < r)
+		r = d;
+	return r;
 }
 
-static float Math_MinF(float a, float b)
+static float Math_MinF(float a, float b, float c, float d)
 {
-	return a < b ? a : b;
+	float r = a < b ? a : b;
+	if (hll_current_nr_args >= 3 && c < r)
+		r = c;
+	if (hll_current_nr_args >= 4 && d < r)
+		r = d;
+	return r;
 }
 
-static int Math_Max(int a, int b)
+static int Math_Max(int a, int b, int c, int d)
 {
-	return a > b ? a : b;
+	int r = a > b ? a : b;
+	if (hll_current_nr_args >= 3 && c > r)
+		r = c;
+	if (hll_current_nr_args >= 4 && d > r)
+		r = d;
+	return r;
 }
 
-static float Math_MaxF(float a, float b)
+static float Math_MaxF(float a, float b, float c, float d)
 {
-	return a > b ? a : b;
+	float r = a > b ? a : b;
+	if (hll_current_nr_args >= 3 && c > r)
+		r = c;
+	if (hll_current_nr_args >= 4 && d > r)
+		r = d;
+	return r;
+}
+
+static int Math_Clamp(int v, int lo, int hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static float Math_ClampF(float v, float lo, float hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int Math_Abs(int v)
+{
+	return v < 0 ? -v : v;
 }
 
 static void Math_Swap(int *a, int *b)
@@ -162,6 +205,16 @@ static int Math_Ceil(float f)
 	return (int)ceilf(f);
 }
 
+static int Math_Floor(float f)
+{
+	return (int)floorf(f);
+}
+
+static int Math_Round(float f)
+{
+	return (int)roundf(f);
+}
+
 static bool Math_BezierCurve(struct page **x_array, struct page **y_array, int num, float t, int *result_x, int *result_y)
 {
 	vec2 *coeffs = xmalloc(num * sizeof(vec2));
@@ -189,7 +242,8 @@ HLL_LIBRARY(Math,
 	    HLL_EXPORT(Sqrt, sqrtf),
 	    HLL_EXPORT(Atan, atanf),
 	    HLL_EXPORT(Atan2, atan2f),
-	    HLL_EXPORT(Abs, abs),
+	    HLL_EXPORT(Abs, Math_Abs),
+	    HLL_EXPORT_F(Abs, fabsf),
 	    HLL_EXPORT(AbsF, fabsf),
 	    HLL_EXPORT(Pow, powf),
 	    HLL_EXPORT(SetSeed, srand),
@@ -202,13 +256,19 @@ HLL_LIBRARY(Math,
 	    //HLL_EXPORT(RandTable2Init, Math_RandTable2Init),
 	    //HLL_EXPORT(RandTable2, Math_RandTable2),
 	    HLL_EXPORT(Min, Math_Min),
+	    HLL_EXPORT_F(Min, Math_MinF),
 	    HLL_EXPORT(MinF, Math_MinF),
 	    HLL_EXPORT(Max, Math_Max),
+	    HLL_EXPORT_F(Max, Math_MaxF),
 	    HLL_EXPORT(MaxF, Math_MaxF),
+	    HLL_EXPORT(Clamp, Math_Clamp),
+	    HLL_EXPORT_F(Clamp, Math_ClampF),
 	    HLL_EXPORT(Swap, Math_Swap),
 	    HLL_EXPORT(SwapF, Math_SwapF),
 	    HLL_EXPORT(Log, logf),
 	    HLL_EXPORT(Log10, log10f),
 	    HLL_EXPORT(Ceil, Math_Ceil),
+	    HLL_EXPORT(Floor, Math_Floor),
+	    HLL_EXPORT(Round, Math_Round),
 	    HLL_EXPORT(BezierCurve, Math_BezierCurve));
 

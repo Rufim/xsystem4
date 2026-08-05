@@ -103,9 +103,19 @@ static inline void _page_set_var(struct page *page, int i, union vm_value v)
 
 // variables
 union vm_value variable_initval(enum ain_data_type type);
+// Тот же initval, но со знанием слота в контейнере: generic-контейнер Ixseal
+// (AIN_ARRAY) рождается типизированной пустой страницей (см. src/page.c).
+union vm_value variable_initval_var(struct page *container, int varno, enum ain_data_type type);
+enum ain_data_type array_resolve_var_type(struct page *container, int varno, int *struct_type,
+					  int *rank, bool *ref_elem);
 void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor);
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank);
 void variable_set(struct page *page, int varno, enum ain_data_type type, union vm_value val);
+// Ixseal: сколько слотов страницы занимает объявленная переменная — считается по
+// филлерам <void>, которые компилятор кладёт после многослотового значения.
+int decl_slots(struct ain_variable *vars, int nr_vars, int i);
+// Ixseal: инициализировать option-переменные страницы пустыми ([-1..., тег 1]).
+void init_option_vars(struct page *page, struct ain_variable *vars, int nr_vars, int from);
 
 // pages
 struct page *alloc_page(enum page_type type, int type_index, int nr_vars);
@@ -121,6 +131,13 @@ void delete_struct(int no, int slot);
 void create_struct(int no, union vm_value *var);
 
 // arrays
+// Тип элемента — ссылка на интерфейс (пара «объект, база интерфейса»)?
+// Это `ref <интерфейс>` (AIN_IFACE) и `wrap<интерфейс>` (AIN_IFACE_WRAP).
+bool array_iface_pair_type(enum ain_data_type a_type);
+// Число слотов страницы на ОДИН элемент массива: 1 для всех обычных массивов и
+// 2 для Ixseal-массива с интерфейсным элементом (см. выше).
+// Индексы элементов во всех array_*-функциях — в ЭЛЕМЕНТАХ.
+int array_elem_slots(struct page *page);
 enum ain_data_type array_type(enum ain_data_type type);
 struct page *alloc_array(int rank, union vm_value *dimensions, enum ain_data_type data_type, int struct_type, bool init_structs);
 struct page *realloc_array(struct page *src, int rank, union vm_value *dimensions, enum ain_data_type data_type, int struct_type, bool init_structs);
@@ -128,9 +145,12 @@ int array_numof(struct page *page, int rank);
 void array_copy(struct page *dst, int dst_i, struct page *src, int src_i, int n);
 int array_fill(struct page *dst, int dst_i, int n, union vm_value v);
 struct page *array_pushback(struct page *dst, union vm_value v, enum ain_data_type data_type, int struct_type);
+// Варианты для многослотового элемента: `v` — nvals подряд идущих слотов.
+struct page *array_pushback_n(struct page *dst, const union vm_value *v, int nvals, enum ain_data_type data_type, int struct_type);
 struct page *array_popback(struct page *dst);
 struct page *array_erase(struct page *page, int i, bool *success);
 struct page *array_insert(struct page *page, int i, union vm_value v, enum ain_data_type data_type, int struct_type);
+struct page *array_insert_n(struct page *page, int i, const union vm_value *v, int nvals, enum ain_data_type data_type, int struct_type);
 void array_sort(struct page *page, int compare_fno);
 void array_sort_mem(struct page *page, int member_no);
 int array_find(struct page *page, int start, int end, union vm_value v, int compare_fno);

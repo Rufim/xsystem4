@@ -39,6 +39,27 @@ struct parts_message {
 static STAILQ_HEAD(, parts_message) msg_queue =
 		STAILQ_HEAD_INITIALIZER(msg_queue);
 
+// Значение GetMessageType на ПУСТОЙ очереди — «сообщений больше нет». Игра крутит
+// drain-луп именно по этому сентинелу, и он СМЕНИЛСЯ между версиями библиотеки:
+//   Tsumamigui 3 (v7) parts::detail::CPartsMessageManager@Update @0x155d36:
+//     type = GetMessageType(); while (type != 0) { CallDelegate(type); PopMessage(); ... }
+//   Dohna (v14)        parts::detail::CPartsMessageManager@Update @0x2c7924:
+//     type = GetMessageType(); while (type != -1) { CallDelegate(type); PopMessage(); ... }
+// С прежним жёстким 0 у Dohna луп не заканчивался НИКОГДА: движок отдавал 0, игра
+// считала это настоящим сообщением типа 0 и вечно скармливала его CallEvent2<int,int>
+// (~1 млн вызовов/с). Луп сидит внутри View_Update, поэтому кадр не завершался —
+// за 20 с прогона отрисовывался РОВНО ОДИН кадр, таймеры/задачи не тикали, и сцена
+// логотипа не могла уйти дальше (SceneLogo@Run ждёт DelayedCallback→ShowLogo).
+// Гейт структурный и привязан к самой этой фиче: SeekMessage/GetMessageUniqueID
+// объявлены ТОЛЬКО в новом message-API (тул ainliball: у Dohna есть, у Tsumamigui 3
+// и Escalayer Reboot нет ни одной из двух).
+static int msg_empty_type = 0;
+
+void PE_set_message_empty_type_minus_one(void)
+{
+	msg_empty_type = -1;
+}
+
 static void msg_push_v(int parts_no, int delegate_index, int type,
 		const char *fmt, va_list ap)
 {
@@ -128,7 +149,7 @@ void PE_PopMessage(void)
 int PE_GetMessageType(void)
 {
 	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
-	return msg ? msg->type : 0;
+	return msg ? msg->type : msg_empty_type;
 }
 
 int PE_GetMessagePartsNumber(void)

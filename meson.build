@@ -1,6 +1,8 @@
-project('system4', 'c',
+# 'cpp' нужен ровно для одного модуля — src/regex_ecma.cpp: Ixseal-библиотека
+# String использует ECMAScript-регулярки (std::regex), которых нет в POSIX ERE.
+project('system4', ['c', 'cpp'],
         meson_version: '>= 0.59',
-        default_options : ['c_std=c11'])
+        default_options : ['c_std=c11', 'cpp_std=c++17'])
 add_project_arguments('-D_DEFAULT_SOURCE', language : 'c')
 add_project_arguments('-DXSYS4_DATA_DIR="' + get_option('prefix') / get_option('datadir') / 'xsystem4"', language : 'c')
 

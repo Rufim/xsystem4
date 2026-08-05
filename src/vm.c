@@ -79,6 +79,33 @@ bool vm_reset_once = false;
 // XSYS4_FN_TRACE=<comma-separated fn numbers>. Env-gated, harmless.
 static int fn_trace_list[32];
 static int fn_trace_count = -1;
+// Diagnostic: XSYS4_SP_CHECK — проверять баланс стека на каждом RETURN.
+static bool sp_check = false;
+static uint8_t sp_check_reported[65536];
+
+/*
+ * Сколько слотов стека занимает значение объявленного типа (Ixseal). Для
+ * ПЕРЕМЕННЫХ это же число видно по филлерам <void> (decl_slots), но у типа
+ * возврата филлеров нет — считаем по структуре типа:
+ *   wrap<интерфейс> (82 → 100) — два слота (объект, база интерфейса);
+ *   option<T>                  — слоты T плюс тег.
+ */
+static int type_slots(struct ain_type *t)
+{
+	if (!t || t->data == AIN_VOID)
+		return 0;
+	// Ссылка на интерфейс — пара (объект, база интерфейса). Подтверждено тем же
+	// правилом филлеров: локал типа 89 всегда идёт с одним `<void>` за ним
+	// (напр. var[0]/var[1] в `Motion::ParamAnalyzer@Parse`).
+	if (t->data == AIN_IFACE || t->data == AIN_IFACE_WRAP)
+		return 2;
+	if ((t->data == AIN_WRAP || t->data == AIN_OPTION) && t->array_type) {
+		int inner = t->array_type->data == AIN_IFACE_WRAP
+			? 2 : type_slots(t->array_type);
+		return t->data == AIN_OPTION ? inner + 1 : inner;
+	}
+	return 1;
+}
 // Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr> logs every entered
 // function whose name contains <substr>. Env-gated, harmless.
 static const char *fn_trace_ns = (const char *)1; // 1 = not-yet-resolved
@@ -215,7 +242,55 @@ struct page *get_struct_page(int frame_no)
 // the lambda's lexically-enclosing function (encoded in the mangled name as
 // `...<lambda : PARENT(args)(line, col)>`) and walking down the call stack for
 // the nearest matching frame.
-static int get_function_by_name(const char *name);
+// Extract the lexically-enclosing function's name from a lambda's mangled name,
+// or NULL if `name` is not a lambda. Returns a malloc'd string.
+//
+// The payload of the outer `<lambda : ...>` is `PARENT(args)(line, col)`, and
+// PARENT may ITSELF be a lambda name, so the form nests:
+//   `Foo@<lambda : Foo@<lambda : Foo@Bar(string)(160, 23)>(int)(160, 48)>`
+// Cutting at the first `(` therefore loses the parent of every nested lambda
+// (221 of Dohna's 4031) — they silently fell back to the `this` page. Take the
+// payload with `<`/`>` balancing, then strip the two trailing parenthesised
+// groups (the argument list and the line/column pair).
+static char *lambda_parent_name(const char *name)
+{
+	const char *lm = name ? strstr(name, "<lambda : ") : NULL;
+	if (!lm)
+		return NULL;
+	const char *begin = lm + strlen("<lambda : ");
+	const char *end = begin;
+	for (int depth = 1; *end; end++) {
+		if (*end == '<') {
+			depth++;
+		} else if (*end == '>') {
+			if (--depth == 0)
+				break;
+		}
+	}
+	if (*end != '>' || end == begin)
+		return NULL;
+	for (int i = 0; i < 2; i++) {
+		if (end - begin < 2 || end[-1] != ')')
+			return NULL;
+		int depth = 0;
+		do {
+			end--;
+			if (*end == ')')
+				depth++;
+			else if (*end == '(')
+				depth--;
+		} while (depth > 0 && end > begin);
+		if (depth != 0)
+			return NULL;
+	}
+	if (end == begin)
+		return NULL;
+	size_t len = end - begin;
+	char *pname = xmalloc(len + 1);
+	memcpy(pname, begin, len);
+	pname[len] = '\0';
+	return pname;
+}
 
 static int lambda_parent_fno(int fno)
 {
@@ -231,19 +306,33 @@ static int lambda_parent_fno(int fno)
 		return cache[fno];
 
 	int result = -2;
-	const char *name = ain->functions[fno].name;
-	const char *lm = name ? strstr(name, "<lambda : ") : NULL;
-	if (lm) {
-		lm += strlen("<lambda : ");
-		const char *paren = strchr(lm, '(');
-		if (paren && paren > lm) {
-			size_t len = paren - lm;
-			char *pname = xmalloc(len + 1);
-			memcpy(pname, lm, len);
-			pname[len] = '\0';
-			result = get_function_by_name(pname);
-			free(pname);
+	char *pname = lambda_parent_name(ain->functions[fno].name);
+	if (pname) {
+		// The parent name is NOT unique: OVERLOADS share it, and taking the
+		// first match by index picks the wrong one for 153 of Dohna's lambdas.
+		// A lambda's body is emitted INSIDE its enclosing function's body, so
+		// among same-named candidates the parent is the one with the greatest
+		// address BELOW the lambda's own. (Checked over all 4031 lambdas: the
+		// 153 ambiguous names all belong to regular functions and all have a
+		// candidate below; where the parent is itself a lambda the name is
+		// unique — it carries a line/column — and its body may well sit AFTER
+		// the child's, so the address rule must not apply there.)
+		int32_t self = ain->functions[fno].address;
+		int32_t best = 0;
+		for (int i = 0; i < ain->nr_functions; i++) {
+			if (i == fno || !ain->functions[i].name
+					|| strcmp(pname, ain->functions[i].name))
+				continue;
+			int32_t addr = ain->functions[i].address;
+			if (result < 0) {
+				result = i;
+				best = addr;
+			} else if (addr < self && (best >= self || addr > best)) {
+				result = i;
+				best = addr;
+			}
 		}
+		free(pname);
 	}
 	cache[fno] = result;
 	return result;
@@ -416,60 +505,13 @@ static int alloc_scenario_page(const char *fname)
 	slot = heap_alloc_slot(VM_PAGE);
 	heap_set_page(slot, alloc_page(LOCAL_PAGE, fno, f->nr_vars));
 	for (int i = 0; i < f->nr_vars; i++) {
-		heap[slot].page->values[i] = variable_initval(f->vars[i].type.data);
+		heap[slot].page->values[i] = variable_initval_var(heap[slot].page, i, f->vars[i].type.data);
 	}
+	init_option_vars(heap[slot].page, f->vars, f->nr_vars, 0);
 	return slot;
 }
 
 void vm_optrace_dump(void);
-
-// Map an element data type to the legacy typed-array data type, so Ixseal's
-// generic arrays (AIN_ARRAY, element type carried in ain_type.array_type) can be
-// stored/allocated with the existing array_* helpers, which key off a_type.
-static enum ain_data_type array_type_from_elem(enum ain_data_type et)
-{
-	switch (et) {
-	case AIN_INT:       return AIN_ARRAY_INT;
-	case AIN_FLOAT:     return AIN_ARRAY_FLOAT;
-	case AIN_STRING:    return AIN_ARRAY_STRING;
-	case AIN_STRUCT:    return AIN_ARRAY_STRUCT;
-	case AIN_BOOL:      return AIN_ARRAY_BOOL;
-	case AIN_LONG_INT:  return AIN_ARRAY_LONG_INT;
-	case AIN_FUNC_TYPE: return AIN_ARRAY_FUNC_TYPE;
-	case AIN_DELEGATE:  return AIN_ARRAY_DELEGATE;
-	default:            return AIN_ARRAY_INT;
-	}
-}
-
-// Resolve the (legacy) array data type + struct type + rank for a variable slot,
-// handling both legacy typed arrays and Ixseal generic arrays.
-static enum ain_data_type resolve_array_type(struct page *container, int varno, int *struct_type, int *rank)
-{
-	struct ain_type *vt = NULL;
-	switch (container->type) {
-	case GLOBAL_PAGE: vt = &ain->globals[varno].type; break;
-	case LOCAL_PAGE:  vt = &ain->functions[container->index].vars[varno].type; break;
-	case STRUCT_PAGE: vt = &ain->structures[container->index].members[varno].type; break;
-	default: break;
-	}
-	if (!vt) { *struct_type = 0; *rank = 1; return AIN_ARRAY_INT; }
-	*rank = vt->rank > 0 ? vt->rank : 1;
-	if (vt->data == AIN_ARRAY && vt->array_type) {
-		*struct_type = vt->array_type->struc;
-		enum ain_data_type et = vt->array_type->data;
-		// Ixseal-контейнер часто хранит тип элемента как WRAP<T> (AIN_WRAP)/
-		// OPTION/IFACE_WRAP. Для обёртки над структурой (struc>=0) это struct-
-		// массив — иначе array_type_from_elem(WRAP) уходил в дефолт AIN_ARRAY_INT,
-		// и struct-пул (напр. CPartsMessageManager.m_functionSetList = WRAP<struct328>)
-		// создавался как int-массив → слоты структур хранились как сырые int без
-		// владения → преждевременный free и use-after-free (389/3).
-		if (et == AIN_WRAP || et == AIN_IFACE_WRAP || et == AIN_OPTION)
-			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
-		return array_type_from_elem(et);
-	}
-	*struct_type = vt->struc;
-	return vt->data;
-}
 
 static void set_struct_page(int slot)
 {
@@ -542,14 +584,18 @@ static int _function_call(int fno, int return_address)
 		.return_address = return_address,
 		.page_slot = slot,
 		.struct_page = -1,
+		// уточняется после снятия аргументов/ресивера (см. function_call/method_call)
+		.entry_sp = stack_ptr,
 	};
 	// initialize local variables
 	for (int i = f->nr_args; i < f->nr_vars; i++) {
-		heap[slot].page->values[i] = variable_initval(f->vars[i].type.data);
+		heap[slot].page->values[i] = variable_initval_var(heap[slot].page, i, f->vars[i].type.data);
 		if (ain->version <= 1 && f->vars[i].type.data == AIN_STRUCT) {
 			create_struct(f->vars[i].type.struc, &heap[slot].page->values[i]);
 		}
 	}
+	// Ixseal: локальные option'ы — пустые (аргументы приходят со стека, их не трогаем)
+	init_option_vars(heap[slot].page, f->vars, f->nr_vars, f->nr_args);
 	// jump to function start
 	instr_ptr = ain->functions[fno].address;
 
@@ -621,6 +667,7 @@ static void function_call(int fno, int return_address)
 			break;
 		}
 	}
+	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	if (fn_trace_count != 0) {
 		for (int i = 0; i < fn_trace_count; i++) {
 			if (fn_trace_list[i] == fno) {
@@ -638,19 +685,92 @@ static void method_call(int fno, int return_address)
 {
 	function_call(fno, return_address);
 	int struct_page = stack_pop().i;
+	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	set_struct_page(struct_page);
 	heap[call_stack[call_stack_ptr-1].page_slot].page->local.struct_ptr = struct_page;
 }
 
 static void vm_execute(void);
 
+// Number of stack slots a delegate return value occupies — ровно та же мера,
+// что у возврата обычной функции, поэтому считаем её тем же `type_slots()`
+// (это и инвариант XSYS4_SP_CHECK). Ixseal возвращает из делегатов и
+// многослотовые значения: `option<T>` = слоты T плюс тег, `AIN_IFACE`(89) и
+// `wrap<интерфейс>`(100) = пара (объект, база интерфейса). Раньше здесь стояла
+// частная таблица (void→0, AIN_OPTION→2, иначе 1): она верна для void, скаляров
+// и всех 62 `option<delegate>`-делегатов Dohna, но недосчитывала 6 делегатов с
+// возвратом `AIN_IFACE` и 18 с `wrap<интерфейс>`.
+// Ошибка здесь сдвигает peek-смещения dg_page/dg_index в цикле делегата и
+// протаскивает лишний слот вверх по цепочке вызовов: на втором витке DG_CALL
+// вместо страницы делегата читался уже инкрементированный dg_index
+// (`Not a delegate page: 1` в `ArrayExtensions::Select<ref Motion::IArgument,
+// string>`), а до того так же портился ref далеко в конструкторе CSpriteParts@0.
+// Старые игры (v6/v7) многослотовых возвратов у делегатов не имеют вовсе, т.е.
+// гейт структурный — по самому типу возврата.
+// Самый широкий возврат, встречающийся у Ixseal: `option<wrap<интерфейс>>` = 3.
+#define DG_MAX_RETURN_SLOTS 4
+
+static int dg_return_slots(int dg_no)
+{
+	return type_slots(&ain->delegates[dg_no].return_type);
+}
+
+// Сколько слотов занимает ЗНАЧЕНИЕ внутри Ixseal-`option` (без тега). Операнд
+// X_OP_SET — «класс элемента», та же кодировка, что у 3-го операнда CALLHLL:
+// 1=int, 2=string, 0x10002=объект-хэндл — по одному слоту; 0x10003=wrap<интерфейс>
+// — два слота (объект, база интерфейса). Других значений в .ain Dohna/HT нет.
+static int x_option_value_slots(int elem_class)
+{
+	switch (elem_class) {
+	case 0x00001:
+	case 0x00002:
+	case 0x10002:
+		return 1;
+	case 0x10003:
+		return 2;
+	default:
+		WARNING("X_OP_SET: неизвестный класс элемента 0x%x — считаю значение однослотовым",
+			elem_class);
+		return 1;
+	}
+}
+
+/*
+ * Владеет ли значение этого типа heap-слотом (нужен ли ему счётчик ссылок).
+ * Набор ровно тот, который освобождает variable_fini(): если добавить сюда
+ * скаляр, heap_ref тронет чужой слот кучи.
+ */
+static bool slot_owns_heap_ref(enum ain_data_type t)
+{
+	switch (t) {
+	case AIN_STRING:
+	case AIN_STRUCT:
+	case AIN_DELEGATE:
+	case AIN_ARRAY_TYPE:
+	case AIN_ARRAY:
+	case AIN_REF_TYPE:
+	case AIN_IFACE:
+		return true;
+	default:
+		return ain_is_array_data_type(t);
+	}
+}
+
+// Является ли значение option'а ссылкой на heap-слот (нужен ли учёт ссылок).
+// Целые (класс 1) — нет; строки, объекты и wrap<интерфейс> — да (у wrap считается
+// нижний слот, верхний — целочисленная база интерфейса).
+static bool x_option_class_is_ref(int elem_class)
+{
+	return elem_class != 0x00001;
+}
+
 static void delegate_call(int dg_no, int return_address)
 {
 	if (dg_no < 0 || dg_no >= ain->nr_delegates)
 		VM_ERROR("Invalid delegate index");
 
-	// stack: [arg0, ..., dg_page, dg_index, [return_value]]
-	int return_values = (ain->delegates[dg_no].return_type.data != AIN_VOID) ? 1 : 0;
+	// stack: [arg0, ..., dg_page, dg_index, [return_value(s)]]
+	int return_values = dg_return_slots(dg_no);
 	int dg_page = stack_peek(1 + return_values).i;
 	int dg_index = stack_peek(0 + return_values).i;
 	int obj, fun;
@@ -661,10 +781,9 @@ static void delegate_call(int dg_no, int return_address)
 		if (getenv("XSYS4_DG_TRACE"))
 			WARNING("DGALL dg_no=%d idx=%d -> fn %d (%s)", dg_no, dg_index, fun,
 				(fun >= 0 && fun < ain->nr_functions) ? ain->functions[fun].name : "?");
-		// pop previous return value
-		if (ain->delegates[dg_no].return_type.data != AIN_VOID) {
+		// pop previous return value(s) (2 slots for an AIN_OPTION delegate)
+		for (int i = 0; i < return_values; i++)
 			stack_pop();
-		}
 		// increment dg_index
 		stack[stack_ptr - 1].i++;
 
@@ -680,10 +799,13 @@ static void delegate_call(int dg_no, int return_address)
 		set_struct_page(obj);
 	} else {
 		// call finished: clean up stack and jump to return address
-		union vm_value r;
-		if (return_values) {
-			r = stack_pop();
-		}
+		// Слотов у возврата столько, сколько скажет type_slots(): 2 у
+		// `option<T>`/`AIN_IFACE`/`wrap<интерфейс>`, 3 у `option<wrap<интерфейс>>`.
+		union vm_value r[DG_MAX_RETURN_SLOTS];
+		if (return_values > DG_MAX_RETURN_SLOTS)
+			VM_ERROR("Delegate return value too wide: %d slots", return_values);
+		for (int i = return_values - 1; i >= 0; i--)
+			r[i] = stack_pop();
 		stack_pop(); // dg_index
 		stack_pop(); // dg_page
 		for (int i = ain->delegates[dg_no].nr_variables - 1; i >= 0; i--) {
@@ -697,11 +819,79 @@ static void delegate_call(int dg_no, int return_address)
 				break;
 			}
 		}
-		if (return_values) {
-			stack_push(r);
-		}
+		for (int i = 0; i < return_values; i++)
+			stack_push(r[i]);
 		instr_ptr = get_argument(1);
 	}
+}
+
+/*
+ * Сколько слотов-аргументов объявлено у игровой функции. Для многослотового
+ * аргумента (напр. `wrap<интерфейс>`) компилятор объявляет и филлеры `<void>`,
+ * поэтому nr_args уже равен числу СЛОТОВ, которые нужно положить на стек.
+ */
+int vm_hll_func_nr_args(int fno)
+{
+	if (fno < 0 || fno >= ain->nr_functions)
+		return -1;
+	return ain->functions[fno].nr_args;
+}
+
+/*
+ * Синхронно вызвать игровую лямбду из реализации HLL-функции — механизм
+ * Ixseal-предикатов и компараторов (`Array.EraseAll/Any/Where/Sort/...`, тип
+ * аргумента AIN_HLL_FUNC). Сайт кладёт лямбду ДВУМЯ слотами — (страница
+ * объекта, номер функции), — они приходят сюда в `fn`.
+ *
+ * `argv`/`argc` — уже готовые слоты аргументов; argc обязан совпадать с
+ * `vm_hll_func_nr_args(fno)`. Порядок на стеке для метода: [ресивер, арг0..],
+ * т.е. ресивер ЛЕЖИТ ПОД аргументами (method_call сначала снимает аргументы,
+ * потом ресивер) — поэтому обычный vm_call() здесь не годится, он умеет только
+ * методы без аргументов.
+ *
+ * Возвращается первый слот результата (предикат/компаратор отдают bool).
+ */
+union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *argv, int argc)
+{
+	union vm_value ret = { .i = 0 };
+	if (!fn)
+		return ret;
+	int obj = fn[0].i;
+	int fno = fn[1].i;
+	int want = vm_hll_func_nr_args(fno);
+	if (want < 0) {
+		WARNING("vm_call_hll_func: неверный номер функции %d", fno);
+		return ret;
+	}
+	if (want != argc) {
+		WARNING("vm_call_hll_func: fn %d объявляет %d слотов аргументов, передано %d",
+			fno, want, argc);
+		return ret;
+	}
+
+	// Кадр заполняем сами, как delegate_call: аргументы должны попасть в локалы
+	// КОПИЯМИ (`vm_copy`). Иначе объектное значение (строка, массив, структура)
+	// уходит в лямбду по «сырому» слоту, кадр лямбды при возврате освобождает
+	// его как свой, и элемент контейнера остаётся висячим: `Array.EraseAll` над
+	// `array<string>` в `Motion::Parser@SplitParams` так убивал строки, которыми
+	// владел массив (слот переиспользовался под страницу → бесконечная рекурсия
+	// в delete_page). Через function_call/method_call сделать это нельзя — они
+	// снимают аргументы со стека как есть.
+	size_t saved_ip = instr_ptr;
+	int slot = _function_call(fno, VM_RETURN);
+	struct ain_function *f = &ain->functions[fno];
+	for (int i = 0; i < argc; i++)
+		heap[slot].page->values[i] = vm_copy(argv[i], f->vars[i].type.data);
+	if (heap_index_valid(obj) && heap[obj].page) {
+		set_struct_page(obj);
+		heap[slot].page->local.struct_ptr = obj;
+	}
+	vm_execute();
+	instr_ptr = saved_ip;
+
+	if (f->return_type.data != AIN_VOID)
+		ret = stack_pop();
+	return ret;
 }
 
 void vm_call(int fno, int struct_page)
@@ -727,6 +917,21 @@ static void function_return(void)
 					stack_ptr > 0 ? stack[stack_ptr-1].i : -999);
 				break;
 			}
+		}
+	}
+	// XSYS4_SP_CHECK: функция обязана вернуться со стеком «кадр + возвращаемые
+	// слоты». Лишний слот сам по себе не падает — он смещает ссылки у ВЫЗЫВАЮЩЕГО,
+	// и краш случается далеко от причины (так дважды: S_ASSIGN и X_ASSIGN 0).
+	// Печатаем ПЕРВОЕ расхождение по каждой функции, чтобы не залить лог.
+	if (sp_check) {
+		struct function_call *fc = &call_stack[call_stack_ptr-1];
+		struct ain_function *f = &ain->functions[fc->fno];
+		int expect = fc->entry_sp + type_slots(&f->return_type);
+		if (stack_ptr != expect && !sp_check_reported[fc->fno & 0xffff]) {
+			sp_check_reported[fc->fno & 0xffff] = 1;
+			WARNING("SPCHECK fn %d (%s) вернулась sp=%d, ожидалось %d (разница %+d)",
+				fc->fno, display_sjis0(f->name), stack_ptr, expect,
+				stack_ptr - expect);
 		}
 	}
 	unref_call_frame(&call_stack[call_stack_ptr-1]);
@@ -1174,7 +1379,17 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// снять ссылку, записать N значений в ref[0..N-1], вернуть их на стек
 		// (как обычный ASSIGN возвращает значение). N=1 эквивалентно ASSIGN.
 		int n = get_argument(0);
-		union vm_value vals[n > 0 ? n : 1];
+		// n == 0 — пакетная инициализация ПУСТОГО массива
+		// (`PUSH 0; X_A_INIT; PUSH 0; X_ASSIGN 0`, все 12 сайтов такие):
+		// писать нечего, а разыменовывать ссылку НЕЛЬЗЯ — у массива нулевой
+		// длины индекс 0 уже вне границ (`Out of bounds page index: 223/0`
+		// в CASCommonData@2). Просто снимаем ссылку.
+		if (n == 0) {
+			stack_pop();
+			stack_pop();
+			break;
+		}
+		union vm_value vals[n];
 		for (int i = n - 1; i >= 0; i--)
 			vals[i] = stack_pop();
 		union vm_value *ref = stack_pop_var();
@@ -1204,9 +1419,14 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int slot = heap_alloc_slot(VM_PAGE);
 		if (container && page_index >= 0 && page_index < container->nr_vars) {
 			int struct_type = 0, rank = 1;
-			enum ain_data_type dt = resolve_array_type(container, page_index, &struct_type, &rank);
+			bool ref_elem = false;
+			enum ain_data_type dt = array_resolve_var_type(container, page_index, &struct_type,
+								       &rank, &ref_elem);
 			union vm_value dim = { .i = size > 0 ? size : 0 };
-			heap_set_page(slot, alloc_array(rank, &dim, dt, struct_type, true));
+			// Элемент, объявленный ССЫЛКОЙ (`array<ref Структура>`), пуст до
+			// присваивания — предзаполнять его сконструированными объектами
+			// нельзя (в Ixseal объекты конструирует ИГРА, см. ПРОДВИЖЕНИЕ 14).
+			heap_set_page(slot, alloc_array(rank, &dim, dt, struct_type, !ref_elem));
 			container->values[page_index].i = slot;
 		} else {
 			heap_set_page(slot, NULL);
@@ -1248,26 +1468,203 @@ static enum opcode execute_instruction(enum opcode opcode)
 		stack_push(env >= 0 ? env : struct_page_slot());
 		break;
 	}
-	case X_A_SIZE:
-	case X_TO_STR: {
-		// TODO: пока не реализованы — временный совместимый стаб (как было).
-		stack_pop();
-		stack_push(struct_page_slot());
+	case X_A_SIZE: {
+		// Размер generic-массива (Ixseal). На стеке — ЗНАЧЕНИЕ переменной-массива
+		// (heap-слот страницы), т.е. сайт выглядит как `...; X_REF 1; X_A_SIZE`.
+		// Возвращается число ЭЛЕМЕНТОВ: у массива с элементом wrap<интерфейс>
+		// на элемент приходится два слота страницы, и array_numof это учитывает.
+		// Прежний стаб клал сюда struct_page_slot() — foreach получал мусорную
+		// границу и уходил за конец массива.
+		int slot = stack_pop().i;
+		struct page *p = heap_index_valid(slot) ? heap[slot].page : NULL;
+		stack_push((p && p->type == ARRAY_PAGE) ? array_numof(p, 1) : 0);
 		break;
 	}
-	case X_SET:
-	case X_ICAST:
+	case X_TO_STR: {
+		/*
+		 * Неявное приведение к строке (`"tag" + (i + 1)`). Снимает ОДИН слот
+		 * значения и кладёт слот строки; ОПЕРАНД — тип ИСТОЧНИКА. У Dohna
+		 * встречаются ровно три: 10=int (460 сайтов), 11=float (101), 47=bool
+		 * (14) — сверено `XSCAN_MAX=99999 xscan <ain> X_TO_STR`.
+		 *
+		 * Точность у float на стек НЕ кладётся (в отличие от легаси FTOS):
+		 * System40.exe в таком случае пушит -1, а это по libsys4 значит 6
+		 * знаков после запятой — та же ветка, что у старых игр.
+		 *
+		 * bool хранится int'ом, и формат («1» против «true») игра прочитать
+		 * обратно не может: все 14 bool-сайтов — это `@ToString`/лог
+		 * (напр. `"apply result:" + m_applied` → system.Output в
+		 * `ActionFrameController@CatchUpFrame`), никто их не парсит.
+		 *
+		 * Прежний стаб отдавал слот СТРАНИЦЫ структуры — следующий S_ADD читал
+		 * его как строку и падал (`Invalid string index` в `StandNameTags@0`).
+		 */
+		int src_type = get_argument(0);
+		union vm_value v = stack_pop();
+		switch (src_type) {
+		case AIN_FLOAT:
+			stack_push_string(float_to_string(v.f, -1));
+			break;
+		case AIN_INT:
+		case AIN_BOOL:
+			stack_push_string(integer_to_string(v.i));
+			break;
+		default: {
+			static bool xtostr_logged = false;
+			if (!xtostr_logged) {
+				xtostr_logged = true;
+				WARNING("X_TO_STR: тип источника %d не установлен, "
+					"приводим как int", src_type);
+			}
+			stack_push_string(integer_to_string(v.i));
+			break;
+		}
+		}
+		break;
+	}
 	case X_OP_SET: {
-		// TODO: пока не реализованы — логируем контекст для реверса и падаем.
-		if (getenv("XSYS4_TRACE_X")) {
-			WARNING("X_TRACE op=0x%04x %s arg0=%d arg1=%d sp=%d top=[%d %d %d %d %d %d]",
-				opcode, instructions[opcode].name,
-				get_argument(0), get_argument(1), stack_ptr,
+		// Ixseal: записать значение в `option<T>`. Стек: [ссылка (2 слота),
+		// v0..v(n-1), тег] — в память идут n слотов значения и СЛЕДОМ тег
+		// (0 = значение есть, 1 = пусто), после чего всё возвращается на стек
+		// (сайты снимают ровно n+1 POP'ов, как X_ASSIGN возвращает значение).
+		//
+		// Операнд — «класс элемента», тот же, что 3-й операнд CALLHLL:
+		// 1=int, 2=string, 0x10002=объект-хэндл (по 1 слоту значения),
+		// 0x10003=wrap<интерфейс> (2 слота: объект, база интерфейса).
+		// Формы сайтов: «PUSH val; PUSH 0» (Some) против
+		// «PUSH -1[; PUSH -1]; PUSH 1» (None).
+		int elem_class = get_argument(0);
+		int n = x_option_value_slots(elem_class);
+		if (getenv("XSYS4_OPT_TRACE")) {
+			WARNING("OPT pre-set class=0x%x n=%d sp=%d top=[%d %d %d %d %d %d]",
+				elem_class, n, stack_ptr,
 				stack_ptr>0?stack[stack_ptr-1].i:0, stack_ptr>1?stack[stack_ptr-2].i:0,
 				stack_ptr>2?stack[stack_ptr-3].i:0, stack_ptr>3?stack[stack_ptr-4].i:0,
 				stack_ptr>4?stack[stack_ptr-5].i:0, stack_ptr>5?stack[stack_ptr-6].i:0);
 		}
-		VM_ERROR("Unimplemented X_ opcode: 0x%04x (%s)", opcode, instructions[opcode].name);
+		union vm_value vals[n + 1];
+		for (int i = n; i >= 0; i--)
+			vals[i] = stack_pop();
+		union vm_value *ref = stack_pop_var();
+		if (getenv("XSYS4_OPT_TRACE")) {
+			WARNING("OPT set class=0x%x n=%d tag=%d val=%d (old tag=%d val=%d)",
+				elem_class, n, vals[n].i, vals[0].i, ref[n].i, ref[0].i);
+		}
+		for (int i = 0; i <= n; i++)
+			ref[i] = vals[i];
+		// Взять ВЛАДЕНИЕ значением. Дисциплина ссылок в Ixseal явная (SP_INC /
+		// DELETE), и X_OP_SET обязан считаться владельцем: возврат
+		// `AFL_Parts_CreateSprite` приходит с +1 (SP_INC перед RETURN), а сразу
+		// после X_OP_SET сайт освобождает временный локал («X_REF 1; DELETE») —
+		// без своей ссылки option оставался бы висячим.
+		// Прежнее содержимое НЕ освобождаем: сайты установки в None
+		// (`PUSH -1; PUSH -1; PUSH 1`) не делают этого сами, но семантика по
+		// байткоду не установлена — лишний unref дал бы double free, а лишняя
+		// ссылка только течёт.
+		if (x_option_class_is_ref(elem_class) && vals[n].i == 0 && vals[0].i != -1)
+			heap_ref(vals[0].i);
+		for (int i = 0; i <= n; i++)
+			stack[stack_ptr++] = vals[i];
+		break;
+	}
+	case X_SET: {
+		// Ixseal: присваивание с ВЗЯТИЕМ ВЛАДЕНИЯ. Стек: [ссылка (2 слота),
+		// значение]; значение возвращается на стек (сайты снимают его POP'ом
+		// или DELETE'ом).
+		//
+		// От `X_ASSIGN 1` отличается именно владением. X_ASSIGN — сырая запись
+		// слота, счётчики ведёт сам компилятор (SP_INC/DELETE), и перед ним
+		// всегда стоит идиома освобождения старого значения
+		// («X_DUP 2; X_REF 1; DELETE»). У X_SET её нет, а значение — либо
+		// одалживаемый аргумент (`Params::set`: `X_REF 1; X_SET; POP`), либо
+		// свежая копия, которую сайт сразу освобождает
+		// (`A_REF; X_SET; DELETE`, `Array.Where(...); X_SET; DELETE`).
+		// Без своей ссылки член в обоих случаях остался бы висячим.
+		//
+		// Счётчик берём ТОЛЬКО для типов, которые владеют heap-слотом (набор
+		// тот же, что освобождает variable_fini): для int/float это затронуло
+		// бы чужой слот кучи. Тип берётся из ОБЪЯВЛЕНИЯ приёмника.
+		// Прежнее содержимое не освобождаем — как и в X_OP_SET: семантика по
+		// байт-коду не установлена, лишний unref дал бы double free.
+		int val = stack_pop().i;
+		int page_index = stack_pop().i;
+		int heap_index = stack_pop().i;
+		if (unlikely(!heap_index_valid(heap_index) || !heap[heap_index].page
+			    || page_index < 0 || page_index >= heap[heap_index].page->nr_vars))
+			VM_ERROR("X_SET: out of bounds page index: %d/%d", heap_index, page_index);
+		struct page *page = heap[heap_index].page;
+		if (val != -1 && slot_owns_heap_ref(variable_type(page, page_index, NULL, NULL)))
+			heap_ref(val);
+		page->values[page_index].i = val;
+		stack_push(val);
+		break;
+	}
+	case X_ICAST: {
+		/*
+		 * Приведение ссылки к типу-операнду (оператор «as»): снимает ОДИН слот
+		 * (хэндл объекта) и кладёт ТРИ — `[obj, base, тег]`:
+		 *   тег 0 = приведение удалось (та же конвенция, что у `option<T>`:
+		 *           0 = значение ЕСТЬ), >=1 = не удалось;
+		 *   base  = смещение методов целевого интерфейса в vtable объекта, т.е.
+		 *           вторая половина 2-слотовой пары `wrap<интерфейс>`;
+		 *   obj   = сам объект (на провале -1).
+		 *
+		 * Форма снята с байткода. Сайт с интерфейсной целью
+		 * (`activityeditor::detail::CInstanceItem@GetSprite` @0x5C50A,
+		 * цель 394=ISpriteParts) прямо показывает и число слотов, и смысл тега:
+		 *   X_ICAST 394; PUSH 1; GTE; IFNZ fail
+		 *   fail: POP; POP; PUSH -1; PUSH 0      // пара → null-интерфейс
+		 *   ok:   X_DUP 2 ...                    // пара идёт в дело
+		 * т.е. проверяется `тег >= 1` = НЕ удалось, а на успехе остаётся пара.
+		 * Сайт со структурной целью (`Motion::EasingArgumentAnalyzer@
+		 * AnalyzeEasingType` @0x597D4E, цель 623=Motion::ArgumentEasingType)
+		 * делает `X_ICAST 623; X_MOV 2 1; POP; POP` — отбрасывает base и тег и
+		 * оставляет obj, а провал ловит сравнением `obj != -1`; поэтому на
+		 * провале obj обязан быть -1. Оба варианта требуют ровно +2 слота к
+		 * входному — это же следует из баланса стека обеих функций.
+		 *
+		 * `base` берётся из .ain: у структуры есть список реализованных
+		 * интерфейсов `interfaces[] = {struct_type, vtable_offset}` (libsys4
+		 * его давно читает, движок не использовал). Проверено: у
+		 * Motion::ArgumentEasingType(623) и ArgumentDigit(621) — по одному
+		 * интерфейсу Motion::IArgument(620) с vtable_offset=0.
+		 */
+		int target = get_argument(0);
+		if (instructions[opcode].nr_args >= 2 && get_argument(1) != 0)
+			WARNING("X_ICAST: второй операнд %d != 0 — назначение не установлено",
+				get_argument(1));
+		int src = stack_pop().i;
+		int base = -1;
+		if (heap_index_valid(src) && heap[src].page
+		    && heap[src].page->type == STRUCT_PAGE) {
+			// index у STRUCT_PAGE — номер структуры объекта.
+			int st = heap[src].page->index;
+			if (st == target) {
+				// Приведение к собственному типу (в т.ч. обратное
+				// приведение интерфейс→конкретный класс): методы объекта
+				// лежат с начала его vtable.
+				base = 0;
+			} else if (st >= 0 && st < ain->nr_structures) {
+				struct ain_struct *s = &ain->structures[st];
+				for (int i = 0; i < s->nr_interfaces; i++) {
+					if (s->interfaces[i].struct_type == target) {
+						base = s->interfaces[i].vtable_offset;
+						break;
+					}
+				}
+			}
+		}
+		if (base < 0) {
+			// Не удалось: null-объект и тег «пусто».
+			stack_push(-1);
+			stack_push(0);
+			stack_push(1);
+		} else {
+			stack_push(src);
+			stack_push(base);
+			stack_push(0);
+		}
+		break;
 	}
 	//
 	// --- Variables ---
@@ -1458,7 +1855,10 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case CALLHLL: {
-		hll_call(get_argument(0), get_argument(1));
+		// Ixseal added a third operand describing the element type of a generic
+		// container (see hll_call). Older games emit only two.
+		int elem_class = instructions[CALLHLL].nr_args >= 3 ? get_argument(2) : 0;
+		hll_call(get_argument(0), get_argument(1), elem_class);
 		break;
 	}
 	case RETURN: {
@@ -1942,6 +2342,24 @@ static enum opcode execute_instruction(enum opcode opcode)
 	}
 	//case S_REFREF: // ???: why/how is this different from regular REFREF?
 	case S_ASSIGN: { // A = B
+		// Ixseal (v11+) сменил ФОРМУ lvalue, как и у SR_ASSIGN: вместо
+		// разыменованного слота строки на стеке лежит ДВУСЛОТОВАЯ ссылка
+		// (страница, индекс) — сайты выглядят как `PUSHSTRUCTPAGE; PUSH <член>;
+		// S_PUSH ...; S_ASSIGN; DELETE` или `...X_REF 1; PUSH <элемент>;
+		// ...; A_REF; S_ASSIGN; DELETE`, т.е. БЕЗ классического REF/S_REF
+		// (в v6/v7 он всегда есть — сверено xscan'ом по трём .ain).
+		// Классический обработчик снимал (rval, index) и писал строку в
+		// heap[index] — то есть в ЧУЖОЙ слот кучи (порча!), да ещё оставлял
+		// на стеке лишний слот: конструктор структуры 418 возвращался с
+		// перекошенным стеком, и следующий `X_ASSIGN` в глобальной
+		// инициализации падал с `Out of bounds page index: 125/186`.
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			int rval = stack_pop().i;
+			union vm_value *ref = stack_pop_var();
+			heap_string_assign(ref->i, heap_get_string(rval));
+			stack_push(rval); // оставить B: сайт освобождает его DELETE'ом
+			break;
+		}
 		int rval = stack_peek(0).i;
 		int lval = stack_peek(1).i;
 		heap_string_assign(lval, heap_get_string(rval));
@@ -2143,6 +2561,35 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case SR_ASSIGN: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal (System 4 v11+): struct-member struct-copy assignment.
+			// The lvalue is expressed as a TWO-slot member reference
+			// (struct page + member index) — NOT a pre-resolved struct slot —
+			// and there is NO trailing struct-type slot. Codegen for an
+			// embedded-struct member `this.member[m] = src`:
+			//   PUSHSTRUCTPAGE; PUSH <m>; <src struct page>; SR_ASSIGN; DELETE
+			// Interpreting this with the legacy [lval,rval,struct_type] layout
+			// pops (src, m, this) and does heap_struct_assign(this, m), which
+			// overwrites the WHOLE parent struct (e.g. a CASFont) with a copy
+			// of some unrelated heap[m] page and drops the real value — that is
+			// what turned CASFont slot 53 into an empty int array and crashed
+			// CTextParts@Font::set with `323/2`. Resolve the destination as
+			// this.member[m] (an embedded struct slot) and copy src into it.
+			// The pushed src is the caller's temporary (A_REF/NEW) copy, which
+			// the following DELETE frees; heap_struct_assign deep-copies it, so
+			// there is no double free. Older releases still push
+			// [lval, rval, struct_type] with the lvalue pre-resolved via
+			// SR_REF/REF (handled below, unchanged — e.g. Escalayer v6).
+			int src = stack_pop().i;
+			int member = stack_pop().i;
+			int dst_page = stack_pop().i;
+			if (unlikely(!heap_index_valid(dst_page) || !heap[dst_page].page
+					|| member < 0 || member >= heap[dst_page].page->nr_vars))
+				VM_ERROR("SR_ASSIGN: bad member ref %d/%d", dst_page, member);
+			heap_struct_assign(heap[dst_page].page->values[member].i, src);
+			stack_push(src);
+			break;
+		}
 		if (ain->version > 1)
 			stack_pop(); // struct type
 		int rval = stack_pop().i;
@@ -2725,6 +3172,30 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case DG_ASSIGN: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal: как у DG_PLUSA/S_ASSIGN/SR_ASSIGN, lvalue — ДВУСЛОТОВАЯ
+			// ссылка (страница, член), а не разыменованный слот делegate-страницы
+			// (все 51 сайт Dohna: `...X_REF 1; PUSH <член>; ...; A_REF;
+			// DG_ASSIGN; DELETE`; у v7 перед DG_ASSIGN всегда классический REF).
+			// Классический путь снимал (rval, член), т.е. считал НОМЕР ЧЛЕНА
+			// heap-слотом страницы, и оставлял лишний слот на стеке: цепочка
+			// AddPartsUpdateEvent → AddEndUpdateEvent → RCASTimerManager@0
+			// возвращалась с +1, и X_OP_SET в RCASTimerManager::Instance читал
+			// сдвинутую ссылку (`Out of bounds page index: 210/528`).
+			// Пустой делегат-lvalue хранит 0 и страницы ещё не имеет.
+			int set_i = stack_pop().i;
+			union vm_value *dst = stack_pop_var();
+			struct page *new_dg = copy_page(heap_get_delegate_page(set_i));
+			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
+			    heap[dst->i].page->type == DELEGATE_PAGE) {
+				delete_page(dst->i);
+				heap_set_page(dst->i, new_dg);
+			} else {
+				dst->i = heap_alloc_page(new_dg);
+			}
+			stack_push(set_i);
+			break;
+		}
 		int set_i = stack_pop().i;
 		int dst_i = stack_pop().i;
 		struct page *set = heap_get_delegate_page(set_i);
@@ -2753,9 +3224,16 @@ static enum opcode execute_instruction(enum opcode opcode)
 			} else {
 				dst->i = heap_alloc_page(delegate_plusa(NULL, add));
 			}
-			// Ixseal emits DG_PLUSA as a statement (no trailing POP), so it must
-			// be stack-neutral for its inputs and leave nothing behind — unlike
-			// the legacy form which pushes the added value back as an rvalue.
+			// `dg += x` is an expression: push the added value back as the
+			// rvalue, exactly like the legacy form (libsys4 types DG_PLUSA as
+			// (T_PAGE, T_PAGE) -> (T_PAGE)). Closures that wrap the result in an
+			// option rely on this slot: e.g. `... DG_PLUSA; PUSH 0; RETURN`
+			// builds a two-slot AIN_OPTION [added_delegate, tag]. Suppressing
+			// the push made such lambdas return one slot too few, which only
+			// surfaced as a corrupted ref much later (CSpriteParts@0 ctor). The
+			// added page is a caller-owned temporary (delegate_plusa copies from
+			// it without taking ownership), so the eventual DELETE frees it.
+			stack_push(add_i);
 			break;
 		}
 		int add_i = stack_pop().i;
@@ -2767,6 +3245,30 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case DG_MINUSA: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal: приёмник — такая же ДВУСЛОТОВАЯ ссылка-lvalue
+			// (heap-слот, номер члена), как у DG_PLUSA выше. Сайт
+			// `parts::detail::RemovePartsUpdateEvent` @0x2ead24:
+			//   PUSHLOCALPAGE; PUSH 4; X_REF 1   <- страница `data`
+			//   PUSH 1                           <- номер члена (делегат), БЕЗ REF
+			//   ...вычислить вычитаемый делегат...; A_REF
+			//   DG_MINUSA; DELETE
+			// Легаси-ветка снимала номер члена как heap-индекс и звала
+			// heap_get_delegate_page(1) → `Not a delegate page: 1`.
+			int minus_i = stack_pop().i;
+			union vm_value *dst = stack_pop_var();
+			struct page *minus = heap_get_delegate_page(minus_i);
+			// Пустой приёмник (делегату ещё не назначали обработчиков) —
+			// вычитать не из чего, оставляем как есть.
+			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
+			    heap[dst->i].page->type == DELEGATE_PAGE) {
+				heap_set_page(dst->i, delegate_minusa(heap[dst->i].page, minus));
+			}
+			// `dg -= x` — выражение: возвращаем вычитаемое (сайт освобождает
+			// его следующим DELETE), ровно как у DG_PLUSA.
+			stack_push(minus_i);
+			break;
+		}
 		int minus_i = stack_pop().i;
 		int dst_i = stack_pop().i;
 		struct page *minus = heap_get_delegate_page(minus_i);
@@ -2801,11 +3303,12 @@ static enum opcode execute_instruction(enum opcode opcode)
 		stack[stack_ptr-1].i = dg_page;
 		stack_push(0);
 
-		// XXX: If the delegate has a return value, we push a dummy value
-		//      so that DG_CALL can replace it
-		if (dg->return_type.data != AIN_VOID) {
+		// Push one dummy per return slot so DG_CALL can replace them. An
+		// AIN_OPTION return (Ixseal option, e.g. DG_DeletedHandler?) occupies
+		// two slots, so two dummies are needed; must stay in lock-step with the
+		// return_values count used by delegate_call.
+		for (int i = 0; i < dg_return_slots(dg_no); i++)
 			stack_push(0);
-		}
 		break;
 	}
 	case DG_NEW: {
@@ -2869,8 +3372,10 @@ void vm_optrace_dump(void)
 
 static void vm_execute(void)
 {
-	if (optrace_on < 0)
+	if (optrace_on < 0) {
 		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
+		sp_check = getenv("XSYS4_SP_CHECK") != NULL;
+	}
 	for (;;) {
 		uint16_t opcode;
 		if (instr_ptr == VM_RETURN)
@@ -2975,19 +3480,46 @@ int vm_execute_ain(struct ain *program)
 	heap_init();
 	init_libraries();
 
+	/*
+	 * Ixseal (System 4 v11+) сам конструирует struct-глобалы: функция "0"
+	 * (`ain->alloc`) для КАЖДОГО из них выполняет `DELETE old; NEW <s>;
+	 * X_ASSIGN 1` (проверено по всем 78 struct-глобалам Dohna — четыре из них
+	 * получают объект из вызова, напр. `DamageNumber::CreateFont`, но идиома та
+	 * же). Поэтому легаси-схема «alloc_struct до, init_struct после» здесь ломает
+	 * сразу две вещи:
+	 *   - `DELETE old` уносит ПРЕДварительно выделенную страницу, вызывая её
+	 *     ДЕСТРУКТОР на объекте, чей конструктор никогда не работал: `CASTimer@1`
+	 *     звал `CASTimerManager@ReleaseHandle(handle=0)` до первого CreateHandle
+	 *     → 53 игровых ассерта «CASTimerManager - Bundle Error» и путаница в
+	 *     учёте хэндлов (ReleaseHandle вызывался чаще CreateHandle);
+	 *   - `init_struct` после функции "0" вызывает конструктор ВТОРОЙ раз, уже на
+	 *     объекте, построенном игрой: `CGlobalObject@0` проверяет
+	 *     `assert( ! m_Created )` (global[141]) и падает.
+	 * Легаси-игры (v6/v7) в функции "0" struct-глобалы не конструируют — там
+	 * обе фазы обязательны, поэтому гейт структурный (v11+).
+	 */
+	bool ix_globals_self_ctor = instructions[CALLMETHOD].args[0] == T_INT;
+
 	// Initialize globals
 	heap[0].ref = 1;
 	heap[0].seq = heap_next_seq++;
 	heap_set_page(0, alloc_page(GLOBAL_PAGE, 0, ain->nr_globals));
 	for (int i = 0; i < ain->nr_globals; i++) {
 		if (ain->globals[i].type.data == AIN_STRUCT) {
+			// Ixseal: объекта ещё нет — null-маркер -1 (DELETE его игнорирует;
+			// ноль здесь означал бы heap-слот 0, т.е. саму глобальную страницу).
+			if (ix_globals_self_ctor) {
+				heap[0].page->values[i].i = -1;
+				continue;
+			}
 			// XXX: need to allocate storage for global structs BEFORE calling
 			//      constructors.
 			heap[0].page->values[i].i = alloc_struct(ain->globals[i].type.struc);
 		} else {
-			heap[0].page->values[i] = variable_initval(ain->globals[i].type.data);
+			heap[0].page->values[i] = variable_initval_var(heap[0].page, i, ain->globals[i].type.data);
 		}
 	}
+	init_option_vars(heap[0].page, ain->globals, ain->nr_globals, 0);
 	for (int i = 0; i < ain->nr_initvals; i++) {
 		int32_t index;
 		struct ain_initval *v = &ain->global_initvals[i];
@@ -3006,11 +3538,29 @@ int vm_execute_ain(struct ain *program)
 	if (ain->alloc >= 0)
 		vm_call(ain->alloc, -1); // function "0": allocate global arrays
 
-	// XXX: global constructors must be called AFTER initializing non-struct variables
-	//      otherwise a global set in a constructor will be clobbered by its initval
-	for (int i = 0; i < ain->nr_globals; i++) {
-		if (ain->globals[i].type.data == AIN_STRUCT)
-			init_struct(ain->globals[i].type.struc, heap[0].page->values[i].i);
+	if (ix_globals_self_ctor) {
+		// Конструкторы уже отработали внутри функции "0". Здесь только проверяем
+		// допущение: если какой-то struct-глобал остался null, значит функция "0"
+		// его НЕ построила и схема для этой игры другая — молчать нельзя.
+		int unbuilt = 0;
+		for (int i = 0; i < ain->nr_globals; i++) {
+			if (ain->globals[i].type.data != AIN_STRUCT)
+				continue;
+			if (heap[0].page->values[i].i >= 0)
+				continue;
+			if (++unbuilt <= 4)
+				WARNING("struct-глобал g[%d] %s не построен функцией \"0\"",
+					i, display_sjis0(ain->globals[i].name));
+		}
+		if (unbuilt > 4)
+			WARNING("...и ещё %d непостроенных struct-глобалов", unbuilt - 4);
+	} else {
+		// XXX: global constructors must be called AFTER initializing non-struct variables
+		//      otherwise a global set in a constructor will be clobbered by its initval
+		for (int i = 0; i < ain->nr_globals; i++) {
+			if (ain->globals[i].type.data == AIN_STRUCT)
+				init_struct(ain->globals[i].type.struc, heap[0].page->values[i].i);
+		}
 	}
 
 	vm_call(ain->main, -1);

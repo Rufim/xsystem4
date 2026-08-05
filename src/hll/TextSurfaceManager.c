@@ -73,8 +73,34 @@ static void TextSurfaceManager_SetFontEdgeColor(int nR, int nG, int nB)
 	ts.edge_color = (SDL_Color){ nR, nG, nB, 255 };
 }
 
-static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width)
+/*
+ * Ixseal (System 4 v14) передаёт всё описание шрифта прямо в аргументах вместо
+ * предварительных SetFont*-вызовов: GetFontWidth(Text, Width, nType, nSize,
+ * nR, nG, nB, fBoldWeight, fEdgeWeight, nEdgeR, nEdgeG, nEdgeB). Обе формы
+ * линкуются на эту функцию (сопоставление по имени), поэтому расширенные
+ * параметры читаем только когда они реально объявлены в .ain.
+ */
+static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width,
+					    int nType, int nSize, int nR, int nG, int nB,
+					    float fBoldWeight, float fEdgeWeight,
+					    int nEdgeR, int nEdgeG, int nEdgeB)
 {
+	if (!text || !width)
+		return false;
+
+	// Ixseal-форма вызова (12 аргументов) описывает шрифт прямо в параметрах; классическая
+	// форма пользуется тем, что накопили SetFont*. Метрики ниже считаются по `style`, а не
+	// по `ts`, чтобы работали ОБА пути.
+	struct text_style style = ts;
+	if (hll_current_nr_args >= 12) {
+		style.face = nType;
+		style.size = nSize;
+		style.color = (SDL_Color){ nR, nG, nB, 255 };
+		style.bold_width = fBoldWeight;
+		style.edge_left = style.edge_up = style.edge_right = style.edge_down = fEdgeWeight;
+		style.edge_color = (SDL_Color){ nEdgeR, nEdgeG, nEdgeB, 255 };
+	}
+
 	// The glyph outline reserves advance, exactly as in upstream's gfx_size_text.
 	// Tsumamigui 3's ADV loop draws the message one character per parts-text and
 	// advances its own cursor by this width (it never asks the engine for a parts
@@ -83,7 +109,7 @@ static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width)
 	// instead of 2px, and a line 42px short. See FINDINGS §5f.
 	// Величина надбавки — та же, что в рисовании и gfx_size_text
 	// (text_style_advance_padding: до и после глифа).
-	float edge_advance = 2.0f * text_style_advance_padding(&ts);
+	float edge_advance = 2.0f * text_style_advance_padding(&style);
 	// Per-glyph advance is integral, rounded UP: an .fnl advance is width/denominator
 	// and lands on a quarter pixel, and rounding to nearest lost 1px on every glyph
 	// whose fraction was .25 — measured as a line 12px short of the original over 42
@@ -92,7 +118,7 @@ static bool TextSurfaceManager_GetFontWidth(struct string *text, int *width)
 	const char *p = text->text;
 	while (*p) {
 		int len = SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
-		w += ceilf(gfx_size_char(&ts, p) + edge_advance);
+		w += ceilf(gfx_size_char(&style, p) + edge_advance);
 		p += len;
 	}
 	*width = (int)w;

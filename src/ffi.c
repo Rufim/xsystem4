@@ -16,6 +16,7 @@
 
 #define VM_PRIVATE
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ffi.h>
@@ -38,6 +39,11 @@ struct hll_function {
 };
 
 static struct hll_function **libraries = NULL;
+
+// См. hll.h: число аргументов текущего HLL-вызова, чтобы реализация могла
+// отличить свои перегрузки (они делят один C-указатель).
+int hll_current_nr_args = 0;
+struct ain_hll_function *hll_current_fn = NULL;
 
 bool library_exists(int libno)
 {
@@ -293,7 +299,50 @@ static void trace_hll_call(struct ain_library *lib, struct ain_hll_function *f,
 }
 #endif /* TRACE_HLL */
 
-void hll_call(int libno, int fno)
+// How many stack slots does a call site push for a generic (AIN_HLL_PARAM)
+// argument? It cannot be derived from the .ain signature: the very same
+// struct-element container is called both with a plain object handle (one slot)
+// and with a wrap reference (two slots — the object's heap slot followed by the
+// index within it). Ixseal's third CALLHLL operand tells the two apart. It packs
+// two 16-bit class codes, the argument form and the element type, in which class
+// 3 means "wrap reference"; the forms that occur in Dohna Dohna are
+//
+//   0x00001  int value                                1 slot
+//   0x00002  string handle                            1 slot
+//   0x10002  object handle into an object container    1 slot
+//   0x10003  wrap<T> element type   (heap slot, 0)     2 slots
+//   0x30002  wrap<T> argument form  (heap slot, 0)     2 slots
+//
+// Games whose CALLHLL has no third operand pass elem_class 0 and always push a
+// single slot, so they keep the old behaviour.
+/*
+ * Живёт ли значение обёрнутого типа в СОБСТВЕННОМ heap-слоте. От этого зависит
+ * форма ссылки на него — ровно как у обычных ref-типов движка: скаляр
+ * адресуется парой (страница, номер переменной), всё остальное — одним слотом
+ * с heap-индексом. Совпадает со списком двухслотовых AIN_REF_* в arg-цикле.
+ */
+static bool is_wrapped_object_type(enum ain_data_type t)
+{
+	switch (t) {
+	case AIN_INT:
+	case AIN_LONG_INT:
+	case AIN_BOOL:
+	case AIN_FLOAT:
+	case AIN_ENUM:
+		return false;
+	default:
+		return true;
+	}
+}
+
+static int hll_param_slots(int elem_class)
+{
+	if ((elem_class & 0xffff) == 3 || (elem_class >> 16) == 3)
+		return 2;
+	return 1;
+}
+
+void hll_call(int libno, int fno, int elem_class)
 {
 	struct ain_hll_function *f = &ain->libraries[libno].functions[fno];
 
@@ -329,6 +378,10 @@ void hll_call(int libno, int fno)
 	// reallocation during HLL calls.
 	void *heap_ptrs[HLL_MAX_ARGS];
 	int heap_slots[HLL_MAX_ARGS];
+	// Ixseal-лямбда (AIN_HLL_FUNC) — пара (страница объекта, номер функции).
+	// Держим КОПИЮ, а не указатель в стек VM: реализация зовёт VM обратно, и
+	// та затирает слоты стека ниже stack_ptr.
+	union vm_value func_pairs[HLL_MAX_ARGS][2];
 
 	int ref_array_slot = -1;  // heap slot of the AIN_REF_ARRAY arg, for ref-element returns
 	int dbg_sp0 = stack_ptr;
@@ -338,6 +391,38 @@ void hll_call(int libno, int fno)
 			stack[stack_ptr-1].i, stack[stack_ptr-2].i, stack[stack_ptr-3].i, stack[stack_ptr-4].i);
 		for (int k = 0; k < f->nr_arguments; k++)
 			NOTICE("  arg[%d] type=%d", k, f->arguments[k].type.data);
+	}
+
+	// Diagnostic (XSYS4_HLLP_TRACE) for new generic-argument forms: locate the
+	// container argument under both slot counts and report which one actually
+	// lands on an array page, next to the element-class operand that decided it.
+	if (getenv("XSYS4_HLLP_TRACE")) {
+		int g = -1;
+		for (int i = 0; i < f->nr_arguments; i++) {
+			if (f->arguments[i].type.data == AIN_HLL_PARAM)
+				g = i;
+		}
+		if (g > 0 && f->arguments[0].type.data == AIN_REF_ARRAY) {
+			int after = 0;
+			for (int i = g + 1; i < f->nr_arguments; i++) {
+				int t = f->arguments[i].type.data;
+				after += (t == AIN_REF_INT || t == AIN_REF_LONG_INT
+					  || t == AIN_REF_BOOL || t == AIN_REF_FLOAT) ? 2 : 1;
+			}
+			int base = stack_ptr - after - 1;
+			int c1 = base - 1 >= 0 ? stack[base - 1].i : -1;
+			int c2 = base - 2 >= 0 ? stack[base - 2].i : -1;
+			#define PROBE_IS_ARRAY(x) (heap_index_valid(x) && heap[x].page \
+					&& heap[x].page->type == ARRAY_PAGE)
+			NOTICE("HLLP %s.%s elem_class=0x%x chose=%d slots1=%s(a_type=%d) slots2=%s(a_type=%d)",
+			       ain->libraries[libno].name, f->name, elem_class,
+			       hll_param_slots(elem_class),
+			       PROBE_IS_ARRAY(c1) ? "ARRAY" : "no",
+			       PROBE_IS_ARRAY(c1) ? heap[c1].page->index : -1,
+			       PROBE_IS_ARRAY(c2) ? "ARRAY" : "no",
+			       PROBE_IS_ARRAY(c2) ? heap[c2].page->index : -1);
+			#undef PROBE_IS_ARRAY
+		}
 	}
 
 	for (int i = f->nr_arguments - 1; i >= 0; i--) {
@@ -370,13 +455,49 @@ void hll_call(int libno, int fno)
 			stack_ptr--;
 			args[i] = &heap[stack[stack_ptr].i].page;
 			break;
+		case AIN_WRAP:
+			// Форма wrap-АРГУМЕНТА зависит от обёрнутого типа — ровно так же,
+			// как у wrap-ВОЗВРАТА (см. материализацию ссылки ниже):
+			//  • wrap<скаляр> (int/float/bool/…) — ссылка на ПЕРЕМЕННУЮ из ДВУХ
+			//    слотов (страница, номер переменной). Это out-параметр, callee
+			//    ждёт обычный указатель на значение: `TextSurfaceManager.
+			//    GetFontWidth(string, wrap<int> Width, …)` сайт кладёт
+			//    `PUSHLOCALPAGE; PUSH <локал>` без X_REF.
+			//  • wrap<объект> (массив/структура/строка) — ОДИН слот с heap-
+			//    индексом страницы (напр. источник Array.Duplicate); идёт ниже.
+			// Раньше двухслотовая форма разбирала аргументы со сдвигом: строка
+			// получала слот локальной страницы, и следующий X_REF падал.
+			if (f->arguments[i].type.array_type
+					&& !is_wrapped_object_type(f->arguments[i].type.array_type->data)) {
+				stack_ptr -= 2;
+				int pageno = stack[stack_ptr].i;
+				int varno  = stack[stack_ptr+1].i;
+				ptrs[i] = (heap_index_valid(pageno) && heap[pageno].page)
+					? &heap[pageno].page->values[varno] : NULL;
+				args[i] = &ptrs[i];
+				break;
+			}
+			/* fallthrough */
 		case AIN_REF_STRUCT:
 		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
+		// Ixseal: `ref delegate` — тоже страница по ссылке, один слот с heap-
+		// индексом (сайт кладёт `X_REF 1`). Обязательно с обратной записью:
+		// delegate_append() ПЕРЕВЫДЕЛЯЕТ страницу. Раньше тип 67 уходил в
+		// `default` и callee получал адрес слота стека вместо страницы.
+		// Аргументов типа 67 у v6/v7 нет вообще (0 против 9 у Dohna — все в
+		// библиотеке `Delegate`), так что ветка структурно гейтится.
+		case AIN_REF_DELEGATE:
 			// Ixseal's generic array-by-reference (AIN_REF_ARRAY) is passed the
 			// same way as a struct/typed-array ref: a single stack slot holding
 			// the array page's heap index (verified by stack-balance tracing —
 			// consuming two slots underflows the caller's stack).
+			// AIN_WRAP arguments (wrap<array<T>>, e.g. the four arrays of
+			// PartsEngine.AddPartsConstructionProcess or Array.Duplicate's
+			// source) are pushed the same way — the call site reads the member
+			// with X_REF 1. They used to fall through to the default case, which
+			// handed the callee the address of the stack slot instead of the page
+			// (a garbage pointer).
 			stack_ptr--;
 			heap_slots[i] = stack[stack_ptr].i;
 			heap_ptrs[i] = heap_index_valid(stack[stack_ptr].i) ? heap[stack[stack_ptr].i].page : NULL;
@@ -385,11 +506,32 @@ void hll_call(int libno, int fno)
 			if (f->arguments[i].type.data == AIN_REF_ARRAY)
 				ref_array_slot = heap_slots[i];
 			break;
-		case AIN_HLL_PARAM:
+		case AIN_HLL_PARAM: {
 			// Generic container element: pass a pointer to the raw stack slot;
-			// the callee interprets it per the array's element type.
-			stack_ptr--;
+			// the callee interprets it per the array's element type. A wrap
+			// reference occupies two slots — the object's heap slot plus the
+			// index within it — and the value the callee wants is the lower one.
+			// Двухслотовая форма — значение wrap<интерфейс>: (heap-слот
+			// объекта, база интерфейса). Оба слота лежат на стеке подряд, и
+			// callee (Array.PushBack/Insert) читает их как value[0], value[1].
+			int slots = hll_param_slots(elem_class);
+			stack_ptr -= slots;
 			ptrs[i] = &stack[stack_ptr];
+			args[i] = &ptrs[i];
+			break;
+		}
+		case AIN_HLL_FUNC:
+			// Ixseal: лямбда/предикат приходит ДВУМЯ слотами — (страница
+			// объекта, номер функции): сайт кладёт `PUSHSTRUCTPAGE; PUSH <fno>`
+			// (см. Array.EraseAll/Any/Where/Sort — 20 функций, ~740 сайтов).
+			// Реализация вызовет VM обратно, поэтому пару КОПИРУЕМ: указатель
+			// в стек VM затёрся бы аргументами вложенного вызова.
+			// Старые игры аргументов типа 95 не имеют вообще (0 у v6/v7),
+			// поэтому ветка структурно гейтится.
+			stack_ptr -= 2;
+			func_pairs[i][0] = stack[stack_ptr];
+			func_pairs[i][1] = stack[stack_ptr + 1];
+			ptrs[i] = func_pairs[i];
 			args[i] = &ptrs[i];
 			break;
 		default:
@@ -407,12 +549,22 @@ void hll_call(int libno, int fno)
 		r.i = 0;
 		if (f->return_type.data == AIN_STRING)
 			r.ref = string_ref(&EMPTY_STRING);
-	} else
+	} else {
+		// Сообщаем реализации её перегрузку (см. hll_current_nr_args в hll.h).
+		// Сохраняем/восстанавливаем: HLL-функция может вызвать VM обратно,
+		// и вложенный HLL-вызов затрёт значение.
+		int saved_nr_args = hll_current_nr_args;
+		struct ain_hll_function *saved_fn = hll_current_fn;
+		hll_current_nr_args = f->nr_arguments;
+		hll_current_fn = f;
 #ifdef TRACE_HLL
-	trace_hll_call(&ain->libraries[libno], f, fun, &r, args);
+		trace_hll_call(&ain->libraries[libno], f, fun, &r, args);
 #else
-	ffi_call(&fun->cif, (void*)fun->fun, &r, args);
+		ffi_call(&fun->cif, (void*)fun->fun, &r, args);
 #endif
+		hll_current_nr_args = saved_nr_args;
+		hll_current_fn = saved_fn;
+	}
 
 
 	for (int i = 0, j = 0; i < f->nr_arguments; i++, j++) {
@@ -431,7 +583,29 @@ void hll_call(int libno, int fno)
 		case AIN_REF_STRUCT:
 		case AIN_REF_ARRAY:
 		case AIN_REF_ARRAY_TYPE:
-			// Write the (possibly reallocated) array/struct page back to its slot.
+		case AIN_REF_DELEGATE:
+			// Write the (possibly reallocated) array/struct/delegate page back
+			// to its slot.
+			if (heap_index_valid(heap_slots[i]))
+				heap[heap_slots[i]].page = heap_ptrs[i];
+			break;
+		case AIN_WRAP:
+			// Двухслотовый wrap<скаляр> занял на стеке две ячейки — сдвигаем
+			// счётчик слотов. Обратная запись не нужна: callee получил
+			// указатель прямо в страницу.
+			if (f->arguments[i].type.array_type
+					&& !is_wrapped_object_type(f->arguments[i].type.array_type->data)) {
+				j++;
+				break;
+			}
+			// wrap<объект> маршалится как страница по ссылке (см. ветку
+			// AIN_REF_ARRAY выше), и callee вправе её ПЕРЕВЫДЕЛИТЬ: `String.
+			// SearchAll(self, wrap<array<string>> matchList, regex)` дописывает
+			// найденные токены через array_pushback_n. Без обратной записи
+			// heap-слот оставался бы с указателем на освобождённую страницу →
+			// double free при разборе кадра (`Motion::Parser@SplitParams`).
+			// Раньше это не всплывало: все wrap<объект>-аргументы были
+			// ТОЛЬКО источниками (Array.Duplicate/Copy/Concat).
 			if (heap_index_valid(heap_slots[i]))
 				heap[heap_slots[i]].page = heap_ptrs[i];
 			break;
@@ -485,8 +659,27 @@ void hll_call(int libno, int fno)
 			break;
 		}
 		int idx = r.i;
-		enum ain_data_type et = (idx >= 0 && idx < ap->nr_vars)
-			? variable_type(ap, idx, NULL, NULL) : AIN_INT;
+		// Массив с элементом wrap<интерфейс>: элемент занимает ДВА слота
+		// страницы, поэтому ссылка на него — это всегда пара
+		// (слот массива, idx*2); «своего» heap-слота у такого элемента нет.
+		int eslots = array_elem_slots(ap);
+		if (eslots != 1) {
+			if (heap_index_valid(ref_array_slot))
+				heap_ref(ref_array_slot);
+			stack_push(ref_array_slot);
+			stack_push(idx >= 0 ? idx * eslots : idx);
+			break;
+		}
+		// Тип элемента берём из САМОГО МАССИВА, а не из слота по индексу.
+		// Индекс бывает -1 (At/First/Find/Min/... ничего не нашли), и тогда
+		// прежний `variable_type(ap, idx)` давал AIN_INT: строковый элемент
+		// возвращался 2-слотовой скалярной ссылкой вместо 1-слотовой, и стек
+		// ВЫЗЫВАЮЩЕГО съезжал на слот. Так `Array.At(list, 1)` на массиве из
+		// одного элемента ломал следующий `S_ASSIGN` в
+		// `Motion::ParamAnalyzer@0` (`Out of bounds page index: 0/555`).
+		// Для валидного индекса результат тот же: variable_type() у ARRAY_PAGE
+		// и так возвращает array_type(a_type).
+		enum ain_data_type et = array_type(ap->a_type);
 		// Классификация элемента: «объект» (собственный heap-слот, 1-значный
 		// ref) — это struct/string/delegate/iface и ВЛОЖЕННЫЙ массив (типизир.
 		// AIN_ARRAY_* или generic AIN_ARRAY/REF_ARRAY/WRAP/...). Всё остальное
@@ -507,7 +700,54 @@ void hll_call(int libno, int fno)
 			elem_is_object = ain_is_array_data_type(et); // generic вложенные массивы
 			break;
 		}
-		if (elem_is_object && idx >= 0) {
+		/*
+		 * У ПУСТОГО массива типа элемента ещё НЕТ: страница создаётся
+		 * `variable_initval(AIN_ARRAY)` и её `a_type` остаётся заглушкой
+		 * AIN_ARRAY_INT(14), т.е. `et` выше — не факт, а догадка «int» → скаляр
+		 * → 2-слотовая ссылка. Но САЙТ знает настоящий класс элемента и
+		 * объявляет его третьим операндом CALLHLL (та же кодировка, что у
+		 * `hll_param_slots`): 1=int, 2=string, 0x10002=объект, 0x10003=wrap<
+		 * интерфейс>. Поэтому объявление сайта важнее догадки по странице.
+		 *
+		 * Проверено по всем сайтам Dohna: там, где тип массива РЕАЛЬНО известен,
+		 * elem_class и `et` всегда согласованы (a_type=50/et=47 bool → 0x1;
+		 * a_type=17/et=13 struct и a_type=16/et=12 string → 0x2), так что
+		 * приоритет ничего не меняет. Расходятся они ровно на пустом массиве:
+		 * `Array.At(arg, 0)` в `Motion::ParamAnalyzer@AnalyzeTime` (idx=-1,
+		 * elem_class=0x10002) получал 2-слотовую ссылку вместо 1-слотовой, и
+		 * каждый такой вызов оставлял на стеке лишний слот. Два вызова подряд
+		 * давали AnalyzeTime +2 (XSYS4_SP_CHECK), из-за чего у ВЫЗЫВАЮЩЕГО
+		 * `Motion::ParamCollection@Parse` ссылка `mp` уезжала на 2 слота и
+		 * X_ASSIGN бил по чужой странице.
+		 */
+		switch (elem_class) {
+		case 0x00001:               // int — скаляр, ссылка (страница, индекс)
+			elem_is_object = false;
+			break;
+		case 0x00002:               // string (и struct — тот же 1-слотовый хэндл)
+		case 0x10002:               // объект
+			elem_is_object = true;
+			break;
+		case 0x10003:
+			// wrap<интерфейс> — элемент 2-слотовый, его отдаёт ветка
+			// `eslots != 1` выше. Сюда можно попасть только у ПУСТОГО массива
+			// (stride ещё не выставлен); форма для этого случая по байткоду не
+			// установлена — сообщаем и оставляем прежнее поведение.
+			WARNING("Array.%s: elem_class=wrap<интерфейс> на массиве без stride "
+				"(a_type=%d) — форма ссылки не установлена", f->name, ap->a_type);
+			break;
+		default:
+			break;              // 0 — старые игры без третьего операнда
+		}
+		if (getenv("XSYS4_ELEMFORM_TRACE"))
+			WARNING("ELEMFORM libno=%d fn=%s a_type=%d et=%d eslots=%d idx=%d "
+				"elem_class=0x%x -> %s", libno, f->name, ap->a_type, et, eslots,
+				idx, elem_class, elem_is_object ? "объект(1)" : "скаляр(2)");
+		if (elem_is_object && idx < 0) {
+			// Элемента нет: отдаём null-ссылку одним слотом (форма та же, что
+			// у найденного объектного элемента, — иначе стек съедет).
+			stack_push(-1);
+		} else if (elem_is_object) {
 			// The reference is the element's own heap slot; the caller owns it
 			// and releases it with DELETE, so hand out a counted reference.
 			int es = ap->values[idx].i;
@@ -560,6 +800,7 @@ extern struct static_library lib_DALKDemo;
 extern struct static_library lib_DALKEDemo;
 extern struct static_library lib_Data;
 extern struct static_library lib_DataFile;
+extern struct static_library lib_Delegate;
 extern struct static_library lib_Discord;
 extern struct static_library lib_DrawDungeon;
 extern struct static_library lib_DrawDungeon2;
@@ -620,10 +861,13 @@ extern struct static_library lib_SealEngine;
 extern struct static_library lib_SengokuRanceFont;
 extern struct static_library lib_Sound2ex;
 extern struct static_library lib_SoundFilePlayer;
+extern struct static_library lib_String;
 extern struct static_library lib_StoatSpriteEngine;
 extern struct static_library lib_StretchHelper;
 extern struct static_library lib_system;
 extern struct static_library lib_SystemService;
+extern struct static_library lib_Sys43VM;
+extern struct static_library lib_TextFile;
 extern struct static_library lib_SystemServiceEx;
 extern struct static_library lib_TextSurfaceManager;
 extern struct static_library lib_TapirEngine;
@@ -685,6 +929,7 @@ static struct static_library *static_libraries[] = {
 	&lib_DALKEDemo,
 	&lib_Data,
 	&lib_DataFile,
+	&lib_Delegate,
 	&lib_Discord,
 	&lib_DrawDungeon,
 	&lib_DrawDungeon2,
@@ -747,8 +992,11 @@ static struct static_library *static_libraries[] = {
 	&lib_SoundFilePlayer,
 	&lib_StoatSpriteEngine,
 	&lib_StretchHelper,
+	&lib_String,
 	&lib_system,
 	&lib_SystemService,
+	&lib_Sys43VM,
+	&lib_TextFile,
 	&lib_SystemServiceEx,
 	&lib_TextSurfaceManager,
 	&lib_TapirEngine,
@@ -817,8 +1065,12 @@ static ffi_type *ain_to_ffi_type(enum ain_data_type type)
 	// function index.
 	case AIN_HLL_PARAM:
 		return &ffi_type_pointer;
+	// Ixseal-лямбда: реализация получает УКАЗАТЕЛЬ на пару (страница, fno) —
+	// см. AIN_HLL_FUNC в hll_call. Как тип ВОЗВРАТА тип 95 не встречается ни в
+	// одной библиотеке ни одной из игр (проверено ainliball), так что смена
+	// ffi-типа затрагивает только аргументы.
 	case AIN_HLL_FUNC:
-		return &ffi_type_sint32;
+		return &ffi_type_pointer;
 	// A reference to a generic element (e.g. Array.At's return) is represented
 	// as the element's own value/heap-slot — a single integer slot.
 	case AIN_REF_HLL_PARAM:
@@ -843,6 +1095,15 @@ static void link_static_library_function(struct hll_function *dst, struct ain_hl
 		ERROR("Failed to link HLL function");
 }
 
+static void *static_library_lookup(struct static_library *lib, const char *name)
+{
+	for (int j = 0; lib->functions[j].name; j++) {
+		if (!strcmp(name, lib->functions[j].name))
+			return lib->functions[j].fun;
+	}
+	return NULL;
+}
+
 /*
  * "Link" a library that has been compiled into the xsystem4 executable.
  */
@@ -851,12 +1112,29 @@ static struct hll_function *link_static_library(struct ain_library *ainlib, stru
 	struct hll_function *dst = xcalloc(ainlib->nr_functions, sizeof(struct hll_function));
 
 	for (int i = 0; i < ainlib->nr_functions; i++) {
-		for (int j = 0; lib->functions[j].name; j++) {
-			if (!strcmp(ainlib->functions[i].name, lib->functions[j].name)) {
-				link_static_library_function(&dst[i], &ainlib->functions[i], lib->functions[j].fun);
-				break;
-			}
+		struct ain_hll_function *f = &ainlib->functions[i];
+		void *fun = NULL;
+		// Перегрузка по АРНОСТИ (см. HLL_EXPORT_N в hll.h): сначала пробуем имя,
+		// декорированное числом аргументов — `Имя@<n>`. Нужно там, где у перегрузок
+		// разъезжаются ПОЗИЦИИ параметров и одной C-функцией их не обслужить
+		// (cif строится по .ain): Ixseal-овские четыре `Array.Copy`.
+		{
+			char decorated[256];
+			snprintf(decorated, sizeof(decorated), "%s@%d", f->name, f->nr_arguments);
+			fun = static_library_lookup(lib, decorated);
 		}
+		// Перегрузка по ТИПУ (см. HLL_EXPORT_F в hll.h): для функции,
+		// возвращающей float, сначала пробуем декорированное имя `Имя@f`.
+		// Если библиотека такого не экспортирует — обычное имя, как раньше.
+		if (!fun && f->return_type.data == AIN_FLOAT) {
+			char decorated[256];
+			snprintf(decorated, sizeof(decorated), "%s@f", f->name);
+			fun = static_library_lookup(lib, decorated);
+		}
+		if (!fun)
+			fun = static_library_lookup(lib, f->name);
+		if (fun)
+			link_static_library_function(&dst[i], f, fun);
 		if (!dst[i].fun) {
 			if (getenv("XSYS4_LIST_UNIMPL"))
 				WARNING("UNIMPL: %s.%s", ainlib->name, ainlib->functions[i].name);

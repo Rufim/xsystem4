@@ -14,6 +14,12 @@
  * along with this program; if not, see <http://gnu.org/licenses/>.
  */
 
+#include <limits.h>
+#include <string.h>
+
+#include "system4/string.h"
+
+#include "vm.h"
 #include "hll.h"
 #include "vm/page.h"
 #include "vm/heap.h"
@@ -318,6 +324,45 @@ static void ix_resize(struct page **self, int n)
 	*self = a;
 }
 
+/*
+ * Стереть элемент, СОХРАНИВ типизацию опустевшего контейнера.
+ *
+ * `array_erase`, удаляя ПОСЛЕДНИЙ элемент, освобождает страницу и возвращает
+ * NULL — вместе с ней теряется объявленный тип элемента. Для generic-контейнера
+ * Ixseal это тот же инвариант, что уже соблюдают `ix_resize` и `Array_PopBack`:
+ * пустой контейнер обязан остаться валидной 0-элементной ТИПИЗИРОВАННОЙ
+ * страницей, иначе следующий `PushBack`/`EmplaceBack` создаст массив с
+ * дефолт-типом int и положит heap-слот объекта СЫРЫМ int'ом, без владения —
+ * первый же `DELETE` временной ссылки игры уносит элемент, слот
+ * переиспользуется под другой объект, и обращение к элементу читает чужую
+ * страницу.
+ *
+ * Именно так падал титул Dohna: `Motion::ExecuterCollection@Add` сначала зовёт
+ * `EraseEndTask` (= `Array.EraseAll` по предикату), коллекция пустела в NULL,
+ * следующий `PushBack` пересоздавал её int-массивом (проверено: `a_type=14
+ * struct=0` вместо `17/611`), и `Motion::Executer@IsAlive::get` читал член 5
+ * чужой 2-членной страницы → `Out of bounds page index: 17670/5`. Тем же
+ * способом ломался `EndEventCallbackCollection`.
+ *
+ * Правка Ixseal-only по построению: библиотека `Array` объявлена ТОЛЬКО у Dohna
+ * (у Tsumamigui 3 и Escalayer её нет вообще), а легаси-опкод `A_ERASE`, где
+ * NULL как признак пустого массива — штатное поведение, не встречается ни в
+ * одной из трёх игр.
+ */
+static bool ix_erase_at(struct page **self, int index)
+{
+	enum ain_data_type dt = ix_dtype(*self);
+	int st = ix_stype(*self);
+	int rank = ix_rank(*self);
+	bool ok = false;
+	*self = array_erase(*self, index, &ok);
+	if (!*self) {
+		union vm_value dim = { .i = 0 };
+		*self = alloc_array(rank, &dim, dt, st, false);
+	}
+	return ok;
+}
+
 static void Array_Alloc(struct page **self, int numof) { ix_resize(self, numof); }
 static void Array_Realloc(struct page **self, int numof) { ix_resize(self, numof); }
 static void Array_Free(struct page **self) { ix_resize(self, 0); }
@@ -335,12 +380,18 @@ static bool ix_elem_is_object(enum ain_data_type array_dt)
 	case AIN_STRING:
 	case AIN_DELEGATE:
 	case AIN_IFACE:
+	// wrap<интерфейс>: нижний слот пары — heap-слот объекта, владение как у
+	// struct-элемента (верхний слот — просто индекс, ничем не владеет).
+	case AIN_IFACE_WRAP:
 	case AIN_ARRAY_TYPE:
 		return true;
 	default:
 		return ain_is_array_data_type(et);
 	}
 }
+
+// Сколько слотов значения кладёт вызывающий под элемент этого контейнера.
+static int ix_value_slots(struct page **self) { return self ? array_elem_slots(*self) : 1; }
 
 static void Array_PushBack(struct page **self, union vm_value *value)
 {
@@ -353,7 +404,9 @@ static void Array_PushBack(struct page **self, union vm_value *value)
 	// висячий слот в пуле → use-after-free при следующем чтении пула.
 	if (ix_elem_is_object(ix_dtype(*self)))
 		heap_ref(value->i);
-	*self = array_pushback(*self, *value, ix_dtype(*self), ix_stype(*self));
+	// `value` указывает на первый из слотов значения на стеке VM: у
+	// wrap<интерфейс> их два (объект, база интерфейса) — оба идут в элемент.
+	*self = array_pushback_n(*self, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
 }
 
 static void Array_PopBack(struct page **self)
@@ -385,7 +438,7 @@ static void Array_ix_Insert(struct page **self, int index, union vm_value *value
 	// см. Array_PushBack: объектный элемент — контейнер владеет своим счётчиком.
 	if (ix_elem_is_object(ix_dtype(*self)))
 		heap_ref(value->i);
-	*self = array_insert(*self, index, *value, ix_dtype(*self), ix_stype(*self));
+	*self = array_insert_n(*self, index, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
 }
 
 static bool Array_ix_Erase(struct page **self, int index, int length)
@@ -395,13 +448,45 @@ static bool Array_ix_Erase(struct page **self, int index, int length)
 	bool any = false;
 	int n = length > 0 ? length : 1;
 	for (int k = 0; k < n; k++) {
-		bool ok = false;
-		*self = array_erase(*self, index, &ok);
-		if (!ok)
+		if (!ix_erase_at(self, index))
 			break;
 		any = true;
 	}
 	return any;
+}
+
+/*
+ * `Copy(dst, dstPos, src, srcPos, count)` — пятиаргументная перегрузка (в .ain
+ * `(refarray,int,wrap,int,int)`). Линковка идёт по ИМЕНИ, поэтому раньше ВСЕ
+ * четыре перегрузки `Copy` попадали в двухаргументный `Array_ix_Copy(self, src)`,
+ * а cif собирается по .ain — во втором параметре C-функция получала не приёмник,
+ * а int-индекс, и снимок не копировался НИЧЕГО, молча и без ошибки.
+ *
+ * Чем это ломало Dohna: `parts::detail::CallPartsUpdateEvent` @0x2eaf32 делает
+ * `X_A_INIT; Array.Realloc(list, Numof(dataList)); Array.Copy(list, 0, dataList, 0,
+ * Numof(dataList))` и дальше диспатчит делегаты ИЗ СНИМКА. Снимок оставался пустым,
+ * поэтому НИ ОДНО покадровое событие частей не вызывалось: `CASTask@UpdateEvent`
+ * (его регистрирует `CASTask@ExecuteImp` через `AFL_Parts_AddBeginUpdateEvent`)
+ * не тикал, значит не тикали таймеры и задачи — `SceneLogo@Run` вечно ждал
+ * `DelayedCallback(10, ()=>ShowLogo())`, и сцена логотипа не двигалась.
+ *
+ * Остальные три перегрузки Dohna не зовёт (тул xscan по CALLHLL: fn33 — 3 сайта,
+ * fn30/31/32 — ноль), поэтому реализуется ровно эта форма.
+ */
+static int Array_ix_Copy5(struct page **self, int dst_i, struct page **src, int src_i, int n)
+{
+	if (!self || !*self || !src || !*src || n <= 0)
+		return 0;
+	int dst_cap = array_numof(*self, 1) - dst_i;
+	int src_cap = array_numof(*src, 1) - src_i;
+	if (dst_i < 0 || src_i < 0 || dst_cap <= 0 || src_cap <= 0)
+		return 0;
+	if (n > dst_cap)
+		n = dst_cap;
+	if (n > src_cap)
+		n = src_cap;
+	array_copy(*self, dst_i, *src, src_i, n);
+	return n;
 }
 
 static int Array_ix_Copy(struct page **self, struct page **src)
@@ -425,11 +510,93 @@ static int Array_ix_Fill(struct page **self, union vm_value *value)
 	return array_fill(*self, 0, array_numof(*self, 1), *value);
 }
 
+/*
+ * --- Предикаты и компараторы (Ixseal, тип аргумента AIN_HLL_FUNC) ---
+ *
+ * Сайт кладёт лямбду ДВУМЯ слотами — (страница объекта, номер функции), —
+ * и ffi отдаёт реализации указатель на эту пару (см. ffi.c). Сигнатуры лямбд
+ * взяты из .ain: предикат — ОДИН аргумент-элемент и возврат bool, компаратор —
+ * ДВА аргумента и тоже bool, т.е. `less(a, b)` как в std::sort.
+ *
+ * Перегрузки «по значению» и «по предикату» имеют ОДИНАКОВУЮ арность и
+ * одинаковый тип возврата (напр. `Find(self, 74)` и `Find(self, 95)`), поэтому
+ * различить их можно только по объявленным типам — через hll_current_fn.
+ */
+static bool ix_arg_is_func(int i)
+{
+	return hll_current_fn && i < (int)hll_current_fn->nr_arguments
+		&& hll_current_fn->arguments[i].type.data == AIN_HLL_FUNC;
+}
+
+// Позвать предикат для элемента `index`. Аргументы лямбды — слоты элемента
+// (у wrap<интерфейса> их два, и компилятор объявляет оба).
+static bool ix_pred(union vm_value *fn, struct page *a, int index)
+{
+	int slots = array_elem_slots(a);
+	int argc = vm_hll_func_nr_args(fn[1].i);
+	if (argc > slots)
+		argc = slots;
+	return vm_call_hll_func(fn, &a->values[index * slots], argc).i != 0;
+}
+
+// Компаратор `less(a, b)`: слоты обоих элементов подряд.
+static bool ix_less(union vm_value *fn, struct page *a, int i, int j)
+{
+	int slots = array_elem_slots(a);
+	union vm_value argv[4];
+	int argc = vm_hll_func_nr_args(fn[1].i);
+	if (argc > 2 * slots)
+		argc = 2 * slots;
+	for (int k = 0; k < slots && k < 2; k++) {
+		argv[k] = a->values[i * slots + k];
+		argv[slots + k] = a->values[j * slots + k];
+	}
+	return vm_call_hll_func(fn, argv, argc).i != 0;
+}
+
+// Индекс первого/последнего элемента, удовлетворяющего предикату (-1 если нет).
+static int ix_find_pred(struct page **self, union vm_value *fn, bool last)
+{
+	if (!self || !*self || !fn)
+		return -1;
+	int n = array_numof(*self, 1);
+	int found = -1;
+	for (int i = 0; i < n; i++) {
+		// Массив может быть перевыделен лямбдой — берём страницу каждый раз.
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		if (ix_pred(fn, *self, i)) {
+			found = i;
+			if (!last)
+				break;
+		}
+	}
+	return found;
+}
+
 static int Array_ix_Find(struct page **self, union vm_value *search)
 {
 	if (!self || !*self || !search)
 		return -1;
+	if (ix_arg_is_func(1))
+		return ix_find_pred(self, search, false);
 	return array_find(*self, 0, array_numof(*self, 1), *search, 0);
+}
+
+static int Array_ix_FindLast(struct page **self, union vm_value *search)
+{
+	if (!self || !*self || !search)
+		return -1;
+	if (ix_arg_is_func(1))
+		return ix_find_pred(self, search, true);
+	// Значение-перегрузка: ищем последнее вхождение перебором.
+	int n = array_numof(*self, 1);
+	int found = -1;
+	for (int i = 0; i < n; i++) {
+		if (array_find(*self, i, i + 1, *search, 0) >= 0)
+			found = i;
+	}
+	return found;
 }
 
 static bool Array_ix_IsExist(struct page **self, union vm_value *search)
@@ -437,16 +604,355 @@ static bool Array_ix_IsExist(struct page **self, union vm_value *search)
 	return Array_ix_Find(self, search) >= 0;
 }
 
+// bool Any(self) — «есть хоть один элемент»; bool Any(self, предикат) — «есть
+// подходящий». bool All(self, предикат) — «все подходят» (на пустом — true,
+// как принято у all_of).
+static bool Array_ix_Any(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		return ix_find_pred(self, fn, false) >= 0;
+	return self && *self && array_numof(*self, 1) > 0;
+}
+
+static bool Array_ix_All(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return true;
+	int n = array_numof(*self, 1);
+	for (int i = 0; i < n; i++) {
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		if (!ix_pred(fn, *self, i))
+			return false;
+	}
+	return true;
+}
+
+// int Numof/Count(self) — размер; с предикатом — сколько подходит.
+static int Array_ix_Count(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return 0;
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1))
+		return array_numof(*self, 1);
+	int n = array_numof(*self, 1), c = 0;
+	for (int i = 0; i < n; i++) {
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		if (ix_pred(fn, *self, i))
+			c++;
+	}
+	return c;
+}
+
+// bool EraseAll(self, предикат) / bool Erase(self, предикат) — удалить ВСЕ
+// подходящие элементы. Идём с конца, чтобы индексы не съезжали.
+static bool Array_ix_EraseAll(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return false;
+	bool any = false;
+	for (int i = array_numof(*self, 1) - 1; i >= 0; i--) {
+		if (!*self || i >= array_numof(*self, 1))
+			continue;
+		if (!ix_pred(fn, *self, i))
+			continue;
+		any = ix_erase_at(self, i) || any;
+	}
+	return any;
+}
+
+// bool Remain(self, предикат) — оставить только подходящие (инверсия EraseAll).
+static bool Array_ix_Remain(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return false;
+	bool any = false;
+	for (int i = array_numof(*self, 1) - 1; i >= 0; i--) {
+		if (!*self || i >= array_numof(*self, 1))
+			continue;
+		if (ix_pred(fn, *self, i))
+			continue;
+		any = ix_erase_at(self, i) || any;
+	}
+	return any;
+}
+
+// Min/Max по компаратору less: индекс наименьшего/наибольшего элемента.
+static int ix_extreme(struct page **self, union vm_value *fn, bool want_max)
+{
+	if (!self || !*self)
+		return -1;
+	int n = array_numof(*self, 1);
+	if (n == 0)
+		return -1;
+	int best = 0;
+	for (int i = 1; i < n; i++) {
+		bool i_less_best = ix_less(fn, *self, i, best);
+		if (want_max ? ix_less(fn, *self, best, i) : i_less_best)
+			best = i;
+	}
+	return best;
+}
+
+// int First/Last(self[, предикат]) — индекс; ffi материализует из него ссылку
+// на элемент по типу элемента (см. AIN_REF_HLL_PARAM в ffi.c).
+static int Array_ix_First(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return -1;
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		return ix_find_pred(self, fn, false);
+	return array_numof(*self, 1) > 0 ? 0 : -1;
+}
+
+static int Array_ix_Last(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return -1;
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		return ix_find_pred(self, fn, true);
+	int n = array_numof(*self, 1);
+	return n > 0 ? n - 1 : -1;
+}
+
+// int Min/Max(self, компаратор) — индекс крайнего элемента по `less`.
+// Форма БЕЗ компаратора в байт-коде обеих игр не встречается (все сайты кладут
+// лямбду), а «естественный» порядок для произвольного элемента не определён —
+// поэтому она сообщает о себе, а не тихо возвращает мусор.
+static int Array_ix_Min(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1)) {
+		WARNING("Array.Min без компаратора: форма не встречалась в байт-коде");
+		return -1;
+	}
+	return ix_extreme(self, fn, false);
+}
+
+static int Array_ix_Max(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1)) {
+		WARNING("Array.Max без компаратора: форма не встречалась в байт-коде");
+		return -1;
+	}
+	return ix_extreme(self, fn, true);
+}
+
+/*
+ * array<T> Where(self, предикат) — НОВЫЙ массив из подходящих элементов.
+ * Возврат типа 79 уходит на стек как есть (ffi: default-ветка), поэтому отдаём
+ * heap-СЛОТ страницы, а не сам указатель: сырой page* был бы прочитан как
+ * индекс слота. Вызывающий владеет слотом и освобождает его своим DELETE.
+ */
+static int Array_ix_Where(struct page **self, union vm_value *fn)
+{
+	int slot = heap_alloc_slot(VM_PAGE);
+	if (!self || !*self || !fn) {
+		heap_set_page(slot, NULL);
+		return slot;
+	}
+	struct page *src = *self;
+	enum ain_data_type dt = ix_dtype(src);
+	int st = ix_stype(src);
+	int eslots = array_elem_slots(src);
+	union vm_value dim = { .i = 0 };
+	struct page *out = alloc_array(ix_rank(src), &dim, dt, st, false);
+
+	int n = array_numof(src, 1);
+	for (int i = 0; i < n; i++) {
+		if (!*self || i >= array_numof(*self, 1))
+			break;
+		src = *self;
+		if (!ix_pred(fn, src, i))
+			continue;
+		// Элемент-объект попадает в новый контейнер по ссылке — он должен
+		// получить свой счётчик (как в Array_PushBack).
+		if (ix_elem_is_object(dt))
+			heap_ref(src->values[i * eslots].i);
+		out = array_pushback_n(out, &src->values[i * eslots], eslots, dt, st);
+	}
+	heap_set_page(slot, out);
+	return slot;
+}
+
+// Сортировка компаратором `less` (Ixseal). Вставками: устойчиво, не зависит от
+// согласованности лямбды (qsort с «плохим» компаратором может выйти за границы),
+// а списки здесь — интерфейсные, короткие.
+static void ix_swap_elems(struct page *a, int i, int j, int slots)
+{
+	for (int k = 0; k < slots; k++) {
+		union vm_value t = a->values[i * slots + k];
+		a->values[i * slots + k] = a->values[j * slots + k];
+		a->values[j * slots + k] = t;
+	}
+}
+
+static void ix_sort_pred(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return;
+	int slots = array_elem_slots(*self);
+	int n = array_numof(*self, 1);
+	for (int i = 1; i < n; i++) {
+		for (int j = i; j > 0 && ix_less(fn, *self, j, j - 1); j--)
+			ix_swap_elems(*self, j, j - 1, slots);
+	}
+}
+
 // These sort in place. The .ain declares an array/wrap return (for fluent
 // chaining), but a raw page pointer must never be pushed as a VM value (it would
 // be misread as a heap-slot index). Returning null is safe for the common
 // statement-style usage; callers that chain would need the real handle, which
 // isn't available here.
-static struct page *Array_ix_Sort(struct page **self)
+static struct page *Array_ix_Sort(struct page **self, union vm_value *fn)
 {
-	if (self)
+	if (!self)
+		return NULL;
+	// Sort/QuickSort(self, компаратор): лямбда — `less(a, b)` -> bool (взято из
+	// её сигнатуры в .ain: два аргумента-элемента, возврат 47).
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+		ix_sort_pred(self, fn);
+	else
 		array_sort(*self, 0);
 	return NULL;
+}
+
+/*
+ * Сортированные операции: BinarySearch / LowerBound.
+ *
+ * Перегрузка «с лямбдой» — это НЕ `less(a, b)`, а ТРЁХЗНАЧНЫЙ компаратор от
+ * ОДНОГО элемента: ключ лямбда ЗАХВАТЫВАЕТ, среди аргументов его нет. Форма
+ * снята с байткода: `IdArray<string, Dungeon>@FindIndex` (@0x9ad76a) строит
+ * `int(ref Dungeon obj) => this.CompareFunc(obj, <захваченный id>)`, а сама
+ * `CompareFunc` (@0x9ad802) возвращает -1 по `S_LT`, +1 по `S_GT`, иначе 0.
+ * Сигнатура лямбды в .ain это подтверждает: nr_args=1, возврат int (10).
+ * Знак — «элемент относительно ключа», как у strcmp.
+ */
+static int ix_cmp3(union vm_value *fn, struct page *a, int index)
+{
+	int slots = array_elem_slots(a);
+	int argc = vm_hll_func_nr_args(fn[1].i);
+	if (argc > slots)
+		argc = slots;
+	return vm_call_hll_func(fn, &a->values[index * slots], argc).i;
+}
+
+// Сравнение элемента с ключом-ЗНАЧЕНИЕМ (перегрузки `(self, значение)`).
+// INT_MIN = порядок для этого типа элемента не установлен.
+static int ix_value_cmp(struct page *a, int index, union vm_value *key)
+{
+	switch (array_type(a->a_type)) {
+	case AIN_INT:
+	case AIN_BOOL:
+	case AIN_LONG_INT:
+		return (a->values[index].i > key->i) - (a->values[index].i < key->i);
+	case AIN_FLOAT:
+		return (a->values[index].f > key->f) - (a->values[index].f < key->f);
+	case AIN_STRING:
+		return strcmp(heap_get_string(a->values[index].i)->text,
+			      heap_get_string(key->i)->text);
+	default: {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			WARNING("Array.LowerBound/BinarySearch по ЗНАЧЕНИЮ: порядок для "
+				"элемента типа %d не установлен", array_type(a->a_type));
+		}
+		return INT_MIN;
+	}
+	}
+}
+
+// Индекс совпавшего элемента (компаратор вернул 0), иначе -1.
+static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
+{
+	if (!self || !*self || !key)
+		return -1;
+	int n = array_numof(*self, 1);
+	// Перегрузка «по значению» (fn54) в Dohna не встречается ни разу, поэтому
+	// упорядоченность массива для неё не доказана: ищем равенство перебором —
+	// на отсортированном массиве ответ тот же, на неотсортированном корректнее.
+	if (!ix_arg_is_func(1))
+		return array_find(*self, 0, n, *key, 0);
+	int lo = 0, hi = n - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		// Лямбда может перевыделить страницу — сверяемся каждый шаг.
+		if (!*self || mid >= array_numof(*self, 1))
+			return -1;
+		int c = ix_cmp3(key, *self, mid);
+		if (c == 0)
+			return mid;
+		if (c < 0)
+			lo = mid + 1;   // элемент МЕНЬШЕ ключа → искать правее
+		else
+			hi = mid - 1;
+	}
+	return -1;
+}
+
+// Первый индекс, где элемент уже НЕ меньше ключа (std::lower_bound); `n`, если
+// такого нет. Сайт `resources::detail::ResourceInfoCollection@Add` (@0x156124)
+// использует результат прямо как позицию для последующего `Array.Insert`, т.е.
+// «не найдено» обязано означать «в конец».
+static int Array_ix_LowerBound(struct page **self, union vm_value *key)
+{
+	if (!self || !*self || !key)
+		return 0;
+	int n = array_numof(*self, 1);
+	bool by_func = ix_arg_is_func(1);
+	int lo = 0, hi = n;
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (!*self || mid >= array_numof(*self, 1))
+			break;
+		int c = by_func ? ix_cmp3(key, *self, mid) : ix_value_cmp(*self, mid, key);
+		if (c == INT_MIN)
+			return n;
+		if (c < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * `ShallowCopy(self) -> array` — НОВЫЙ контейнер с ТЕМИ ЖЕ элементами.
+ *
+ * Именно поверхностная: объектные элементы не клонируются, у них лишь растёт
+ * счётчик ссылок. Это отличает функцию от соседней `Duplicate` (тот же приём,
+ * что `Unique` против `UniqueSorted`), и подтверждается сайтом
+ * `PlayerCollection@GetAllInstances` @0x5b4cfa — он отдаёт наружу список тех же
+ * самых объектов-игроков, по которым игра потом сверяет тождество. Через
+ * copy_page/vm_copy тут идти нельзя: для элемента AIN_STRUCT они делают ГЛУБОКУЮ
+ * копию страницы, т.е. вернули бы клонов.
+ *
+ * Возврат типа `array` (ret=79) отдаётся ГОТОВЫМ heap-слотом, а не указателем на
+ * страницу: ffi для таких типов кладёт значение на стек как есть, и ту же
+ * конвенцию уже использует `String.Split`. Слотом владеет вызывающий.
+ */
+static int Array_ix_ShallowCopy(struct page **self)
+{
+	int slot = heap_alloc_slot(VM_PAGE);
+	if (!self || !*self) {
+		heap_set_page(slot, NULL);
+		return slot;
+	}
+	struct page *src = *self;
+	struct page *dst = alloc_page(ARRAY_PAGE, src->a_type, src->nr_vars);
+	dst->array = src->array;
+	int slots = array_elem_slots(src);
+	bool obj = ix_elem_is_object(src->a_type);
+	for (int i = 0; i < src->nr_vars; i++) {
+		dst->values[i] = src->values[i];
+		// У 2-слотового элемента (wrap<интерфейс>) владеет только НИЖНИЙ слот —
+		// верхний это база интерфейса, обычное число.
+		if (obj && i % slots == 0 && src->values[i].i != -1)
+			heap_ref(src->values[i].i);
+	}
+	heap_set_page(slot, dst);
+	return slot;
 }
 
 static struct page *Array_ix_DescSort(struct page **self)
@@ -468,17 +974,24 @@ static int Array_EmplaceBack(struct page **self)
 	struct page *a = *self;
 	enum ain_data_type dt = a->a_type;
 	int st = a->array.struct_type;
-	union vm_value v;
-	if (array_type(dt) == AIN_STRUCT)
-		create_struct(st, &v);
-	else
-		v = variable_initval(array_type(dt));
-	*self = array_pushback(a, v, dt, st);
+	int slots = array_elem_slots(a);
+	union vm_value v[2];
+	if (slots == 2) {
+		// Пустая пара wrap<интерфейс>: объекта нет, база интерфейса 0.
+		v[0].i = -1;
+		v[1].i = 0;
+	} else if (array_type(dt) == AIN_STRUCT) {
+		create_struct(st, &v[0]);
+	} else {
+		v[0] = variable_initval(array_type(dt));
+	}
+	*self = array_pushback_n(a, v, slots, dt, st);
 	a = *self;
 	// EmplaceBack returns a WRAP (ref) to the newly-added element; hll_call
 	// materialises the concrete reference from this element index (a struct
 	// element becomes a 1-value page-slot ref, a scalar a 2-value ref).
-	return (a && a->nr_vars > 0) ? a->nr_vars - 1 : -1;
+	int n = array_numof(a, 1);
+	return n > 0 ? n - 1 : -1;
 }
 
 // Return a reference to element `index` — its value/heap-slot (a struct element
@@ -492,47 +1005,111 @@ static int Array_At(struct page **self, int index)
 	if (!self || !*self)
 		return -1;
 	struct page *a = *self;
-	if (index < 0 || index >= a->nr_vars)
+	if (index < 0 || index >= array_numof(a, 1))
 		return -1;
 	return index;
 }
 
-// First/Last: ссылка на первый/последний элемент (Ixseal). Как At с
-// фиксированным индексом; -1 на пустом массиве. hll_call() материализует
-// конкретный ref из индекса по типу элемента. Перегрузка с предикатом
-// (…, HLL_FUNC) НЕ применяет предикат — возвращаем простой первый/последний
-// (безопасно: лишний arg в cif игнорируется этой C-функцией).
-static int Array_First(struct page **self)
+/*
+ * Unique(self) / Unique(self, равенство) — удалить ДУБЛИКАТЫ, сохранив порядок.
+ *
+ * Что это именно «удалить все дубликаты», а не std::unique (только соседние),
+ * следует из того, что в библиотеке ОТДЕЛЬНО объявлена `UniqueSorted` — иначе
+ * две функции совпадали бы. Лямбда-перегрузка получает ДВА элемента и отдаёт
+ * bool, причём это предикат РАВЕНСТВА, а не «меньше»: тело лямбды на сайте
+ * @0x1fb27e — ровно `lhs.IsSame(rhs)` (`elkeditor::detail::CEmitterKey@IsSame`).
+ *
+ * Идём с конца, чтобы удалялся ПОЗДНИЙ из совпавших (первое вхождение остаётся
+ * на месте) и чтобы удаление не сдвигало ещё не просмотренные индексы.
+ */
+static void ix_unique(struct page **self, union vm_value *fn, bool use_pred)
 {
 	if (!self || !*self)
-		return -1;
-	return (*self)->nr_vars > 0 ? 0 : -1;
+		return;
+	int slots = array_elem_slots(*self);
+	for (int i = array_numof(*self, 1) - 1; i >= 1; i--) {
+		bool dup = false;
+		if (use_pred) {
+			for (int j = 0; j < i && !dup; j++)
+				dup = ix_less(fn, *self, j, i);
+		} else {
+			dup = array_find(*self, 0, i, (*self)->values[i * slots], 0) >= 0;
+		}
+		if (!dup)
+			continue;
+		ix_erase_at(self, i);
+	}
 }
 
-static int Array_Last(struct page **self)
+static void Array_ix_Unique(struct page **self, union vm_value *fn)
 {
-	if (!self || !*self)
-		return -1;
-	return (*self)->nr_vars > 0 ? (*self)->nr_vars - 1 : -1;
+	ix_unique(self, fn, hll_current_nr_args >= 2 && ix_arg_is_func(1));
+}
+
+/*
+ * array SYSTEMONLY_GetStructPageList(self) — «сырые» страницы объектов из
+ * контейнера интерфейсных ссылок. Служебная функция сериализации: единственный
+ * сайт — `AFL_GameSave_StructLoad` (@0x227e56), который собирает
+ * `array<wrap<интерфейс>>` из одного элемента (`dest`) и передаёт результат в
+ * `system.DeserializeStruct(fileName, <этот список>, 1)`; та объявлена как
+ * `(string, array, bool)`, т.е. ждёт именно список СТРАНИЦ, а не пар.
+ *
+ * Поэтому берём нижний слот каждого элемента (heap-слот объекта) и отбрасываем
+ * верхний (базу интерфейса) — ровно обратное тому, что делает X_ICAST. Новый
+ * контейнер владеет своей ссылкой на объект (как Array_PushBack/Where).
+ *
+ * Возврат — heap-СЛОТ страницы (тип 79 уходит на стек как есть, см. Where).
+ * Сайт его не освобождает, так что слот на вызов утекает; DeserializeStruct
+ * пока заглушка, так что цена нулевая, но это стоит помнить.
+ */
+static int Array_SYSTEMONLY_GetStructPageList(struct page **self)
+{
+	int slot = heap_alloc_slot(VM_PAGE);
+	if (!self || !*self) {
+		heap_set_page(slot, NULL);
+		return slot;
+	}
+	struct page *src = *self;
+	int eslots = array_elem_slots(src);
+	int n = array_numof(src, 1);
+	union vm_value dim = { .i = 0 };
+	struct page *out = alloc_array(1, &dim, AIN_ARRAY_STRUCT, ix_stype(src), false);
+	for (int i = 0; i < n; i++) {
+		union vm_value obj = src->values[i * eslots];
+		heap_ref(obj.i);
+		out = array_pushback_n(out, &obj, 1, AIN_ARRAY_STRUCT, ix_stype(src));
+	}
+	heap_set_page(slot, out);
+	return slot;
 }
 
 HLL_LIBRARY(Array,
 	    HLL_EXPORT(Alloc, Array_Alloc),
+	    HLL_EXPORT(SYSTEMONLY_GetStructPageList, Array_SYSTEMONLY_GetStructPageList),
+	    HLL_EXPORT(Unique, Array_ix_Unique),
 	    HLL_EXPORT(EmplaceBack, Array_EmplaceBack),
 	    HLL_EXPORT(At, Array_At),
-	    HLL_EXPORT(First, Array_First),
-	    HLL_EXPORT(Last, Array_Last),
+	    HLL_EXPORT(First, Array_ix_First),
+	    HLL_EXPORT(Last, Array_ix_Last),
+	    HLL_EXPORT(Min, Array_ix_Min),
+	    HLL_EXPORT(Max, Array_ix_Max),
 	    HLL_EXPORT(Realloc, Array_Realloc),
 	    HLL_EXPORT(Free, Array_Free),
 	    HLL_EXPORT(Clear, Array_ix_Clear),
-	    HLL_EXPORT(Numof, Array_ix_Numof),
-	    HLL_EXPORT(Count, Array_ix_Numof),
+	    HLL_EXPORT(Numof, Array_ix_Count),
+	    HLL_EXPORT(Count, Array_ix_Count),
+	    HLL_EXPORT(Any, Array_ix_Any),
+	    HLL_EXPORT(All, Array_ix_All),
+	    HLL_EXPORT(Where, Array_ix_Where),
+	    HLL_EXPORT(EraseAll, Array_ix_EraseAll),
+	    HLL_EXPORT(Remain, Array_ix_Remain),
 	    HLL_EXPORT(Empty, Array_Empty),
 	    HLL_EXPORT(PushBack, Array_PushBack),
 	    HLL_EXPORT(Add, Array_PushBack),
 	    HLL_EXPORT(PopBack, Array_PopBack),
 	    HLL_EXPORT(Insert, Array_ix_Insert),
 	    HLL_EXPORT(Erase, Array_ix_Erase),
+	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),
 	    HLL_EXPORT(Duplicate, Array_ix_Copy),
 	    HLL_EXPORT(Concat, Array_ix_Copy),
@@ -540,8 +1117,11 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Reverse, Array_Reverse),
 	    HLL_EXPORT(Fill, Array_ix_Fill),
 	    HLL_EXPORT(Find, Array_ix_Find),
-	    HLL_EXPORT(FindLast, Array_ix_Find),
+	    HLL_EXPORT(FindLast, Array_ix_FindLast),
 	    HLL_EXPORT(IsExist, Array_ix_IsExist),
+	    HLL_EXPORT(ShallowCopy, Array_ix_ShallowCopy),
+	    HLL_EXPORT(BinarySearch, Array_ix_BinarySearch),
+	    HLL_EXPORT(LowerBound, Array_ix_LowerBound),
 	    HLL_EXPORT(Sort, Array_ix_Sort),
 	    HLL_EXPORT(AscSort, Array_ix_Sort),
 	    HLL_EXPORT(QuickSort, Array_ix_Sort),

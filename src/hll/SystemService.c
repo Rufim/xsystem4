@@ -58,17 +58,99 @@ static int SystemService_GetGameVersion(void)
 	return ain->game_version;
 }
 
+/*
+ * Анти-тамппер: `main` сверяет строку версии рантайма System4 по фиксированным
+ * позициям — склеивает несколько `String.GetPart(v, index, len)` и сравнивает со
+ * своей строковой константой, а рядом требует `ToInt(v[i]) == ToInt(v[j])`. Не
+ * сошлось — `main` уходит в пустой цикл (чёрный экран).
+ *
+ * Строка у каждой сборки рантайма СВОЯ, поэтому один водяной знак на все игры
+ * невозможен (у Dohna `[0:3]`=="sd4", у Healing Touch — "fea"). Ниже — снятые с
+ * байткода наборы ограничений; нужный выбирается по наличию ожидаемой константы
+ * в строковой таблице .ain, а сама строка синтезируется из ограничений.
+ */
+struct version_check {
+	const char *expect;                    // константа, с которой сверяет main
+	struct { int index, len; } frag[4];     // фрагменты в порядке конкатенации
+	int eq_a, eq_b;                        // требование ToInt(v[a]) == ToInt(v[b])
+};
+
+static const struct version_check version_checks[] = {
+	// Tsumamigui 3 (v7), main: [6:9] + [13:16] + [20:25], плюс [5] == [32].
+	{ "]:77d66sadc", { {6,3}, {13,3}, {20,5} }, 5, 32 },
+	// Dohna Dohna (v14), main @0x49a26c: [6:9] + [0:3] + [16:20]; @0x49a08a: [2] == [24].
+	{ "6sdsd48f63", { {6,3}, {0,3}, {16,4} }, 2, 24 },
+	// Healing Touch (v14, оба маршрута — проверки идентичны), main @0x49a7a0:
+	// [5:8] + [13:16] + [0:3]; @0x49a5be: [16] == [3].
+	{ "b544iofea", { {5,3}, {13,3}, {0,3} }, 16, 3 },
+};
+
+static const char *game_version_text(void)
+{
+	static char buf[64];
+	static bool built = false;
+	if (built)
+		return buf;
+	built = true;
+	memset(buf, '0', sizeof(buf));
+	// Длина 33 — как у строки, на которой проверка Tsumamigui 3 уже проверена
+	// работающей; самый большой нужный индекс — 32 (её же `[5]==[32]`).
+	buf[33] = '\0';
+
+	for (size_t v = 0; v < sizeof(version_checks) / sizeof(*version_checks); v++) {
+		const struct version_check *vc = &version_checks[v];
+		bool found = false;
+		for (int i = 0; i < ain->nr_strings && !found; i++)
+			found = !strcmp(ain->strings[i]->text, vc->expect);
+		if (!found)
+			continue;
+		bool covered[sizeof(buf)];
+		memset(covered, 0, sizeof(covered));
+		const char *p = vc->expect;
+		for (int f = 0; f < 4 && vc->frag[f].len; f++) {
+			for (int k = 0; k < vc->frag[f].len; k++) {
+				int at = vc->frag[f].index + k;
+				if (at < 0 || at >= 33 || !*p)
+					break;
+				buf[at] = *p++;
+				covered[at] = true;
+			}
+		}
+		// `ToInt(v[a]) == ToInt(v[b])`: подгоняем ту позицию, которую фрагменты
+		// не задали (если не задана ни одна, обе уже равны — там наполнитель).
+		if (buf[vc->eq_a] != buf[vc->eq_b]) {
+			if (!covered[vc->eq_b])
+				buf[vc->eq_b] = buf[vc->eq_a];
+			else if (!covered[vc->eq_a])
+				buf[vc->eq_a] = buf[vc->eq_b];
+			else
+				WARNING("версия рантайма: ограничения [%d]==[%d] и фрагменты "
+					"противоречивы", vc->eq_a, vc->eq_b);
+		}
+		return buf;
+	}
+	WARNING("анти-тамппер: набор ограничений для этой игры не известен — "
+		"main может уйти в пустой цикл");
+	return buf;
+}
+
+// v7-форма: out-параметр `ref string`, возвращает bool.
 static bool SystemService_GetGameVersionByText(struct string **text)
 {
-	// Анти-тамппер: игра сверяет строку версии рантайма System4 по фиксированным
-	// позициям (Tsumamigui 3: [6:9]"]:7" + [13:16]"7d6" + [20:25]"6sadc" == её
-	// строковая константа, плюс [5]==[32]). Иначе main крутит пустой цикл (чёрный
-	// экран). Возвращаем строку-водяной знак, удовлетворяющую этой проверке.
-	static const char watermark[] = "000000]:700007d600006sadc00000000";
 	if (*text)
 		free_string(*text);
-	*text = cstr_to_string(watermark);
+	*text = cstr_to_string(game_version_text());
 	return true;
+}
+
+// Ixseal-форма (v14): без аргументов, строка — это ВОЗВРАТ (`ret=12 ()`).
+// Прежде она линковалась на v7-функцию: cif собирался по объявлению .ain, т.е.
+// без аргументов и с указателем-возвратом, а C-функция читала `text` из
+// неинициализированного регистра и отдавала `true` — движок оборачивал 1 как
+// `struct string *` и падал в `sjis_count_char(0x9)` при первом же GetPart.
+static struct string *SystemService_GetGameVersionByText_ix(void)
+{
+	return cstr_to_string(game_version_text());
 }
 
 static void SystemService_GetGameName(struct string **game_name)
@@ -77,6 +159,111 @@ static void SystemService_GetGameName(struct string **game_name)
 		free_string(*game_name);
 	*game_name = cstr_to_string(config.game_name);
 }
+
+// Ixseal-формы: в v14 `GetGameName`/`GetGameFolderPath` объявлены `ret=12 ()`,
+// т.е. строка — ВОЗВРАТ, а не out-параметр (у v6/v7 out-параметр). Линковка идёт
+// по имени, cif строится по .ain, поэтому v7-функция получала мусорный
+// указатель в первом регистре и ПИСАЛА по нему, а возвращала мусор: слот строки
+// оказывался с `s = NULL`, и первый же `A_REF` падал в `string_ref(NULL)`
+// (`ExtableFormatLoader@Load` @0x5807f6). Тот же класс, что у
+// GetGameVersionByText (см. выше). Подмена — в _PreLink по nr_arguments == 0.
+static struct string *SystemService_GetGameName_ix(void)
+{
+	return cstr_to_string(config.game_name);
+}
+
+
+/*
+ * Хранилища именованных строковых переменных (Ixseal): `SystemVariable_*` и
+ * `GameVariable_*` — два независимых словаря ключ→значение с одинаковым API
+ * (IsExist/Set/Get/NumofKey/GetKey/Erase). У v6/v7 этих функций нет вообще
+ * (проверено ainliball по трём .ain), так что ветка Ixseal-only.
+ *
+ * Зачем они игре, видно по единственному потребителю — `ResetLoadManager`:
+ * перед перезапуском VM он кладёт `ResetLoadTargetIndex`/`ResetLoadType`
+ * (`Run` @0x61c448), а после — читает и СТИРАЕТ их (`LoadObject` @0x61c516,
+ * ключа нет → сразу `return 0`). То есть требуется пережить vm-reset, а не
+ * перезапуск процесса; сохранение на диск ни одним сайтом не подтверждается,
+ * поэтому словари живут в памяти. Порядок ключей — порядок вставки: его
+ * задаёт пара NumofKey/GetKey, другого способа перечислить ключи нет.
+ */
+struct sv_entry {
+	struct string *key;
+	struct string *value;
+};
+
+struct sv_store {
+	struct sv_entry *entries;
+	int nr_entries;
+	int cap;
+};
+
+static struct sv_store sv_system, sv_game;
+
+static int sv_find(struct sv_store *st, struct string *key)
+{
+	for (int i = 0; i < st->nr_entries; i++) {
+		if (!strcmp(st->entries[i].key->text, key->text))
+			return i;
+	}
+	return -1;
+}
+
+static void sv_set(struct sv_store *st, struct string *key, struct string *value)
+{
+	int i = sv_find(st, key);
+	if (i >= 0) {
+		free_string(st->entries[i].value);
+		st->entries[i].value = string_ref(value);
+		return;
+	}
+	if (st->nr_entries == st->cap) {
+		st->cap = st->cap ? st->cap * 2 : 8;
+		st->entries = xrealloc(st->entries, st->cap * sizeof(struct sv_entry));
+	}
+	st->entries[st->nr_entries].key = string_ref(key);
+	st->entries[st->nr_entries].value = string_ref(value);
+	st->nr_entries++;
+}
+
+static struct string *sv_get(struct sv_store *st, struct string *key)
+{
+	int i = sv_find(st, key);
+	return string_ref(i >= 0 ? st->entries[i].value : &EMPTY_STRING);
+}
+
+static struct string *sv_get_key(struct sv_store *st, int index)
+{
+	if (index < 0 || index >= st->nr_entries)
+		return string_ref(&EMPTY_STRING);
+	return string_ref(st->entries[index].key);
+}
+
+static void sv_erase(struct sv_store *st, struct string *key)
+{
+	int i = sv_find(st, key);
+	if (i < 0)
+		return;
+	free_string(st->entries[i].key);
+	free_string(st->entries[i].value);
+	memmove(&st->entries[i], &st->entries[i + 1],
+		(st->nr_entries - i - 1) * sizeof(struct sv_entry));
+	st->nr_entries--;
+}
+
+static bool SystemService_SystemVariable_IsExist(struct string *key) { return sv_find(&sv_system, key) >= 0; }
+static void SystemService_SystemVariable_Set(struct string *key, struct string *value) { sv_set(&sv_system, key, value); }
+static struct string *SystemService_SystemVariable_Get(struct string *key) { return sv_get(&sv_system, key); }
+static int SystemService_SystemVariable_NumofKey(void) { return sv_system.nr_entries; }
+static struct string *SystemService_SystemVariable_GetKey(int index) { return sv_get_key(&sv_system, index); }
+static void SystemService_SystemVariable_Erase(struct string *key) { sv_erase(&sv_system, key); }
+
+static bool SystemService_GameVariable_IsExist(struct string *key) { return sv_find(&sv_game, key) >= 0; }
+static void SystemService_GameVariable_Set(struct string *key, struct string *value) { sv_set(&sv_game, key, value); }
+static struct string *SystemService_GameVariable_Get(struct string *key) { return sv_get(&sv_game, key); }
+static int SystemService_GameVariable_NumofKey(void) { return sv_game.nr_entries; }
+static struct string *SystemService_GameVariable_GetKey(int index) { return sv_get_key(&sv_game, index); }
+static void SystemService_GameVariable_Erase(struct string *key) { sv_erase(&sv_game, key); }
 
 HLL_WARN_UNIMPLEMENTED(false, bool, SystemService, AddURLMenu, struct string *title, struct string *url);
 
@@ -322,6 +509,15 @@ void SystemService_GetGameFolderPath(struct string **folder_path)
 	free(sjis);
 }
 
+// Ixseal-форма (см. SystemService_GetGameName_ix).
+static struct string *SystemService_GetGameFolderPath_ix(void)
+{
+	char *sjis = utf2sjis(config.game_dir, 0);
+	struct string *s = make_string(sjis, strlen(sjis));
+	free(sjis);
+	return s;
+}
+
 static void SystemService_GetTime(int *hour, int *min, int *sec)
 {
 	int ms;
@@ -422,6 +618,74 @@ HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, IsExistSystemMessage);
 
 static void SystemService_RestrainScreensaver(void) { }
 
+/*
+ * Индикатор «подождите» рантайма (`_system::detail::BeginWaitMessage` даёт 1,
+ * `EndWaitMessage` — 0). Своего индикатора у движка нет, а прочитать состояние
+ * игра не может — геттера у функции нет во всей библиотеке, — так что для
+ * игрового кода no-op неотличим от настоящего показа.
+ */
+static void SystemService_ShowWaitMessage(bool show)
+{
+	(void)show;
+}
+
+/*
+ * Резервные копии сейвов (Ixseal). Игра лишь РЕГИСТРИРУЕТ имена файлов
+ * (`AddBackupSaveFileName`) и просит скопировать их (`BackupSaveFile`) — ни
+ * геттера, ни возвращаемого значения у этой пары нет, так что имена копий и
+ * восстановление из них целиком внутреннее дело движка.
+ *
+ * Сайты: `_system::detail::Init` (fno 20591) регистрирует имена вроде
+ * `AFCGMode.asd` и значения EX-ключей «重要セーブファイル名N», а
+ * `BackupSaveFile` вызывается один раз — при возврате в титул
+ * (`・タイトルに戻る・確認なし`, fno 20526).
+ */
+#define MAX_BACKUP_SAVE_FILES 32
+static struct string *backup_save_names[MAX_BACKUP_SAVE_FILES];
+static int nr_backup_save_names = 0;
+
+static void SystemService_AddBackupSaveFileName(struct string *name)
+{
+	if (!name || !name->size)
+		return;
+	for (int i = 0; i < nr_backup_save_names; i++) {
+		if (!strcmp(backup_save_names[i]->text, name->text))
+			return;
+	}
+	if (nr_backup_save_names == MAX_BACKUP_SAVE_FILES) {
+		WARNING("SystemService.AddBackupSaveFileName: список полон (%d), «%s» пропущено",
+			MAX_BACKUP_SAVE_FILES, display_sjis0(name->text));
+		return;
+	}
+	backup_save_names[nr_backup_save_names++] = string_ref(name);
+}
+
+static bool copy_file_bytes(const char *src, const char *dst)
+{
+	size_t len;
+	void *data = file_read(src, &len);
+	if (!data)
+		return false;  // файла может не быть — это норма
+	bool ok = file_write(dst, data, len);
+	free(data);
+	return ok;
+}
+
+static void SystemService_BackupSaveFile(void)
+{
+	// Суффикс копии по байткоду не установлен (игра его никогда не читает),
+	// поэтому берём общепринятый `.bak` рядом с оригиналом в папке сейвов.
+	for (int i = 0; i < nr_backup_save_names; i++) {
+		char *src = savedir_path(backup_save_names[i]->text);
+		char *dst = xmalloc(strlen(src) + 5);
+		sprintf(dst, "%s.bak", src);
+		if (!copy_file_bytes(src, dst))
+			NOTICE("SystemService.BackupSaveFile: нет %s — пропущено", src);
+		free(dst);
+		free(src);
+	}
+}
+
 //static int SystemService_Debug_GetUseVideoMemorySize(void);
 
 // Rance 01
@@ -456,6 +720,43 @@ static void SystemService_Rance96161988(struct string **text) {
 // Pascha3 Plus Contents
 static void SystemService_XXX(struct string **text) {
 	*text = cstr_to_string("FORMAT HDD ERASE 578205024758284076520478254092784789752384758204687293");
+}
+
+/*
+ * Масштаб игрового вида внутри окна. Пара сеттер/геттер (`SetGameViewScaleRate`
+ * fn11 / `GetGameViewScaleRate` fn12), у v6/v7 её нет вовсе (проверено
+ * ainliball по трём .ain), обёртки игры — прямые проходные
+ * (`view::detail::SetGameViewScaleRate` @0x4ae814,
+ * `AFL_View_GetGameViewScaleRate` @0x4ae098).
+ *
+ * Зачем геттер игре: `AFL_View_CalcGameViewPos` (@0x4ae0ea) пересчитывает
+ * координату из оконной в видовую и при rate == 1.0f возвращает её КАК ЕСТЬ,
+ * иначе делит. Через него идёт `input::detail::GetMousePos`, то есть без
+ * геттера вставал каждый кадр титула (`TitleCharacterView@UpdateCharacterPos`).
+ *
+ * Движок рисует вид 1:1 в окно того же размера, поэтому честное значение — 1.0,
+ * и пересчёт мыши становится тождественным. Само масштабирование вида не
+ * реализовано: если игра выставит не 1.0, координаты разойдутся — вместо тихого
+ * дефолта стоит проверка допущения.
+ */
+static float sys_game_view_scale_rate = 1.0f;
+
+static void SystemService_SetGameViewScaleRate(float rate)
+{
+	if (rate != 1.0f) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("SetGameViewScaleRate(%f): масштабирование игрового вида "
+				"не реализовано, координаты мыши не пересчитываются", rate);
+		}
+	}
+	sys_game_view_scale_rate = rate;
+}
+
+static float SystemService_GetGameViewScaleRate(void)
+{
+	return sys_game_view_scale_rate;
 }
 
 static void SystemService_PreLink(void);
@@ -494,6 +795,8 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(ChangeFullScreen, SystemService_ChangeFullScreen),
 	    HLL_EXPORT(InitMainWindowPosAndSize, SystemService_InitMainWindowPosAndSize),
 	    HLL_EXPORT(UpdateView, SystemService_UpdateView),
+	    HLL_EXPORT(SetGameViewScaleRate, SystemService_SetGameViewScaleRate),
+	    HLL_EXPORT(GetGameViewScaleRate, SystemService_GetGameViewScaleRate),
 	    HLL_EXPORT(GetViewWidth, SystemService_GetViewWidth),
 	    HLL_EXPORT(GetViewHeight, SystemService_GetViewHeight),
 	    HLL_EXPORT(GetDefaultViewWidth, SystemService_GetDefaultViewWidth),
@@ -502,15 +805,25 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(SetHideMouseCursorByGame, SystemService_SetHideMouseCursorByGame),
 	    HLL_TODO_EXPORT(GetHideMouseCursorByGame, SystemService_GetHideMouseCursorByGame),
 	    HLL_EXPORT(SetUsePower2Texture, SystemService_SetUsePower2Texture),
-	    HLL_TODO_EXPORT(GetUsePower2Texture, SystemService_GetUsePower2Texture),
 	    HLL_EXPORT(SetAntiAliasingMode, SystemService_SetAntiAliasingMode),
-	    HLL_TODO_EXPORT(GetAntiAliasingMode, SystemService_GetAntiAliasingMode),
 	    HLL_EXPORT(SetWindowSetting, SystemService_SetWindowSetting),
 	    HLL_EXPORT(GetWindowSetting, SystemService_GetWindowSetting),
 	    HLL_EXPORT(SetMouseCursorConfig, SystemService_SetMouseCursorConfig),
 	    HLL_EXPORT(GetMouseCursorConfig, SystemService_GetMouseCursorConfig),
 	    HLL_TODO_EXPORT(RunProgram, SystemService_RunProgram),
 	    HLL_TODO_EXPORT(IsOpenedMutex, SystemService_IsOpenedMutex),
+	    HLL_EXPORT(SystemVariable_IsExist, SystemService_SystemVariable_IsExist),
+	    HLL_EXPORT(SystemVariable_Set, SystemService_SystemVariable_Set),
+	    HLL_EXPORT(SystemVariable_Get, SystemService_SystemVariable_Get),
+	    HLL_EXPORT(SystemVariable_NumofKey, SystemService_SystemVariable_NumofKey),
+	    HLL_EXPORT(SystemVariable_GetKey, SystemService_SystemVariable_GetKey),
+	    HLL_EXPORT(SystemVariable_Erase, SystemService_SystemVariable_Erase),
+	    HLL_EXPORT(GameVariable_IsExist, SystemService_GameVariable_IsExist),
+	    HLL_EXPORT(GameVariable_Set, SystemService_GameVariable_Set),
+	    HLL_EXPORT(GameVariable_Get, SystemService_GameVariable_Get),
+	    HLL_EXPORT(GameVariable_NumofKey, SystemService_GameVariable_NumofKey),
+	    HLL_EXPORT(GameVariable_GetKey, SystemService_GameVariable_GetKey),
+	    HLL_EXPORT(GameVariable_Erase, SystemService_GameVariable_Erase),
 	    HLL_EXPORT(GetGameFolderPath, SystemService_GetGameFolderPath),
 	    HLL_EXPORT(GetDate, get_date),
 	    HLL_EXPORT(GetTime, SystemService_GetTime),
@@ -520,6 +833,9 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(IsExistSystemMessage, SystemService_IsExistSystemMessage),
 	    HLL_TODO_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
 	    HLL_EXPORT(RestrainScreensaver, SystemService_RestrainScreensaver),
+	    HLL_EXPORT(ShowWaitMessage, SystemService_ShowWaitMessage),
+	    HLL_EXPORT(AddBackupSaveFileName, SystemService_AddBackupSaveFileName),
+	    HLL_EXPORT(BackupSaveFile, SystemService_BackupSaveFile),
 	    HLL_TODO_EXPORT(Debug_GetUseVideoMemorySize, SystemService_Debug_GetUseVideoMemorySize),
 	    HLL_EXPORT(Rance0123456789, SystemService_Rance0123456789),
 	    HLL_EXPORT(XXXXX01XXXXXXXX, SystemService_XXXXX01XXXXXXXX),
@@ -545,5 +861,24 @@ static void SystemService_PreLink(void)
 	if (fun && fun->nr_arguments == 1) {
 		static_library_replace(&lib_SystemService, "IsResetOnce",
 				SystemService_IsResetOnce_Drapeko);
+	}
+
+	// Ixseal отдаёт строку версии ВОЗВРАТОМ, а не через out-параметр.
+	fun = get_fun(libno, "GetGameVersionByText");
+	if (fun && fun->nr_arguments == 0) {
+		static_library_replace(&lib_SystemService, "GetGameVersionByText",
+				SystemService_GetGameVersionByText_ix);
+	}
+
+	// Тот же сдвиг формы у остальных строковых геттеров без аргументов.
+	fun = get_fun(libno, "GetGameName");
+	if (fun && fun->nr_arguments == 0) {
+		static_library_replace(&lib_SystemService, "GetGameName",
+				SystemService_GetGameName_ix);
+	}
+	fun = get_fun(libno, "GetGameFolderPath");
+	if (fun && fun->nr_arguments == 0) {
+		static_library_replace(&lib_SystemService, "GetGameFolderPath",
+				SystemService_GetGameFolderPath_ix);
 	}
 }

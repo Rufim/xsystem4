@@ -83,6 +83,18 @@ static struct string *System_Error(struct string *text)
 	// system.Error is a script-level assert (has a Continue affordance); log
 	// and continue by default so a single failing assert doesn't wedge the game.
 	sys_warning("*GAME ERROR*: %s\n", display_sjis0(text->text));
+	// Диагностика: XSYS4_GAME_ERROR_TRACE=<n> — печатать цепочку игровых функций
+	// для первых n ассертов игры. Без неё непонятно, ЧТО именно ассертит:
+	// сообщение (напр. «AsraFramework internal error») одно на весь фреймворк.
+	static int trace_left = -1;
+	if (trace_left < 0) {
+		const char *e = getenv("XSYS4_GAME_ERROR_TRACE");
+		trace_left = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0;
+	}
+	if (trace_left > 0) {
+		trace_left--;
+		vm_stack_trace();
+	}
 	if (getenv("XSYS4_STOP_ON_GAME_ERROR"))
 		vm_exit(1);
 	return sys_ref(text);
