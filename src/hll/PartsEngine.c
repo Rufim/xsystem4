@@ -1514,6 +1514,118 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_StopSwipe, void);
 // Purely diagnostic metadata — safe no-op for reaching the screen.
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_SetComment, int a, struct string *b);
 
+/*
+ * Имя SE «клик мимо» — глобальное (не по части) имя звука, который парт-движок
+ * играет, когда клик не попал ни в одну часть. Хранится по-настоящему, потому
+ * что у сеттера ЕСТЬ геттер (`GetClickMissSoundName`), то есть no-op отличим:
+ * `parts::detail::WaitForClick` ставит своё имя на время ожидания и обязано
+ * вернуть прежнее. Само воспроизведение здесь не появляется — движок не играет
+ * ни одного parts-звука (`Parts_SetSoundName`/`Parts_PlaySound` тоже no-op),
+ * это отдельный слой.
+ */
+static struct string *pe_click_miss_sound = NULL;
+
+static void PE_SetClickMissSoundName(struct string *name)
+{
+	if (pe_click_miss_sound)
+		free_string(pe_click_miss_sound);
+	pe_click_miss_sound = string_ref(name ? name : &EMPTY_STRING);
+}
+
+static struct string *pe_click_miss_sound_get(void)
+{
+	return string_ref(pe_click_miss_sound ? pe_click_miss_sound : &EMPTY_STRING);
+}
+
+static void PE_GetClickMissSoundName(struct string **out)
+{
+	if (*out)
+		free_string(*out);
+	*out = pe_click_miss_sound_get();
+}
+
+static struct string *PE_GetClickMissSoundName_ix(void)
+{
+	return pe_click_miss_sound_get();
+}
+
+/*
+ * ★СТРОКОВЫЕ ГЕТТЕРЫ СМЕНИЛИ ФОРМУ (тот же класс, что `GetGameVersionByText`
+ * в SystemService): v6/v7 объявляют `ret=0 (..., ref string out, ...)`, а
+ * Ixseal — `ret=12 (...)`, то есть строку ВОЗВРАТОМ. Линковка идёт по ИМЕНИ, а
+ * cif строится по .ain, поэтому C-функция с out-параметром получает мусорный
+ * указатель, пишет по нему и возвращает мусор → слот строки с `s = NULL` и SEGV
+ * в `string_ref(NULL)`, а НЕ понятная ошибка.
+ *
+ * Расхождение посчитано тулом (`ainliball <ain> <libno PartsEngine>` против
+ * C-сигнатур этого файла): у Dohna 81 функция с `ret=12`, из них движок реально
+ * экспортирует 13; 12 были в форме v7 (остальные 68 — либо `HLL_TODO_EXPORT`
+ * с `.fun = NULL`, то есть честная ошибка вместо SEGV, либо не экспортируются
+ * вовсе). Форма каждой сверена по трём .ain: Dohna `ret=12`, Tsumamigui 3 и
+ * Escalayer — `ret=0` с `ref string`.
+ *
+ * Гейт структурный: подмена в `_PreLink` только если .ain объявил возврат
+ * строкой (`return_type.data == AIN_STRING`), поэтому у v6/v7 остаётся прежняя
+ * форма с out-параметром.
+ */
+static struct string *PE_GetActivityPartsName_ix(struct string *act, int number)
+{
+	struct string *out = NULL;
+	PE_GetActivityPartsName(&out, act, number);
+	return out;
+}
+
+static struct string *PE_GetActivityEXText_ix(struct string *act)
+{
+	struct string *out = NULL;
+	PE_GetActivityEXText(act, &out);
+	return out;
+}
+
+static struct string *PE_GetMessageVariableString_ix(int index)
+{
+	struct string *out = NULL;
+	PE_GetMessageVariableString(index, &out);
+	return out;
+}
+
+static struct string *PE_Parts_GetSoundName_ix(int parts_no, int state)
+{
+	struct string *out = NULL;
+	PE_Parts_GetSoundName(parts_no, &out, state);
+	return out;
+}
+
+static struct string *PE_GetPartsCGName_ix(int parts_no, int state)
+{
+	// v7-форма НЕ пишет out, когда у состояния нет CG (и оставляет прежнее
+	// значение вызывающего); возвратной форме нужна пустая строка.
+	struct string *out = NULL;
+	PE_GetPartsCGName(parts_no, &out, state);
+	return out ? out : string_ref(&EMPTY_STRING);
+}
+
+// Заглушки-геттеры (у движка нет хранилища этих имён): пустая строка вместо
+// мусора. Смысл — тот же, что у прежней out-формы, менялась только форма.
+static struct string *PE_empty_string_ix(void)
+{
+	return string_ref(&EMPTY_STRING);
+}
+
+/*
+ * ЗЕРКАЛЬНЫЙ СЛУЧАЙ: `GetTextPartsText` реализован СРАЗУ в Ixseal-форме
+ * (`struct string *PE_GetTextPartsText(int, int)`), а v6/v7 объявляют её
+ * `ret=0 (ref string, int, int)` — значит для СТАРЫХ игр она была сломана тем
+ * же способом. Подставляем out-форму, когда .ain объявил возврат не строкой.
+ */
+static void PE_GetTextPartsText_v7(struct string **out, int parts_no, int state)
+{
+	struct string *s = PE_GetTextPartsText(parts_no, state);
+	if (*out)
+		free_string(*out);
+	*out = s;
+}
+
 static void PartsEngine_PreLink(void);
 
 HLL_LIBRARY(PartsEngine,
@@ -1808,6 +1920,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetThumbnailReductionSize, PE_SetThumbnailReductionSize),
 	    HLL_EXPORT(Parts_SetThumbnailMode, PE_SetThumbnailMode),
 	    HLL_EXPORT(GetClickNumber, PE_GetClickPartsNumber),
+	    HLL_EXPORT(SetClickMissSoundName, PE_SetClickMissSoundName),
+	    HLL_EXPORT(GetClickMissSoundName, PE_GetClickMissSoundName),
 	    HLL_EXPORT(StopSoundWithoutSystemSound, PartsEngine_StopSoundWithoutSystemSound),
 	    HLL_EXPORT(Parts_SetSoundName, PE_Parts_SetSoundName),
 	    HLL_EXPORT(Parts_GetSoundName, PE_Parts_GetSoundName),
@@ -2210,5 +2324,40 @@ static void PartsEngine_PreLink(void)
 	// (см. src/parts/message.c). SeekMessage объявлена только этим API.
 	if (get_fun(libno, "SeekMessage")) {
 		PE_set_message_empty_type_minus_one();
+	}
+
+	// Строковые геттеры: Ixseal отдаёт строку ВОЗВРАТОМ, v6/v7 — через
+	// out-параметр `ref string` (см. большой комментарий выше). Гейт — форма,
+	// объявленная в .ain, а не версия движка.
+	static const struct { const char *name; void *ix; } str_getters[] = {
+		{ "GetClickMissSoundName",  PE_GetClickMissSoundName_ix },
+		{ "GetActivityPartsName",   PE_GetActivityPartsName_ix },
+		{ "GetActivityEXText",      PE_GetActivityEXText_ix },
+		{ "GetMessageVariableString", PE_GetMessageVariableString_ix },
+		{ "Parts_GetSoundName",     PE_Parts_GetSoundName_ix },
+		{ "GetPartsCGName",         PE_GetPartsCGName_ix },
+		{ "Parts_GetPartsCGName",   PE_GetPartsCGName_ix },
+		{ "GetButtonCGName",        PE_empty_string_ix },
+		{ "GetButtonFlatName",      PE_empty_string_ix },
+		{ "GetButtonText",          PE_empty_string_ix },
+		{ "GetVScrollbarCGName",    PE_empty_string_ix },
+		{ "GetVScrollbarFlatName",  PE_empty_string_ix },
+		{ "GetHScrollbarCGName",    PE_empty_string_ix },
+		{ "GetHScrollbarFlatName",  PE_empty_string_ix },
+	};
+	for (unsigned i = 0; i < sizeof(str_getters) / sizeof(*str_getters); i++) {
+		fun = get_fun(libno, str_getters[i].name);
+		if (fun && fun->return_type.data == AIN_STRING) {
+			static_library_replace(&lib_PartsEngine, str_getters[i].name,
+					str_getters[i].ix);
+		}
+	}
+
+	// Зеркально: GetTextPartsText реализована в Ixseal-форме, поэтому старым
+	// играм нужна форма с out-параметром.
+	fun = get_fun(libno, "GetTextPartsText");
+	if (fun && fun->return_type.data != AIN_STRING) {
+		static_library_replace(&lib_PartsEngine, "GetTextPartsText",
+				PE_GetTextPartsText_v7);
 	}
 }
