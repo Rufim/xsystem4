@@ -850,6 +850,44 @@ static int Array_ix_LowerBound(struct page **self, union vm_value *key)
 	return lo;
 }
 
+/*
+ * `ShallowCopy(self) -> array` — НОВЫЙ контейнер с ТЕМИ ЖЕ элементами.
+ *
+ * Именно поверхностная: объектные элементы не клонируются, у них лишь растёт
+ * счётчик ссылок. Это отличает функцию от соседней `Duplicate` (тот же приём,
+ * что `Unique` против `UniqueSorted`), и подтверждается сайтом
+ * `PlayerCollection@GetAllInstances` @0x5b4cfa — он отдаёт наружу список тех же
+ * самых объектов-игроков, по которым игра потом сверяет тождество. Через
+ * copy_page/vm_copy тут идти нельзя: для элемента AIN_STRUCT они делают ГЛУБОКУЮ
+ * копию страницы, т.е. вернули бы клонов.
+ *
+ * Возврат типа `array` (ret=79) отдаётся ГОТОВЫМ heap-слотом, а не указателем на
+ * страницу: ffi для таких типов кладёт значение на стек как есть, и ту же
+ * конвенцию уже использует `String.Split`. Слотом владеет вызывающий.
+ */
+static int Array_ix_ShallowCopy(struct page **self)
+{
+	int slot = heap_alloc_slot(VM_PAGE);
+	if (!self || !*self) {
+		heap_set_page(slot, NULL);
+		return slot;
+	}
+	struct page *src = *self;
+	struct page *dst = alloc_page(ARRAY_PAGE, src->a_type, src->nr_vars);
+	dst->array = src->array;
+	int slots = array_elem_slots(src);
+	bool obj = ix_elem_is_object(src->a_type);
+	for (int i = 0; i < src->nr_vars; i++) {
+		dst->values[i] = src->values[i];
+		// У 2-слотового элемента (wrap<интерфейс>) владеет только НИЖНИЙ слот —
+		// верхний это база интерфейса, обычное число.
+		if (obj && i % slots == 0 && src->values[i].i != -1)
+			heap_ref(src->values[i].i);
+	}
+	heap_set_page(slot, dst);
+	return slot;
+}
+
 static struct page *Array_ix_DescSort(struct page **self)
 {
 	if (self) {
@@ -1016,6 +1054,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Find, Array_ix_Find),
 	    HLL_EXPORT(FindLast, Array_ix_FindLast),
 	    HLL_EXPORT(IsExist, Array_ix_IsExist),
+	    HLL_EXPORT(ShallowCopy, Array_ix_ShallowCopy),
 	    HLL_EXPORT(BinarySearch, Array_ix_BinarySearch),
 	    HLL_EXPORT(LowerBound, Array_ix_LowerBound),
 	    HLL_EXPORT(Sort, Array_ix_Sort),

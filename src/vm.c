@@ -3183,6 +3183,30 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case DG_MINUSA: {
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			// Ixseal: приёмник — такая же ДВУСЛОТОВАЯ ссылка-lvalue
+			// (heap-слот, номер члена), как у DG_PLUSA выше. Сайт
+			// `parts::detail::RemovePartsUpdateEvent` @0x2ead24:
+			//   PUSHLOCALPAGE; PUSH 4; X_REF 1   <- страница `data`
+			//   PUSH 1                           <- номер члена (делегат), БЕЗ REF
+			//   ...вычислить вычитаемый делегат...; A_REF
+			//   DG_MINUSA; DELETE
+			// Легаси-ветка снимала номер члена как heap-индекс и звала
+			// heap_get_delegate_page(1) → `Not a delegate page: 1`.
+			int minus_i = stack_pop().i;
+			union vm_value *dst = stack_pop_var();
+			struct page *minus = heap_get_delegate_page(minus_i);
+			// Пустой приёмник (делегату ещё не назначали обработчиков) —
+			// вычитать не из чего, оставляем как есть.
+			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
+			    heap[dst->i].page->type == DELEGATE_PAGE) {
+				heap_set_page(dst->i, delegate_minusa(heap[dst->i].page, minus));
+			}
+			// `dg -= x` — выражение: возвращаем вычитаемое (сайт освобождает
+			// его следующим DELETE), ровно как у DG_PLUSA.
+			stack_push(minus_i);
+			break;
+		}
 		int minus_i = stack_pop().i;
 		int dst_i = stack_pop().i;
 		struct page *minus = heap_get_delegate_page(minus_i);
