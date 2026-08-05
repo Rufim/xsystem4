@@ -505,6 +505,17 @@ HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, IsExistSystemMessage);
 static void SystemService_RestrainScreensaver(void) { }
 
 /*
+ * Индикатор «подождите» рантайма (`_system::detail::BeginWaitMessage` даёт 1,
+ * `EndWaitMessage` — 0). Своего индикатора у движка нет, а прочитать состояние
+ * игра не может — геттера у функции нет во всей библиотеке, — так что для
+ * игрового кода no-op неотличим от настоящего показа.
+ */
+static void SystemService_ShowWaitMessage(bool show)
+{
+	(void)show;
+}
+
+/*
  * Резервные копии сейвов (Ixseal). Игра лишь РЕГИСТРИРУЕТ имена файлов
  * (`AddBackupSaveFileName`) и просит скопировать их (`BackupSaveFile`) — ни
  * геттера, ни возвращаемого значения у этой пары нет, так что имена копий и
@@ -659,6 +670,7 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(IsExistSystemMessage, SystemService_IsExistSystemMessage),
 	    HLL_TODO_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
 	    HLL_EXPORT(RestrainScreensaver, SystemService_RestrainScreensaver),
+	    HLL_EXPORT(ShowWaitMessage, SystemService_ShowWaitMessage),
 	    HLL_EXPORT(AddBackupSaveFileName, SystemService_AddBackupSaveFileName),
 	    HLL_EXPORT(BackupSaveFile, SystemService_BackupSaveFile),
 	    HLL_TODO_EXPORT(Debug_GetUseVideoMemorySize, SystemService_Debug_GetUseVideoMemorySize),
