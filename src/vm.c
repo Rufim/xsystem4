@@ -443,81 +443,13 @@ static int alloc_scenario_page(const char *fname)
 	slot = heap_alloc_slot(VM_PAGE);
 	heap_set_page(slot, alloc_page(LOCAL_PAGE, fno, f->nr_vars));
 	for (int i = 0; i < f->nr_vars; i++) {
-		heap[slot].page->values[i] = variable_initval(f->vars[i].type.data);
+		heap[slot].page->values[i] = variable_initval_var(heap[slot].page, i, f->vars[i].type.data);
 	}
 	init_option_vars(heap[slot].page, f->vars, f->nr_vars, 0);
 	return slot;
 }
 
 void vm_optrace_dump(void);
-
-// Map an element data type to the legacy typed-array data type, so Ixseal's
-// generic arrays (AIN_ARRAY, element type carried in ain_type.array_type) can be
-// stored/allocated with the existing array_* helpers, which key off a_type.
-static enum ain_data_type array_type_from_elem(enum ain_data_type et)
-{
-	switch (et) {
-	case AIN_INT:       return AIN_ARRAY_INT;
-	case AIN_FLOAT:     return AIN_ARRAY_FLOAT;
-	case AIN_STRING:    return AIN_ARRAY_STRING;
-	case AIN_STRUCT:    return AIN_ARRAY_STRUCT;
-	case AIN_BOOL:      return AIN_ARRAY_BOOL;
-	case AIN_LONG_INT:  return AIN_ARRAY_LONG_INT;
-	case AIN_FUNC_TYPE: return AIN_ARRAY_FUNC_TYPE;
-	case AIN_DELEGATE:  return AIN_ARRAY_DELEGATE;
-	default:            return AIN_ARRAY_INT;
-	}
-}
-
-// Resolve the (legacy) array data type + struct type + rank for a variable slot,
-// handling both legacy typed arrays and Ixseal generic arrays.
-static enum ain_data_type resolve_array_type(struct page *container, int varno, int *struct_type, int *rank)
-{
-	struct ain_type *vt = NULL;
-	switch (container->type) {
-	case GLOBAL_PAGE: vt = &ain->globals[varno].type; break;
-	case LOCAL_PAGE:  vt = &ain->functions[container->index].vars[varno].type; break;
-	case STRUCT_PAGE: vt = &ain->structures[container->index].members[varno].type; break;
-	default: break;
-	}
-	if (!vt) { *struct_type = 0; *rank = 1; return AIN_ARRAY_INT; }
-	*rank = vt->rank > 0 ? vt->rank : 1;
-	if (vt->data == AIN_ARRAY && vt->array_type) {
-		*struct_type = vt->array_type->struc;
-		enum ain_data_type et = vt->array_type->data;
-		// Ixseal-контейнер часто хранит тип элемента как WRAP<T> (AIN_WRAP)/
-		// OPTION/IFACE_WRAP. Для обёртки над структурой (struc>=0) это struct-
-		// массив — иначе array_type_from_elem(WRAP) уходил в дефолт AIN_ARRAY_INT,
-		// и struct-пул (напр. CPartsMessageManager.m_functionSetList = WRAP<struct328>)
-		// создавался как int-массив → слоты структур хранились как сырые int без
-		// владения → преждевременный free и use-after-free (389/3).
-		// ОДНАКО ссылка на ИНТЕРФЕЙС — это «толстый указатель» из ДВУХ слотов
-		// (объект, база интерфейса), и элемент такого массива занимает два
-		// слота страницы. Так выглядят ОБА интерфейсных типа: `wrap<интерфейс>`
-		// (AIN_IFACE_WRAP, 100) и `ref <интерфейс>` (AIN_IFACE, 89) — у обоих
-		// type_slots()==2. Такой массив помечаем этим же типом элемента: по
-		// маркеру array_iface_pair_type() шаг равен 2 (см. page.c). Обёртку над
-		// обычной структурой (wrap<struct>, внутренний тип AIN_STRUCT) это не
-		// затрагивает — она остаётся одним heap-слотом.
-		//
-		// Тип 89 сюда попадал через `array_type_from_elem` в дефолт
-		// AIN_ARRAY_INT: `array<ref Motion::IParam>` создавался int-массивом с
-		// шагом 1 и БЕЗ владения элементами. Отсюда `Array.Where/First/Any` над
-		// такими массивами передавали предикату 1 слот вместо 2, арность не
-		// совпадала и лямбда не вызывалась вовсе (вся Motion-аналитика Dohna
-		// «ничего не находила»).
-		if ((et == AIN_WRAP || et == AIN_OPTION) && vt->array_type->array_type
-				&& array_iface_pair_type(vt->array_type->array_type->data))
-			return vt->array_type->array_type->data;
-		if (array_iface_pair_type(et))
-			return et;
-		if (et == AIN_WRAP || et == AIN_OPTION)
-			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
-		return array_type_from_elem(et);
-	}
-	*struct_type = vt->struc;
-	return vt->data;
-}
 
 static void set_struct_page(int slot)
 {
@@ -595,7 +527,7 @@ static int _function_call(int fno, int return_address)
 	};
 	// initialize local variables
 	for (int i = f->nr_args; i < f->nr_vars; i++) {
-		heap[slot].page->values[i] = variable_initval(f->vars[i].type.data);
+		heap[slot].page->values[i] = variable_initval_var(heap[slot].page, i, f->vars[i].type.data);
 		if (ain->version <= 1 && f->vars[i].type.data == AIN_STRUCT) {
 			create_struct(f->vars[i].type.struc, &heap[slot].page->values[i]);
 		}
@@ -1425,9 +1357,14 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int slot = heap_alloc_slot(VM_PAGE);
 		if (container && page_index >= 0 && page_index < container->nr_vars) {
 			int struct_type = 0, rank = 1;
-			enum ain_data_type dt = resolve_array_type(container, page_index, &struct_type, &rank);
+			bool ref_elem = false;
+			enum ain_data_type dt = array_resolve_var_type(container, page_index, &struct_type,
+								       &rank, &ref_elem);
 			union vm_value dim = { .i = size > 0 ? size : 0 };
-			heap_set_page(slot, alloc_array(rank, &dim, dt, struct_type, true));
+			// Элемент, объявленный ССЫЛКОЙ (`array<ref Структура>`), пуст до
+			// присваивания — предзаполнять его сконструированными объектами
+			// нельзя (в Ixseal объекты конструирует ИГРА, см. ПРОДВИЖЕНИЕ 14).
+			heap_set_page(slot, alloc_array(rank, &dim, dt, struct_type, !ref_elem));
 			container->values[page_index].i = slot;
 		} else {
 			heap_set_page(slot, NULL);
@@ -3454,7 +3391,7 @@ int vm_execute_ain(struct ain *program)
 			//      constructors.
 			heap[0].page->values[i].i = alloc_struct(ain->globals[i].type.struc);
 		} else {
-			heap[0].page->values[i] = variable_initval(ain->globals[i].type.data);
+			heap[0].page->values[i] = variable_initval_var(heap[0].page, i, ain->globals[i].type.data);
 		}
 	}
 	init_option_vars(heap[0].page, ain->globals, ain->nr_globals, 0);

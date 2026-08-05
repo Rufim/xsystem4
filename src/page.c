@@ -168,6 +168,142 @@ void init_option_vars(struct page *page, struct ain_variable *vars, int nr_vars,
 	}
 }
 
+// Map an element data type to the legacy typed-array data type, so Ixseal's
+// generic arrays (AIN_ARRAY, element type carried in ain_type.array_type) can be
+// stored/allocated with the existing array_* helpers, which key off a_type.
+static enum ain_data_type array_type_from_elem(enum ain_data_type et)
+{
+	switch (et) {
+	case AIN_INT:       return AIN_ARRAY_INT;
+	case AIN_FLOAT:     return AIN_ARRAY_FLOAT;
+	case AIN_STRING:    return AIN_ARRAY_STRING;
+	case AIN_STRUCT:    return AIN_ARRAY_STRUCT;
+	case AIN_BOOL:      return AIN_ARRAY_BOOL;
+	case AIN_LONG_INT:  return AIN_ARRAY_LONG_INT;
+	case AIN_FUNC_TYPE: return AIN_ARRAY_FUNC_TYPE;
+	case AIN_DELEGATE:  return AIN_ARRAY_DELEGATE;
+	default:            return AIN_ARRAY_INT;
+	}
+}
+
+// Resolve the (legacy) array data type + struct type + rank for a variable slot,
+// handling both legacy typed arrays and Ixseal generic arrays.
+// `ref_elem` (можно NULL) сообщает, что элемент объявлен ССЫЛКОЙ: такой элемент
+// по определению пуст до присваивания, и предзаполнять его объектами нельзя.
+enum ain_data_type array_resolve_var_type(struct page *container, int varno, int *struct_type,
+					  int *rank, bool *ref_elem)
+{
+	if (ref_elem)
+		*ref_elem = false;
+	struct ain_type *vt = NULL;
+	switch (container->type) {
+	case GLOBAL_PAGE: vt = &ain->globals[varno].type; break;
+	case LOCAL_PAGE:  vt = &ain->functions[container->index].vars[varno].type; break;
+	case STRUCT_PAGE: vt = &ain->structures[container->index].members[varno].type; break;
+	default: break;
+	}
+	if (!vt) { *struct_type = 0; *rank = 1; return AIN_ARRAY_INT; }
+	*rank = vt->rank > 0 ? vt->rank : 1;
+	if (vt->data == AIN_ARRAY && vt->array_type) {
+		*struct_type = vt->array_type->struc;
+		enum ain_data_type et = vt->array_type->data;
+		// Ixseal-контейнер часто хранит тип элемента как WRAP<T> (AIN_WRAP)/
+		// OPTION/IFACE_WRAP. Для обёртки над структурой (struc>=0) это struct-
+		// массив — иначе array_type_from_elem(WRAP) уходил в дефолт AIN_ARRAY_INT,
+		// и struct-пул (напр. CPartsMessageManager.m_functionSetList = WRAP<struct328>)
+		// создавался как int-массив → слоты структур хранились как сырые int без
+		// владения → преждевременный free и use-after-free (389/3).
+		// ОДНАКО ссылка на ИНТЕРФЕЙС — это «толстый указатель» из ДВУХ слотов
+		// (объект, база интерфейса), и элемент такого массива занимает два
+		// слота страницы. Так выглядят ОБА интерфейсных типа: `wrap<интерфейс>`
+		// (AIN_IFACE_WRAP, 100) и `ref <интерфейс>` (AIN_IFACE, 89) — у обоих
+		// type_slots()==2. Такой массив помечаем этим же типом элемента: по
+		// маркеру array_iface_pair_type() шаг равен 2 (см. page.c). Обёртку над
+		// обычной структурой (wrap<struct>, внутренний тип AIN_STRUCT) это не
+		// затрагивает — она остаётся одним heap-слотом.
+		//
+		// Тип 89 сюда попадал через `array_type_from_elem` в дефолт
+		// AIN_ARRAY_INT: `array<ref Motion::IParam>` создавался int-массивом с
+		// шагом 1 и БЕЗ владения элементами. Отсюда `Array.Where/First/Any` над
+		// такими массивами передавали предикату 1 слот вместо 2, арность не
+		// совпадала и лямбда не вызывалась вовсе (вся Motion-аналитика Dohna
+		// «ничего не находила»).
+		if ((et == AIN_WRAP || et == AIN_OPTION) && vt->array_type->array_type
+				&& array_iface_pair_type(vt->array_type->array_type->data))
+			return vt->array_type->array_type->data;
+		if (array_iface_pair_type(et))
+			return et;
+		if (et == AIN_WRAP || et == AIN_OPTION)
+			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
+		// `array<ref Структура>` (элемент AIN_REF_STRUCT, 21 — 208 объявлений
+		// у Dohna, ни одного у v6/v7). Ссылка на СТРУКТУРУ, в отличие от ссылки
+		// на интерфейс, — ОДИН слот: у локалов `ref <структура>` компилятор не
+		// кладёт филлер <void> (напр. var[32]/var[33] в
+		// `activity::detail::AddUserComponent`), тогда как у 89/100 он есть.
+		// Значит хранится она ровно как элемент `array<структура>` — heap-слотом
+		// страницы, которым контейнер ВЛАДЕЕТ. Уходя в дефолт AIN_ARRAY_INT,
+		// такой контейнер держал слоты сырыми int'ами без владения:
+		// `activity::detail::AddUserComponent` делал `NEW 14; Array.PushBack;
+		// DELETE temp` — PushBack не брал ссылку, DELETE уносил объект, а
+		// следующий `Array.Last` отдавал счётную ссылку на освобождённый слот
+		// (тот успевал переиспользоваться под строку) → `double free ... VM_STRING`.
+		if (et == AIN_REF_STRUCT) {
+			if (ref_elem)
+				*ref_elem = true;
+			return AIN_ARRAY_STRUCT;
+		}
+		// Вложенный generic-массив (`array<array<T>>`, 5 объявлений у Dohna):
+		// легаси-a_type для «массив массивов» не существует, форма элемента по
+		// байткоду не установлена — оставляем прежнее поведение, но громко.
+		if (et == AIN_ARRAY) {
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				WARNING("array<array<...>>: форма элемента generic-контейнера не "
+					"установлена, элемент трактуется как int (varno=%d)", varno);
+			}
+		}
+		return array_type_from_elem(et);
+	}
+	*struct_type = vt->struc;
+	return vt->data;
+}
+
+/*
+ * Инициализация переменной, для которой известен её СЛОТ в контейнере
+ * (глобал / локал / член структуры). От variable_initval() отличается ровно
+ * одним: generic-контейнер Ixseal (AIN_ARRAY, 79) рождается ТИПИЗИРОВАННОЙ
+ * пустой страницей, а не heap-слотом с NULL-страницей.
+ *
+ * Тип элемента объявлен в .ain (`ain_type.array_type`, напр.
+ * `g[22] activity::detail::g_UserComponentManagerList type=79 struc=14`), но
+ * variable_initval() получает только enum-тип и терял его: страница
+ * материализовывалась лишь при первом Array.PushBack — с дефолтом
+ * AIN_ARRAY_INT. Объектный элемент ложился в контейнер сырым int'ом, БЕЗ
+ * владения, и первый же DELETE временной ссылки игры уносил только что
+ * добавленный объект. Так падал `activity::detail::AddUserComponent`
+ * (`NEW 14; Array.PushBack; DELETE temp; Array.Last`): Last отдавал
+ * счётную ссылку на УЖЕ освобождённый слот, тот успевал переиспользоваться
+ * под строку — и DELETE @0x28BF8 давал `double free of slot N (VM_STRING)`.
+ *
+ * Инвариант «пустой generic-контейнер — валидная 0-элементная ТИПИЗИРОВАННАЯ
+ * страница» уже соблюдают Array_PopBack/ix_resize (см. src/hll/Array.c);
+ * здесь он распространён на РОЖДЕНИЕ переменной. Гейт структурный: тип
+ * AIN_ARRAY(79) есть только у Ixseal — легаси-массивы (AIN_ARRAY_TYPE) идут
+ * прежней веткой и по-прежнему создаются пустым слотом под A_ALLOC.
+ */
+union vm_value variable_initval_var(struct page *container, int varno, enum ain_data_type type)
+{
+	if (type != AIN_ARRAY || !container)
+		return variable_initval(type);
+	int struct_type = 0, rank = 1;
+	enum ain_data_type dt = array_resolve_var_type(container, varno, &struct_type, &rank, NULL);
+	union vm_value dim = { .i = 0 };
+	int slot = heap_alloc_slot(VM_PAGE);
+	heap_set_page(slot, alloc_array(rank, &dim, dt, struct_type, false));
+	return (union vm_value) { .i = slot };
+}
+
 void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 {
 	switch (type) {
@@ -381,7 +517,7 @@ int alloc_struct(int no)
 			heap[slot].page->values[i].i = ix
 				? -1 : alloc_struct(s->members[i].type.struc);
 		} else {
-			heap[slot].page->values[i] = variable_initval(s->members[i].type.data);
+			heap[slot].page->values[i] = variable_initval_var(heap[slot].page, i, s->members[i].type.data);
 		}
 	}
 	init_option_vars(heap[slot].page, s->members, s->nr_members, 0);
