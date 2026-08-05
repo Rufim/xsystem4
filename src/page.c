@@ -17,6 +17,7 @@
 #include <string.h>
 #include "system4.h"
 #include "system4/ain.h"
+#include "system4/instructions.h"
 #include "system4/string.h"
 #include "vm.h"
 #include "vm/heap.h"
@@ -347,14 +348,38 @@ struct page *copy_page(struct page *src)
 	return dst;
 }
 
+/*
+ * Ixseal (System 4 v11+) конструирует struct-ЧЛЕНЫ сам: у каждой структуры есть
+ * функция-инициализатор членов `<Имя>@2`, которую первым делом вызывает её
+ * конструктор, и для члена struct-типа она выполняет `DELETE old; NEW <s>;
+ * X_ASSIGN 1` (напр. `message::detail::CMessageTextView@2` @0x9db15a строит
+ * `m_AutoModeTimer`=NEW 257 и `m_MessageKeyControl`=NEW 258).
+ *
+ * Поэтому легаси-рекурсия «выделить члены в alloc_struct, сконструировать их в
+ * init_struct» здесь лишняя и вредная: `DELETE old` уносил предварительно
+ * выделенную страницу члена и запускал её ДЕСТРУКТОР на объекте, чей конструктор
+ * никогда не работал (`CASTimer@1` → `ReleaseHandle(handle=0)` → игровой ассерт
+ * «CASTimerManager - Bundle Error»). Ровно та же причина, что у struct-ГЛОБАЛОВ
+ * (см. vm_execute_ain). Легаси-игр гейт не касается: у них `@2`-функций нет и
+ * члены обязан строить движок.
+ */
+static bool ix_members_self_ctor(void)
+{
+	return instructions[CALLMETHOD].args[0] == T_INT;
+}
+
 int alloc_struct(int no)
 {
 	struct ain_struct *s = &ain->structures[no];
 	int slot = heap_alloc_slot(VM_PAGE);
 	heap_set_page(slot, alloc_page(STRUCT_PAGE, no, s->nr_members));
+	bool ix = ix_members_self_ctor();
 	for (int i = 0; i < s->nr_members; i++) {
 		if (s->members[i].type.data == AIN_STRUCT) {
-			heap[slot].page->values[i].i = alloc_struct(s->members[i].type.struc);
+			// Ixseal: объекта ещё нет — null-маркер -1 (DELETE его игнорирует;
+			// ноль означал бы heap-слот 0, т.е. глобальную страницу).
+			heap[slot].page->values[i].i = ix
+				? -1 : alloc_struct(s->members[i].type.struc);
 		} else {
 			heap[slot].page->values[i] = variable_initval(s->members[i].type.data);
 		}
@@ -366,9 +391,11 @@ int alloc_struct(int no)
 void init_struct(int no, int slot)
 {
 	struct ain_struct *s = &ain->structures[no];
-	for (int i = 0; i < s->nr_members; i++) {
-		if (s->members[i].type.data == AIN_STRUCT) {
-			init_struct(s->members[i].type.struc, heap[slot].page->values[i].i);
+	if (!ix_members_self_ctor()) {
+		for (int i = 0; i < s->nr_members; i++) {
+			if (s->members[i].type.data == AIN_STRUCT) {
+				init_struct(s->members[i].type.struc, heap[slot].page->values[i].i);
+			}
 		}
 	}
 	if (s->constructor > 0) {
