@@ -1419,9 +1419,45 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case X_TO_STR: {
-		// TODO: пока не реализован — временный совместимый стаб (как было).
-		stack_pop();
-		stack_push(struct_page_slot());
+		/*
+		 * Неявное приведение к строке (`"tag" + (i + 1)`). Снимает ОДИН слот
+		 * значения и кладёт слот строки; ОПЕРАНД — тип ИСТОЧНИКА. У Dohna
+		 * встречаются ровно три: 10=int (460 сайтов), 11=float (101), 47=bool
+		 * (14) — сверено `XSCAN_MAX=99999 xscan <ain> X_TO_STR`.
+		 *
+		 * Точность у float на стек НЕ кладётся (в отличие от легаси FTOS):
+		 * System40.exe в таком случае пушит -1, а это по libsys4 значит 6
+		 * знаков после запятой — та же ветка, что у старых игр.
+		 *
+		 * bool хранится int'ом, и формат («1» против «true») игра прочитать
+		 * обратно не может: все 14 bool-сайтов — это `@ToString`/лог
+		 * (напр. `"apply result:" + m_applied` → system.Output в
+		 * `ActionFrameController@CatchUpFrame`), никто их не парсит.
+		 *
+		 * Прежний стаб отдавал слот СТРАНИЦЫ структуры — следующий S_ADD читал
+		 * его как строку и падал (`Invalid string index` в `StandNameTags@0`).
+		 */
+		int src_type = get_argument(0);
+		union vm_value v = stack_pop();
+		switch (src_type) {
+		case AIN_FLOAT:
+			stack_push_string(float_to_string(v.f, -1));
+			break;
+		case AIN_INT:
+		case AIN_BOOL:
+			stack_push_string(integer_to_string(v.i));
+			break;
+		default: {
+			static bool xtostr_logged = false;
+			if (!xtostr_logged) {
+				xtostr_logged = true;
+				WARNING("X_TO_STR: тип источника %d не установлен, "
+					"приводим как int", src_type);
+			}
+			stack_push_string(integer_to_string(v.i));
+			break;
+		}
+		}
 		break;
 	}
 	case X_OP_SET: {

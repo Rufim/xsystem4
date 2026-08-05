@@ -14,6 +14,11 @@
  * along with this program; if not, see <http://gnu.org/licenses/>.
  */
 
+#include <limits.h>
+#include <string.h>
+
+#include "system4/string.h"
+
 #include "vm.h"
 #include "hll.h"
 #include "vm/page.h"
@@ -745,6 +750,106 @@ static struct page *Array_ix_Sort(struct page **self, union vm_value *fn)
 	return NULL;
 }
 
+/*
+ * Сортированные операции: BinarySearch / LowerBound.
+ *
+ * Перегрузка «с лямбдой» — это НЕ `less(a, b)`, а ТРЁХЗНАЧНЫЙ компаратор от
+ * ОДНОГО элемента: ключ лямбда ЗАХВАТЫВАЕТ, среди аргументов его нет. Форма
+ * снята с байткода: `IdArray<string, Dungeon>@FindIndex` (@0x9ad76a) строит
+ * `int(ref Dungeon obj) => this.CompareFunc(obj, <захваченный id>)`, а сама
+ * `CompareFunc` (@0x9ad802) возвращает -1 по `S_LT`, +1 по `S_GT`, иначе 0.
+ * Сигнатура лямбды в .ain это подтверждает: nr_args=1, возврат int (10).
+ * Знак — «элемент относительно ключа», как у strcmp.
+ */
+static int ix_cmp3(union vm_value *fn, struct page *a, int index)
+{
+	int slots = array_elem_slots(a);
+	int argc = vm_hll_func_nr_args(fn[1].i);
+	if (argc > slots)
+		argc = slots;
+	return vm_call_hll_func(fn, &a->values[index * slots], argc).i;
+}
+
+// Сравнение элемента с ключом-ЗНАЧЕНИЕМ (перегрузки `(self, значение)`).
+// INT_MIN = порядок для этого типа элемента не установлен.
+static int ix_value_cmp(struct page *a, int index, union vm_value *key)
+{
+	switch (array_type(a->a_type)) {
+	case AIN_INT:
+	case AIN_BOOL:
+	case AIN_LONG_INT:
+		return (a->values[index].i > key->i) - (a->values[index].i < key->i);
+	case AIN_FLOAT:
+		return (a->values[index].f > key->f) - (a->values[index].f < key->f);
+	case AIN_STRING:
+		return strcmp(heap_get_string(a->values[index].i)->text,
+			      heap_get_string(key->i)->text);
+	default: {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			WARNING("Array.LowerBound/BinarySearch по ЗНАЧЕНИЮ: порядок для "
+				"элемента типа %d не установлен", array_type(a->a_type));
+		}
+		return INT_MIN;
+	}
+	}
+}
+
+// Индекс совпавшего элемента (компаратор вернул 0), иначе -1.
+static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
+{
+	if (!self || !*self || !key)
+		return -1;
+	int n = array_numof(*self, 1);
+	// Перегрузка «по значению» (fn54) в Dohna не встречается ни разу, поэтому
+	// упорядоченность массива для неё не доказана: ищем равенство перебором —
+	// на отсортированном массиве ответ тот же, на неотсортированном корректнее.
+	if (!ix_arg_is_func(1))
+		return array_find(*self, 0, n, *key, 0);
+	int lo = 0, hi = n - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		// Лямбда может перевыделить страницу — сверяемся каждый шаг.
+		if (!*self || mid >= array_numof(*self, 1))
+			return -1;
+		int c = ix_cmp3(key, *self, mid);
+		if (c == 0)
+			return mid;
+		if (c < 0)
+			lo = mid + 1;   // элемент МЕНЬШЕ ключа → искать правее
+		else
+			hi = mid - 1;
+	}
+	return -1;
+}
+
+// Первый индекс, где элемент уже НЕ меньше ключа (std::lower_bound); `n`, если
+// такого нет. Сайт `resources::detail::ResourceInfoCollection@Add` (@0x156124)
+// использует результат прямо как позицию для последующего `Array.Insert`, т.е.
+// «не найдено» обязано означать «в конец».
+static int Array_ix_LowerBound(struct page **self, union vm_value *key)
+{
+	if (!self || !*self || !key)
+		return 0;
+	int n = array_numof(*self, 1);
+	bool by_func = ix_arg_is_func(1);
+	int lo = 0, hi = n;
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (!*self || mid >= array_numof(*self, 1))
+			break;
+		int c = by_func ? ix_cmp3(key, *self, mid) : ix_value_cmp(*self, mid, key);
+		if (c == INT_MIN)
+			return n;
+		if (c < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 static struct page *Array_ix_DescSort(struct page **self)
 {
 	if (self) {
@@ -911,6 +1016,8 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Find, Array_ix_Find),
 	    HLL_EXPORT(FindLast, Array_ix_FindLast),
 	    HLL_EXPORT(IsExist, Array_ix_IsExist),
+	    HLL_EXPORT(BinarySearch, Array_ix_BinarySearch),
+	    HLL_EXPORT(LowerBound, Array_ix_LowerBound),
 	    HLL_EXPORT(Sort, Array_ix_Sort),
 	    HLL_EXPORT(AscSort, Array_ix_Sort),
 	    HLL_EXPORT(QuickSort, Array_ix_Sort),

@@ -160,6 +160,18 @@ static void SystemService_GetGameName(struct string **game_name)
 	*game_name = cstr_to_string(config.game_name);
 }
 
+// Ixseal-формы: в v14 `GetGameName`/`GetGameFolderPath` объявлены `ret=12 ()`,
+// т.е. строка — ВОЗВРАТ, а не out-параметр (у v6/v7 out-параметр). Линковка идёт
+// по имени, cif строится по .ain, поэтому v7-функция получала мусорный
+// указатель в первом регистре и ПИСАЛА по нему, а возвращала мусор: слот строки
+// оказывался с `s = NULL`, и первый же `A_REF` падал в `string_ref(NULL)`
+// (`ExtableFormatLoader@Load` @0x5807f6). Тот же класс, что у
+// GetGameVersionByText (см. выше). Подмена — в _PreLink по nr_arguments == 0.
+static struct string *SystemService_GetGameName_ix(void)
+{
+	return cstr_to_string(config.game_name);
+}
+
 HLL_WARN_UNIMPLEMENTED(false, bool, SystemService, AddURLMenu, struct string *title, struct string *url);
 
 static bool SystemService_IsFullScreen(void)
@@ -402,6 +414,15 @@ void SystemService_GetGameFolderPath(struct string **folder_path)
 	char *sjis = utf2sjis(config.game_dir, 0);
 	*folder_path = make_string(sjis, strlen(sjis));
 	free(sjis);
+}
+
+// Ixseal-форма (см. SystemService_GetGameName_ix).
+static struct string *SystemService_GetGameFolderPath_ix(void)
+{
+	char *sjis = utf2sjis(config.game_dir, 0);
+	struct string *s = make_string(sjis, strlen(sjis));
+	free(sjis);
+	return s;
 }
 
 static void SystemService_GetTime(int *hour, int *min, int *sec)
@@ -705,5 +726,17 @@ static void SystemService_PreLink(void)
 	if (fun && fun->nr_arguments == 0) {
 		static_library_replace(&lib_SystemService, "GetGameVersionByText",
 				SystemService_GetGameVersionByText_ix);
+	}
+
+	// Тот же сдвиг формы у остальных строковых геттеров без аргументов.
+	fun = get_fun(libno, "GetGameName");
+	if (fun && fun->nr_arguments == 0) {
+		static_library_replace(&lib_SystemService, "GetGameName",
+				SystemService_GetGameName_ix);
+	}
+	fun = get_fun(libno, "GetGameFolderPath");
+	if (fun && fun->nr_arguments == 0) {
+		static_library_replace(&lib_SystemService, "GetGameFolderPath",
+				SystemService_GetGameFolderPath_ix);
 	}
 }
