@@ -1892,9 +1892,6 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearChild, int a);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, NumofChild, int a);
 HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChild, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChildIndex, int a, int b);
-// Ixseal (Healing Touch/Dohna): SetEventID(parts, ?, event_id) — привязка id
-// события ввода к части; для достижения экрана безвредный no-op.
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetEventID, int a, int b, int c);
 // Parts_StopSwipe() — отменяет свайп-инерцию. Зовётся первым в
 // CBackLogView@MouseWheelEvent (и swipe-обработчиках). Свайп-инерцию не
 // моделируем, поэтому no-op; без него колесо в бэклоге падало в REPL.
@@ -2376,7 +2373,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(NumofChild, PartsEngine_NumofChild),
 	    HLL_EXPORT(GetChild, PartsEngine_GetChild),
 	    HLL_EXPORT(GetChildIndex, PartsEngine_GetChildIndex),
-	    HLL_EXPORT(SetEventID, PartsEngine_SetEventID),
+	    HLL_EXPORT(SetEventID, PE_SetEventID),
 	    HLL_EXPORT(Parts_StopSwipe, PartsEngine_Parts_StopSwipe),
 	    HLL_EXPORT(Parts_SetComment, PartsEngine_Parts_SetComment),
 	    HLL_EXPORT(RemoveController, PE_RemoveController),
@@ -2395,6 +2392,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(PopMessage, PE_PopMessage),
 	    HLL_EXPORT(GetMessagePartsNumber, PE_GetMessagePartsNumber),
 	    HLL_EXPORT(GetMessageDelegateIndex, PE_GetMessageDelegateIndex),
+	    HLL_EXPORT(GetMessageUniqueID, PE_GetMessageUniqueID),
 	    HLL_EXPORT(GetDelegateIndex, PE_GetDelegateIndex),
 	    HLL_EXPORT(GetMessageType, PE_GetMessageType),
 	    HLL_EXPORT(GetMessageVariableCount, PE_GetMessageVariableCount),
@@ -2770,10 +2768,12 @@ static void PartsEngine_PreLink(void)
 	if (get_fun(libno, "AddController")) {
 		PE_enable_multi_controller();
 	}
-	// В новом message-API «сообщений больше нет» = GetMessageType() == -1, а не 0
-	// (см. src/parts/message.c). SeekMessage объявлена только этим API.
+	// В новом message-API «сообщений больше нет» = GetMessageType() == -1, а не 0,
+	// и САМИ НОМЕРА типов сообщений другие (см. src/parts/message.c). SeekMessage
+	// объявлена только этим API.
 	if (get_fun(libno, "SeekMessage")) {
 		PE_set_message_empty_type_minus_one();
+		PE_set_message_types_ixseal();
 	}
 
 	// Строковые геттеры: Ixseal отдаёт строку ВОЗВРАТОМ, v6/v7 — через

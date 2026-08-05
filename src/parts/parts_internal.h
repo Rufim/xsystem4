@@ -430,6 +430,9 @@ struct parts {
 	int dirty;
 	int no;
 	int delegate_index;
+	// `uniqueID` из SetEventID: идентификатор набора обработчиков, который игровой
+	// CPartsMessageManager сверяет с сообщением (см. PE_SetEventID). Дефолт -1.
+	int event_unique_id;
 	int sprite_deform;
 	bool clickable;
 	// True for activity "button" parts (パーツタイプ=0) created by ReadActivityFile.

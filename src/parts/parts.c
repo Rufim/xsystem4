@@ -64,6 +64,7 @@ static void parts_init(struct parts *parts)
 	parts->local = PARTS_PARAMS_INITIALIZER;
 	parts->global = PARTS_PARAMS_INITIALIZER;
 	parts->delegate_index = -1;
+	parts->event_unique_id = -1;
 	parts->want_save = true;
 	// Игра зовёт SetWantSaveBackScene только с enable=0 (пять мест в байткоде) ⇒ дефолт «да».
 	parts->want_save_back_scene = true;
@@ -1246,6 +1247,27 @@ int PE_GetDelegateIndex(int parts_no)
 {
 	struct parts *parts = parts_try_get(parts_no);
 	return parts ? parts->delegate_index : -1;
+}
+
+// Ixseal-форма привязки обработчика к части. Имена аргументов взяты из .ain
+// (`ainfnsig` по обёртке `parts::detail::SetEventID` fno 9144):
+// `SetEventID(partsNumber, delegateIndex, uniqueID)` — то есть это и есть
+// «SetDelegateIndex» новых игр, только вместе с идентификатором набора
+// обработчиков. Оба значения обязательны: `CPartsMessageManager@CallDelegate`
+// (@0x2c6eb6) сначала требует, чтобы `GetMessageDelegateIndex` был валидным
+// индексом в его списке наборов, а затем — чтобы `GetMessageUniqueID` совпал с
+// `GetUniqueID` найденного набора; иначе он молча возвращает false, и клик по
+// кнопке не диспатчится (так на титуле Dohna не работал ни один пункт меню).
+void PE_SetEventID(int parts_no, int delegate_index, int unique_id)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT SetEventID(parts=%d, delegate=%d, uid=%d)",
+		       parts_no, delegate_index, unique_id);
+	parts->delegate_index = delegate_index;
+	parts->event_unique_id = unique_id;
 }
 
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state)
