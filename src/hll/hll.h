@@ -66,6 +66,17 @@ extern struct ain_hll_function *hll_current_fn;
  * float, сначала ищет декорированное имя `Имя@f` и только потом обычное.
  */
 #define HLL_EXPORT_F(fname, funptr) { .name = #fname "@f", .fun = funptr }
+/*
+ * Перегрузка по ЧИСЛУ АРГУМЕНТОВ, у которой ПОЗИЦИИ параметров разъезжаются, —
+ * `hll_current_nr_args` тут тоже не спасает (им можно лишь не читать непереданный
+ * хвост, как в String.c, а тут конфликтует ТИП одного и того же по счёту
+ * параметра). Образец: Ixseal объявляет четыре `Array.Copy` —
+ * `(refarray,wrap)`, `(refarray,int,wrap)`, `(refarray,wrap,int,int)` и
+ * `(refarray,int,wrap,int,int)`: во втором параметре то приёмник, то индекс.
+ * Линковка (ffi.c) сначала ищет имя, декорированное АРНОСТЬЮ (`Имя@<n>`), и лишь
+ * потом `Имя@f` / обычное `Имя`.
+ */
+#define HLL_EXPORT_N(fname, nargs, funptr) { .name = #fname "@" #nargs, .fun = funptr }
 #define HLL_TODO_EXPORT(fname, funptr) { .name = #fname, .fun = NULL }
 
 #define HLL_LIBRARY(lname, ...)				\

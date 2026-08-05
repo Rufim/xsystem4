@@ -418,6 +418,40 @@ static bool Array_ix_Erase(struct page **self, int index, int length)
 	return any;
 }
 
+/*
+ * `Copy(dst, dstPos, src, srcPos, count)` — пятиаргументная перегрузка (в .ain
+ * `(refarray,int,wrap,int,int)`). Линковка идёт по ИМЕНИ, поэтому раньше ВСЕ
+ * четыре перегрузки `Copy` попадали в двухаргументный `Array_ix_Copy(self, src)`,
+ * а cif собирается по .ain — во втором параметре C-функция получала не приёмник,
+ * а int-индекс, и снимок не копировался НИЧЕГО, молча и без ошибки.
+ *
+ * Чем это ломало Dohna: `parts::detail::CallPartsUpdateEvent` @0x2eaf32 делает
+ * `X_A_INIT; Array.Realloc(list, Numof(dataList)); Array.Copy(list, 0, dataList, 0,
+ * Numof(dataList))` и дальше диспатчит делегаты ИЗ СНИМКА. Снимок оставался пустым,
+ * поэтому НИ ОДНО покадровое событие частей не вызывалось: `CASTask@UpdateEvent`
+ * (его регистрирует `CASTask@ExecuteImp` через `AFL_Parts_AddBeginUpdateEvent`)
+ * не тикал, значит не тикали таймеры и задачи — `SceneLogo@Run` вечно ждал
+ * `DelayedCallback(10, ()=>ShowLogo())`, и сцена логотипа не двигалась.
+ *
+ * Остальные три перегрузки Dohna не зовёт (тул xscan по CALLHLL: fn33 — 3 сайта,
+ * fn30/31/32 — ноль), поэтому реализуется ровно эта форма.
+ */
+static int Array_ix_Copy5(struct page **self, int dst_i, struct page **src, int src_i, int n)
+{
+	if (!self || !*self || !src || !*src || n <= 0)
+		return 0;
+	int dst_cap = array_numof(*self, 1) - dst_i;
+	int src_cap = array_numof(*src, 1) - src_i;
+	if (dst_i < 0 || src_i < 0 || dst_cap <= 0 || src_cap <= 0)
+		return 0;
+	if (n > dst_cap)
+		n = dst_cap;
+	if (n > src_cap)
+		n = src_cap;
+	array_copy(*self, dst_i, *src, src_i, n);
+	return n;
+}
+
 static int Array_ix_Copy(struct page **self, struct page **src)
 {
 	if (!self || !*self || !src || !*src)
@@ -1045,6 +1079,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(PopBack, Array_PopBack),
 	    HLL_EXPORT(Insert, Array_ix_Insert),
 	    HLL_EXPORT(Erase, Array_ix_Erase),
+	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),
 	    HLL_EXPORT(Duplicate, Array_ix_Copy),
 	    HLL_EXPORT(Concat, Array_ix_Copy),

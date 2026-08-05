@@ -1117,10 +1117,19 @@ static struct hll_function *link_static_library(struct ain_library *ainlib, stru
 	for (int i = 0; i < ainlib->nr_functions; i++) {
 		struct ain_hll_function *f = &ainlib->functions[i];
 		void *fun = NULL;
+		// Перегрузка по АРНОСТИ (см. HLL_EXPORT_N в hll.h): сначала пробуем имя,
+		// декорированное числом аргументов — `Имя@<n>`. Нужно там, где у перегрузок
+		// разъезжаются ПОЗИЦИИ параметров и одной C-функцией их не обслужить
+		// (cif строится по .ain): Ixseal-овские четыре `Array.Copy`.
+		{
+			char decorated[256];
+			snprintf(decorated, sizeof(decorated), "%s@%d", f->name, f->nr_arguments);
+			fun = static_library_lookup(lib, decorated);
+		}
 		// Перегрузка по ТИПУ (см. HLL_EXPORT_F в hll.h): для функции,
 		// возвращающей float, сначала пробуем декорированное имя `Имя@f`.
 		// Если библиотека такого не экспортирует — обычное имя, как раньше.
-		if (f->return_type.data == AIN_FLOAT) {
+		if (!fun && f->return_type.data == AIN_FLOAT) {
 			char decorated[256];
 			snprintf(decorated, sizeof(decorated), "%s@f", f->name);
 			fun = static_library_lookup(lib, decorated);
