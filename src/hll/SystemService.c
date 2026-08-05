@@ -422,6 +422,63 @@ HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, IsExistSystemMessage);
 
 static void SystemService_RestrainScreensaver(void) { }
 
+/*
+ * Резервные копии сейвов (Ixseal). Игра лишь РЕГИСТРИРУЕТ имена файлов
+ * (`AddBackupSaveFileName`) и просит скопировать их (`BackupSaveFile`) — ни
+ * геттера, ни возвращаемого значения у этой пары нет, так что имена копий и
+ * восстановление из них целиком внутреннее дело движка.
+ *
+ * Сайты: `_system::detail::Init` (fno 20591) регистрирует имена вроде
+ * `AFCGMode.asd` и значения EX-ключей «重要セーブファイル名N», а
+ * `BackupSaveFile` вызывается один раз — при возврате в титул
+ * (`・タイトルに戻る・確認なし`, fno 20526).
+ */
+#define MAX_BACKUP_SAVE_FILES 32
+static struct string *backup_save_names[MAX_BACKUP_SAVE_FILES];
+static int nr_backup_save_names = 0;
+
+static void SystemService_AddBackupSaveFileName(struct string *name)
+{
+	if (!name || !name->size)
+		return;
+	for (int i = 0; i < nr_backup_save_names; i++) {
+		if (!strcmp(backup_save_names[i]->text, name->text))
+			return;
+	}
+	if (nr_backup_save_names == MAX_BACKUP_SAVE_FILES) {
+		WARNING("SystemService.AddBackupSaveFileName: список полон (%d), «%s» пропущено",
+			MAX_BACKUP_SAVE_FILES, display_sjis0(name->text));
+		return;
+	}
+	backup_save_names[nr_backup_save_names++] = string_ref(name);
+}
+
+static bool copy_file_bytes(const char *src, const char *dst)
+{
+	size_t len;
+	void *data = file_read(src, &len);
+	if (!data)
+		return false;  // файла может не быть — это норма
+	bool ok = file_write(dst, data, len);
+	free(data);
+	return ok;
+}
+
+static void SystemService_BackupSaveFile(void)
+{
+	// Суффикс копии по байткоду не установлен (игра его никогда не читает),
+	// поэтому берём общепринятый `.bak` рядом с оригиналом в папке сейвов.
+	for (int i = 0; i < nr_backup_save_names; i++) {
+		char *src = savedir_path(backup_save_names[i]->text);
+		char *dst = xmalloc(strlen(src) + 5);
+		sprintf(dst, "%s.bak", src);
+		if (!copy_file_bytes(src, dst))
+			NOTICE("SystemService.BackupSaveFile: нет %s — пропущено", src);
+		free(dst);
+		free(src);
+	}
+}
+
 //static int SystemService_Debug_GetUseVideoMemorySize(void);
 
 // Rance 01
@@ -520,6 +577,8 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(IsExistSystemMessage, SystemService_IsExistSystemMessage),
 	    HLL_TODO_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
 	    HLL_EXPORT(RestrainScreensaver, SystemService_RestrainScreensaver),
+	    HLL_EXPORT(AddBackupSaveFileName, SystemService_AddBackupSaveFileName),
+	    HLL_EXPORT(BackupSaveFile, SystemService_BackupSaveFile),
 	    HLL_TODO_EXPORT(Debug_GetUseVideoMemorySize, SystemService_Debug_GetUseVideoMemorySize),
 	    HLL_EXPORT(Rance0123456789, SystemService_Rance0123456789),
 	    HLL_EXPORT(XXXXX01XXXXXXXX, SystemService_XXXXX01XXXXXXXX),
