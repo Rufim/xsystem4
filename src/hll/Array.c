@@ -324,6 +324,45 @@ static void ix_resize(struct page **self, int n)
 	*self = a;
 }
 
+/*
+ * Стереть элемент, СОХРАНИВ типизацию опустевшего контейнера.
+ *
+ * `array_erase`, удаляя ПОСЛЕДНИЙ элемент, освобождает страницу и возвращает
+ * NULL — вместе с ней теряется объявленный тип элемента. Для generic-контейнера
+ * Ixseal это тот же инвариант, что уже соблюдают `ix_resize` и `Array_PopBack`:
+ * пустой контейнер обязан остаться валидной 0-элементной ТИПИЗИРОВАННОЙ
+ * страницей, иначе следующий `PushBack`/`EmplaceBack` создаст массив с
+ * дефолт-типом int и положит heap-слот объекта СЫРЫМ int'ом, без владения —
+ * первый же `DELETE` временной ссылки игры уносит элемент, слот
+ * переиспользуется под другой объект, и обращение к элементу читает чужую
+ * страницу.
+ *
+ * Именно так падал титул Dohna: `Motion::ExecuterCollection@Add` сначала зовёт
+ * `EraseEndTask` (= `Array.EraseAll` по предикату), коллекция пустела в NULL,
+ * следующий `PushBack` пересоздавал её int-массивом (проверено: `a_type=14
+ * struct=0` вместо `17/611`), и `Motion::Executer@IsAlive::get` читал член 5
+ * чужой 2-членной страницы → `Out of bounds page index: 17670/5`. Тем же
+ * способом ломался `EndEventCallbackCollection`.
+ *
+ * Правка Ixseal-only по построению: библиотека `Array` объявлена ТОЛЬКО у Dohna
+ * (у Tsumamigui 3 и Escalayer её нет вообще), а легаси-опкод `A_ERASE`, где
+ * NULL как признак пустого массива — штатное поведение, не встречается ни в
+ * одной из трёх игр.
+ */
+static bool ix_erase_at(struct page **self, int index)
+{
+	enum ain_data_type dt = ix_dtype(*self);
+	int st = ix_stype(*self);
+	int rank = ix_rank(*self);
+	bool ok = false;
+	*self = array_erase(*self, index, &ok);
+	if (!*self) {
+		union vm_value dim = { .i = 0 };
+		*self = alloc_array(rank, &dim, dt, st, false);
+	}
+	return ok;
+}
+
 static void Array_Alloc(struct page **self, int numof) { ix_resize(self, numof); }
 static void Array_Realloc(struct page **self, int numof) { ix_resize(self, numof); }
 static void Array_Free(struct page **self) { ix_resize(self, 0); }
@@ -409,9 +448,7 @@ static bool Array_ix_Erase(struct page **self, int index, int length)
 	bool any = false;
 	int n = length > 0 ? length : 1;
 	for (int k = 0; k < n; k++) {
-		bool ok = false;
-		*self = array_erase(*self, index, &ok);
-		if (!ok)
+		if (!ix_erase_at(self, index))
 			break;
 		any = true;
 	}
@@ -620,9 +657,7 @@ static bool Array_ix_EraseAll(struct page **self, union vm_value *fn)
 			continue;
 		if (!ix_pred(fn, *self, i))
 			continue;
-		bool ok = false;
-		*self = array_erase(*self, i, &ok);
-		any = any || ok;
+		any = ix_erase_at(self, i) || any;
 	}
 	return any;
 }
@@ -638,9 +673,7 @@ static bool Array_ix_Remain(struct page **self, union vm_value *fn)
 			continue;
 		if (ix_pred(fn, *self, i))
 			continue;
-		bool ok = false;
-		*self = array_erase(*self, i, &ok);
-		any = any || ok;
+		any = ix_erase_at(self, i) || any;
 	}
 	return any;
 }
@@ -1004,10 +1037,7 @@ static void ix_unique(struct page **self, union vm_value *fn, bool use_pred)
 		}
 		if (!dup)
 			continue;
-		bool ok = false;
-		*self = array_erase(*self, i, &ok);
-		if (!*self)
-			break;
+		ix_erase_at(self, i);
 	}
 }
 
