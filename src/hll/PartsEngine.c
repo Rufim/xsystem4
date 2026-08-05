@@ -1515,6 +1515,56 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_StopSwipe, void);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, Parts_SetComment, int a, struct string *b);
 
 /*
+ * Покомпонентные геттеры сложения/умножения цвета части. Сеттеры
+ * (`SetComponentAddColor`/`SetComponentMulColor` → `PE_SetAddColor`/
+ * `PE_SetMultiplyColor`) хранят значения по-настоящему, и агрегатные
+ * `PE_GetAddColor`/`PE_GetMultiplyColor` их читают — не хватало только
+ * покомпонентной формы, которой объявлены эти функции в .ain (одинаково у v7 и
+ * v14: `ret=10 (int)`, сдвига формы тут нет, просто были `HLL_TODO_EXPORT`).
+ *
+ * Нужны именно как геттеры: motion-движок читает ТЕКУЩЕЕ значение как начало
+ * интерполяции (`Motion::Executer@InitializeParams` ← `GetValue<float>` ←
+ * `CSpriteParts@MulColorR::get`), поэтому без них не работает ни один
+ * цветовой фейд. Дефолт части — (255,255,255), нейтральное умножение.
+ */
+static int PE_GetComponentAddColorR(int parts_no)
+{
+	int r, g, b;
+	PE_GetAddColor(parts_no, &r, &g, &b);
+	return r;
+}
+static int PE_GetComponentAddColorG(int parts_no)
+{
+	int r, g, b;
+	PE_GetAddColor(parts_no, &r, &g, &b);
+	return g;
+}
+static int PE_GetComponentAddColorB(int parts_no)
+{
+	int r, g, b;
+	PE_GetAddColor(parts_no, &r, &g, &b);
+	return b;
+}
+static int PE_GetComponentMulColorR(int parts_no)
+{
+	int r, g, b;
+	PE_GetMultiplyColor(parts_no, &r, &g, &b);
+	return r;
+}
+static int PE_GetComponentMulColorG(int parts_no)
+{
+	int r, g, b;
+	PE_GetMultiplyColor(parts_no, &r, &g, &b);
+	return g;
+}
+static int PE_GetComponentMulColorB(int parts_no)
+{
+	int r, g, b;
+	PE_GetMultiplyColor(parts_no, &r, &g, &b);
+	return b;
+}
+
+/*
  * Имя SE «клик мимо» — глобальное (не по части) имя звука, который парт-движок
  * играет, когда клик не попал ни в одну часть. Хранится по-настоящему, потому
  * что у сеттера ЕСТЬ геттер (`GetClickMissSoundName`), то есть no-op отличим:
@@ -1965,13 +2015,13 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetComponentAlpha, PE_SetAlpha),
 	    HLL_EXPORT(GetComponentAlpha, PE_GetPartsAlpha),
 	    HLL_EXPORT(SetComponentAddColor, PE_SetAddColor),
-	    HLL_TODO_EXPORT(GetComponentAddColorR, PartsEngine_GetComponentAddColorR),
-	    HLL_TODO_EXPORT(GetComponentAddColorG, PartsEngine_GetComponentAddColorG),
-	    HLL_TODO_EXPORT(GetComponentAddColorB, PartsEngine_GetComponentAddColorB),
+	    HLL_EXPORT(GetComponentAddColorR, PE_GetComponentAddColorR),
+	    HLL_EXPORT(GetComponentAddColorG, PE_GetComponentAddColorG),
+	    HLL_EXPORT(GetComponentAddColorB, PE_GetComponentAddColorB),
 	    HLL_EXPORT(SetComponentMulColor, PE_SetMultiplyColor),
-	    HLL_TODO_EXPORT(GetComponentMulColorR, PartsEngine_GetComponentMulColorR),
-	    HLL_TODO_EXPORT(GetComponentMulColorG, PartsEngine_GetComponentMulColorG),
-	    HLL_TODO_EXPORT(GetComponentMulColorB, PartsEngine_GetComponentMulColorB),
+	    HLL_EXPORT(GetComponentMulColorR, PE_GetComponentMulColorR),
+	    HLL_EXPORT(GetComponentMulColorG, PE_GetComponentMulColorG),
+	    HLL_EXPORT(GetComponentMulColorB, PE_GetComponentMulColorB),
 	    HLL_EXPORT(SetComponentDrawFilter, PE_SetPartsDrawFilter),
 	    HLL_TODO_EXPORT(GetComponentDrawFilter, PartsEngine_GetComponentDrawFilter),
 	    HLL_EXPORT(SetComponentMagX, PE_SetPartsMagX),
