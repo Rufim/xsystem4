@@ -657,6 +657,82 @@ static struct string *act_str(struct ex_tree *t, const char *utf8)
 	return NULL;
 }
 
+/*
+ * ★У IXSEAL `パーツタイプ` В РАСКЛАДКЕ — СТРОКА, А НЕ ЧИСЛО.
+ *
+ * Tsumamigui 3 хранит тип части числом (`パーツタイプ = 0`), Dohna — ИМЕНЕМ
+ * (`パーツタイプ = "ボタン"`), и `act_int` на строковом узле честно отдавал
+ * дефолт -1. Из-за этого весь разбор типа у Dohna молча не работал: ни одна
+ * часть не опознавалась кнопкой, поэтому `parts::detail::GetComponentType` не
+ * отдавал 0, а `activity::detail::CActivityWrap@CompParts` (@0x1fd54) сравнивает
+ * его с запрошенным типом и при несовпадении заставляет `GetButton` вернуть
+ * ПУСТОЙ wrap `(-1, 0)`. Титул строит список кнопок как
+ * `ArrayExtensions::Select(имена, name => activity.GetButton(name))`, то есть
+ * получал 8 пустых элементов. Проверялось: части НАХОДЯТСЯ
+ * (`ButtonOmake -> 90000021` … `ButtonExit -> 90000025`), ломался только гейт
+ * по типу. Логотип рисовался, потому что CG-части и панели и без разбора типа
+ * уходят в общую ветку состояний.
+ *
+ * Порядок имён — не догадка: снят с SWITCH-таблицы самой игры в
+ * `parts::detail::GetComponentTypeName` (@0x2edf18, switch 312, 31 ветка),
+ * значение case = id типа.
+ *
+ * Нумерация v14 отличается от классической: у классического семейства (id 18+,
+ * собственно `パーツ`) сдвиг на 8, а виджеты 10-17 классического аналога не
+ * имеют — тот же перевод, что `component_type_to_classic` в src/parts/parts.c.
+ * Возвращаем КЛАССИЧЕСКИЙ id, потому что именно им пользуются ветки ниже
+ * (0/1/2/3 у виджетов совпадают в обеих нумерациях; テキストパーツ 21→13 и
+ * 構築パーツ 26→18 совпадают с проверками в act_set_state_cg).
+ */
+static const char *const act_component_type_names[] = {
+	"ボタン", "チェックボックス", "縦スクロールバー", "横スクロールバー",
+	"テキストボックス", "リストボックス", "コンボボックス",
+	"マルチラインテキストボックス", "レイアウトボックス", "ラジオボタンボックス",
+	"メッセージウィンドウ", "スピンボックス", "縦スライダーバー",
+	"横スライダーバー", "パネル", "フォーム", "フォームグループ",
+	"ユーザコンポーネント", "低レベルパーツ", "ＣＧパーツ", "ループＣＧパーツ",
+	"テキストパーツ", "横ゲージパーツ", "縦ゲージパーツ", "数字パーツ",
+	"矩形パーツ", "構築パーツ", "ＣＧ判定パーツ", "フラットパーツ",
+	"３Ｄレイヤパーツ", "ムービーパーツ",
+};
+#define ACT_COMPONENT_TYPE_SHIFT 8
+
+static int act_parts_type(struct ex_tree *t)
+{
+	struct ex_tree *c = act_child(t, "パーツタイプ");
+	if (!c || !c->is_leaf)
+		return -1;
+	if (c->leaf.value.type == EX_INT)
+		return c->leaf.value.i;  // v6/v7: тип уже число классической нумерации
+	if (c->leaf.value.type != EX_STRING || !c->leaf.value.s)
+		return -1;
+	const char *name = c->leaf.value.s->text;
+	int v14 = -1;
+	for (unsigned i = 0; i < sizeof(act_component_type_names) / sizeof(*act_component_type_names); i++) {
+		char *sjis = utf2sjis(act_component_type_names[i], strlen(act_component_type_names[i]));
+		bool hit = !strcmp(name, sjis);
+		free(sjis);
+		if (hit) {
+			v14 = i;
+			break;
+		}
+	}
+	if (v14 < 0) {
+		// Имя вне таблицы игры — не молчаливый дефолт, а проверка допущения.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("act_parts_type: неизвестный パーツタイプ '%s'", display_sjis0(name));
+		}
+		return -1;
+	}
+	if (v14 < 10)
+		return v14;                              // виджеты: нумерация общая
+	if (v14 < 10 + ACT_COMPONENT_TYPE_SHIFT)
+		return -1;                               // виджет только v14 (напр. パネル)
+	return v14 - ACT_COMPONENT_TYPE_SHIFT;       // классическое семейство パーツ
+}
+
 // nth element of a list-valued child, as int (floats truncated)
 static int act_list_int(struct ex_tree *t, const char *utf8, int idx, int dflt)
 {
@@ -706,7 +782,7 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	}
 	// Text state: テキスト + テキスト装飾 (font). Used e.g. by the config sample
 	// message ("サンプル") whose 通常状態 is a パーツタイプ=13 text sub-node.
-	if (act_int(st, "パーツタイプ", -1) == 13) {
+	if (act_parts_type(st) == 13) {
 		struct string *txt = act_str(st, "テキスト");
 		if (txt && txt->size) {
 			struct ex_tree *fd = act_child(st, "テキスト装飾");
@@ -736,7 +812,7 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// full compositing procedure; we only need an opaque mask of the viewport
 	// rect so it can serve as an alpha-clipper (rectangular clip) for siblings.
 	// The 手順1 create op's 先矩形 gives the size [.,.,.,.,w,h].
-	if (act_int(st, "パーツタイプ", -1) == 18) {
+	if (act_parts_type(st) == 18) {
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
 		if (step1) {
@@ -744,6 +820,51 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 			int h = act_list_int(step1, "先矩形", 5, 0);
 			if (w > 0 && h > 0)
 				PE_SetPartsColorFill(no, w, h);
+		}
+		return;
+	}
+	/*
+	 * Прямоугольная часть (`矩形パーツ`, классический id 17) — не картинка, а
+	 * область определения попадания, заданная ЧЕТЫРЬМЯ УГЛАМИ
+	 * (左上/右上/左下/右下), а не парой ширина-высота.
+	 *
+	 * Без этой ветки состояние оставалось «CG», и игра, которая гейтится по типу
+	 * компонента (`activity::detail::CActivityWrap@GetRect` → `CompParts(имя, 25, 1)`
+	 * → сравнение с `parts::detail::GetComponentType`), получала из `GetRect`
+	 * ПУСТОЙ wrap: так падал `ArrayExtensions::Select<IRectParts&, string>` в
+	 * `TitleCharacterView@Attach`.
+	 *
+	 * Данные по всем 195 раскладкам Dohna: 216 таких состояний, у ВСЕХ
+	 * `矩形モード = 1` и `左上 = (0,0)`. Смысл режима и ненулевого начала координат
+	 * не установлен — вместо тихого дефолта стоит проверка допущения.
+	 */
+	if (act_parts_type(st) == 17) {
+		int x0 = act_list_int(st, "左上", 0, 0);
+		int y0 = act_list_int(st, "左上", 1, 0);
+		int w = act_list_int(st, "右上", 0, 0) - x0;
+		int h = act_list_int(st, "左下", 1, 0) - y0;
+		int mode = act_int(st, "矩形モード", 1);
+		if (mode != 1) {
+			static bool warned_mode = false;
+			if (!warned_mode) {
+				warned_mode = true;
+				WARNING("矩形パーツ: 矩形モード=%d, смысл не установлен "
+					"(во всех раскладках Dohna было 1)", mode);
+			}
+		}
+		if (x0 || y0) {
+			static bool warned_org = false;
+			if (!warned_org) {
+				warned_org = true;
+				WARNING("矩形パーツ: 左上=(%d,%d) не в начале координат, "
+					"смещение не учитывается", x0, y0);
+			}
+		}
+		if (w > 0 && h > 0) {
+			// Часть ещё не существует: у прямоугольного состояния нет
+			// картинки, а значит и сеттера, который создал бы её попутно.
+			PE_EnsureParts(no);
+			PE_SetPartsRectangleDetectionSize(no, w, h, state);
 		}
 		return;
 	}
@@ -795,7 +916,7 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 	}
 
 	struct ex_tree *ti = act_child(node, "種類別情報");
-	int ptype = ti ? act_int(ti, "パーツタイプ", -1) : -1;
+	int ptype = ti ? act_parts_type(ti) : -1;
 	if (getenv("XSYS4_PT_TRACE")) {
 		struct string *dcg = ti ? act_str(ti, "ＣＧ名") : NULL;
 		NOTICE("PT part '%s' no=%d ptype=%d cg='%s'", display_sjis0(node->name->text),

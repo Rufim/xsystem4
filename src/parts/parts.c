@@ -2193,6 +2193,18 @@ void PE_SetComponentType(int parts_no, int type, int state)
 			parts_state_reset(&parts->states[state], PARTS_PANEL);
 		return;
 	}
+	// Кнопка (id 0 в обеих нумерациях): у движка это не отдельный вид рендера, а
+	// ФЛАГ на CG-части (`is_button`), который и отдаёт обратно PE_GetComponentType,
+	// — так же её помечает загрузчик раскладок. Состояние сбрасывать НЕЛЬЗЯ:
+	// parts_state_reset затёр бы CG, уже загруженный из раскладки.
+	// Ixseal конструирует кнопку сама: `parts::detail::CButtonParts@0` (@0x2f0aaa)
+	// завершается вызовом `SetComponentType(no, 0, 1)`, и без этой ветки первая же
+	// кнопка титула валила движок («unknown component type 0»). У v6/v7 тип 0 тоже
+	// означал кнопку, но они его не выставляли — ветка ничего не меняет для них.
+	if (type == 0) {
+		parts->is_button = true;
+		return;
+	}
 	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
@@ -2455,6 +2467,22 @@ int PE_GetPartsCheckBoxB(int parts_no)
 {
 	struct parts *parts = parts_try_get(parts_no);
 	return parts ? parts->checkbox_b : 0;
+}
+
+/*
+ * Создать часть с дефолтами движка, если её ещё нет.
+ *
+ * Загрузчик раскладок нумерует части сам, а РЕАЛЬНО часть появляется как
+ * побочный эффект первого сеттера, который пользуется `parts_get`
+ * (PE_SetPartsCG/PE_SetPartsFlat/...). Состоянию «прямоугольная часть»
+ * (`矩形パーツ`) грузить нечего — это чистая область попадания, — а
+ * `PE_SetPartsRectangleDetectionSize` намеренно НЕ создаёт часть
+ * (`parts_try_get`, HLL-семантика: на несуществующий номер вернуть false),
+ * поэтому загрузчику нужен явный способ её создать.
+ */
+void PE_EnsureParts(int parts_no)
+{
+	parts_get(parts_no);
 }
 
 bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state)
