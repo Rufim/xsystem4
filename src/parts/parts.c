@@ -178,6 +178,11 @@ bool parts_exists(int parts_no)
 
 static void parts_state_free(struct parts_state *state)
 {
+	// Маска попиксельного hit-теста привязана к текстуре состояния, которую этот
+	// switch и удаляет — иначе после смены CG остался бы кэш от прежней картинки.
+	free(state->common.hit_mask);
+	state->common.hit_mask = NULL;
+	state->common.hit_mask_w = state->common.hit_mask_h = 0;
 	switch (state->type) {
 	case PARTS_UNINITIALIZED:
 	case PARTS_RECT_DETECTION:

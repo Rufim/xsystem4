@@ -1271,6 +1271,11 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetPartsMagY(no, sy);
 	if (act_int(node, "クリック許可", 0))
 		PE_SetClickable(no, true);
+	// `マウスカーソルピクセル判定`: hit-тест по непрозрачным пикселям, а не по боксу
+	// (см. parts->pixel_hittest — без него перекрывающиеся диагональные полосы меню
+	// титула Dohna воровали клик друг у друга).
+	if (act_int(node, "マウスカーソルピクセル判定", 0))
+		PE_SetPartsPixelHitTest(no, true);
 	if (parent_no >= 0)
 		PE_SetParentPartsNumber(no, parent_no);
 	PE_SetShow(no, act_int(node, "表示", 1));

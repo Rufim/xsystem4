@@ -215,6 +215,7 @@ void PE_SetPassCursor(int parts_no, bool pass);
 bool PE_GetPartsPassCursor(int parts_no);
 void PE_SetClickable(int parts_no, bool clickable);
 void PE_SetPartsIsButton(int parts_no, bool is_button);
+void PE_SetPartsPixelHitTest(int parts_no, bool enable);
 void PE_SetEnableInputProcess(int parts_no, bool enable);
 bool PE_IsEnableInputProcess(int parts_no);
 void PE_SetPartsWheelable(int parts_no, bool wheelable);

@@ -52,6 +52,8 @@ static Point drag_initial_pos;
 static Point drag_start_cursor;
 static struct parts *drop_target = NULL;
 
+static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos);
+
 static bool parts_hittest(struct parts *parts, int state, Point pos)
 {
 	struct parts_common *c = &parts->states[state].common;
@@ -75,7 +77,40 @@ static bool parts_hittest(struct parts *parts, int state, Point pos)
 			hitbox.y += parts->parent->global.pos.y;
 		}
 	}
-	return SDL_PointInRect(&pos, &hitbox);
+	if (!SDL_PointInRect(&pos, &hitbox))
+		return false;
+	if (!parts->pixel_hittest)
+		return true;
+	return parts_pixel_hittest(c, hitbox, pos);
+}
+
+// `マウスカーソルピクセル判定`: попадание считается только по НЕПРОЗРАЧНОМУ пикселю
+// текстуры. Альфа читается с GPU ОДИН раз на состояние (glReadPixels синхронизирует
+// конвейер, а hit-тест идёт каждый кадр) и кэшируется в common->hit_mask.
+static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos)
+{
+	if (!c->texture.handle || c->texture.w <= 0 || c->texture.h <= 0)
+		return true;  // нечего проверять — остаётся прямоугольник
+	if (!c->hit_mask) {
+		uint8_t *px = gfx_get_pixels(&c->texture);
+		if (!px)
+			return true;
+		int n = c->texture.w * c->texture.h;
+		c->hit_mask = xmalloc(n);
+		for (int i = 0; i < n; i++)
+			c->hit_mask[i] = px[i * 4 + 3];
+		c->hit_mask_w = c->texture.w;
+		c->hit_mask_h = c->texture.h;
+		free(px);
+	}
+	// Точка → тексель: hitbox растянут на всю текстуру (при масштабе — с ним).
+	if (hitbox.w <= 0 || hitbox.h <= 0)
+		return true;
+	int tx = (int)((int64_t)(pos.x - hitbox.x) * c->hit_mask_w / hitbox.w);
+	int ty = (int)((int64_t)(pos.y - hitbox.y) * c->hit_mask_h / hitbox.h);
+	if (tx < 0 || ty < 0 || tx >= c->hit_mask_w || ty >= c->hit_mask_h)
+		return false;
+	return c->hit_mask[ty * c->hit_mask_w + tx] != 0;
 }
 
 static void drag_state_reset(void)
@@ -420,6 +455,13 @@ void PE_UpdateInputState(int passed_time)
 void PE_SetPassCursor(int parts_no, bool pass)
 {
 	parts_get(parts_no)->pass_cursor = !!pass;
+}
+
+// `マウスカーソルピクセル判定` из раскладки (см. parts->pixel_hittest). В библиотеке
+// PartsEngine функции для этого нет — поле читает загрузчик раскладок act_build_part.
+void PE_SetPartsPixelHitTest(int parts_no, bool enable)
+{
+	parts_get(parts_no)->pixel_hittest = !!enable;
 }
 
 bool PE_GetPartsPassCursor(int parts_no)

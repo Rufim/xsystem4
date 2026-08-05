@@ -119,6 +119,12 @@ struct parts_common {
 	Point origin_offset;
 	Rectangle hitbox;
 	Rectangle surface_area;
+	// Кэш маски попиксельного hit-теста (см. parts->pixel_hittest): 1 байт на
+	// пиксель, !=0 = непрозрачный. Строится ЛЕНИВО из текстуры при первом
+	// попадании в hitbox и живёт до parts_state_free — читать альфу с GPU каждый
+	// кадр нельзя (glReadPixels синхронизирует конвейер).
+	uint8_t *hit_mask;
+	int hit_mask_w, hit_mask_h;
 };
 
 struct parts_cg {
@@ -438,6 +444,15 @@ struct parts {
 	// видно на экране. Флаг убирает такую часть из отрисовки, оставляя текстуру
 	// доступной клипперу (он читает её напрямую, независимо от show).
 	bool construction_mask;
+	// `マウスカーソルピクセル判定` из раскладки: курсор попадает в часть только там, где
+	// её текстура НЕ прозрачна, а не по всему прямоугольнику. Без этого перекрывающиеся
+	// части воруют клик друг у друга: меню титула Dohna — восемь ДИАГОНАЛЬНЫХ полос,
+	// каждая лежит в текстуре 704x236 при своей видимой высоте ~91, и соседние боксы
+	// перекрываются вчетверо, так что клик по «Start Game» доставался «Load Game»
+	// (та выше по z). Гейт структурный и узкий: у Dohna флаг стоит у 13 частей из 2708
+	// по всем 195 раскладкам (8 кнопок титула, 4 в SceneHome, 1 в DungeonSelector),
+	// у Tsumamigui 3 — у 0 из 629, т.е. старые игры этим путём не идут вовсе.
+	bool pixel_hittest;
 	// Widget state for config-style screens (scrollbars/sliders and checkboxes).
 	// Not yet rendered as interactive widgets, but the game reads these back, so
 	// we store what it sets to keep the config UI logic consistent.
