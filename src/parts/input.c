@@ -22,8 +22,17 @@
 #include "xsystem4.h"
 #include "parts_internal.h"
 
-// true between calls to BeginClick and EndClick
+// true while at least one BeginClick/BeginInput session is open
 bool parts_began_click = false;
+// Nesting depth of those sessions. A modal child screen opens its own session on
+// top of its parent's: Tsumamigui 3's save screen calls BeginInput, then the
+// "save here?" dialog calls BeginInput again, and closing the dialog calls
+// EndInput ONCE — the parent never ends its own session. With a plain flag that
+// single EndInput killed input for the whole game: parts stopped updating their
+// hover/click state, so the save screen no longer answered Parts_GetInputState
+// and neither RETURN nor any slot responded (looked like a hang; the frame loop
+// was still running). Counting sessions keeps the parent's alive.
+static int parts_input_depth = 0;
 
 // the mouse position at last update
 static Point parts_prev_pos = {0};
@@ -167,8 +176,16 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		parts_set_state(parts, PARTS_STATE_HOVERED);
 	}
 
-	// click event: only if the click down event had same parts number
-	if (parts->clickable && prev_clicking && !cur_clicking
+	// click event: only if the click down event had same parts number.
+	// Условие — та же click_eligible, что и у нажатия выше, а НЕ один parts->clickable.
+	// `clickable` выставляет только SACT-овский PartsEngine.SetClickable, которого новые
+	// игры не зовут: Tsumamigui 3 держит карту обработчиков у себя
+	// (`CPartsMessageManager@AddMouseLClickEvent`) и ждёт от движка сообщение MOUSE_CLICK.
+	// Из-за лишнего условия MOUSE_CLICK и KEY_UP не отправлялись НИ ОДНОМУ парту за всю
+	// сессию (проверено трейсом: `clicked_parts` не становился ненулевым никогда), поэтому
+	// кнопки, повешенные игрой на клик, молчали — например 戻る в BACK SCENE (парт 90000021):
+	// нажатие доходило (KEY_TRIGGER), клик — нет, и вьювер невозможно было закрыть.
+	if (click_eligible && prev_clicking && !cur_clicking
 			&& click_down_parts == parts->no) {
 		audio_play_sound(parts->on_click_sound);
 		clicked_parts = parts->no;
@@ -443,13 +460,27 @@ bool PE_SetClickMissSoundNumber(possibly_unused int sound_no)
 
 void PE_BeginInput(void)
 {
+	parts_input_depth++;
 	parts_began_click = true;
 }
 
 void PE_EndInput(void)
 {
+	if (parts_input_depth > 0)
+		parts_input_depth--;
+	parts_began_click = parts_input_depth > 0;
+	clicked_parts = 0;
+	drag_state_reset();
+}
+
+// Returning to the title (system.Reset) abandons any open input session; without
+// this the depth would leak and input could never be disabled again.
+void parts_input_reset(void)
+{
+	parts_input_depth = 0;
 	parts_began_click = false;
 	clicked_parts = 0;
+	click_down_parts = 0;
 	drag_state_reset();
 }
 

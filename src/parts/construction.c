@@ -509,9 +509,12 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 	// line count instead (91/2 = 45) drifted every line after the first and clipped
 	// the last one at the texture border.
 	int line_h = (int)ceilf(text_style_height(&op->style)) + op->line_space;
-	// Reserve room for the outline: the edge extends edge_left px to the left of the
-	// first glyph and edge_up px above. Drawing at op->x/op->y clipped the first
-	// glyph's left outline at the texture border. Inset the text by the edge width.
+	// Reserve room for the outline ABOVE the first line: nothing in the text renderer
+	// pads vertically, so drawing at op->y clipped the outline at the texture border.
+	// Horizontally there is nothing to add: _gfx_render_text already advances by
+	// text_style_advance_padding before every glyph (restored in §5f ФИКС 3), which is
+	// exactly the room the left outline needs. Insetting by edge_left here too pushed
+	// the log's ink 2 px right of the original (замер: x=97 против 95).
 	int ex = (int)ceilf(op->style.edge_left);
 	int ey = (int)ceilf(op->style.edge_up);
 	char *buf = xstrdup(op->text->text);
@@ -546,7 +549,7 @@ static bool build_copy_text(struct parts_construction_process *cproc, struct par
 			continue;
 		bool end = (*p == '\0');
 		*p = '\0';
-		gfx_render_text(&cproc->common.texture, op->x + ex, y + ey, line, &op->style, false);
+		gfx_render_text(&cproc->common.texture, op->x, y + ey, line, &op->style, false);
 		if (end)
 			break;
 		y += line_h;

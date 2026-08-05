@@ -64,6 +64,8 @@ static void parts_init(struct parts *parts)
 	parts->global = PARTS_PARAMS_INITIALIZER;
 	parts->delegate_index = -1;
 	parts->want_save = true;
+	// Игра зовёт SetWantSaveBackScene только с enable=0 (пять мест в байткоде) ⇒ дефолт «да».
+	parts->want_save_back_scene = true;
 	parts->on_cursor_sound = -1;
 	parts->on_click_sound = -1;
 	parts->origin_mode = 1;
@@ -1102,6 +1104,7 @@ void PE_Reset(void)
 {
 	PE_ReleaseAllParts();
 	PE_ReleaseMessage();
+	parts_input_reset();
 	ctrl_stack_init();
 	sact_ModuleFini();
 }
@@ -2019,16 +2022,22 @@ bool PE_SetThumbnailMode(bool mode)
 	return true;
 }
 
-bool PE_save_thumbnail(struct string *filename, int reduction_factor)
+// thumbnail_width — ШИРИНА превью в пикселях, не делитель. В .ain Tsumamigui 3 параметр
+// обёртки так и называется (`gamesave::SaveThumbnail(int SaveNumber, int ThumbnailWidth)`),
+// а игра передаёт 200 (`AFL_GameSave_SaveThumbnail`: PUSH 81 / PUSH 200). Прежняя трактовка
+// «reduction factor» (догадка upstream, судя по всему непроверенная) давала 1024/200 = 5 ⇒
+// превью 5×3 px, и превью в слотах сохранения выглядели пустыми. Высота — по пропорции кадра.
+bool PE_save_thumbnail(struct string *filename, int thumbnail_width)
 {
-	if (reduction_factor < 1)
-		reduction_factor = 1;
-
 	Texture *src = gfx_main_surface();
-	int w = src->w / reduction_factor;
-	int h = src->h / reduction_factor;
+	int w = thumbnail_width > 0 ? thumbnail_width : src->w;
+	if (w > src->w)
+		w = src->w;
+	int h = src->h * w / src->w;
+	if (h < 1)
+		h = 1;
 	bool thtrace = getenv("XSYS4_TH_TRACE");
-	if (thtrace) NOTICE("THUMB start: src=%dx%d rf=%d -> %dx%d", src->w, src->h, reduction_factor, w, h);
+	if (thtrace) NOTICE("THUMB start: src=%dx%d width=%d -> %dx%d", src->w, src->h, thumbnail_width, w, h);
 
 	// Downscale by repeatedly halving until we are within a factor of two of
 	// the target size, then do the final stretch. This avoids the aliasing
@@ -2553,6 +2562,17 @@ int PE_get_system_controller(void)
 void PE_parts_set_want_save(int parts_no, bool want_save)
 {
 	parts_get(parts_no)->want_save = want_save;
+}
+
+void PE_parts_set_want_save_back_scene(int parts_no, bool want)
+{
+	parts_get(parts_no)->want_save_back_scene = want;
+}
+
+bool PE_parts_get_want_save_back_scene(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->want_save_back_scene : false;
 }
 
 float PE_parts_get_absolute_x(int parts_no)

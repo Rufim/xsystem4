@@ -445,6 +445,11 @@ struct parts {
 	bool pass_cursor;
 	bool lock_input_state;
 	bool want_save;
+	// Отдельный флаг для снимка «画面保管»/BACK SCENE (PartsEngine.SetWantSaveBackScene).
+	// НЕ переиспользуем want_save: игра гасит им служебные оверлеи (системные кнопки,
+	// mode-CG, отладочные тексты), и если исключить их ещё и из ИГРОВОГО сейва, после
+	// resume-загрузки они не вернутся — конструкторы вьюх повторно не выполняются.
+	bool want_save_back_scene;
 	bool draggable;
 	int on_cursor_sound;
 	int on_click_sound;
@@ -555,6 +560,7 @@ void parts_add_motion(struct parts *parts, struct parts_motion *motion);
 
 // input.c
 extern bool parts_began_click;
+void parts_input_reset(void);
 void parts_input_reset_drag(struct parts *parts);
 
 // message.c

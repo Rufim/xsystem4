@@ -331,7 +331,11 @@ static void load_parts_flash(struct iarray_reader *r, struct parts *parts,
 {
 	struct string *name = iarray_read_string_or_null(r);
 	parts_flash_load(parts, flash, name);
-	free_string(name);
+	// A nameless part is saved as null, and free_string() dereferences its argument
+	// (libsys4 string.c: `if (!str->ref)`), so an unconditional free segfaults. See
+	// load_parts_flat below — that is where it actually crashed on load.
+	if (name)
+		free_string(name);
 	flash->stopped = !!iarray_read(r);
 	parts_flash_seek(flash, iarray_read(r));
 }
@@ -346,7 +350,12 @@ static void load_parts_flat(struct iarray_reader *r, struct parts *parts,
 {
 	struct string *name = iarray_read_string_or_null(r);
 	parts_flat_load(parts, flat, name);
-	free_string(name);
+	// CRASH ON LOAD (Tsumamigui 3): the save/load screen sets its slot-card flats with
+	// an empty file name (`Ｐ＿フラット設定(… ファイル名 = "")`), so those parts are
+	// saved with a null name and this free_string(NULL) dereferenced it — SIGSEGV inside
+	// PartsEngine.Load, i.e. the game died the moment a save was loaded from that screen.
+	if (name)
+		free_string(name);
 	flat->needs_advance = true;
 }
 
@@ -650,6 +659,19 @@ static void save_numeral_fonts(struct iarray_writer *w)
 	}
 }
 
+// Consume a numeral-font table without applying it (back-scene load: the table is global
+// state shared with the live UI, and replacing it would also leak the current one).
+static void skip_numeral_fonts(struct iarray_reader *r)
+{
+	int n = iarray_read(r);
+	for (int i = 0; i < n; i++) {
+		iarray_read(r);  // type
+		iarray_read(r);  // cg_no
+		for (int j = 0; j < 12; j++)
+			iarray_read(r);  // widths
+	}
+}
+
 static void load_numeral_fonts(struct iarray_reader *r)
 {
 	parts_nr_numeral_fonts = iarray_read(r);
@@ -665,7 +687,10 @@ static void load_numeral_fonts(struct iarray_reader *r)
 	}
 }
 
-static bool parts_engine_save(struct page **buffer, bool save_hidden)
+// back_scene: снимок для «画面保管»/BACK SCENE — у него свой опт-аут
+// (PartsEngine.SetWantSaveBackScene), чтобы служебные оверлеи не попадали в сцену, но
+// ОСТАВАЛИСЬ в игровом сейве (иначе после resume-загрузки их некому пересоздать).
+static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_scene)
 {
 	// get parts into clean state first
 	PE_UpdateComponent(0);
@@ -691,7 +716,7 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden)
 	PARTS_LIST_FOREACH(parts) {
 		if (!save_hidden && !parts->global.show)
 			continue;
-		if (!parts->want_save)
+		if (back_scene ? !parts->want_save_back_scene : !parts->want_save)
 			continue;
 		save_parts(&w, parts);
 		count++;
@@ -711,15 +736,33 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden)
 
 bool PE_SaveWithoutHideParts(struct page **buffer)
 {
-	return parts_engine_save(buffer, false);
+	return parts_engine_save(buffer, false, false);
 }
 
 bool PE_Save(struct page **buffer)
 {
-	return parts_engine_save(buffer, true);
+	return parts_engine_save(buffer, true, false);
 }
 
-bool PE_Load(struct page **buffer)
+// The back scene (画面保管 / BACK SCENE menu) is the same parts-library snapshot, just kept
+// per stored screen instead of per save file: backscene::detail::SaveBackSceneData packs
+// sound + last voice + message window + this buffer into one ADVSceneData entry.
+bool PE_SaveBackScene(struct page **buffer)
+{
+	return parts_engine_save(buffer, true, true);
+}
+
+// restore_globals=false for the back scene, and it matters twice over.
+// CBackSceneView@SetSceneIndex calls LoadBackScene while ITS OWN activity parts (page
+// counter, buttons, scrollbar) are on screen, so (1) wiping every part would take the
+// viewer's UI down with it — parts are keyed by number, so loading over the current set
+// restores the stored screen in place; and (2) the controller stack and the numeral-font
+// table are GLOBAL state, not part of the stored screen. Restoring them rolled
+// nr_controllers back to what it was when the snapshot was taken, and the game's next
+// SetActiveController(1) then died with "Invalid controller number: 1" (VM_ERROR → REPL,
+// i.e. the game froze right after browsing a back scene). The values still have to be READ
+// to keep the stream in sync — just not applied.
+static bool parts_engine_load(struct page **buffer, bool restore_globals)
 {
 	if (!(*buffer)) {
 		WARNING("savedata array is empty");
@@ -737,16 +780,25 @@ bool PE_Load(struct page **buffer)
 		return false;
 	}
 
-	parts_release_all();
+	if (restore_globals)
+		parts_release_all();
 
-	if (version > 1)
-		load_numeral_fonts(&r);
+	if (version > 1) {
+		if (restore_globals)
+			load_numeral_fonts(&r);
+		else
+			skip_numeral_fonts(&r);
+	}
 
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
 	if (parts_multi_controller) {
-		ctrl_stack.active = iarray_read(&r);
-		ctrl_stack.nr_controllers = iarray_read(&r);
+		int active = iarray_read(&r);
+		int nr_controllers = iarray_read(&r);
+		if (restore_globals) {
+			ctrl_stack.active = active;
+			ctrl_stack.nr_controllers = nr_controllers;
+		}
 	}
 
 	int nr_parts = iarray_read(&r);
@@ -761,4 +813,38 @@ bool PE_Load(struct page **buffer)
 
 	parts_engine_clean();
 	return true;
+}
+
+bool PE_Load(struct page **buffer)
+{
+	return parts_engine_load(buffer, true);
+}
+
+// AliceSoft keeps the stored screen in a SEPARATE parts library — that is why the whole
+// Set*ForBackScene family is duplicated: those setters address the back-scene copy of a
+// part, which coexists with the live part of the same number. We have one parts library,
+// so a back-scene load overwrites the live parts instead. To keep that reversible, the
+// live library is snapshotted on the first load and put back by ClearBackScene, which
+// backscene::detail::CBackSceneView@Execute calls right after the viewer closes and just
+// before ShowAllFrontScene. Without it the browsed scene stayed on top of the restored
+// game (two message texts drawn over each other).
+static struct page *back_scene_live_backup = NULL;
+
+bool PE_LoadBackScene(struct page **buffer)
+{
+	// Тем же фильтром, что и снимок сцены: возвращать надо ровно те парты, которые
+	// загрузка бэк-сцены перезапишет.
+	if (!back_scene_live_backup)
+		parts_engine_save(&back_scene_live_backup, true, true);
+	return parts_engine_load(buffer, false);
+}
+
+void PE_ClearBackScene(void)
+{
+	if (!back_scene_live_backup)
+		return;
+	parts_engine_load(&back_scene_live_backup, false);
+	delete_page_vars(back_scene_live_backup);
+	free_page(back_scene_live_backup);
+	back_scene_live_backup = NULL;
 }

@@ -322,7 +322,7 @@ static int PartsEngine_PartsFunc(int func_id, struct page **array_int,
 		REQUIRE_INTS(2);
 		PE_parts_set_want_save(ints[0].i, !!ints[1].i);
 		return 1;
-	case 6:  // bool SaveThumbnail(string filename, int reduction_factor)
+	case 6:  // bool SaveThumbnail(string filename, int thumbnail_width)
 		REQUIRE_INTS(2);
 		REQUIRE_STRINGS(1);
 		ints[1].i = PE_save_thumbnail(heap_get_string(strings[0].i), ints[0].i);
@@ -400,23 +400,45 @@ HLL_WARN_UNIMPLEMENTED(, void, PartsEngine, StopSoundWithoutSystemSound);
 // (e.g. C_TITLE@EnableButton -> Ｐ＿オンカーソル効果音設定) proceeds.
 static void PE_Parts_SetSoundName(int parts_no, struct string *name, int state) { (void)parts_no; (void)name; (void)state; }
 static void PE_Parts_GetSoundName(int parts_no, struct string **out, int state) { (void)parts_no; (void)state; if (out) { if (*out) free_string(*out); *out = string_ref(&EMPTY_STRING); } }
-// Tsumamigui 3: фон под меню сохранения. Визуальный no-op — рендер идёт своим путём.
+// Опт-аут парта из снимка «画面保管»/BACK SCENE. Игра зовёт это ТОЛЬКО с enable=0 и только
+// для служебных оверлеев, которые рисует поверх сцены: отладочные FPS/память, системные
+// кнопки, mode-CG, 3D-слой (пять мест в байткоде, все `PUSH 0`) ⇒ дефолт «сохранять».
+// ВАЖНО: флаг СВОЙ, а не upstream-овский want_save, по которому фильтруется ИГРОВОЙ сейв.
+// Исключив оверлеи и оттуда, мы потеряли бы их после resume-загрузки: конструкторы вьюх
+// (CSystemButtonView и пр.) повторно не выполняются, пересоздавать парты некому.
 static void PE_SetWantSaveBackScene(int parts_no, int enable)
 {
 	if (getenv("XSYS4_BS_TRACE"))
 		NOTICE("BACKSCENE want-save part=%d enable=%d", parts_no, enable);
+	PE_parts_set_want_save_back_scene(parts_no, !!enable);
 }
-// Save-thumbnail of the parts back-scene into a save buffer. Not captured yet —
-// return false (no data) so saving proceeds without a scene thumbnail.
-static bool PE_SaveBackScene(struct page **buf) { (void)buf; return false; }
-// Direct SaveThumbnail(filename, size) export. Newer games (Tsumamigui 3) call
-// this via AutoSave when opening the town map; without it the unimplemented-HLL
-// error dropped into the debugger REPL and the map never became interactive.
-// Reuse PE_save_thumbnail (same as PartsFunc case 6); the int is the reduction
-// factor. Returning success lets AutoSave complete and the map's input loop run.
-static bool PE_SaveThumbnail(struct string *filename, int reduction_factor)
+static bool PE_IsWantSaveBackScene(int parts_no)
 {
-	return PE_save_thumbnail(filename, reduction_factor);
+	return PE_parts_get_want_save_back_scene(parts_no);
+}
+// Остальное семейство *ForBackScene правит ВОССТАНОВЛЕННЫЙ снимок: CBackSceneView гасит
+// экран, ставит цвет шрифта окна сообщений и скрывает лишние парты. У AliceSoft снимок,
+// судя по имени, живёт отдельной библиотекой партов; у нас LoadBackScene восстанавливает
+// его в живые парты (см. parts_engine_load), поэтому это ровно обычные сеттеры.
+static void PE_SetAlphaForBackScene(int parts_no, int alpha) { PE_SetAlpha(parts_no, alpha); }
+static void PE_SetShowForBackScene(int parts_no, bool show) { PE_SetShow(parts_no, show); }
+static void PE_SetMulColorForBackScene(int parts_no, int r, int g, int b)
+{
+	PE_SetMultiplyColor(parts_no, r, g, b);
+}
+static void PE_SetFontColorForBackScene(int parts_no, int r, int g, int b, int state)
+{
+	PE_SetPartsFontColor(parts_no, r, g, b, state);
+}
+// PE_ClearBackScene — в src/parts/save.c: он возвращает живые парты, подменённые загрузкой
+// бэк-сцены (у нас одна библиотека партов, а не две, как у AliceSoft).
+// Direct SaveThumbnail(filename, width) export. Newer games (Tsumamigui 3) call this via
+// AutoSave when opening the town map; without it the unimplemented-HLL error dropped into
+// the debugger REPL and the map never became interactive. Второй аргумент — ШИРИНА превью
+// (в .ain: ThumbnailWidth, игра передаёт 200); см. PE_save_thumbnail.
+static bool PE_SaveThumbnail(struct string *filename, int thumbnail_width)
+{
+	return PE_save_thumbnail(filename, thumbnail_width);
 }
 // Батч-форма построения parts (3 массива-параметра). Единый интерфейс, через
 // который игра (parts::AddConstructProcess в .ain) добавляет ВСЕ операции
@@ -1605,6 +1627,15 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(UpdateGUIController, PartsEngine_UpdateGUIController),
 	    HLL_EXPORT(SetWantSaveBackScene, PE_SetWantSaveBackScene),
 	    HLL_EXPORT(SaveBackScene, PE_SaveBackScene),
+	    // Пары не было вовсе: просмотр BACK SCENE (CBackSceneView@SetSceneIndex →
+	    // parts::detail::LoadBackScene) уходил в «Unimplemented HLL function» → REPL.
+	    HLL_EXPORT(LoadBackScene, PE_LoadBackScene),
+	    HLL_EXPORT(IsWantSaveBackScene, PE_IsWantSaveBackScene),
+	    HLL_EXPORT(ClearBackScene, PE_ClearBackScene),
+	    HLL_EXPORT(SetAlphaForBackScene, PE_SetAlphaForBackScene),
+	    HLL_EXPORT(SetShowForBackScene, PE_SetShowForBackScene),
+	    HLL_EXPORT(SetMulColorForBackScene, PE_SetMulColorForBackScene),
+	    HLL_EXPORT(SetFontColorForBackScene, PE_SetFontColorForBackScene),
 	    HLL_EXPORT(SaveThumbnail, PE_SaveThumbnail),
 	    HLL_EXPORT(GetFreeSystemPartsNumber, PE_GetFreeNumber),
 	    // FIXME: what is the difference?

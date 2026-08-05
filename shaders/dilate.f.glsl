@@ -22,32 +22,47 @@ in vec2 tex_coord;
 out vec4 frag_color;
 
 void main() {
-	// Morphological dilation via MAX of neighbour coverage. (Summing instead
-	// spreads partial alpha across the kernel, which fattens AND softens the
-	// edges — the "мыло" on bold/outlined text.) MAX expands the shape by the
-	// threshold radius while keeping antialiased edges crisp. The fractional
-	// part of threshold weights the outermost ring for sub-pixel AA.
-	int size = int(floor(threshold));
-	int cutoff = size + 1;
-	float edge_weight = fract(threshold);
+	// Morphological dilation by `threshold` pixels done in the DISTANCE domain
+	// (max-plus), not as a max of neighbour alphas.
+	//
+	// The glyph texture is a coverage field, and for an antialiased edge coverage
+	// encodes the signed distance from the pixel centre to the outline:
+	// a = 0.5 - d. So a sample `a` at offset k implies the shape is at distance
+	// |k| + 0.5 - a from us; growing the shape by r moves that outline inward by
+	// r, and the new coverage is
+	//     a' = clamp(max over k of [a(p+k) - |k|] + r)
+	// taken over samples that actually carry distance information (a > 0; a == 0
+	// only means "at least half a pixel away", so including it would paint an
+	// r-wide halo over empty space).
+	//
+	// This SATURATES, and that is the whole point: a 1px partially-covered stroke
+	// dilated by r = 0.5 becomes a solid 2px stroke. A max of alphas cannot do
+	// that — the fractional part of r only down-weighted the outermost ring, so
+	// r < 1 was a no-op (太さ = 0.5 in Tsumamigui 3's BACK LOG drew hairlines),
+	// and r = 1 widened the stroke to 3px while leaving it soft. Measured against
+	// the original, the reference glyph is both NARROWER and DENSER than that:
+	// 2px strokes at full coverage (FINDINGS §5j).
+	int cutoff = int(ceil(threshold)) + 1;
 	vec2 tex_size = vec2(textureSize(tex, 0).xy);
-	float t = ceil(threshold);
 
-	float a_out = 0.0;
+	// sentinel: no sample carries coverage ⇒ stays empty (no halo)
+	float best = -1024.0;
 
 	for (int x = -cutoff; x <= cutoff; x++) {
 		for (int y = -cutoff; y <= cutoff; y++) {
-			float d = distance(vec2(x, y), vec2(0, 0));
-			if (d > t)
+			float d = length(vec2(x, y));
+			// past this the term cannot be positive for any coverage
+			if (d > threshold + 1.0)
 				continue;
 			float a = texture(tex, tex_coord + vec2(x, y) / tex_size).r;
-			if (d > float(size))
-				a *= edge_weight;
-			a_out = max(a_out, a);
+			if (a <= 0.0)
+				continue;
+			best = max(best, a - d);
 		}
 	}
+	float a_out = clamp(best + threshold, 0.0, 1.0);
 
 	if (a_out < color.a)
 		discard;
-	frag_color = vec4(color.rgb, min(a_out, 1.0));
+	frag_color = vec4(color.rgb, a_out);
 }
