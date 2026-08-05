@@ -801,6 +801,45 @@ static int Array_At(struct page **self, int index)
 }
 
 /*
+ * Unique(self) / Unique(self, равенство) — удалить ДУБЛИКАТЫ, сохранив порядок.
+ *
+ * Что это именно «удалить все дубликаты», а не std::unique (только соседние),
+ * следует из того, что в библиотеке ОТДЕЛЬНО объявлена `UniqueSorted` — иначе
+ * две функции совпадали бы. Лямбда-перегрузка получает ДВА элемента и отдаёт
+ * bool, причём это предикат РАВЕНСТВА, а не «меньше»: тело лямбды на сайте
+ * @0x1fb27e — ровно `lhs.IsSame(rhs)` (`elkeditor::detail::CEmitterKey@IsSame`).
+ *
+ * Идём с конца, чтобы удалялся ПОЗДНИЙ из совпавших (первое вхождение остаётся
+ * на месте) и чтобы удаление не сдвигало ещё не просмотренные индексы.
+ */
+static void ix_unique(struct page **self, union vm_value *fn, bool use_pred)
+{
+	if (!self || !*self)
+		return;
+	int slots = array_elem_slots(*self);
+	for (int i = array_numof(*self, 1) - 1; i >= 1; i--) {
+		bool dup = false;
+		if (use_pred) {
+			for (int j = 0; j < i && !dup; j++)
+				dup = ix_less(fn, *self, j, i);
+		} else {
+			dup = array_find(*self, 0, i, (*self)->values[i * slots], 0) >= 0;
+		}
+		if (!dup)
+			continue;
+		bool ok = false;
+		*self = array_erase(*self, i, &ok);
+		if (!*self)
+			break;
+	}
+}
+
+static void Array_ix_Unique(struct page **self, union vm_value *fn)
+{
+	ix_unique(self, fn, hll_current_nr_args >= 2 && ix_arg_is_func(1));
+}
+
+/*
  * array SYSTEMONLY_GetStructPageList(self) — «сырые» страницы объектов из
  * контейнера интерфейсных ссылок. Служебная функция сериализации: единственный
  * сайт — `AFL_GameSave_StructLoad` (@0x227e56), который собирает
@@ -840,6 +879,7 @@ static int Array_SYSTEMONLY_GetStructPageList(struct page **self)
 HLL_LIBRARY(Array,
 	    HLL_EXPORT(Alloc, Array_Alloc),
 	    HLL_EXPORT(SYSTEMONLY_GetStructPageList, Array_SYSTEMONLY_GetStructPageList),
+	    HLL_EXPORT(Unique, Array_ix_Unique),
 	    HLL_EXPORT(EmplaceBack, Array_EmplaceBack),
 	    HLL_EXPORT(At, Array_At),
 	    HLL_EXPORT(First, Array_ix_First),
