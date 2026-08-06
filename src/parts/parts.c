@@ -1109,14 +1109,15 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
 		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
-		       p->global.alpha, parts_hidden_by_layer(p), cgname);
+		       p->global.alpha, parts_hidden_by_layer(p), p->message_window,
+		       p->linked_to, p->states[p->state].common.texture.handle, cgname);
 		n++;
 	}
 	NOTICE("parts_debug_dump: %d parts total", n);
@@ -1204,6 +1205,17 @@ static void parts_combine_params(struct parts_params *parent, struct parts_param
 	out->multiply_color.b = parent->multiply_color.b * (child->multiply_color.b / 255.0f);
 }
 
+// Передать слой всему поддереву: у детей он тоже определяется местом в дереве.
+static void parts_inherit_controller(struct parts *parts, int controller_no)
+{
+	if (parts->controller_no == controller_no)
+		return;
+	parts->controller_no = controller_no;
+	struct parts *child;
+	PARTS_FOREACH_CHILD(child, parts)
+		parts_inherit_controller(child, controller_no);
+}
+
 static void parts_update_component(struct parts *parts)
 {
 	if (parts->parent) {
@@ -1248,6 +1260,19 @@ void PE_UpdateComponent(possibly_unused int passed_time)
 			}
 			parts->parent = parent;
 			TAILQ_INSERT_TAIL(&parent->children, parts, child_list_entry);
+			// Слой (контроллер) определяется МЕСТОМ В ДЕРЕВЕ, а не тем, какой
+			// слой был активен в момент создания части: переподчинение и есть
+			// способ перенести часть на другой экран. Раньше `controller_no`
+			// оставался от создания, и часть навсегда сортировалась по ЧУЖОМУ
+			// слою — а при multi-controller слой это ПЕРВИЧНЫЙ ключ порядка
+			// (parts_get_sprite_z), z — только вторичный.
+			// Живой случай: системные кнопки ADV у Haha Ranman создаются на слое
+			// 0 (титул), затем подвешиваются к частям окна сообщений на слое 1.
+			// Оставаясь на слое 0, они уходили ПОД непрозрачную рамку окна и
+			// пропадали с экрана — при том что show, alpha, текстура и координаты
+			// у них были верные (проверено дампом). Пересортировку делать не надо:
+			// `parts_update_component` ниже сам заметит смену ключа.
+			parts_inherit_controller(parts, parent->controller_no);
 
 			// if parent is layout box, mark it dirty so that it can re-layout its children
 			if (parent->states[0].type == PARTS_LAYOUT_BOX)
