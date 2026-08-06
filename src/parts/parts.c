@@ -1176,6 +1176,14 @@ void parts_debug_dump(void)
 {
 	struct parts *p;
 	int n = 0;
+	{
+		char buf[256]; int m = 0;
+		for (int i = 0; i < ctrl_stack.nr_controllers && m < 200; i++)
+			m += snprintf(buf + m, sizeof(buf) - m, "%d%s ", ctrl_stack.stack[i],
+				      ctrl_stack.hidden[i] ? "(скрыт)" : "");
+		buf[m] = 0;
+		NOTICE("  СТЕК СЛОЁВ (низ→верх): %s| активный %d", buf, ctrl_stack.active);
+	}
 	PARTS_LIST_FOREACH(p) {
 		Rectangle *hb = &p->states[0].common.hitbox;
 		// Имя CG у состояния 0 — без него в дампе не отличить «наш прямоугольник не
@@ -3584,6 +3592,8 @@ int PE_get_active_controller(void)
 
 int PE_get_controller_length(void)
 {
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("GetControllerLength -> %d", ctrl_stack.nr_controllers);
 	return ctrl_stack.nr_controllers;
 }
 
@@ -3591,6 +3601,8 @@ int PE_get_controller_id(int index)
 {
 	if (index < 0 || index >= ctrl_stack.nr_controllers)
 		return -1;
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("GetControllerID(%d) -> %d", index, ctrl_stack.stack[index]);
 	return ctrl_stack.stack[index];
 }
 

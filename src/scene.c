@@ -154,16 +154,15 @@ void scene_set_sprite_z2(struct sprite *sp, int z, int z2)
 void scene_trace_once(void)
 {
 	static bool done = false;
-	static int frames = 0;
 	const char *e = getenv("XSYS4_SCENE_TRACE");
 	if (done || !e)
 		return;
-	// Значение переменной — НОМЕР КАДРА, на котором снять срез (по умолчанию 1200,
-	// ~20 с при 60 к/с). Момент важен: до постройки экрана в сцене почти пусто.
+	// Значение — СЕКУНДЫ от старта, а не кадры: под llvmpipe частота плавает, и по
+	// номеру кадра в нужный момент не попасть (при 9000 срез не срабатывал вовсе).
 	int at = atoi(e);
 	if (at < 1)
-		at = 1200;
-	if (++frames < at)
+		at = 20;
+	if (SDL_GetTicks() < (uint32_t)at * 1000)
 		return;
 	done = true;
 	struct sprite *p;
