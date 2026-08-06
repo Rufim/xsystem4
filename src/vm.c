@@ -1290,6 +1290,40 @@ static void echo_message(int i)
 	NOTICE("MSG %d: %s", i, display_sjis0(ain->messages[i]->text));
 }
 
+/*
+ * ★У IXSEAL ПОЛЕ `MSGF` В ЗАГОЛОВКЕ .ain НЕ ЗАПОЛНЕНО — обработчик ищется ПО ИМЕНИ.
+ *
+ * `MSG n` передаёт текст реплики игровой «функции сообщения»; её номер движок
+ * брал только из заголовка. У Dohna там 0, а функция 0 в ЛЮБОМ .ain — это
+ * пустышка-заполнитель с именем `NULL` (проверено: fn0 = "NULL" и у Dohna, и у
+ * Tsumamigui 3). Проверка `msgf < 0` ноль пропускала, поэтому первая же реплика
+ * сценария прыгала по адресу заполнителя: `Illegal instruction pointer:
+ * 0x00A2A714` в `ＥＶ／メイン／０１０１` сразу после `○台詞` и `VOICE`.
+ *
+ * Настоящий обработчик у Dohna есть — глобальная функция `message(int nMsgNum,
+ * int nNumofMsg, string szText)` (fno 0x1b3b), рядом с которой лежат `R`
+ * (перевод строки/ожидание) и `A` (ожидание клика), вызываемые сценарием явными
+ * CALLFUNC. Сигнатура ровно та, что кладёт на стек `_MSG`.
+ *
+ * Гейт структурный и не трогает старые игры: поиск по имени включается ТОЛЬКО
+ * при `msgf <= 0`, а у Tsumamigui 3 и Escalayer Reboot заголовок заполнен
+ * (0xe6d и 0xfe5), так что до поиска дело не доходит.
+ */
+static int vm_message_function(void)
+{
+	static int cached = -2;  // -2 = ещё не искали
+	if (cached != -2)
+		return cached;
+	cached = ain->msgf;
+	if (cached <= 0) {
+		cached = ain_get_function(ain, (char *)"message");
+		if (cached > 0)
+			NOTICE("MSG: поле MSGF в заголовке пусто, обработчик найден по имени: "
+			       "функция 'message' (#%d)", cached);
+	}
+	return cached;
+}
+
 static enum opcode execute_instruction(enum opcode opcode)
 {
 	switch (opcode) {
@@ -1907,12 +1941,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 	case _MSG: {
 		if (config.echo)
 			echo_message(get_argument(0));
-		if (ain->msgf < 0)
+		int msgf = vm_message_function();
+		if (msgf <= 0)
 			break;
 		stack_push(get_argument(0));
 		stack_push(ain->nr_messages);
 		stack_push_string(string_ref(ain->messages[get_argument(0)]));
-		function_call(ain->msgf, instr_ptr + instruction_width(_MSG));
+		function_call(msgf, instr_ptr + instruction_width(_MSG));
 		break;
 	}
 	case JUMP: { // ADDR

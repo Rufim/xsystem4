@@ -38,6 +38,13 @@ struct adv_log {
 	struct string **lines;
 	unsigned nr_voices;
 	int *voices;
+	// Ixseal (v14, библиотека AnteaterADVLogList): реплика помечается не НОМЕРОМ
+	// голоса, а ИМЕНЕМ файла озвучки плюс именем «фильтра». Отдельные массивы, а
+	// не переиспользование `voices`: игра либо старая, либо новая, и смешивать
+	// int-номера со строками значило бы гадать, какой из них валиден.
+	unsigned nr_voice_names;
+	struct string **voice_names;
+	struct string **voice_filters;
 };
 
 static bool enabled = true;
@@ -64,10 +71,19 @@ static void free_log(struct adv_log *log)
 	}
 	free(log->lines);
 	free(log->voices);
+	for (unsigned i = 0; i < log->nr_voice_names; i++) {
+		free_string(log->voice_names[i]);
+		free_string(log->voice_filters[i]);
+	}
+	free(log->voice_names);
+	free(log->voice_filters);
 	log->nr_lines = 0;
 	log->lines = NULL;
 	log->nr_voices = 0;
 	log->voices = NULL;
+	log->nr_voice_names = 0;
+	log->voice_names = NULL;
+	log->voice_filters = NULL;
 }
 
 // Ensure there is at least one log allocated
@@ -548,6 +564,187 @@ static void AnteaterADVEngine_ADVLogList_AddText_with_window_byval(struct string
 {
 	advlog_add_text_impl(text);
 }
+
+/*
+ * ★БИБЛИОТЕКА `AnteaterADVLogList` (Ixseal, v14) — тот же бэклог, но ПЛОСКИМ
+ * API вместо префиксных функций `ADVLogList_*` внутри AnteaterADVEngine, и с
+ * изменившимися формами. Разница снята с .ain (тулы ainlibbyname/ainlibn — они
+ * дают имена аргументов, гадать не нужно):
+ *   AddText(string Text, string WindowName)      было: (ref string) / (string,int)
+ *   AddVoice(string VoiceName, string VoiceFilterName)   было: (int nVoiceNumber)
+ *   GetADVLogText(int,int) -> string             было: out-параметр ref string
+ *   GetADVLogVoice(int,int) -> string            было: -> int
+ *   GetADVLogVoiceFilter(int,int) -> string      новая
+ *   Save/Load(wrap<array<int>>)                  было: ref array<int>
+ * Хранилище общее (те же `logs`), поэтому обе версии дают один и тот же бэклог.
+ *
+ * `WindowName` НЕ хранится: геттера у него нет ни одного (в библиотеке 15
+ * функций, все перечислены выше), то есть игра его обратно не читает — правило
+ * «есть геттер — свойство обязано храниться по-настоящему» работает и в обратную
+ * сторону. Игра берёт его из текущего окна сообщений
+ * (`backlog::detail::SYS_AddBackLogText`: global[95].GetMessageWindowName()).
+ *
+ * `wrap<array<int>>` маршалится ffi так же, как `ref array<int>` (одна ячейка с
+ * heap-индексом страницы, см. ветку AIN_REF_ARRAY в ffi.c), поэтому сигнатура
+ * `struct page **` подходит без изменений.
+ */
+
+static void advloglist_AddText(struct string *text, possibly_unused struct string *window_name)
+{
+	advlog_add_text_impl(text);
+}
+
+static void advloglist_AddVoice(struct string *voice_name, struct string *filter_name)
+{
+	if (!enabled)
+		return;
+	struct adv_log *log = current_log();
+	log->voice_names = xrealloc_array(log->voice_names, log->nr_voice_names,
+			log->nr_voice_names + 1, sizeof(struct string*));
+	log->voice_filters = xrealloc_array(log->voice_filters, log->nr_voice_names,
+			log->nr_voice_names + 1, sizeof(struct string*));
+	log->voice_names[log->nr_voice_names] = string_ref(voice_name);
+	log->voice_filters[log->nr_voice_names] = string_ref(filter_name);
+	log->nr_voice_names++;
+}
+
+static struct string *advloglist_GetADVLogText(int log_no, int line_no)
+{
+	struct adv_log *log = log_entry(log_no);
+	// NOTE: AnteaterADVEngine.dll segfaults on invalid index
+	if (line_no < 0 || (unsigned)line_no >= log->nr_lines)
+		VM_ERROR("Invalid line number: %d", line_no);
+	return string_ref(log->lines[line_no]);
+}
+
+static int advloglist_GetNumofADVLogVoice(int log_no)
+{
+	return log_entry(log_no)->nr_voice_names;
+}
+
+static struct string *advloglist_GetADVLogVoice(int log_no, int voice_no)
+{
+	struct adv_log *log = log_entry(log_no);
+	if (voice_no < 0 || (unsigned)voice_no >= log->nr_voice_names)
+		VM_ERROR("Invalid voice number: %d", voice_no);
+	return string_ref(log->voice_names[voice_no]);
+}
+
+static struct string *advloglist_GetADVLogVoiceFilter(int log_no, int voice_no)
+{
+	struct adv_log *log = log_entry(log_no);
+	if (voice_no < 0 || (unsigned)voice_no >= log->nr_voice_names)
+		VM_ERROR("Invalid voice number: %d", voice_no);
+	return string_ref(log->voice_filters[voice_no]);
+}
+
+/*
+ * Сериализация: тот же контейнер-iarray, что у v6/v7, но озвучка пишется
+ * СТРОКАМИ. Формат наш собственный (магия "ADL", как у старого) — с форматом
+ * оригинального движка он не обязан совпадать: наши сейвы читаются нашим же
+ * загрузчиком, а официальный сейв Dohna движок всё равно пока не открывает.
+ */
+static bool advloglist_Save(struct page **iarray)
+{
+	ensure_log();
+	struct iarray_writer b;
+	iarray_init_writer(&b, "ADL");
+	iarray_write(&b, 0);
+	int nr_logs = ADVLogList_GetNumofADVLog();
+	iarray_write(&b, nr_logs);
+	for (int i = 0; i < nr_logs; i++) {
+		struct adv_log *log = &logs[(log_first + i) % LOG_BUFFER_SIZE];
+		iarray_write(&b, log->nr_lines);
+		for (unsigned j = 0; j < log->nr_lines; j++)
+			iarray_write_string(&b, log->lines[j]);
+		iarray_write(&b, log->nr_voice_names);
+		for (unsigned j = 0; j < log->nr_voice_names; j++) {
+			iarray_write_string(&b, log->voice_names[j]);
+			iarray_write_string(&b, log->voice_filters[j]);
+		}
+	}
+	iarray_write(&b, 1);
+
+	if (*iarray) {
+		delete_page_vars(*iarray);
+		free_page(*iarray);
+	}
+	*iarray = iarray_to_page(&b);
+	iarray_free_writer(&b);
+	return true;
+}
+
+static bool advloglist_Load(struct page **data)
+{
+	if (!(*data))
+		return false;
+	struct iarray_reader r;
+	iarray_init_reader(&r, *data, "ADL");
+	if (iarray_read(&r))
+		return false;
+
+	ADVLogList_Clear();
+
+	int nr_pages = iarray_read(&r);
+	if (nr_pages < 0 || nr_pages > 10000) {
+		WARNING("Invalid value for nr_pages: %d", nr_pages);
+		goto error;
+	}
+	ensure_log();
+
+	// Как и у v6/v7: страница 0 остаётся пустой, загруженные идут после неё.
+	for (int i = 1; i < nr_pages + 1; i++) {
+		ADVLogList_AddNewPage();
+		struct adv_log *log = current_log();
+		int nr_lines = iarray_read(&r);
+		if (nr_lines <= 0 || nr_lines > 10000) {
+			WARNING("Invalid value for nr_lines[%d]: %d", i, nr_lines);
+			goto error;
+		}
+		log->lines = xcalloc(nr_lines, sizeof(struct string*));
+		for (int j = 0; j < nr_lines; j++)
+			log->lines[j] = iarray_read_string(&r);
+		log->nr_lines = nr_lines;
+
+		int nr_voices = iarray_read(&r);
+		if (nr_voices < 0 || nr_voices > 10000) {
+			WARNING("Invalid value for nr_voices[%d]: %d", i, nr_voices);
+			goto error;
+		}
+		log->voice_names = xcalloc(nr_voices, sizeof(struct string*));
+		log->voice_filters = xcalloc(nr_voices, sizeof(struct string*));
+		for (int j = 0; j < nr_voices; j++) {
+			log->voice_names[j] = iarray_read_string(&r);
+			log->voice_filters[j] = iarray_read_string(&r);
+		}
+		log->nr_voice_names = nr_voices;
+	}
+
+	if (iarray_read(&r) != 1 || r.error)
+		goto error;
+	return true;
+error:
+	ADVLogList_Clear();
+	return false;
+}
+
+HLL_LIBRARY(AnteaterADVLogList,
+	    HLL_EXPORT(Clear, ADVLogList_Clear),
+	    HLL_EXPORT(AddText, advloglist_AddText),
+	    HLL_EXPORT(AddNewLine, ADVLogList_AddNewLine),
+	    HLL_EXPORT(AddNewPage, ADVLogList_AddNewPage),
+	    HLL_EXPORT(AddVoice, advloglist_AddVoice),
+	    HLL_EXPORT(SetEnable, ADVLogList_SetEnable),
+	    HLL_EXPORT(IsEnable, ADVLogList_IsEnable),
+	    HLL_EXPORT(GetNumofADVLog, ADVLogList_GetNumofADVLog),
+	    HLL_EXPORT(GetNumofADVLogText, ADVLogList_GetNumofADVLogText),
+	    HLL_EXPORT(GetADVLogText, advloglist_GetADVLogText),
+	    HLL_EXPORT(GetNumofADVLogVoice, advloglist_GetNumofADVLogVoice),
+	    HLL_EXPORT(GetADVLogVoice, advloglist_GetADVLogVoice),
+	    HLL_EXPORT(GetADVLogVoiceFilter, advloglist_GetADVLogVoiceFilter),
+	    HLL_EXPORT(Save, advloglist_Save),
+	    HLL_EXPORT(Load, advloglist_Load)
+	);
 
 HLL_LIBRARY(AnteaterADVEngine,
 	    HLL_EXPORT(_PreLink, AnteaterADVEngine_PreLink),

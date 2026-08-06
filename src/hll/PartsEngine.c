@@ -1257,7 +1257,9 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		 * его теми же сеттерами, которыми потом пользуется игра — никакой
 		 * второй дороги к тем же полям.
 		 */
-		PE_CreateMessageWindow(no, ++pe_act_part_seq);
+		int mw_text_no = ++pe_act_part_seq;
+		int mw_mark_no = ++pe_act_part_seq;
+		PE_CreateMessageWindow(no, mw_text_no, mw_mark_no);
 		PE_SetMessageWindowInactiveMultipleColor(no,
 			act_list_int(ti, "非アクティブ時の乗算カラー", 0, 255),
 			act_list_int(ti, "非アクティブ時の乗算カラー", 1, 255),
@@ -1308,6 +1310,21 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			PE_SetMessageWindowRubyLineSpace(no, act_int(ruby, "行間隔", 0));
 		}
 		PE_SetEnableMessageWindowTextWrapping(no, act_int(ti, "折り返し", 0));
+		struct ex_tree *mark = act_child(ti, "キー待ちマーク");
+		if (mark && !mark->is_leaf) {
+			PE_SetKeyWaitPos(no, act_list_int(mark, "座標", 0, 0),
+				act_list_int(mark, "座標", 1, 0),
+				act_list_int(mark, "座標", 2, 0));
+			struct string *mcg = act_str(mark, "ＣＧ名");
+			if (mcg)
+				PE_SetKeyWaitCGName(no, mcg,
+					act_int(mark, "ループＣＧ開始番号", 0),
+					act_int(mark, "ループＣＧ枚数", 0),
+					act_int(mark, "ループＣＧ切り替え時間", 0));
+			struct string *mflat = act_str(mark, "フラット名");
+			if (mflat)
+				PE_SetKeyWaitFlatName(no, mflat);
+		}
 		/*
 		 * `テキスト` из раскладки — образец для редактора активностей («проверьте
 		 * прозрачность/яркость»), а не реплика: игра выдаёт текст сама через
@@ -2614,6 +2631,16 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetMessageWindowRubyLineSpace, PE_GetMessageWindowRubyLineSpace),
 	    HLL_EXPORT(SetEnableMessageWindowTextWrapping, PE_SetEnableMessageWindowTextWrapping),
 	    HLL_EXPORT(IsEnableMessageWindowTextWrapping, PE_IsEnableMessageWindowTextWrapping),
+	    HLL_EXPORT(SetKeyWaitCGName, PE_SetKeyWaitCGName),
+	    HLL_EXPORT(GetKeyWaitCGName, PE_GetKeyWaitCGName),
+	    HLL_EXPORT(SetKeyWaitFlatName, PE_SetKeyWaitFlatName),
+	    HLL_EXPORT(GetKeyWaitFlatName, PE_GetKeyWaitFlatName),
+	    HLL_EXPORT(SetKeyWaitPos, PE_SetKeyWaitPos),
+	    HLL_EXPORT(GetKeyWaitPosX, PE_GetKeyWaitPosX),
+	    HLL_EXPORT(GetKeyWaitPosY, PE_GetKeyWaitPosY),
+	    HLL_EXPORT(GetKeyWaitPosZ, PE_GetKeyWaitPosZ),
+	    HLL_EXPORT(SetKeyWaitShow, PE_SetKeyWaitShow),
+	    HLL_EXPORT(IsKeyWaitShow, PE_IsKeyWaitShow),
 	    HLL_EXPORT(SetComponentAlpha, PE_SetAlpha),
 	    HLL_EXPORT(GetComponentAlpha, PE_GetPartsAlpha),
 	    HLL_EXPORT(SetComponentAddColor, PE_SetAddColor),

@@ -589,6 +589,14 @@ struct parts_message_window {
 	// основной), поэтому лежит здесь.
 	struct text_style ruby_ts;
 	int ruby_char_space, ruby_line_space;
+	// キー待ちマーク — значок «жду клика». Хранится здесь, рисуется служебной
+	// частью-потомком; показом управляет игра (SetKeyWaitShow).
+	struct string *mark_cg_name;
+	struct string *mark_flat_name;
+	int mark_start_no, mark_nr_cg, mark_time_per_cg;  // ループＣＧ開始番号/枚数/切り替え時間
+	Point mark_pos;
+	int mark_z;
+	bool mark_show;
 	// Служебные части-потомки: текст и キー待ちマーク. -1 = не создана.
 	int text_parts_no;
 	int mark_parts_no;

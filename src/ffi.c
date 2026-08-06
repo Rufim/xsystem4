@@ -783,6 +783,7 @@ extern struct static_library lib_AliceLogo3;
 extern struct static_library lib_AliceLogo4;
 extern struct static_library lib_AliceLogo5;
 extern struct static_library lib_AnteaterADVEngine;
+extern struct static_library lib_AnteaterADVLogList;
 extern struct static_library lib_Array;
 extern struct static_library lib_BanMisc;
 extern struct static_library lib_Bitarray;
@@ -913,6 +914,7 @@ static struct static_library *static_libraries[] = {
 	&lib_AliceLogo4,
 	&lib_AliceLogo5,
 	&lib_AnteaterADVEngine,
+	&lib_AnteaterADVLogList,
 	&lib_Array,
 	&lib_BanMisc,
 	&lib_Bitarray,

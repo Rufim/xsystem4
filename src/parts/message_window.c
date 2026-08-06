@@ -76,6 +76,10 @@ void parts_message_window_free(struct parts_message_window *mw)
 		free_string(mw->flat_name);
 	if (mw->msg_func_name)
 		free_string(mw->msg_func_name);
+	if (mw->mark_cg_name)
+		free_string(mw->mark_cg_name);
+	if (mw->mark_flat_name)
+		free_string(mw->mark_flat_name);
 	free(mw);
 }
 
@@ -132,20 +136,29 @@ static struct string *mw_strip_markup(struct string *src)
 	struct string *dst = string_ref(&EMPTY_STRING);
 	const char *p = src->text;
 	const char *end = src->text + src->size;
+	const char *run = p;   // начало неразмеченного куска
 	bool seen_tag = false;
 
+	// ★Копируем КУСКАМИ, а не побайтно: `string_push_back` принимает СИМВОЛ, и на
+	// ведущем байте двухбайтового SJIS (SJIS_2BYTE) дописывает второй байт из
+	// старших разрядов — то есть НОЛЬ. Побайтная сборка превращала каждую
+	// многобайтовую букву в «ведущий байт + 0x00», и реплика выходила на экран
+	// мусором из отдельных латинских глифов.
 	while (p < end) {
 		if (p[0] == '$' && p + 1 < end && p[1] == '{') {
 			const char *close = memchr(p, '}', end - p);
 			if (close) {
+				if (p > run)
+					string_append_cstr(&dst, run, p - run);
 				seen_tag = true;
-				p = close + 1;
+				p = run = close + 1;
 				continue;
 			}
 		}
-		string_push_back(&dst, (unsigned char)*p);
 		p++;
 	}
+	if (p > run)
+		string_append_cstr(&dst, run, p - run);
 
 	if (seen_tag) {
 		static bool warned = false;
@@ -189,10 +202,13 @@ static int mw_text_parts(struct parts_message_window *mw)
 void parts_message_window_relayout(struct parts *parts)
 {
 	struct parts_message_window *mw = parts->mw;
-	if (!mw || mw->text_parts_no < 0)
+	if (!mw)
 		return;
 	Point off = parts->states[PARTS_STATE_DEFAULT].common.origin_offset;
-	PE_SetPos(mw->text_parts_no, off.x + mw->text_area.x, off.y + mw->text_area.y);
+	if (mw->text_parts_no >= 0)
+		PE_SetPos(mw->text_parts_no, off.x + mw->text_area.x, off.y + mw->text_area.y);
+	if (mw->mark_parts_no >= 0)
+		PE_SetPos(mw->mark_parts_no, off.x + mw->mark_pos.x, off.y + mw->mark_pos.y);
 }
 
 static void mw_apply_text_area(int parts_no, struct parts_message_window *mw)
@@ -212,17 +228,147 @@ static void mw_apply_text_area(int parts_no, struct parts_message_window *mw)
  * ПО ИМЕНИ (GetActivityPartsNumber), поэтому лишний номер посередине ничего не
  * сдвигает — так же уже сделана подпись чекбокса в act_build_part.
  */
-void PE_CreateMessageWindow(int parts_no, int text_parts_no)
+void PE_CreateMessageWindow(int parts_no, int text_parts_no, int mark_parts_no)
 {
 	struct parts *parts = parts_get(parts_no);
 	if (parts->mw)
 		parts_message_window_free(parts->mw);
 	parts->mw = parts_message_window_alloc();
 	parts->mw->text_parts_no = text_parts_no;
+	parts->mw->mark_parts_no = mark_parts_no;
 
 	PE_SetParentPartsNumber(text_parts_no, parts_no);
 	PE_SetZ(text_parts_no, 1);
 	PE_SetShow(text_parts_no, true);
+
+	// Значок ожидания клика по умолчанию скрыт: его зажигает сама игра
+	// (message::detail::キー待ちマーク表示設定 -> SetKeyWaitShow), когда реплика
+	// дочитана.
+	PE_SetParentPartsNumber(mark_parts_no, parts_no);
+	PE_SetZ(mark_parts_no, 2);
+	PE_SetShow(mark_parts_no, false);
+}
+
+// --------------------------------------------------- キー待ちマーク (мигалка клика)
+
+/*
+ * `キー待ちマーク` — значок «жду клика» в углу окна. Раскладка задаёт его
+ * подузлом окна (`ＣＧ名`, `フラット名`, `ループＣＧ開始番号`, `ループＣＧ枚数`,
+ * `ループＣＧ切り替え時間`, `座標`), а ПОКАЗОМ управляет сама игра
+ * (`message::detail::キー待ちマーク表示設定` -> SetKeyWaitShow), поэтому угадывать
+ * правило видимости не нужно: движок только хранит и рисует.
+ *
+ * Это отдельная часть-потомок, а не второе состояние окна: значок живёт ПОВЕРХ
+ * фона одновременно с текстом и мигает своей циклической анимацией.
+ */
+static int mw_mark_parts(possibly_unused int parts_no, struct parts_message_window *mw)
+{
+	return mw->mark_parts_no;
+}
+
+void PE_SetKeyWaitCGName(int parts_no, struct string *name, int start_no, int nr_cg, int time_per_cg)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetKeyWaitCGName");
+	if (!mw)
+		return;
+	if (mw->mark_cg_name)
+		free_string(mw->mark_cg_name);
+	mw->mark_cg_name = string_ref(name);
+	mw->mark_start_no = start_no;
+	mw->mark_nr_cg = nr_cg;
+	mw->mark_time_per_cg = time_per_cg;
+
+	int no = mw_mark_parts(parts_no, mw);
+	if (!name || !name->size)
+		return;
+	// `ループＣＧ枚数` = 0 — обычный одиночный CG, иначе циклическая анимация из
+	// nr_cg кадров с шагом time_per_cg (у キー待ちマーク／Ａ в архиве лежат кадры
+	// `…_01` … `…_04`, у `／Ｂ` — только базовый).
+	if (nr_cg > 0)
+		PE_SetLoopCG(no, name, start_no, nr_cg, time_per_cg, 1);
+	else
+		PE_SetPartsCG(no, name, 0, 1);
+	parts_message_window_relayout(parts_get(parts_no));
+}
+
+void PE_GetKeyWaitCGName(int parts_no, struct string **name, int *start_no, int *nr_cg,
+                         int *time_per_cg)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (name) {
+		if (*name)
+			free_string(*name);
+		*name = string_ref(mw && mw->mark_cg_name ? mw->mark_cg_name : &EMPTY_STRING);
+	}
+	if (start_no) *start_no = mw ? mw->mark_start_no : 0;
+	if (nr_cg) *nr_cg = mw ? mw->mark_nr_cg : 0;
+	if (time_per_cg) *time_per_cg = mw ? mw->mark_time_per_cg : 0;
+}
+
+void PE_SetKeyWaitFlatName(int parts_no, struct string *name)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetKeyWaitFlatName");
+	if (!mw)
+		return;
+	if (mw->mark_flat_name)
+		free_string(mw->mark_flat_name);
+	mw->mark_flat_name = string_ref(name);
+	if (name && name->size) {
+		PE_SetPartsFlat(mw_mark_parts(parts_no, mw), name, 1);
+		parts_message_window_relayout(parts_get(parts_no));
+	}
+}
+
+struct string *PE_GetKeyWaitFlatName(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return string_ref(mw && mw->mark_flat_name ? mw->mark_flat_name : &EMPTY_STRING);
+}
+
+void PE_SetKeyWaitPos(int parts_no, int x, int y, int z)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetKeyWaitPos");
+	if (!mw)
+		return;
+	mw->mark_pos = (Point) { x, y };
+	mw->mark_z = z;
+	if (mw->mark_parts_no >= 0) {
+		PE_SetZ(mw->mark_parts_no, z ? z : 2);
+		parts_message_window_relayout(parts_get(parts_no));
+	}
+}
+
+int PE_GetKeyWaitPosX(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->mark_pos.x : 0;
+}
+
+int PE_GetKeyWaitPosY(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->mark_pos.y : 0;
+}
+
+int PE_GetKeyWaitPosZ(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->mark_z : 0;
+}
+
+void PE_SetKeyWaitShow(int parts_no, bool show)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetKeyWaitShow");
+	if (!mw)
+		return;
+	mw->mark_show = show;
+	PE_SetShow(mw_mark_parts(parts_no, mw), show);
+}
+
+bool PE_IsKeyWaitShow(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->mark_show : false;
 }
 
 // ------------------------------------------------------------- HLL: активность

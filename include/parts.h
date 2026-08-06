@@ -398,7 +398,17 @@ int PE_get_layoutbox_padding_left(int parts_no);
 int PE_get_layoutbox_padding_right(int parts_no);
 
 // message_window.c — окно реплик ADV (`メッセージウィンドウ`, тип компонента v14 = 10).
-void PE_CreateMessageWindow(int parts_no, int text_parts_no);
+void PE_CreateMessageWindow(int parts_no, int text_parts_no, int mark_parts_no);
+void PE_SetKeyWaitCGName(int parts_no, struct string *name, int start_no, int nr_cg, int time_per_cg);
+void PE_GetKeyWaitCGName(int parts_no, struct string **name, int *start_no, int *nr_cg, int *time_per_cg);
+void PE_SetKeyWaitFlatName(int parts_no, struct string *name);
+struct string *PE_GetKeyWaitFlatName(int parts_no);
+void PE_SetKeyWaitPos(int parts_no, int x, int y, int z);
+int PE_GetKeyWaitPosX(int parts_no);
+int PE_GetKeyWaitPosY(int parts_no);
+int PE_GetKeyWaitPosZ(int parts_no);
+void PE_SetKeyWaitShow(int parts_no, bool show);
+bool PE_IsKeyWaitShow(int parts_no);
 void PE_SetMessageWindowActive(int parts_no, bool active);
 void PE_SetMessageWindowInactiveMultipleColor(int parts_no, int r, int g, int b);
 int PE_GetMessageWindowInactiveMultipleColorR(int parts_no);
