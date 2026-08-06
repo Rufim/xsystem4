@@ -190,6 +190,21 @@ static enum ain_data_type array_type_from_elem(enum ain_data_type et)
 // handling both legacy typed arrays and Ixseal generic arrays.
 // `ref_elem` (можно NULL) сообщает, что элемент объявлен ССЫЛКОЙ: такой элемент
 // по определению пуст до присваивания, и предзаполнять его объектами нельзя.
+// Ведёт ли цепочка обёрток (`wrap`/`option`) к ссылке на ИНТЕРФЕЙС — то есть к
+// «толстому указателю» из двух слотов. Обёртка над обычной структурой сюда не
+// попадает: она остаётся одним heap-слотом.
+static bool type_wraps_iface_pair(struct ain_type *t)
+{
+	while (t) {
+		if (array_iface_pair_type(t->data))
+			return true;
+		if (t->data != AIN_WRAP && t->data != AIN_OPTION)
+			return false;
+		t = t->array_type;
+	}
+	return false;
+}
+
 enum ain_data_type array_resolve_var_type(struct page *container, int varno, int *struct_type,
 					  int *rank, bool *ref_elem)
 {
@@ -228,7 +243,15 @@ enum ain_data_type array_resolve_var_type(struct page *container, int varno, int
 		// такими массивами передавали предикату 1 слот вместо 2, арность не
 		// совпадала и лямбда не вызывалась вовсе (вся Motion-аналитика Dohna
 		// «ничего не находила»).
-		if ((et == AIN_WRAP || et == AIN_OPTION) && vt->array_type->array_type
+		// `option<wrap<интерфейс>>` — ТРИ слота (пара + тег наличия), и байткод
+		// так его и адресует: `RankGauge@EndCurrentMotion` (@0x660c12) считает
+		// `index * 3`, затем `X_REF 3`. Помечаем такой массив маркером
+		// AIN_OPTION (как самостоятельный a_type он больше нигде не рождается).
+		// Интерфейс лежит на уровень ГЛУБЖЕ, чем у голого wrap: цепочка типов
+		// у `array<option<wrap<IParts>>>` — 79 → 86 → 82 → 100.
+		if (et == AIN_OPTION && type_wraps_iface_pair(vt->array_type->array_type))
+			return AIN_OPTION;
+		if (et == AIN_WRAP && vt->array_type->array_type
 				&& array_iface_pair_type(vt->array_type->array_type->data))
 			return vt->array_type->array_type->data;
 		if (array_iface_pair_type(et))
@@ -378,6 +401,8 @@ enum ain_data_type array_type(enum ain_data_type type)
 	// каждого слота даёт variable_type() по чётности. Маркер возвращаем как есть.
 	case AIN_IFACE:
 	case AIN_IFACE_WRAP:
+	// Тот же случай, только элемент — `option<wrap<интерфейс>>` (ТРИ слота).
+	case AIN_OPTION:
 		return type;
 	default:
 		WARNING("Unknown/invalid array type: %d", type);
@@ -408,16 +433,22 @@ bool array_iface_pair_type(enum ain_data_type a_type)
 	return a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
 }
 
+// Слотов на элемент по маркеру `a_type`: 2 — интерфейсная пара, 3 — она же под
+// `option<>` (пара + тег наличия), иначе 1.
+static int elem_slots_for_type(enum ain_data_type data_type, int rank)
+{
+	if (rank != 1)
+		return 1;
+	if (array_iface_pair_type(data_type))
+		return 2;
+	return data_type == AIN_OPTION ? 3 : 1;
+}
+
 int array_elem_slots(struct page *page)
 {
 	if (!page || page->type != ARRAY_PAGE)
 		return 1;
-	return (page->array.rank == 1 && array_iface_pair_type(page->a_type)) ? 2 : 1;
-}
-
-static int elem_slots_for_type(enum ain_data_type data_type, int rank)
-{
-	return (rank == 1 && array_iface_pair_type(data_type)) ? 2 : 1;
+	return elem_slots_for_type(page->a_type, page->array.rank);
 }
 
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank)
@@ -450,8 +481,14 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
 		// объекта (владение и копирование как у struct-элемента), верхний —
 		// целочисленная база интерфейса. Благодаря этому delete_page_vars /
 		// copy_page / variable_set работают с такой страницей без изменений.
-		if (array_elem_slots(page) == 2)
-			return (varno & 1) ? AIN_INT : AIN_STRUCT;
+		{
+			// У многослотового элемента «типа элемента» нет: владеет только
+			// НУЛЕВОЙ слот (heap-слот объекта), остальные — обычные числа
+			// (база интерфейса и, у option, тег наличия).
+			int es = array_elem_slots(page);
+			if (es > 1)
+				return (varno % es) ? AIN_INT : AIN_STRUCT;
+		}
 		return page->array.rank > 1 ? page->a_type : array_type(page->a_type);
 	case DELEGATE_PAGE:
 		// XXX: we return void here because objects in a delegate page aren't
@@ -585,7 +622,8 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 	case AIN_ARRAY_TYPE:          return type;
 	// Ixseal: маркер массива двухслотовых интерфейсных элементов (89/100).
 	case AIN_IFACE:
-	case AIN_IFACE_WRAP:          return type;
+	case AIN_IFACE_WRAP:
+	case AIN_OPTION:              return type;
 	default: VM_ERROR("Attempt to array allocate non-array type");
 	}
 }
@@ -594,10 +632,14 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 static void init_array_elem(struct page *page, int elem, enum ain_data_type type,
 			    int struct_type, bool init_structs)
 {
-	if (array_elem_slots(page) == 2) {
+	int es = array_elem_slots(page);
+	if (es > 1) {
 		// Пустая ссылка на интерфейс: объекта нет, база интерфейса 0.
-		page->values[elem*2].i = -1;
-		page->values[elem*2 + 1].i = 0;
+		// У `option<>` третий слот — ТЕГ, и 1 значит «пусто» (0 = значение есть).
+		page->values[elem*es].i = -1;
+		page->values[elem*es + 1].i = 0;
+		if (es > 2)
+			page->values[elem*es + 2].i = 1;
 	} else if (type == AIN_STRUCT && init_structs) {
 		create_struct(struct_type, &page->values[elem]);
 	} else {

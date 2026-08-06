@@ -913,13 +913,18 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// rect so it can serve as an alpha-clipper (rectangular clip) for siblings.
 	// The 手順1 create op's 先矩形 gives the size [.,.,.,.,w,h].
 	if (act_parts_type(st) == 18) {
+		// Тип состояния выставляем ВСЕГДА, даже когда `手順リスト` пуст (так у
+		// «PlayerC» в StandView): игра ищет такие части сравнением типа
+		// компонента (`CActivityWrap@GetConstruction`), и без этого падал ассерт
+		// `StandView.jaf:52: (nonnull) m_act.GetConstruction("PlayerC")`.
+		PE_ClearPartsConstructionProcess(no, state);
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
 		if (step1) {
 			int w = act_list_int(step1, "先矩形", 4, 0);
 			int h = act_list_int(step1, "先矩形", 5, 0);
 			if (w > 0 && h > 0) {
-				PE_SetPartsColorFill(no, w, h);
+				PE_SetPartsConstructionFill(no, w, h, state);
 				// Заливка — ТОЛЬКО маска: сама часть не рисуется, иначе
 				// непрозрачный прямоугольник закрывает экран (титул Dohna
 				// объявляет такую часть `表示 = 1, アルファ = 255`, z=29,

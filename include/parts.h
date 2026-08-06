@@ -228,6 +228,7 @@ bool PE_AddDrawTextToPartsConstructionProcess(int parts_no, int x, int y, struct
 		int char_space, int line_space, int state);
 bool PE_BuildPartsConstructionProcess(int parts_no, int state);
 bool PE_ClearPartsConstructionProcess(int parts_no, int state);
+void PE_SetPartsConstructionFill(int parts_no, int w, int h, int state);
 bool PE_SetPartsConstructionSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
 
 // input.c
