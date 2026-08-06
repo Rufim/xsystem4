@@ -550,6 +550,12 @@ struct parts {
 	// По этому флагу ClearBackScene сносит снимок, не гадая по диапазону номеров.
 	bool back_scene_copy;
 	bool draggable;
+	// «Свайп» (`スワイプ` в раскладке, Parts_Set/GetSwipeType): вид инерционного
+	// перетаскивания списка. Значение ХРАНИТСЯ и отдаётся геттером — им игра
+	// читает текущий режим (`ScrollBase@CreateSwipeTargetParts`), — а САМО
+	// поведение свайпа НЕ РЕАЛИЗОВАНО: смысл конкретных значений не установлен,
+	// а списки прокручиваются полосой и колесом.
+	int swipe_type;
 	int on_cursor_sound;
 	int on_click_sound;
 	int origin_mode;

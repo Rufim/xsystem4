@@ -633,6 +633,24 @@ void PE_SetDrag(int parts_no, bool enable)
 	parts_get(parts_no)->draggable = !!enable;
 }
 
+/*
+ * `スワイプ` — вид инерционного перетаскивания. Геттер у пары есть
+ * (Parts_GetSwipeType), то есть no-op отличим: значение обязано хранИться
+ * и возвращаться. Само поведение свайпа не реализовано — см. комментарий у
+ * поля swipe_type. Без этой пары `ScrollBase@0` (список предметов) падал на
+ * «Unimplemented HLL function: PartsEngine.Parts_SetSwipeType».
+ */
+void PE_SetSwipeType(int parts_no, int type)
+{
+	parts_get(parts_no)->swipe_type = type;
+}
+
+int PE_GetSwipeType(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->swipe_type : 0;
+}
+
 int PE_GetClickPartsNumber(void)
 {
 	return clicked_parts;
