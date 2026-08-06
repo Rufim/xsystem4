@@ -2793,6 +2793,10 @@ HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, LoadActivityEXText, struct str
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonSize, int a, int b, int c);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonEnable, int a, bool b);
 HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsButtonEnable, int a);
+// Чекбоксы — так же: «доступность» не рисуем, но считаем включёнными. Без этих
+// двух System Menu в ADV (SceneAdvButtonMenu@UpdateCheckable) валит движок.
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetCheckBoxEnable, int a, bool b);
+HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsCheckBoxEnable, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonColor, int a, int b, int c, int d);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonR, int a);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonG, int a);
@@ -3429,6 +3433,22 @@ static void PE_GetTextPartsText_v7(struct string **out, int parts_no, int state)
 
 static void PartsEngine_PreLink(void);
 
+// --- «Асинхронная» загрузка ресурса в часть (Ixseal-игры).
+// Делегат завершения игра вызывает САМА: в .ain у parts::detail::SetPartsCGThread
+// после CALLHLL идёт проверка Delegate.Empty и вызов лямбд. Движку остаётся
+// загрузить ресурс — делаем это синхронно, и на «готово?» отвечаем сразу да.
+static bool PartsEngine_Parts_SetPartsCGThread(int parts_no, struct string *cg_name, int state)
+{
+	return PE_SetPartsCG(parts_no, cg_name, 0, state);
+}
+
+static bool PartsEngine_Parts_SetPartsFlatThread(int parts_no, struct string *filename, int state)
+{
+	return PE_SetPartsFlat(parts_no, filename, state);
+}
+
+HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, Parts_IsThreadLoading, int a, int b);
+
 HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(_PreLink, PartsEngine_PreLink),
 	    // for versions without PartsEngine.Init
@@ -3928,6 +3948,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetCheckBoxSize, PartsEngine_SetCheckBoxSize),
 	    HLL_TODO_EXPORT(SetCheckBoxDrag, PartsEngine_SetCheckBoxDrag),
 	    HLL_TODO_EXPORT(IsCheckBoxDrag, PartsEngine_IsCheckBoxDrag),
+	    HLL_EXPORT(SetCheckBoxEnable, PartsEngine_SetCheckBoxEnable),
+	    HLL_EXPORT(IsCheckBoxEnable, PartsEngine_IsCheckBoxEnable),
 	    HLL_EXPORT(CheckBoxChecked, PE_SetPartsCheckBoxChecked),
 	    HLL_EXPORT(IsCheckBoxChecked, PE_GetPartsCheckBoxChecked),
 	    HLL_EXPORT(SetCheckBoxColor, PE_SetPartsCheckBoxColor),
@@ -4078,6 +4100,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetPanelAlphaGradationRight, PE_GetPanelAlphaGradationRight),
 	    HLL_EXPORT(GetLayoutBoxAlign, PE_GetLayoutBoxAlign),
 	    HLL_EXPORT(Parts_SetPartsCG, PE_SetPartsCG),
+	    HLL_EXPORT(Parts_SetPartsCGThread, PartsEngine_Parts_SetPartsCGThread),
+	    HLL_EXPORT(Parts_IsThreadLoading, PartsEngine_Parts_IsThreadLoading),
 	    HLL_EXPORT(Parts_GetPartsCGName, PE_GetPartsCGName),
 	    HLL_EXPORT(Parts_GetPartsCGDeform, PE_GetPartsCGDeform),
 	    HLL_EXPORT(Parts_SetPartsCGSurfaceArea, PE_SetPartsCGSurfaceArea),
@@ -4130,6 +4154,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetNumeralLength, PE_GetNumeralLength),
 	    HLL_TODO_EXPORT(Parts_SetPartsCGDetectionSurfaceArea, PartsEngine_Parts_SetPartsCGDetectionSurfaceArea),
 	    HLL_EXPORT(Parts_SetPartsFlat, PE_SetPartsFlat),
+	    HLL_EXPORT(Parts_SetPartsFlatThread, PartsEngine_Parts_SetPartsFlatThread),
 	    HLL_EXPORT(Parts_IsPartsFlatEnd, PE_IsPartsFlatEnd),
 	    HLL_EXPORT(Parts_GetPartsFlatCurrentFrameNumber, PE_GetPartsFlatCurrentFrameNumber),
 	    HLL_EXPORT(Parts_BackPartsFlatBeginFrame, PE_BackPartsFlatBeginFrame),
