@@ -195,6 +195,9 @@ int PE_get_controller_id(int index);
 // «Компонент» в HLL адресует и парт, и слой-контроллер; различение по диапазону ID.
 bool parts_controller_is_layer(int id);
 void parts_controller_set_show(int id, bool show);
+// Восстановить стек слоёв после загрузки сейва (в сейве лежит только его глубина).
+void parts_controller_stack_restore(int nr, int active);
+int PE_get_controller_index(int id);
 bool parts_controller_get_show(int id);
 int PE_get_system_controller(void);
 void PE_parts_set_want_save(int parts_no, bool want_save);

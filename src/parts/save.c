@@ -887,8 +887,8 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 		int active = iarray_read(&r);
 		int nr_controllers = iarray_read(&r);
 		if (restore_globals) {
-			ctrl_stack.active = active;
-			ctrl_stack.nr_controllers = nr_controllers;
+			// Стек id восстанавливаем целиком: в сейве лежит только глубина.
+			parts_controller_stack_restore(nr_controllers, active);
 		}
 	}
 

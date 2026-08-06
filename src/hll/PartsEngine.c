@@ -3427,6 +3427,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetActiveController, PE_set_active_controller),
 	    HLL_EXPORT(GetActiveController, PE_get_active_controller),
 	    HLL_EXPORT(GetControllerLength, PE_get_controller_length),
+	    HLL_EXPORT(GetControllerIndex, PE_get_controller_index),
 	    HLL_EXPORT(GetControllerID, PE_get_controller_id),
 	    // Слой системного оверлея — на нём игра рисует полноэкранные эффекты
 	    // (`全画面色` → `■フラッシュ`, вспышка при событии). Реализация была, но
