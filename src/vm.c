@@ -27,6 +27,7 @@
 
 #include "system4.h"
 #include "system4/ain.h"
+#include "system4/dasm.h"
 #include "system4/instructions.h"
 #include "system4/file.h"
 #include "system4/little_endian.h"
@@ -402,14 +403,27 @@ int vm_lambda_capture_env(int fun)
 {
 	if (fun < 0 || fun >= ain->nr_functions)
 		return -1;
-	static int8_t *is_lambda = NULL;
-	if (!is_lambda) {
-		is_lambda = xcalloc(ain->nr_functions, 1);
-		for (int i = 0; i < ain->nr_functions; i++)
-			is_lambda[i] = ain->functions[i].name
-				&& strstr(ain->functions[i].name, "<lambda : ") ? 1 : 0;
+	// Отмечаем не «лямбду вообще», а лямбду, которая ЧИТАЕТ окружение: захват
+	// удерживает локальную страницу до самой смерти делегата, и удержание всех
+	// подряд обходится дорого (у Dohna X_GETENV пользуются 1029 функций — все
+	// до одной лямбды). Один проход по коду при первом обращении.
+	static int8_t *uses_env = NULL;
+	if (!uses_env) {
+		uses_env = xcalloc(ain->nr_functions, 1);
+		struct dasm dasm;
+		dasm_init(&dasm, ain);
+		int cur = -1;
+		for (dasm_jump(&dasm, 0); !dasm_eof(&dasm); dasm_next(&dasm)) {
+			int op = dasm_opcode(&dasm);
+			if (op == FUNC) {
+				int no = dasm_arg(&dasm, 0);
+				cur = (no >= 0 && no < ain->nr_functions) ? no : -1;
+			} else if (op == X_GETENV && cur >= 0) {
+				uses_env[cur] = 1;
+			}
+		}
 	}
-	return is_lambda[fun] ? local_page_slot() : -1;
+	return uses_env[fun] ? local_page_slot() : -1;
 }
 
 // Return the heap slot of the local page that holds a lambda's captured

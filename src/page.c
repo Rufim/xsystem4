@@ -1270,7 +1270,12 @@ static void delegate_env_ref(int env)
 
 static void delegate_env_unref(int env)
 {
-	if (env >= 0)
+	// XSYS4_DG_ENV_KEEP=1 — диагностический выключатель освобождения окружений:
+	// отделяет «страница умерла из-за нашего unref» от прочих причин ценой утечки.
+	static int keep = -1;
+	if (keep < 0)
+		keep = getenv("XSYS4_DG_ENV_KEEP") ? 1 : 0;
+	if (env >= 0 && !keep)
 		heap_unref(env);
 }
 

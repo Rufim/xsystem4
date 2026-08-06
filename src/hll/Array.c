@@ -514,6 +514,55 @@ static int Array_ix_Copy(struct page **self, struct page **src)
 	return n;
 }
 
+/*
+ * `AddRange(dst, src)` и `Concat(dst, src)` (fn13/fn12, оба `(80,82)`) —
+ * ДОПИСАТЬ все элементы src В КОНЕЦ dst, а не переписать начало. Раньше обе
+ * вели в `Array_ix_Copy`, который копирует лишь в пределах уже имеющейся длины
+ * приёмника; `SceneWorkMatching@GetAllShop` строит список магазинов как
+ * «`Add`(свой) + `AddRange`(чужие)», то есть приёмник тут длиной 1 — чужие
+ * магазины не добавились бы вовсе, а свой был бы затёрт. Падало раньше: у
+ * пустого приёмника, созданного `X_A_INIT 0`, тип элемента ещё не установлен,
+ * и `array_copy` отказывался сверять его с типом источника.
+ *
+ * Элементы кладём через PushBack — он один знает про многослотовый элемент
+ * (wrap<интерфейс> — два слота) и про то, что объектный элемент берёт СВОЙ
+ * счётчик ссылок.
+ */
+static void Array_ix_AddRange(struct page **self, struct page **src)
+{
+	if (!self || !src || !*src)
+		return;
+	int n = array_numof(*src, 1);
+	if (n <= 0)
+		return;
+	// Приёмник, ещё не знающий своего типа элемента (пустой generic-контейнер),
+	// наследует тип источника: иначе PushBack положит слоты объектов как сырые
+	// int'ы (без владения), и первое же чтение уйдёт в освобождённую страницу.
+	if (*self && array_numof(*self, 1) == 0 && ix_dtype(*self) != ix_dtype(*src)) {
+		(*self)->a_type = ix_dtype(*src);
+		(*self)->array.struct_type = ix_stype(*src);
+	} else if (*self && ix_dtype(*self) != ix_dtype(*src)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("Array.AddRange: тип приёмника %d(s%d) ≠ типа источника %d(s%d)",
+				ix_dtype(*self), ix_stype(*self), ix_dtype(*src), ix_stype(*src));
+		}
+	}
+	// Элементы кладутся слот-в-слот, поэтому ширина элемента обязана совпадать
+	// (wrap<структура> и array<структура> — оба по слоту; пара wrap<интерфейс> —
+	// два). Разной ширины у Dohna не встречалось; если встретится, лучше громко
+	// ничего не сделать, чем сдвинуть содержимое приёмника.
+	int slots = array_elem_slots(*src);
+	if (*self && array_elem_slots(*self) != slots) {
+		WARNING("Array.AddRange: элемент приёмника %d слотов, источника %d — пропущено",
+			array_elem_slots(*self), slots);
+		return;
+	}
+	for (int i = 0; i < n; i++)
+		Array_PushBack(self, &(*src)->values[i*slots]);
+}
+
 static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
 static void Array_Shuffle(struct page **self, int seed) { if (self) array_shuffle(*self, seed); }
 
@@ -1164,8 +1213,8 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),
 	    HLL_EXPORT(Duplicate, Array_ix_Copy),
-	    HLL_EXPORT(Concat, Array_ix_Copy),
-	    HLL_EXPORT(AddRange, Array_ix_Copy),
+	    HLL_EXPORT(Concat, Array_ix_AddRange),
+	    HLL_EXPORT(AddRange, Array_ix_AddRange),
 	    HLL_EXPORT(Reverse, Array_Reverse),
 	    HLL_EXPORT(Shuffle, Array_Shuffle),
 	    HLL_EXPORT(Fill, Array_ix_Fill),
