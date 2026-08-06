@@ -134,6 +134,48 @@ void parts_input_reset_drag(struct parts *parts)
 		dragging_scrollbar = NULL;
 }
 
+/*
+ * Может ли часть В ПРИНЦИПЕ получить ввод. Чистая ДЕКОРАЦИЯ не должна перехватывать
+ * курсор у кнопок под собой.
+ *
+ * Повод: титул Haha Ranman. Поверх меню (части z 5..20) висит полноэкранная плёночная
+ * «грязь» 1000001057 — CG 1280×720, НЕПРОЗРАЧНАЯ (alpha 220..255, так что попиксельная
+ * проверка не спасает), `pass_cursor = 0`, и она МЕДЛЕННО ЕДЕТ. На кадрах, где её
+ * прямоугольник накрывал пункт, она забирала курсор, на остальных — нет: в трейсе
+ * `MOUSE_ENTER`/`MOUSE_LEAVE` чередовались КАЖДЫЙ КАДР у пункта 90000026 и у неё.
+ * Клик срабатывал только если случайно попадал в «хороший» кадр — один раз из двух.
+ *
+ * Гейт узкий и опирается на доказуемый факт: в НОВОМ message-API (тот, где объявлена
+ * `PartsEngine.SeekMessage`) диспатчер игры
+ * `parts::detail::CPartsMessageManager@CallDelegate` при `delegateIndex < 0` сразу
+ * возвращает 0 — часть без набора обработчиков не может получить НИ ОДНОГО сообщения,
+ * поэтому перехват курсора ею — чистая потеря. Старые игры (v6/v7) диспатчат по НОМЕРУ
+ * части и `delegate_index` не выставляют вовсе, поэтому там правило не применяется.
+ *
+ * Типы-детекторы (`ＣＧ判定パーツ`, `矩形パーツ`) и всё, что несёт собственную механику
+ * ввода (кнопка, чекбокс, скроллбар, перетаскивание, колесо, попиксельный хит),
+ * считаются способными к вводу всегда — независимо от делегата.
+ */
+static bool parts_can_take_cursor(struct parts *parts)
+{
+	// ★`wheelable` СЮДА НЕ ГОДИТСЯ: его дефолт — true у КАЖДОЙ части (parts_init),
+	// то есть признаком способности к вводу он не является и обнулял весь гейт.
+	bool own_input = parts->clickable || parts->is_button || parts->pixel_hittest
+			|| parts->is_checkbox || parts->is_hscrollbar || parts->is_vscrollbar
+			|| parts->draggable;
+	enum parts_type t = parts->states[parts->state].type;
+	bool detector = (t == PARTS_CG_DETECTION || t == PARTS_RECT_DETECTION);
+	bool r = own_input || detector || !parts_msg_api_new() || parts->delegate_index >= 0;
+	if (getenv("XSYS4_CURSOR_TRACE"))
+		NOTICE("CURSORTRACE part=%d -> %d (own=%d det=%d type=%d dg=%d newapi=%d"
+		       " clk=%d btn=%d px=%d chk=%d hsb=%d vsb=%d drag=%d whl=%d)",
+		       parts->no, r, own_input, detector, t, parts->delegate_index,
+		       parts_msg_api_new(), parts->clickable, parts->is_button,
+		       parts->pixel_hittest, parts->is_checkbox, parts->is_hscrollbar,
+		       parts->is_vscrollbar, parts->draggable, parts->wheelable);
+	return r;
+}
+
 static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clicking,
 		int passed_time, bool *hover_consumed, bool *click_consumed)
 {
@@ -141,6 +183,11 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	// hit-теста, ни сообщений, и курсор она НЕ перехватывает у частей за собой.
 	// Сбрасываем is_hovered, иначе «залипший» hover выстрелит MOUSE_LEAVE позже.
 	if (!parts->enable_input_process) {
+		parts->is_hovered = false;
+		return;
+	}
+	// Чистая декорация — так же вне обработки ввода (см. parts_can_take_cursor).
+	if (!parts_can_take_cursor(parts)) {
 		parts->is_hovered = false;
 		return;
 	}
