@@ -45,6 +45,8 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_DRAW_CUT_CG:
 	case PARTS_CP_COPY_CUT_CG:
 	case PARTS_CP_GRAY_FILTER:
+	case PARTS_CP_FILL_GRADATION_HORIZON:
+	case PARTS_CP_MUL_FILTER:
 		break;
 	case PARTS_CP_DRAW_TEXT:
 	case PARTS_CP_COPY_TEXT:
@@ -273,10 +275,47 @@ bool PE_AddGrayFilterToPartsConstructionProcess(int parts_no, int x, int y, int 
 
 bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, bool full_size, int state);
-bool PE_AddMulFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
-		int r, int g, int b, bool full_size, int state);
 bool PE_AddDrawLineToPartsConstructionProcess(int parts_no, int x1, int y1, int x2, int y2,
 		int r, int g, int b, int a, int state);
+
+bool PE_AddFillGradationHorizonToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, int top_r, int top_g, int top_b, int bot_r, int bot_g, int bot_b,
+		int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_FILL_GRADATION_HORIZON;
+	op->gradation = (struct parts_cp_fill_gradation) {
+		.x = x, .y = y, .w = w, .h = h,
+		.top_r = top_r, .top_g = top_g, .top_b = top_b,
+		.bot_r = bot_r, .bot_g = bot_g, .bot_b = bot_b
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
+bool PE_AddMulFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		int r, int g, int b, bool full_size, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_MUL_FILTER;
+	op->color_filter = (struct parts_cp_color_filter) {
+		.x = x, .y = y, .w = w, .h = h,
+		.r = r, .g = g, .b = b,
+		.full_size = full_size
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
 
 static bool add_text_to_cproc(int parts_no, int x, int y, struct string *text,
 		int type, int size, int r, int g, int b, float bold_weight,
@@ -581,6 +620,46 @@ static bool build_gray_filter(struct parts_construction_process *cproc, struct p
 	return true;
 }
 
+// Цветового градиента в gfx нет (`gfx_fill_amap_gradation_ud` красит АЛЬФУ и требует
+// своего шейдера), поэтому кладём построчно обычным `gfx_fill`. Это не горячий путь:
+// construction-процесс строится ОДИН раз в текстуру, а не каждый кадр, поэтому h вызовов
+// заливки — единовременная плата, а не нагрузка на отрисовку.
+static bool build_fill_gradation_horizon(struct parts_construction_process *cproc,
+		struct parts_cp_fill_gradation *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	if (op->w <= 0 || op->h <= 0)
+		return true;
+
+	for (int i = 0; i < op->h; i++) {
+		// Делим на h-1, чтобы НИЖНЯЯ строка получила ровно нижний цвет
+		// (при делении на h последняя строка не дотягивала бы до него).
+		int d = op->h > 1 ? op->h - 1 : 1;
+		int r = op->top_r + (op->bot_r - op->top_r) * i / d;
+		int g = op->top_g + (op->bot_g - op->top_g) * i / d;
+		int b = op->top_b + (op->bot_b - op->top_b) * i / d;
+		gfx_fill(&cproc->common.texture, op->x, op->y + i, op->w, 1, r, g, b);
+	}
+	return true;
+}
+
+static bool build_mul_filter(struct parts_construction_process *cproc,
+		struct parts_cp_color_filter *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	if (op->full_size) {
+		x = 0; y = 0;
+		w = cproc->common.texture.w;
+		h = cproc->common.texture.h;
+	}
+
+	gfx_fill_multiply(&cproc->common.texture, x, y, w, h, op->r, op->g, op->b);
+	return true;
+}
+
 bool parts_build_construction_process(struct parts *parts,
 		struct parts_construction_process *cproc)
 {
@@ -637,6 +716,14 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_GRAY_FILTER:
 			if (!build_gray_filter(cproc, &op->filter))
+				return false;
+			break;
+		case PARTS_CP_FILL_GRADATION_HORIZON:
+			if (!build_fill_gradation_horizon(cproc, &op->gradation))
+				return false;
+			break;
+		case PARTS_CP_MUL_FILTER:
+			if (!build_mul_filter(cproc, &op->color_filter))
 				return false;
 			break;
 		}
