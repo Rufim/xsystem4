@@ -97,22 +97,44 @@ void gfx_font_init(void)
 	font_initialized = true;
 }
 
+/*
+ * Нумерация лиц шрифта у System4 (доказано данными и байткодом, FINDINGS §5af):
+ *
+ *   0     — «ゴシック», ВСТРОЕННЫЙ шрифт движка = системный MS Gothic
+ *   1     — «明朝»,   встроенный MS Mincho
+ *   256+N — шрифт N из библиотеки `.fnl` САМОЙ ИГРЫ
+ *
+ * `.fnl` несёт не встроенные, а «ВНЕШНИЕ» шрифты — лицензионные начертания,
+ * запечённые в игру. Так их и называет сама игра: `Ｅ＿外部フォント名`
+ * («имена внешних шрифтов») в `.ex` перечисляет их по именам, а
+ * `parts::detail::GetFontNumber` возвращает `256 + индекс в этом списке`
+ * (симметрично `GetFontName`: 0 → "ゴシック", 1 → "明朝", ≥256 → внешний).
+ * Сходится и по счёту: у Tsumamigui 3 в списке два имени
+ * («ハミング», «筑紫A丸ゴシック») и в `.fnl` ровно `nr_fonts = 2`.
+ *
+ * ПРЕЖДЕ мы подменяли лица 0/1 на FNL, считая его «встроенным» шрифтом игры.
+ * Окно сообщений от этого не страдало (оно просит 256 и попадало в FNL верно),
+ * а вот GUI-части просят именно 0 — и получали приземистый ASCII из FNL:
+ * чернила цифры 8 px против 11 у оригинала, причём высота не росла ни с каким
+ * кеглем и ни с каким face, потому что в этом шрифте таких пропорций нет вовсе.
+ * Радиус проверен трейсом `XSYS4_FACE_TRACE`: Daiteikoku и Escalayer просят
+ * ТОЛЬКО 256, лиц 0/1 не запрашивают ни разу, так что возврат к системному
+ * шрифту их не задевает. `XSYS4_FNL_FACE01=1` возвращает прежнее поведение.
+ */
 static struct font *get_font(unsigned face)
 {
+	bool no_fnl = getenv("XSYS4_NO_FNL");
 	if (face > 255) {
 		face -= 256;
+		if (no_fnl)
+			return font_ttf[0];
 		if (face >= MAX_FNL_FONTS || !font_fnl[face]) {
 			WARNING("Invalid fnl face: %u", face);
 			return font_ttf[0];
 		}
 		return font_fnl[face];
 	}
-	// Prefer the game's embedded .fnl font for the standard faces (0=gothic,
-	// 1=mincho) when it is available: this matches the original glyphs, metrics
-	// and line spacing far better than a substitute system TTF. Falls back to
-	// FreeType when no .fnl is loaded (games without one are unaffected).
-	// Toggle off with XSYS4_NO_FNL to compare.
-	if (face <= 1 && font_fnl[face] && !getenv("XSYS4_NO_FNL"))
+	if (face <= 1 && font_fnl[face] && !no_fnl && getenv("XSYS4_FNL_FACE01"))
 		return font_fnl[face];
 	if (face > 1)
 		return font_ttf[0];
@@ -122,6 +144,14 @@ static struct font *get_font(unsigned face)
 struct font_size *gfx_font_get_size(unsigned face, float size)
 {
 	struct font *font = get_font(face);
+	// Диагностика: КАКОЙ face просит игра. Нумерация лиц у System4 —
+	// 0 = встроенный ゴシック, 1 = 明朝, 256+N = шрифт N из .fnl игры
+	// (доказано байткодом Tsumamigui 3: parts::detail::GetFontName).
+	// Нужна, чтобы понять, какие игры вообще обращаются к 0/1.
+	if (getenv("XSYS4_FACE_TRACE"))
+		WARNING("FACEREQ face=%u size=%.2f -> %s", face, size,
+			font == font_ttf[0] ? "ttf-gothic" :
+			font == font_ttf[1] ? "ttf-mincho" : "fnl");
 	return font->get_size(font, size);
 }
 
