@@ -2564,9 +2564,15 @@ void PE_SetPartsPixelDecide(int parts_no, bool pixel_decide)
 	//UNIMPLEMENTED("(%d, %s)", parts_no, pixel_decide ? "true" : "false");
 }
 
+// ★Коэффициент уменьшения превью. Хранить его обязательно: он ЕДИНСТВЕННЫЙ признак,
+// по которому различаются две несовместимые трактовки второго аргумента SaveThumbnail
+// (см. PE_save_thumbnail). Tsumamigui 3 не зовёт эту функцию ВООБЩЕ (0 вхождений в
+// байткоде), Escalayer Reboot зовёт перед каждым сохранением со значением 5.
+static int thumbnail_reduction_size = 0;
+
 bool PE_SetThumbnailReductionSize(int reduction_size)
 {
-	UNIMPLEMENTED("(%d)", reduction_size);
+	thumbnail_reduction_size = reduction_size;
 	return true;
 }
 
@@ -2576,15 +2582,30 @@ bool PE_SetThumbnailMode(bool mode)
 	return true;
 }
 
-// thumbnail_width — ШИРИНА превью в пикселях, не делитель. В .ain Tsumamigui 3 параметр
-// обёртки так и называется (`gamesave::SaveThumbnail(int SaveNumber, int ThumbnailWidth)`),
-// а игра передаёт 200 (`AFL_GameSave_SaveThumbnail`: PUSH 81 / PUSH 200). Прежняя трактовка
-// «reduction factor» (догадка upstream, судя по всему непроверенная) давала 1024/200 = 5 ⇒
-// превью 5×3 px, и превью в слотах сохранения выглядели пустыми. Высота — по пропорции кадра.
+// ★ВТОРОЙ АРГУМЕНТ ЗНАЧИТ РАЗНОЕ У РАЗНЫХ ИГР, и это не догадка, а замер по двум играм:
+//
+//   Tsumamigui 3  — `SetThumbnailReductionSize` НЕ зовёт вовсе (0 вхождений в байткоде),
+//                   параметр обёртки называется `ThumbnailWidth`, игра передаёт 200.
+//                   Это ШИРИНА: превью выходят ~40 КБ и выглядят как надо.
+//   Escalayer Reboot — зовёт `SetThumbnailReductionSize(5)` перед КАЖДЫМ сохранением
+//                   (`AFL_GameSave_SaveThumbnail`: SetReductionSize → SetThumbnailMode(1)
+//                   → Update → SaveThumbnail) и передаёт ту же пятёрку. Это ДЕЛИТЕЛЬ:
+//                   трактовка «ширина» давала 5×3 px и файлы по 140 байт — в слотах
+//                   сохранения картинок просто не было видно (нашёл пользователь).
+//
+// Различитель — сам факт вызова `SetThumbnailReductionSize`: у кого он задан, у того
+// второй аргумент делитель. Подгонка по величине («меньше 32 — значит делитель») тут не
+// нужна и была бы догадкой. Высота — по пропорции кадра.
 bool PE_save_thumbnail(struct string *filename, int thumbnail_width)
 {
 	Texture *src = gfx_main_surface();
-	int w = thumbnail_width > 0 ? thumbnail_width : src->w;
+	int w;
+	if (thumbnail_reduction_size > 1)
+		w = src->w / thumbnail_reduction_size;
+	else
+		w = thumbnail_width > 0 ? thumbnail_width : src->w;
+	if (w < 1)
+		w = 1;
 	if (w > src->w)
 		w = src->w;
 	int h = src->h * w / src->w;
