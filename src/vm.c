@@ -2384,6 +2384,23 @@ static enum opcode execute_instruction(enum opcode opcode)
 	}
 	case S_PLUSA:
 	case S_PLUSA2: {
+		// Тот же рассинхрон формы, что у S_ASSIGN выше: у Ixseal слева лежит
+		// ДВУСЛОТОВАЯ ссылка (страница, индекс), а не разыменованный слот
+		// строки. Гейт проверен по трём .ain: у Dohna НОЛЬ опкодов REF/S_REF
+		// (у Tsumamigui 3 — 6558 S_REF, у Escalayer — 222), то есть новый
+		// компилятор ссылку перед присваиванием не разыменовывает НИКОГДА.
+		// Классический обработчик снимал только два слота и оставлял на стеке
+		// лишний: `ArrayExtensions::Join<string>` копил +1 слот за итерацию
+		// цикла и возвращался с перекошенным стеком (SPCHECK +3 на трёх
+		// элементах), а такой перекос смещает ссылки уже у ВЫЗЫВАЮЩЕГО.
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			int rval = stack_pop().i;
+			union vm_value *ref = stack_pop_var();
+			string_append(&heap[ref->i].s, heap_get_string(rval));
+			heap_unref(rval);
+			stack_push_string(string_ref(heap[ref->i].s));
+			break;
+		}
 		int a = stack_peek(1).i;
 		int b = stack_peek(0).i;
 		string_append(&heap[a].s, heap[b].s);
@@ -3369,6 +3386,7 @@ static struct optrace_entry optrace_ring[OPTRACE_SIZE];
 static uint32_t optrace_pos;
 static int optrace_on = -1;
 static bool optrace_underflow_logged = false;
+static unsigned ip_trace_lo, ip_trace_hi;
 
 void vm_optrace_dump(void)
 {
@@ -3389,6 +3407,12 @@ static void vm_execute(void)
 	if (optrace_on < 0) {
 		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
 		sp_check = getenv("XSYS4_SP_CHECK") != NULL;
+		// XSYS4_IP_TRACE=<lo>-<hi> (hex): построчный лог «опкод, sp до -> sp после»
+		// для диапазона адресов. Так ищется функция, которая возвращается с лишними
+		// слотами (SPCHECK показывает ФАКТ расхождения, а этот трейс — сайт).
+		const char *r = getenv("XSYS4_IP_TRACE");
+		if (r && sscanf(r, "%x-%x", &ip_trace_lo, &ip_trace_hi) != 2)
+			ip_trace_lo = ip_trace_hi = 0;
 	}
 	for (;;) {
 		uint16_t opcode;
@@ -3407,8 +3431,8 @@ static void vm_execute(void)
 			optrace_pos++;
 		}
 		opcode = execute_instruction(opcode);
-		if (optrace_on > 0 && rec_ip >= 0x66a5d0 && rec_ip <= 0x66a600)
-			sys_warning("FN6 0x%06x %-14s sp %d->%d\n", rec_ip,
+		if (unlikely(ip_trace_hi) && rec_ip >= ip_trace_lo && rec_ip <= ip_trace_hi)
+			sys_warning("IPTRACE 0x%06x %-14s sp %d->%d\n", rec_ip,
 				    instructions[rec_op].name ? instructions[rec_op].name : "?", rec_sp, stack_ptr);
 		if (optrace_on > 0 && !optrace_underflow_logged && stack_ptr < 0) {
 			optrace_underflow_logged = true;
