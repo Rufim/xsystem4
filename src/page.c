@@ -271,8 +271,13 @@ enum ain_data_type array_resolve_var_type(struct page *container, int varno, int
 		// меняются — расходится только copy_page().
 		if (et == AIN_WRAP)
 			return (*struct_type >= 0) ? AIN_WRAP : AIN_ARRAY_INT;
+		// `option<wrap<структура>>` — ДВА слота (объект + тег наличия), поэтому
+		// маркер тот же AIN_OPTION, что и у интерфейсного варианта: ширину
+		// различает elem_slots_for_type по `is_interface`. Прежде такой массив
+		// помечался обычным AIN_ARRAY_STRUCT с шагом 1, и байткод (`index * 2`)
+		// адресовал элементы мимо — см. MatchingCalculator@MatchShop.
 		if (et == AIN_OPTION)
-			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
+			return (*struct_type >= 0) ? AIN_OPTION : AIN_ARRAY_INT;
 		// `array<ref Структура>` (элемент AIN_REF_STRUCT, 21 — 208 объявлений
 		// у Dohna, ни одного у v6/v7). Ссылка на СТРУКТУРУ, в отличие от ссылки
 		// на интерфейс, — ОДИН слот: у локалов `ref <структура>` компилятор не
@@ -465,22 +470,37 @@ bool array_iface_pair_type(enum ain_data_type a_type)
 	return a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
 }
 
-// Слотов на элемент по маркеру `a_type`: 2 — интерфейсная пара, 3 — она же под
-// `option<>` (пара + тег наличия), иначе 1.
-static int elem_slots_for_type(enum ain_data_type data_type, int rank)
+/*
+ * Слотов на элемент по маркеру `a_type`: 2 — интерфейсная пара, 1 — обычный
+ * элемент. У `option<>` ширина зависит от того, что он оборачивает: тег наличия
+ * добавляется к самому значению, поэтому `option<wrap<интерфейс>>` — ТРИ слота
+ * (пара + тег), а `option<wrap<структура>>` — ДВА (heap-слот объекта + тег).
+ * Второй случай раньше считался однослотовым, и `foreach` по такому контейнеру
+ * уходил мимо элементов: `MatchingCalculator@MatchShop` (@0x5ea99c, контейнер
+ * `array<option<wrap<Worker>>>`) адресует элемент как `index * 2`, а затем
+ * читает тег по смещению `+1` — на подборе клиента в Dohna это падало
+ * «Out of bounds page index». Все 32 объявления `array<option<wrap<T>>>` у
+ * Dohna — над СТРУКТУРАМИ (Worker, Item, кнопки, вьюхи), интерфейса среди них
+ * нет ни одного, но ширину всё равно определяем по типу, а не допущением.
+ */
+static int elem_slots_for_type(enum ain_data_type data_type, int rank, int struct_type)
 {
 	if (rank != 1)
 		return 1;
 	if (array_iface_pair_type(data_type))
 		return 2;
-	return data_type == AIN_OPTION ? 3 : 1;
+	if (data_type != AIN_OPTION)
+		return 1;
+	bool iface = struct_type >= 0 && struct_type < ain->nr_structures
+		&& ain->structures[struct_type].is_interface;
+	return iface ? 3 : 2;
 }
 
 int array_elem_slots(struct page *page)
 {
 	if (!page || page->type != ARRAY_PAGE)
 		return 1;
-	return elem_slots_for_type(page->a_type, page->array.rank);
+	return elem_slots_for_type(page->a_type, page->array.rank, page->array.struct_type);
 }
 
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank)
@@ -727,7 +747,7 @@ struct page *alloc_array(int rank, union vm_value *dimensions, enum ain_data_typ
 	enum ain_data_type type = array_type(data_type);
 	// `dimensions` задаёт число ЭЛЕМЕНТОВ; слотов страницы может быть вдвое
 	// больше (Ixseal wrap<интерфейс> — см. array_elem_slots).
-	int slots = elem_slots_for_type(data_type, rank);
+	int slots = elem_slots_for_type(data_type, rank, struct_type);
 	struct page *page = alloc_page(ARRAY_PAGE, data_type, max(0, dimensions->i) * slots);
 	page->array.struct_type = struct_type;
 	page->array.rank = rank;

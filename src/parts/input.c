@@ -675,6 +675,41 @@ bool PE_SetPartsClickSoundNumber(int parts_no, int sound_no)
 	return true;
 }
 
+// Parts_SetSoundNumber/Parts_GetSoundNumber — звук части ПО СОСТОЯНИЮ.
+//
+// Состояние здесь 1-based, как у всего остального parts-API (ср. PE_SetPartsCG с `--state`):
+// 1 — обычное, 2 — под курсором, 3 — клик. Мэппинг взят НЕ из догадки, а из байткода игры:
+// у Escalayer `AFL_Parts_GetOnCursorSound` зовёт Parts_GetSoundNumber с 2, а
+// `AFL_Parts_GetClickSound` — с 3. У обычного состояния своего звука нет.
+//
+// ★Граница «нет звука»: игра считает таковым НОЛЬ (`AFL_Parts_PlaySound` выходит сразу,
+// если SoundNumber == 0), а у нас это −1 (parts_play_sound играет только >= 0). Поэтому
+// переводим на границе в обе стороны — иначе «пустой» звук либо потерялся бы, либо мы
+// попытались бы играть несуществующий номер 0 (ровно тот шум, который убран в §5ah).
+void PE_Parts_SetSoundNumber(int parts_no, int sound_no, int state)
+{
+	struct parts *parts = parts_get(parts_no);
+	if (sound_no <= 0)
+		sound_no = -1;
+	switch (state) {
+	case 2: parts->on_cursor_sound = sound_no; break;
+	case 3: parts->on_click_sound = sound_no; break;
+	default: break;
+	}
+}
+
+int PE_Parts_GetSoundNumber(int parts_no, int state)
+{
+	struct parts *parts = parts_get(parts_no);
+	int sound_no;
+	switch (state) {
+	case 2: sound_no = parts->on_cursor_sound; break;
+	case 3: sound_no = parts->on_click_sound; break;
+	default: return 0;
+	}
+	return sound_no >= 0 ? sound_no : 0;
+}
+
 bool PE_SetClickMissSoundNumber(possibly_unused int sound_no)
 {
 	UNIMPLEMENTED("(%d)", sound_no);
