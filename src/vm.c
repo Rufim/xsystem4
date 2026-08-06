@@ -106,9 +106,30 @@ static int type_slots(struct ain_type *t)
 	}
 	return 1;
 }
-// Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr> logs every entered
-// function whose name contains <substr>. Env-gated, harmless.
+// Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr>[,<substr>...] logs
+// every entered function whose name contains any of the substrings.
+// Env-gated, harmless.
 static const char *fn_trace_ns = (const char *)1; // 1 = not-yet-resolved
+static int32_t struct_page_slot(void);
+static bool fn_trace_ns_match(const char *n)
+{
+	const char *p = fn_trace_ns;
+	while (*p) {
+		const char *comma = strchr(p, ',');
+		size_t len = comma ? (size_t)(comma - p) : strlen(p);
+		if (len) {
+			// strstr with a bounded needle
+			for (const char *h = n; *h; h++) {
+				if (!strncmp(h, p, len))
+					return true;
+			}
+		}
+		if (!comma)
+			break;
+		p = comma + 1;
+	}
+	return false;
+}
 static void vm_fn_trace_ns(int fno)
 {
 	if (fn_trace_ns == (const char *)1)
@@ -118,8 +139,31 @@ static void vm_fn_trace_ns(int fno)
 	if (fno < 0 || fno >= ain->nr_functions)
 		return;
 	const char *n = ain->functions[fno].name;
-	if (n && strstr(n, fn_trace_ns))
-		WARNING("NSTRACE fn %d %s", fno, n);
+	if (n && fn_trace_ns_match(n))
+		WARNING("NSTRACE fn %d this=%d %s", fno, struct_page_slot(), n);
+}
+// Delegate watch: XSYS4_DG_WATCH=<dg_no>[,<dg_no>...] logs every DG_PLUSA
+// (subscription) and every DG_CALLBEGIN of the listed delegate types together
+// with the owning heap slot and the subscriber count. Answers "who subscribed
+// to which object" when a click handler silently never runs. Env-gated.
+static const char *dg_watch = (const char *)1;
+static bool dg_watch_on(void)
+{
+	if (dg_watch == (const char *)1)
+		dg_watch = getenv("XSYS4_DG_WATCH");
+	return dg_watch && *dg_watch;
+}
+static bool dg_watch_type(int dg_no)
+{
+	if (!dg_watch_on())
+		return false;
+	for (const char *p = dg_watch; p && *p; ) {
+		if (strtol(p, (char**)&p, 0) == dg_no)
+			return true;
+		while (*p == ',' || *p == ' ') p++;
+		if (*p && !(*p >= '0' && *p <= '9')) break;
+	}
+	return false;
 }
 static void vm_fn_trace(int fno, const char *via)
 {
@@ -1713,6 +1757,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 				}
 			}
 		}
+		if (getenv("XSYS4_ICAST_WATCH")
+		    && target == atoi(getenv("XSYS4_ICAST_WATCH"))) {
+			struct page *sp = (heap_index_valid(src) && src > 0) ? heap[src].page : NULL;
+			WARNING("ICAST target=%d src=%d src_type=%d src_struct=%d base=%d",
+				target, src, sp ? (int)sp->type : -1,
+				sp ? sp->index : -1, base);
+		}
 		if (base < 0) {
 			// Не удалось: null-объект и тег «пусто».
 			stack_push(-1);
@@ -3293,8 +3344,22 @@ static enum opcode execute_instruction(enum opcode opcode)
 			// An empty delegate lvalue holds 0 and has no page yet, so we must
 			// allocate a fresh one instead of dereferencing slot 0.
 			int add_i = stack_pop().i;
+			int dg_member = stack_peek(0).i;  // member/variable index
+			int dg_owner = stack_peek(1).i;   // heap slot of the owning page
 			union vm_value *dst = stack_pop_var();
 			struct page *add = heap_get_delegate_page(add_i);
+			if (dg_watch_on()) {
+				struct page *ap = heap_get_delegate_page(add_i);
+				struct page *op = (dg_owner > 0 && heap_index_valid(dg_owner))
+					? heap[dg_owner].page : NULL;
+				WARNING("DGWATCH plusa owner=%d(t%d s%d) member=%d dg_slot=%d add_fn=%d (%s)",
+					dg_owner, op ? (int)op->type : -1, op ? op->index : -1,
+					dg_member, dst->i,
+					(ap && ap->nr_vars >= 2) ? ap->values[1].i : -1,
+					(ap && ap->nr_vars >= 2 && ap->values[1].i >= 0
+					 && ap->values[1].i < ain->nr_functions)
+						? ain->functions[ap->values[1].i].name : "?");
+			}
 			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
 			    heap[dst->i].page->type == DELEGATE_PAGE) {
 				heap_set_page(dst->i, delegate_plusa(heap[dst->i].page, add));
@@ -3373,6 +3438,16 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Stack before: [dg_page, arg0, ...]
 		// Stack after:  [arg0, ..., dg_page, 0(dg_index)]
 		int dg_page = stack_peek(dg->nr_arguments).i;
+		if (dg_watch_type(dg_no)) {
+			struct page *p = (dg_page > 0 && heap_index_valid(dg_page))
+				? heap[dg_page].page : NULL;
+			int cf = call_stack[call_stack_ptr-1].fno;
+			WARNING("DGWATCH callbegin dg_no=%d dg_slot=%d numof=%d this=%d in %s",
+				dg_no, dg_page,
+				(p && p->type == DELEGATE_PAGE) ? p->nr_vars / 2 : -1,
+				struct_page_slot(),
+				(cf >= 0 && cf < ain->nr_functions) ? ain->functions[cf].name : "?");
+		}
 		for (int i = 0; i < dg->nr_arguments; i++) {
 			int pos = (stack_ptr - dg->nr_arguments) + i;
 			stack[pos-1] = stack[pos];

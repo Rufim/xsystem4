@@ -407,7 +407,19 @@ static void Array_PushBack(struct page **self, union vm_value *value)
 		heap_ref(value->i);
 	// `value` указывает на первый из слотов значения на стеке VM: у
 	// wrap<интерфейс> их два (объект, база интерфейса) — оба идут в элемент.
-	*self = array_pushback_n(*self, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
+	int pb_slots = ix_value_slots(self);
+	enum ain_data_type pb_dt = ix_dtype(*self);
+	int pb_st = ix_stype(*self);
+	*self = array_pushback_n(*self, value, pb_slots, pb_dt, pb_st);
+	const char *w = getenv("XSYS4_PB_WATCH");
+	if (w && pb_st == atoi(w)) {
+		NOTICE("PBWATCH push value=%d dtype=%d stype=%d slots=%d -> nr_vars=%d elems: %d %d %d %d",
+		       value->i, pb_dt, pb_st, pb_slots, *self ? (*self)->nr_vars : -1,
+		       (*self && (*self)->nr_vars > 0) ? (*self)->values[0].i : -1,
+		       (*self && (*self)->nr_vars > 1) ? (*self)->values[1].i : -1,
+		       (*self && (*self)->nr_vars > 2) ? (*self)->values[2].i : -1,
+		       (*self && (*self)->nr_vars > 3) ? (*self)->values[3].i : -1);
+	}
 }
 
 static void Array_PopBack(struct page **self)
