@@ -192,6 +192,15 @@ struct parts_gauge {
 	Texture cg;
 	int cg_no;
 	float rate;
+	/*
+	 * Дробь, которой игра задала заполнение. Движку для рисования хватает `rate`,
+	 * но игра читает её обратно (`Parts_GetHGaugeNumerator`/`Denominator` — их зовёт
+	 * `行動選択` у Haha Ranman), а из одного отношения числитель со знаменателем не
+	 * восстановить. В СЕЙВ НЕ ПИШУТСЯ: формат сохранений менять нельзя, поэтому при
+	 * загрузке восстанавливаются как (rate, 1.0) — отношение то же.
+	 */
+	float numerator;
+	float denominator;
 };
 
 // Serialized in save data. Do not reorder.

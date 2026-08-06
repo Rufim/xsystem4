@@ -285,6 +285,17 @@ void heap_set_page(int slot, struct page *page)
 
 void heap_string_assign(int slot, struct string *string)
 {
+	/*
+	 * Присваивание по НУЛЕВОЙ ссылке — ошибка VM, а не SIGSEGV. `heap[-1]` даёт
+	 * мусорный указатель, и падение происходило внутри `free_string` в libsys4,
+	 * то есть в месте, никак не указывающем на виноватую инструкцию. У соседнего
+	 * `heap_struct_assign` такая проверка есть с самого начала — здесь её не было.
+	 * Живой случай: Haha Ranman, `■実行済コマンド設定` @0x699aae делает
+	 * `Array.At(list, nTimezone)` без проверки результата (в соседней
+	 * `■実行済コマンド取得` игра его проверяет на -1) и присваивает по ссылке.
+	 */
+	if (unlikely(slot < 0))
+		VM_ERROR("Assignment to null string reference");
 #ifdef DEBUG_HEAP
 	if (unlikely(!string_index_valid(slot)))
 		VM_ERROR("Tried to assign string to non-string slot %d (type=%s ref=%d)",

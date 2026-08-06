@@ -322,6 +322,10 @@ static void ix_resize(struct page **self, int n)
 	struct page *a = realloc_array(*self, rank, &dim, dt, st, true);
 	if (!a && dim.i == 0)
 		a = alloc_array(rank, &dim, dt, st, false);
+	if (getenv("XSYS4_ARRAY_TRACE"))
+		NOTICE("ARRAYTRACE resize -> %d: было %d, стало %d (dt=%d st=%d rank=%d)",
+		       n, *self ? array_numof(*self, 1) : -1, a ? array_numof(a, 1) : -1,
+		       dt, st, rank);
 	*self = a;
 }
 
@@ -500,6 +504,65 @@ static int Array_ix_Copy(struct page **self, struct page **src)
 		n = cap;
 	array_copy(*self, 0, *src, 0, n);
 	return n;
+}
+
+/*
+ * `void Duplicate(ref array self, wrap<array> src)` — приёмник СТАНОВИТСЯ копией
+ * источника: его размер задаёт ИСТОЧНИК. `void Concat(...)` / `AddRange(...)` —
+ * ДОПИСАТЬ источник в конец приёмника.
+ *
+ * Обе были повешены на `Array_ix_Copy` (это `int Copy(self, src)` — «скопировать,
+ * сколько влезет в НЫНЕШНИЙ размер приёмника»), и на пустом приёмнике обе не делали
+ * ровно ничего, молча и без ошибки. В .ain это три РАЗНЫЕ функции, и `Copy` даже
+ * отличается типом возврата (int против void).
+ *
+ * Чем это ломало Haha Ranman: `CExecutedCommandParam@InitInstantList` делает
+ * `Array.Duplicate(InstantList, List)` — снимок списка выполненных команд. `List`
+ * конструктор аллоцирует на 12 элементов, `InstantList` пуст, поэтому снимок
+ * оставался ПУСТЫМ. Дальше `GetList` при `Instant = true` отдаёт именно `InstantList`,
+ * а `■実行済コマンド設定` @0x699aae берёт `Array.At(list, nTimezone)` БЕЗ проверки
+ * (в соседней `■実行済コマンド取得` игра его проверяет на -1) и присваивает по
+ * полученной ссылке — то есть по ссылке -1. Итог: SIGSEGV в `free_string` уже внутри
+ * libsys4, в месте, никак не указывающем на виноватую инструкцию.
+ *
+ * Частота вызовов (тул: `alice ain dump -c` + grep CALLHLL): Haha Ranman —
+ * Duplicate 17, Concat 45; Dohna — Duplicate 14, Concat 62, AddRange 16;
+ * Tsumamigui 3 не объявляет ни одной, так что старых игр правка не касается.
+ */
+static void Array_ix_Duplicate(struct page **self, struct page **src)
+{
+	if (!self)
+		return;
+	int n = (src && *src) ? array_numof(*src, 1) : 0;
+	if (!*self && n > 0) {
+		// Приёмника ещё нет: тип элемента берём У ИСТОЧНИКА. Через ix_resize
+		// нельзя — `ix_dtype(NULL)` даёт AIN_ARRAY_INT, и `array_copy` потом
+		// свалился бы на несовпадении типов массивов.
+		union vm_value dim = { .i = n };
+		*self = alloc_array(ix_rank(*src), &dim, ix_dtype(*src), ix_stype(*src), true);
+	} else {
+		ix_resize(self, n);
+	}
+	if (n > 0 && *self)
+		array_copy(*self, 0, *src, 0, n);
+}
+
+static void Array_ix_Concat(struct page **self, struct page **src)
+{
+	if (!self || !src || !*src)
+		return;
+	int n = array_numof(*src, 1);
+	if (n <= 0)
+		return;
+	int base = *self ? array_numof(*self, 1) : 0;
+	if (!*self) {
+		union vm_value dim = { .i = n };
+		*self = alloc_array(ix_rank(*src), &dim, ix_dtype(*src), ix_stype(*src), true);
+	} else {
+		ix_resize(self, base + n);
+	}
+	if (*self)
+		array_copy(*self, base, *src, 0, n);
 }
 
 static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
@@ -1042,11 +1105,18 @@ static int Array_EmplaceBack(struct page **self)
 // hll_call() supplies the array slot for the AIN_REF_HLL_PARAM return.
 static int Array_At(struct page **self, int index)
 {
-	if (!self || !*self)
+	if (!self || !*self) {
+		if (getenv("XSYS4_ARRAY_TRACE"))
+			NOTICE("ARRAYTRACE At(index=%d) -> -1 (массива нет)", index);
 		return -1;
+	}
 	struct page *a = *self;
-	if (index < 0 || index >= array_numof(a, 1))
+	if (index < 0 || index >= array_numof(a, 1)) {
+		if (getenv("XSYS4_ARRAY_TRACE"))
+			NOTICE("ARRAYTRACE At(index=%d) -> -1 (размер %d)",
+			       index, array_numof(a, 1));
 		return -1;
+	}
 	return index;
 }
 
@@ -1151,9 +1221,9 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Erase, Array_ix_Erase),
 	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),
-	    HLL_EXPORT(Duplicate, Array_ix_Copy),
-	    HLL_EXPORT(Concat, Array_ix_Copy),
-	    HLL_EXPORT(AddRange, Array_ix_Copy),
+	    HLL_EXPORT(Duplicate, Array_ix_Duplicate),
+	    HLL_EXPORT(Concat, Array_ix_Concat),
+	    HLL_EXPORT(AddRange, Array_ix_Concat),
 	    HLL_EXPORT(Reverse, Array_Reverse),
 	    HLL_EXPORT(Shuffle, Array_Shuffle),
 	    HLL_EXPORT(Fill, Array_ix_Fill),

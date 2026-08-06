@@ -67,6 +67,11 @@ bool PE_SetVGaugeCG_by_index(int parts_no, int cg_no, int state);
 bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int state);
 bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int state);
 bool PE_SetVGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
+// Дробь заполнения, которой игра задала калибр (она же её и читает обратно).
+float PE_GetHGaugeNumerator(int parts_no, int state);
+float PE_GetHGaugeDenominator(int parts_no, int state);
+float PE_GetVGaugeNumerator(int parts_no, int state);
+float PE_GetVGaugeDenominator(int parts_no, int state);
 bool PE_SetNumeralCG(int parts_no, struct string *cg_name, int state);
 bool PE_SetNumeralCG_by_index(int parts_no, int cg_no, int state);
 bool PE_SetNumeralLinkedCGNumberWidthWidthList_by_index(int parts_no, int cg_no,

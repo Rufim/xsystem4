@@ -1658,6 +1658,8 @@ bool PE_SetHGaugeRate(int parts_no, float numerator, float denominator, int stat
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_gauge *g = parts_get_hgauge(parts, state);
+	g->numerator = numerator;
+	g->denominator = denominator;
 	parts_hgauge_set_rate(parts, g, numerator/denominator);
 	return true;
 }
@@ -1674,6 +1676,8 @@ bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int stat
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_gauge *g = parts_get_vgauge(parts, state);
+	g->numerator = numerator;
+	g->denominator = denominator;
 	parts_vgauge_set_rate(parts, g, (float)numerator/(float)denominator);
 	return true;
 }
@@ -1692,6 +1696,50 @@ bool PE_SetHGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state
 	struct parts_gauge *g = parts_get_hgauge(parts, state);
 	parts_set_surface_area(parts, &g->common, x, y, w, h);
 	return true;
+}
+
+/*
+ * Числитель и знаменатель заполнения — игра читает их обратно (у Haha Ranman это
+ * делает экран `行動選択`). Храним ровно то, что задал `SetHGaugeRate`; после
+ * загрузки сейва восстановлено как (rate, 1.0) — отношение то же, см. parts_internal.h.
+ * Отдельный getter на состояние, поэтому тип состояния тут НЕ навязываем: у части,
+ * которая калибром не является, честнее отдать 0, чем молча переписать ей состояние.
+ */
+static const struct parts_gauge *parts_peek_gauge(int parts_no, int state, bool vert)
+{
+	if (!parts_state_valid(--state))
+		return NULL;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return NULL;
+	enum parts_type want = vert ? PARTS_VGAUGE : PARTS_HGAUGE;
+	if (parts->states[state].type != want)
+		return NULL;
+	return &parts->states[state].gauge;
+}
+
+float PE_GetHGaugeNumerator(int parts_no, int state)
+{
+	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, false);
+	return g ? g->numerator : 0.0f;
+}
+
+float PE_GetHGaugeDenominator(int parts_no, int state)
+{
+	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, false);
+	return g ? g->denominator : 0.0f;
+}
+
+float PE_GetVGaugeNumerator(int parts_no, int state)
+{
+	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, true);
+	return g ? g->numerator : 0.0f;
+}
+
+float PE_GetVGaugeDenominator(int parts_no, int state)
+{
+	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, true);
+	return g ? g->denominator : 0.0f;
 }
 
 bool PE_SetVGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
@@ -2494,8 +2542,36 @@ void PE_SetComponentType(int parts_no, int type, int state)
 	case 20: pt = PARTS_FLAT; break;
 	case 21: pt = PARTS_3DLAYER; break;
 	case 22: pt = PARTS_MOVIE; break;
-	default:
-		VM_ERROR("unknown component type %d", type);
+	default: {
+		/*
+		 * ВИДЖЕТ, а не `パーツ`: чекбокс, скроллбары, слайдеры, поля ввода,
+		 * списки, формы, окно сообщения. Своего вида отрисовки у них нет —
+		 * движок ведёт их отдельными механизмами поверх обычной CG-части
+		 * (`is_hscrollbar` + `PE_InitPartsHScrollbar`, `is_checkbox`,
+		 * окно сообщения собрано из служебных частей-потомков), а сам тип
+		 * состояния при этом обязан остаться прежним. Ровно так уже сделаны
+		 * кнопка (0) и `ユーザコンポーネント` (17) выше.
+		 *
+		 * Раньше здесь была VM_ERROR, и первый же `横スライダーバー` (13) на
+		 * игровом экране Haha Ranman `行動選択` ронял движок в REPL. Сбрасывать
+		 * состояние тоже нельзя: parts_state_reset затёр бы CG, уже загруженный
+		 * раскладкой, — по той же причине этого не делает ветка кнопки.
+		 *
+		 * `パーツ`-семейство (классические id 11..22) сюда попасть не должно —
+		 * там неизвестный тип по-прежнему ошибка.
+		 */
+		int classic = component_type_to_classic(type);
+		if (classic >= 11)
+			VM_ERROR("unknown component type %d", type);
+		static bool warned[32];
+		unsigned w = (unsigned)type < 32 ? (unsigned)type : 31;
+		if (!warned[w]) {
+			warned[w] = true;
+			WARNING("SetComponentType: виджет %d без своего вида отрисовки — "
+				"тип состояния оставлен как есть", type);
+		}
+		return;
+	}
 	}
 	if (parts->states[state].type != pt)
 		parts_state_reset(&parts->states[state], pt);

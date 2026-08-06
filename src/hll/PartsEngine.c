@@ -1691,6 +1691,81 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		}
 		return;
 	}
+	/*
+	 * Калибры: `横ゲージパーツ` (классический id 14) и `縦ゲージパーツ` (15).
+	 *
+	 * Без своей ветки состояние оставалось обычным CG, и игра, которая гейтится по
+	 * типу компонента, получала из `GetHGauge`/`GetVGauge` ПУСТОЙ wrap. Ровно так
+	 * падал ассерт Haha Ranman на первом же игровом экране:
+	 *   CMentalGauge.jaf:21: (nonnull) lpIActivity.GetHGauge("横ゲージ：診療所：精神力")
+	 * — причём ПОИСК ПО ИМЕНИ проходил (`GetActivityPartsNumber -> 90000075`),
+	 * падала именно обёртка по типу. Тот же класс, что уже лечили у `構築パーツ`
+	 * (`GetConstruction("PlayerC")`), `ＣＧ判定パーツ` и `矩形パーツ` выше.
+	 *
+	 * Поля состояния: `ＣＧ名` — картинка полного калибра, `分子`/`分母` — начальное
+	 * заполнение (дробь, float), `反転` — заполнение с другого конца,
+	 * `サーフェイスエリア` — площадь.
+	 *
+	 * Замер по всем раскладкам: Haha Ranman — 12 состояний (11 горизонтальных,
+	 * 1 вертикальное), у ВСЕХ `分子 = 分母 = 100`, `反転 = 0`, площадь нулевая.
+	 * Dohna — 33 горизонтальных и ни одного вертикального, там `分母` бывает
+	 * 1/20/100/1000, `分子` — вплоть до 0, а `反転 = 1` у ДЕВЯТИ; площадь нулевая тоже.
+	 */
+	int gauge = act_parts_type(st);
+	if (gauge == 14 || gauge == 15) {
+		bool horiz = (gauge == 14);
+		struct string *gcg = act_str(st, "ＣＧ名");
+		if (gcg && gcg->size) {
+			if (horiz)
+				PE_SetHGaugeCG(no, gcg, state);
+			else
+				PE_SetVGaugeCG(no, gcg, state);
+		} else {
+			// Тип состояния нужен ВСЕГДА (иначе тот же пустой wrap), а рисовать
+			// нечего — ставим тип через площадь: она, в отличие от SetRate, не
+			// ругается на отсутствующую текстуру.
+			if (horiz)
+				PE_SetHGaugeSurfaceArea(no, 0, 0, 0, 0, state);
+			else
+				PE_SetVGaugeSurfaceArea(no, 0, 0, 0, 0, state);
+			static bool warned_nocg = false;
+			if (!warned_nocg) {
+				warned_nocg = true;
+				WARNING("ゲージパーツ: пустое ＣＧ名, тип состояния выставлен без картинки");
+			}
+		}
+		float den = act_float(st, "分母", 100.0f);
+		float num = act_float(st, "分子", 100.0f);
+		if (gcg && gcg->size && den != 0.0f) {
+			if (horiz)
+				PE_SetHGaugeRate(no, num, den, state);
+			else
+				PE_SetVGaugeRate(no, num, den, state);
+		}
+		// `反転` движок не умеет: заполнение всегда идёт от левого/верхнего края,
+		// а признак «с другого конца» хранить негде — `struct parts_gauge` пишется
+		// в сейв, и новое поле сломало бы формат. Вместо тихого дефолта — проверка
+		// допущения (у Haha Ranman таких состояний нет вовсе).
+		if (act_int(st, "反転", 0)) {
+			static bool warned_flip = false;
+			if (!warned_flip) {
+				warned_flip = true;
+				WARNING("ゲージパーツ: 反転=1 не поддержан — калибр заполняется "
+					"от начала, а не с другого конца");
+			}
+		}
+		int sw = act_list_int(st, "サーフェイスエリア", 2, 0);
+		int sh = act_list_int(st, "サーフェイスエリア", 3, 0);
+		if (sw > 0 && sh > 0) {
+			int sx = act_list_int(st, "サーフェイスエリア", 0, 0);
+			int sy = act_list_int(st, "サーフェイスエリア", 1, 0);
+			if (horiz)
+				PE_SetHGaugeSurfaceArea(no, sx, sy, sw, sh, state);
+			else
+				PE_SetVGaugeSurfaceArea(no, sx, sy, sw, sh, state);
+		}
+		return;
+	}
 	struct string *cg = act_str(st, "ＣＧ名");
 	if (cg && cg->size)
 		PE_SetPartsCG(no, cg, 0, state);
@@ -3195,6 +3270,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetHGaugeRate, PE_SetHGaugeRate_int),
 	    HLL_EXPORT(SetVGaugeCG, PE_SetVGaugeCG),
 	    HLL_EXPORT(SetVGaugeRate, PE_SetVGaugeRate_int),
+	    HLL_EXPORT(GetHGaugeNumerator, PE_GetHGaugeNumerator),
+	    HLL_EXPORT(GetHGaugeDenominator, PE_GetHGaugeDenominator),
+	    HLL_EXPORT(GetVGaugeNumerator, PE_GetVGaugeNumerator),
+	    HLL_EXPORT(GetVGaugeDenominator, PE_GetVGaugeDenominator),
 	    HLL_EXPORT(SetHGaugeSurfaceArea, PE_SetHGaugeSurfaceArea),
 	    HLL_EXPORT(SetVGaugeSurfaceArea, PE_SetVGaugeSurfaceArea),
 	    HLL_EXPORT(SetNumeralCG, PE_SetNumeralCG),
@@ -3804,6 +3883,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetHGaugeRate, PE_SetHGaugeRate),
 	    HLL_EXPORT(Parts_SetVGaugeCG, PE_SetVGaugeCG),
 	    HLL_EXPORT(Parts_SetVGaugeRate, PE_SetVGaugeRate),
+	    HLL_EXPORT(Parts_GetHGaugeNumerator, PE_GetHGaugeNumerator),
+	    HLL_EXPORT(Parts_GetHGaugeDenominator, PE_GetHGaugeDenominator),
+	    HLL_EXPORT(Parts_GetVGaugeNumerator, PE_GetVGaugeNumerator),
+	    HLL_EXPORT(Parts_GetVGaugeDenominator, PE_GetVGaugeDenominator),
 	    HLL_EXPORT(Parts_SetHGaugeSurfaceArea, PE_SetHGaugeSurfaceArea),
 	    HLL_EXPORT(Parts_SetVGaugeSurfaceArea, PE_SetVGaugeSurfaceArea),
 	    HLL_EXPORT(Parts_SetNumeralCG, PE_SetNumeralCG),
