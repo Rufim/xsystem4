@@ -779,50 +779,23 @@ static void PartsEngine_AddComponentMotionPos(int parts_no, float begin_x, float
 			begin_t, end_t, curve_name);
 }
 
-static void PartsEngine_add_construction_process(union vm_value *ints,
-		union vm_value *floats, union vm_value *strings)
+/*
+ * Одна операция процедуры построения (構築パーツ). Раньше это был инлайн-switch
+ * внутри HLL-обёртки; вынесен отдельно, потому что ТЕ ЖЕ операции приходят из
+ * ДВУХ мест: игра добавляет их в рантайме через AddPartsConstructionProcess, а
+ * раскладка активности описывает их узлом `手順リスト` (см. act_construction_run).
+ * Поля раскладки ложатся на параметры один в один: `コマンド`, `元矩形`,
+ * `先矩形`, `色１`, `文字間隔`/`行間隔`, `フォント*`, `テキスト`, `ＣＧ名`.
+ */
+static void construction_op(int parts_no, int state, int command, int interp_type,
+		int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh,
+		int r, int g, int b, int a, int r2, int g2, int b2,
+		int char_space, int line_space, int font_type, int font_size,
+		int font_r, int font_g, int font_b, int edge_r, int edge_g, int edge_b,
+		int full_size, float bold_weight, float edge_weight,
+		struct string *text, struct string *cg_name)
 {
-	int parts_no    = ints[0].i;
-	int state       = ints[1].i;
-	int command     = ints[2].i;
-	int interp_type = ints[3].i;
-	int sx          = ints[4].i;
-	int sy          = ints[5].i;
-	int sw          = ints[6].i;
-	int sh          = ints[7].i;
-	int dx          = ints[8].i;
-	int dy          = ints[9].i;
-	int dw          = ints[12].i;
-	int dh          = ints[13].i;
-	int r           = ints[14].i;
-	int g           = ints[15].i;
-	int b           = ints[16].i;
-	int a           = ints[17].i;
-	// int r2       = ints[18].i;
-	// int g2       = ints[19].i;
-	// int b2       = ints[20].i;
-	int char_space  = ints[21].i;
-	int line_space  = ints[22].i;
-	int font_type   = ints[23].i;
-	int font_size   = ints[24].i;
-	int font_r      = ints[25].i;
-	int font_g      = ints[26].i;
-	int font_b      = ints[27].i;
-	int edge_r      = ints[28].i;
-	int edge_g      = ints[29].i;
-	int edge_b      = ints[30].i;
-	int full_size   = ints[31].i;
-	float bold_weight = floats[0].f;
-	float edge_weight = floats[1].f;
-	struct string *text    = heap_get_string(strings[0].i);
-	struct string *cg_name = heap_get_string(strings[1].i);
-
-	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
-		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
-		       command, parts_no, dx, dy, font_type, font_size, font_r, font_g, font_b,
-		       edge_r, edge_g, edge_b, edge_weight, bold_weight,
-		       strings[0].i, text ? (int)text->size : -1, text ? display_sjis0(text->text) : "(null)");
-
+	(void)interp_type; (void)sw; (void)sh;
 	switch (command) {
 	case 0:  // CASConstructionProcess::SetCreate
 		PE_AddCreateToPartsConstructionProcess(parts_no, dw, dh, state);
@@ -945,6 +918,58 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 		WARNING("AddConstructProcess: unknown command %d", command);
 		break;
 	}
+}
+
+
+static void PartsEngine_add_construction_process(union vm_value *ints,
+		union vm_value *floats, union vm_value *strings)
+{
+	int parts_no    = ints[0].i;
+	int state       = ints[1].i;
+	int command     = ints[2].i;
+	int interp_type = ints[3].i;
+	int sx          = ints[4].i;
+	int sy          = ints[5].i;
+	int sw          = ints[6].i;
+	int sh          = ints[7].i;
+	int dx          = ints[8].i;
+	int dy          = ints[9].i;
+	int dw          = ints[12].i;
+	int dh          = ints[13].i;
+	int r           = ints[14].i;
+	int g           = ints[15].i;
+	int b           = ints[16].i;
+	int a           = ints[17].i;
+	int r2          = ints[18].i;
+	int g2          = ints[19].i;
+	int b2          = ints[20].i;
+	int char_space  = ints[21].i;
+	int line_space  = ints[22].i;
+	int font_type   = ints[23].i;
+	int font_size   = ints[24].i;
+	int font_r      = ints[25].i;
+	int font_g      = ints[26].i;
+	int font_b      = ints[27].i;
+	int edge_r      = ints[28].i;
+	int edge_g      = ints[29].i;
+	int edge_b      = ints[30].i;
+	int full_size   = ints[31].i;
+	float bold_weight = floats[0].f;
+	float edge_weight = floats[1].f;
+	struct string *text    = heap_get_string(strings[0].i);
+	struct string *cg_name = heap_get_string(strings[1].i);
+
+	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
+		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
+		       command, parts_no, dx, dy, font_type, font_size, font_r, font_g, font_b,
+		       edge_r, edge_g, edge_b, edge_weight, bold_weight,
+		       strings[0].i, text ? (int)text->size : -1, text ? display_sjis0(text->text) : "(null)");
+
+	construction_op(parts_no, state, command, interp_type, sx, sy, sw, sh,
+			dx, dy, dw, dh, r, g, b, a, r2, g2, b2, char_space, line_space,
+			font_type, font_size, font_r, font_g, font_b,
+			edge_r, edge_g, edge_b, full_size, bold_weight, edge_weight,
+			text, cg_name);
 }
 
 // Generic dispatch function for PartsEngine operations.
@@ -1530,6 +1555,68 @@ static float act_list_float(struct ex_tree *t, const char *utf8, int idx, float 
 
 static float act_float(struct ex_tree *t, const char *utf8, float dflt);
 
+/*
+ * Выполнить процедуру построения, ОПИСАННУЮ В РАСКЛАДКЕ (`手順リスト` у состояния
+ * `構築パーツ`). Раньше не выполнялась ни одна: часть превращалась в
+ * прямоугольную маску, и всё, что игра рисует этим механизмом, с экрана
+ * пропадало. У Dohna таких состояний 178 в 109 раскладках — это подложки
+ * счётчиков («Round128x40» под «TALENT 3/3»), рамки, стрелки навигации,
+ * размытия фона.
+ *
+ * Узел `手順N` описывает ровно ту же операцию, что игра шлёт в рантайме через
+ * `AddPartsConstructionProcess`, поле в поле, поэтому обе дороги сходятся в
+ * `construction_op`. Возвращает число ВЫПОЛНЕННЫХ операций (неизвестные команды
+ * не в счёт) — вызывающему это нужно, чтобы понять, осталась ли часть пустой.
+ */
+static int act_construction_run(int no, int state, struct ex_tree *proc)
+{
+	int done = 0;
+	for (int i = 1; ; i++) {
+		char key[32];
+		snprintf(key, sizeof(key), "手順%d", i);
+		struct ex_tree *op = act_child(proc, key);
+		if (!op)
+			break;
+		int command = act_int(op, "コマンド", -1);
+		if (command < 0)
+			continue;
+		// Команды за пределами реализованного набора (у Dohna в раскладках
+		// встречаются 28 и 122 — расширения v14) пропускаем ЯВНО: пусть их
+		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
+		if (command > 24) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("構築パーツ: команда %d раскладки не реализована "
+					"(часть %d) — этот шаг пропущен", command, no);
+			}
+			continue;
+		}
+		struct string *text = act_str(op, "テキスト");
+		struct string *cg = act_str(op, "ＣＧ名");
+		construction_op(no, state, command, act_int(op, "補間タイプ", 0),
+			act_list_int(op, "元矩形", 0, 0), act_list_int(op, "元矩形", 1, 0),
+			act_list_int(op, "元矩形", 2, 0), act_list_int(op, "元矩形", 3, 0),
+			act_list_int(op, "先矩形", 0, 0), act_list_int(op, "先矩形", 1, 0),
+			act_list_int(op, "先矩形", 4, 0), act_list_int(op, "先矩形", 5, 0),
+			act_list_int(op, "色１", 0, 0), act_list_int(op, "色１", 1, 0),
+			act_list_int(op, "色１", 2, 0), act_list_int(op, "色１", 3, 255),
+			act_list_int(op, "色２", 0, 0), act_list_int(op, "色２", 1, 0),
+			act_list_int(op, "色２", 2, 0),
+			act_int(op, "文字間隔", 0), act_int(op, "行間隔", 0),
+			act_int(op, "フォントタイプ", 0), act_int(op, "フォントサイズ", 16),
+			act_list_int(op, "フォント色", 0, 255), act_list_int(op, "フォント色", 1, 255),
+			act_list_int(op, "フォント色", 2, 255),
+			act_list_int(op, "フォント縁取り色", 0, 0),
+			act_list_int(op, "フォント縁取り色", 1, 0),
+			act_list_int(op, "フォント縁取り色", 2, 0),
+			act_int(op, "全体", 0), act_float(op, "フォント太さ", 0.0f),
+			act_float(op, "フォント縁取り", 0.0f), text, cg);
+		done++;
+	}
+	return done;
+}
+
 static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8, int state)
 {
 	struct ex_tree *st = act_child(ti, state_utf8);
@@ -1717,22 +1804,17 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
 		if (step1) {
-			int w = act_list_int(step1, "先矩形", 4, 0);
-			int h = act_list_int(step1, "先矩形", 5, 0);
-			if (w > 0 && h > 0) {
-				PE_SetPartsConstructionFill(no, w, h, state);
-				// Заливка — ТОЛЬКО маска: сама часть не рисуется, иначе
-				// непрозрачный прямоугольник закрывает экран (титул Dohna
-				// объявляет такую часть `表示 = 1, アルファ = 255`, z=29,
-				// 1480x920 поверх всего, а по её процедуре поверхность
-				// прозрачная). Клипперы Tsumamigui 3 и так `表示 = 0`.
-				PE_SetPartsConstructionMask(no);
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					WARNING("構築パーツ: процедура построения не выполняется, "
-						"часть используется только как прямоугольная маска "
-						"альфа-клиппера и не рисуется");
+			int nr = act_construction_run(no, state, proc);
+			// Процедуры без единой ВЫПОЛНЕННОЙ операции (все команды
+			// неизвестны) оставляем прежним поведением — прямоугольной
+			// маской альфа-клиппера: лучше клип по габаритам, чем пустая
+			// часть. Заодно так ведут себя `表示 = 0`-клипперы Tsumamigui 3.
+			if (nr == 0) {
+				int w = act_list_int(step1, "先矩形", 4, 0);
+				int h = act_list_int(step1, "先矩形", 5, 0);
+				if (w > 0 && h > 0) {
+					PE_SetPartsConstructionFill(no, w, h, state);
+					PE_SetPartsConstructionMask(no);
 				}
 			}
 		}
