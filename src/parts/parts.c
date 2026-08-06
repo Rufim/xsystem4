@@ -3363,6 +3363,8 @@ int PE_GetFreeNumber(void)
 		first_free++;
 	}
 	// XXX: the ID is incremented even if the parts is not created
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS GetFreeNumber -> %d", first_free);
 	return first_free++;
 }
 
