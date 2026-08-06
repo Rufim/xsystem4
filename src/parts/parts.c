@@ -130,12 +130,24 @@ static void dirty_list_remove(struct parts *parts)
 		TAILQ_REMOVE(&dirty_list, parts, dirty_list_entry);
 }
 
+static int ctrl_stack_pos(int id);
+
 static int parts_get_sprite_z(struct parts *parts)
 {
 	if (!parts_multi_controller)
 		return parts->global.z;
+	// ★Порядок слоёв задаёт ПОЗИЦИЯ В СТЕКЕ, а не id: id — просто выданный номер,
+	// и после сноса слоя из середины он уже не совпадает с глубиной (наш id —
+	// наименьший свободный, так что заново созданный слой может получить МАЛЫЙ
+	// номер и оказаться на вершине стека). Пока ключом был id, свежий экран мог
+	// уехать ПОД старый — у Haha Ranman так титул (id 3, позиция 2) сортировался
+	// выше сцены, добавленной после него (id 2, позиция 3).
 	// The system overlay controller sorts above any in-stack controller.
-	return parts->controller_no;
+	if (parts->controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY)
+		return PARTS_CONTROLLER_STACK_MAX;
+	int pos = ctrl_stack_pos(parts->controller_no);
+	// Слоя уже нет в стеке (парт пережил снос) — кладём под всё, а не поверх.
+	return pos >= 0 ? pos : -1;
 }
 
 static int parts_get_sprite_z2(struct parts *parts)
@@ -3219,6 +3231,23 @@ void PE_SetSpeedupRateByMessageSkip(int parts_no, int rate)
 		UNIMPLEMENTED("(%d, %d)");
 }
 
+// Порядок слоёв изменился (добавили/сняли слой) — ключ сортировки у ВСЕХ партов
+// зависит от позиции, поэтому список надо пересобрать целиком.
+static void ctrl_stack_resort_all(void)
+{
+	struct parts *p;
+	struct parts_list saved;
+	TAILQ_INIT(&saved);
+	while ((p = TAILQ_FIRST(&parts_list))) {
+		parts_list_remove(p);   // снимает и с TAILQ, и со сцены спрайтов
+		TAILQ_INSERT_TAIL(&saved, p, parts_list_entry);
+	}
+	while ((p = TAILQ_FIRST(&saved))) {
+		TAILQ_REMOVE(&saved, p, parts_list_entry);
+		parts_list_insert(p);
+	}
+}
+
 // Позиция слоя `id` в стеке (низ = 0) или -1, если такого слоя нет.
 static int ctrl_stack_pos(int id)
 {
@@ -3266,6 +3295,7 @@ int PE_AddController(int index)
 		no++;
 	ctrl_stack.stack[ctrl_stack.nr_controllers++] = no;
 	ctrl_stack.active = no;
+	ctrl_stack_resort_all();   // позиции слоёв — ключ порядка, см. parts_get_sprite_z
 	ctrl_stack.hidden[no] = false;  // номер мог остаться погашенным от прошлого слоя
 	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController(index=%d) -> ctrl %d (nr=%d)", index, no, ctrl_stack.nr_controllers);
 	return no;
@@ -3297,12 +3327,18 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	 *   • как ID     — сносятся ПУСТЫЕ слои: в трейсе `освобождено партов 0` почти на
 	 *                  каждом вызове, а экран титула не разбирается вовсе;
 	 *   • как позиция — то же самое.
+	 * Проверено ТРИ прочтения аргумента, все три дают ЧЁРНЫЙ экран вместо пролога:
+	 * как ID слоя; как позицию в стеке; и то же самое уже ПОСЛЕ того, как порядок
+	 * отрисовки стал считаться по позиции, а не по id (см. parts_get_sprite_z) —
+	 * то есть дело не в порядке.
 	 * Вывод замера: расходится не чтение аргумента, а НАША ПРИВЯЗКА ПАРТОВ К СЛОЯМ
 	 * (`parts_init`: `controller_no = ctrl_stack.active`). Игра адресует слои, в
 	 * которых по-нашему нет ни одного парта, — значит парты попадают не туда. Пока
 	 * это не разобрано, «снести активный» остаётся единственным вариантом, при котором
 	 * экраны разбираются; цена известна и записана: у Haha Ranman на ADV-сцене остаются
-	 * чужие парты (плёночный шум титула, рамка юнит-анимации `行動選択`).
+	 * чужие парты (плёночный шум титула, рамка юнит-анимации `行動選択`) — их
+	 * пересоздаёт покадровое событие мёртвого экрана, которое игра снимает по СВОЕМУ
+	 * номеру слоя (`ResetPartsUpdateEventLayerID`), а он у неё другой.
 	 * Мерить так: `XSYS4_CTRL_TRACE=1` печатает и запрошенный index, и сколько партов
 	 * реально освобождено, и пример их CG.
 	 */
@@ -3377,6 +3413,7 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 		ctrl_stack.stack[i] = ctrl_stack.stack[i + 1];
 	ctrl_stack.nr_controllers--;
 	ctrl_stack.hidden[ctrl_no] = false;
+	ctrl_stack_resort_all();
 	if (ctrl_stack.nr_controllers == 0) {
 		PE_AddController(-1);
 	} else {
@@ -3386,7 +3423,10 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 
 void PE_set_active_controller(int controller_no)
 {
-	if (getenv("XSYS4_CTRL_TRACE"))
+	// ★ОТДЕЛЬНАЯ ручка, а не XSYS4_CTRL_TRACE: игра дёргает это КАЖДЫЙ КАДР (у Haha
+	// Ranman — 3↔0 по три раза за кадр), и под общим трейсом 200 000 строк выносили
+	// из лога всё остальное, включая сами Add/RemoveController.
+	if (getenv("XSYS4_CTRL_TRACE_ACTIVE"))
 		NOTICE("PE_set_active_controller(%d) (был %d)", controller_no, ctrl_stack.active);
 	if (controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY ||
 			ctrl_stack_pos(controller_no) >= 0)
