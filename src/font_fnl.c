@@ -165,18 +165,24 @@ static struct fnl_bitmap_glyph *fnl_get_bitmap_glyph(struct fnl_bitmap_size *bit
 // Downscale filter tuning (see comment in fnl_font_get_glyph); overridable
 // for A/B comparison via XSYS4_FNL_GAMMA=<float> and XSYS4_FNL_SHARP=0/1.
 //
-// Calibrated against the original engine (Tsumamigui 3 message window under Proton,
-// FINDINGS §5f): mean |pixel difference| over the text of one line, smaller = closer.
-//   smoothstep + 0.8  23.61      box + 0.6  22.34
-//   box + 0.7        *19.85*     box + 0.8  21.03
-//   box + 0.9         22.56      box + 1.0  24.16
-// A plain box average is what AliceSoft's engine does with the 4x supersamples, and
-// it reproduces the original's look: a slightly thinner ink core with a broader
-// partial-coverage fringe, which the outline pass then dilates into the heavier edge
-// the original has. The smoothstep was added to stop glyphs clumping, but that had
+// A plain box average of the 4x supersamples is what AliceSoft's engine does, so the
+// physically correct value here is gamma = 1.0, i.e. no gamma at all. An earlier
+// calibration (FINDINGS §5i) landed on 0.7, but that was measured while the bold /
+// outline dilation was a no-op (§5k): the gamma was silently standing in for the
+// weight the dilation pass failed to add. With max-plus dilation fixed, the boost
+// became a double count and left our half-tone fringe ~18% wider than the original's.
+//
+// Re-swept against BOTH references at once (FINDINGS §5v), mean |pixel difference|,
+// smaller = closer; one clean minimum at 1.0 in both, no plateau:
+//   gamma        0.7     0.9    0.95   *1.0*   1.05    1.1
+//   back log    3.844   3.259  3.169  *3.073* 3.167  3.280
+//   msg window 21.144  19.750 19.526 *19.305* 19.782 20.341
+// At 1.0 the message-window line is pixel-identical to the original (ink 921 = 921,
+// mean |difference| over the glyphs 0.054), and the back log's stroke widths and line
+// widths match exactly. The smoothstep was added to stop glyphs clumping, but that had
 // two real causes — the wrong .fnl face (ink ~20% too wide for its advance) and the
 // dropped outline advance — both since fixed, so the sharpening is no longer needed.
-static float fnl_gamma = 0.7f;
+static float fnl_gamma = 1.0f;
 static bool fnl_sharpen = false;
 static bool fnl_filter_initialized = false;
 
@@ -228,16 +234,14 @@ static bool fnl_font_get_glyph(struct font_size *_size, struct glyph *glyph, uin
 		unsigned avg = acc[i] / (size->denominator * size->denominator);
 		// The .fnl faces are 4x-supersampled bitmaps (face height = 4*point
 		// size); AliceSoft's engine box-filters them down, i.e. linear
-		// coverage. A plain gamma boost (0.35) fattened partially-covered
-		// edge pixels and filled the (already tiny, 1-3px native) gaps
-		// between glyphs, making letters touch. Instead sharpen around the
-		// 50%-coverage contour: the true glyph outline stays put, interior
-		// pixels go solid (weight preserved), and the faint outer fringe
-		// fades so inter-letter gaps survive. Mild gamma on top for weight.
+		// coverage, and the plain average above already is that filter. The
+		// tuning below is off by default (gamma 1.0, no sharpening) and only
+		// exists for A/B comparison — see the calibration table above.
 		float t = avg / 255.0f;
 		if (fnl_sharpen)
 			t = t*t*(3.0f - 2.0f*t); // smoothstep, fixed point at 0.5
-		t = powf(t, fnl_gamma);
+		if (fnl_gamma != 1.0f)
+			t = powf(t, fnl_gamma);
 		uint8_t p = (uint8_t)(255.0f * t + 0.5f);
 		pixels[(dst_row+off_y)*width + (dst_col+off_x)] = p;
 	}
