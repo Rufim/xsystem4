@@ -312,6 +312,9 @@ void parts_state_reset(struct parts_state *state, enum parts_type type)
 	case PARTS_NUMERAL:
 		state->num.length = 1;
 		state->num.font_no = -1;
+		// Шрифтовый режим (`表示タイプ = 2`) пользуется этим стилем; нулевой
+		// scale_x из memset дал бы нулевую ширину знака.
+		state->num.ts = default_text_style;
 		break;
 	case PARTS_CONSTRUCTION_PROCESS:
 		TAILQ_INIT(&state->cproc.ops);
@@ -930,10 +933,68 @@ static int parts_load_numeral_font_combined(struct cg *cg, int cg_no, int w[12])
 	return font_no;
 }
 
+/*
+ * Число, нарисованное ШРИФТОМ (`表示タイプ = 2`): цифры берутся не из набора CG,
+ * а из обычного шрифта с параметрами `SetNumeralFont`. У Dohna так сделаны все
+ * счётчики интерфейса — «TALENT 3/3» и «Client 1/4» на экране подбора талантов,
+ * счётчик клиентов и т.д.; движок этот режим не знал вовсе, и на месте чисел
+ * оставались пустые места (сверено с оригиналом на экране Hustling).
+ *
+ * `字間隔` (num->space) прибавляется к шагу каждого знака, как у текстовой части;
+ * запятая и минус — обычные символы шрифта, отдельных CG им не нужно.
+ */
+static bool parts_numeral_font_update(struct parts *parts, struct parts_numeral *num)
+{
+	char buf[64];
+	int_least64_t n = num->num;
+	int len = 0;
+	if (num->show_comma) {
+		char digits[32];
+		int nd = snprintf(digits, sizeof(digits), "%" PRIdLEAST64, n < 0 ? -n : n);
+		if (n < 0)
+			buf[len++] = '-';
+		for (int i = 0; i < nd && len < (int)sizeof(buf) - 2; i++) {
+			if (i > 0 && (nd - i) % 3 == 0)
+				buf[len++] = ',';
+			buf[len++] = digits[i];
+		}
+		buf[len] = '\0';
+	} else if (num->length > 0) {
+		len = snprintf(buf, sizeof(buf), "%0*" PRIdLEAST64, num->length, n);
+	} else {
+		len = snprintf(buf, sizeof(buf), "%" PRIdLEAST64, n);
+	}
+	if (len <= 0)
+		return true;
+
+	int h = text_style_height(&num->ts);
+	float total = 0;
+	for (int i = 0; i < len; i++) {
+		char ch[3] = { buf[i], '\0', '\0' };
+		total += text_style_width(&num->ts, ch) + num->space;
+	}
+	int w = max(1, (int)ceilf(total - num->space));
+
+	gfx_delete_texture(&num->common.texture);
+	gfx_init_texture_rgba(&num->common.texture, w, h, (SDL_Color){0, 0, 0, 0});
+	float x = 0;
+	for (int i = 0; i < len; i++) {
+		char ch[3] = { buf[i], '\0', '\0' };
+		x += gfx_render_textf(&num->common.texture, x, 0, ch, &num->ts, false);
+		x += num->space;
+	}
+	parts_set_dims(parts, &num->common, w, h);
+	return true;
+}
+
 static bool parts_numeral_update(struct parts *parts, struct parts_numeral *num)
 {
 	// XXX: don't generate texture if number hasn't been set yet
-	if (!num->have_num || num->font_no < 0)
+	if (!num->have_num)
+		return true;
+	if (num->use_font)
+		return parts_numeral_font_update(parts, num);
+	if (num->font_no < 0)
 		return true;
 	int_least64_t n = num->num;
 	bool negative = n < 0;
@@ -1991,6 +2052,58 @@ bool PE_SetNumeralShowComma(int parts_no, bool show_comma, int state)
 	num->show_comma = show_comma;
 	parts_numeral_update(parts, num);
 	return true;
+}
+
+/*
+ * `SetNumeralFont(no, type, size, r,g,b, boldWeight, edgeR,edgeG,edgeB,
+ * edgeWeight, state)` — параметры ШРИФТОВОГО режима числовой части (см.
+ * parts_numeral_font_update). Игра зовёт её сама для каждого счётчика; в
+ * раскладке те же значения лежат полями `フォント*` рядом с `表示タイプ = 2`.
+ * Установка параметров включает режим: CG-набор цифр и шрифт исключают друг
+ * друга, и `ＣＧ名` у таких частей пуст.
+ */
+void PE_SetNumeralFont(int parts_no, int type, int size, int r, int g, int b,
+		float bold_weight, int edge_r, int edge_g, int edge_b,
+		float edge_weight, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_numeral *num = parts_get_numeral(parts, state);
+	num->use_font = true;
+	num->ts = default_text_style;
+	num->ts.face = type;
+	num->ts.size = size;
+	num->ts.color = (SDL_Color) { r, g, b, 255 };
+	num->ts.weight = bold_weight * 1000;
+	num->ts.edge_color = (SDL_Color) { edge_r, edge_g, edge_b, 255 };
+	text_style_set_edge_width(&num->ts, edge_weight);
+	parts_numeral_update(parts, num);
+	parts_dirty(parts);
+}
+
+/*
+ * `SetNumeralShowType(no, type, state)`: 2 — рисовать шрифтом, иначе набором CG.
+ * Значение приходит и из раскладки (`表示タイプ`). Другие значения, кроме 0/1/2,
+ * не встречались — на них WARNING, чтобы не превратить неизвестный режим в
+ * молчаливый CG.
+ */
+void PE_SetNumeralShowType(int parts_no, int type, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_numeral *num = parts_get_numeral(parts, state);
+	if (type > 2) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("SetNumeralShowType: неизвестный режим %d (часть %d)", type, parts_no);
+		}
+	}
+	num->use_font = (type == 2);
+	parts_numeral_update(parts, num);
+	parts_dirty(parts);
 }
 
 bool PE_SetNumeralSpace(int parts_no, int space, int state)

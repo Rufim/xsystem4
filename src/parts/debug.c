@@ -117,6 +117,8 @@ static void parts_construction_process_to_json(struct parts_construction_process
 		[PARTS_CP_DRAW_TEXT] = "draw_text",
 		[PARTS_CP_COPY_TEXT] = "copy_text",
 		[PARTS_CP_GRAY_FILTER] = "gray_filter",
+		[PARTS_CP_FILL_GRADATION_HORIZON] = "fill_gradation_horizon",
+		[PARTS_CP_MUL_FILTER] = "mul_filter",
 	};
 
 	cJSON *ops, *tmp;
@@ -188,6 +190,28 @@ static void parts_construction_process_to_json(struct parts_construction_process
 			cJSON_AddNumberToObject(obj, "w", op->filter.w);
 			cJSON_AddNumberToObject(obj, "h", op->filter.h);
 			cJSON_AddBoolToObject(obj, "full_size", op->filter.full_size);
+			break;
+		case PARTS_CP_FILL_GRADATION_HORIZON:
+			cJSON_AddNumberToObject(obj, "x", op->gradation.x);
+			cJSON_AddNumberToObject(obj, "y", op->gradation.y);
+			cJSON_AddNumberToObject(obj, "w", op->gradation.w);
+			cJSON_AddNumberToObject(obj, "h", op->gradation.h);
+			cJSON_AddNumberToObject(obj, "top_r", op->gradation.top_r);
+			cJSON_AddNumberToObject(obj, "top_g", op->gradation.top_g);
+			cJSON_AddNumberToObject(obj, "top_b", op->gradation.top_b);
+			cJSON_AddNumberToObject(obj, "bot_r", op->gradation.bot_r);
+			cJSON_AddNumberToObject(obj, "bot_g", op->gradation.bot_g);
+			cJSON_AddNumberToObject(obj, "bot_b", op->gradation.bot_b);
+			break;
+		case PARTS_CP_MUL_FILTER:
+			cJSON_AddNumberToObject(obj, "x", op->color_filter.x);
+			cJSON_AddNumberToObject(obj, "y", op->color_filter.y);
+			cJSON_AddNumberToObject(obj, "w", op->color_filter.w);
+			cJSON_AddNumberToObject(obj, "h", op->color_filter.h);
+			cJSON_AddNumberToObject(obj, "r", op->color_filter.r);
+			cJSON_AddNumberToObject(obj, "g", op->color_filter.g);
+			cJSON_AddNumberToObject(obj, "b", op->color_filter.b);
+			cJSON_AddBoolToObject(obj, "full_size", op->color_filter.full_size);
 			break;
 		}
 	}
@@ -572,6 +596,12 @@ static void parts_list_print(struct parts *parts, int indent)
 				break;
 			case PARTS_CP_GRAY_FILTER:
 				sys_message(" gray-filter");
+				break;
+			case PARTS_CP_FILL_GRADATION_HORIZON:
+				sys_message(" fill-gradation-horizon");
+				break;
+			case PARTS_CP_MUL_FILTER:
+				sys_message(" mul-filter");
 				break;
 			}
 		}

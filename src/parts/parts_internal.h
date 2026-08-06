@@ -185,6 +185,15 @@ struct parts_numeral {
 	int show_comma;
 	int length;
 	int font_no;
+	/*
+	 * Второй способ рисовать число — ШРИФТОМ, а не набором CG (`表示タイプ = 2`
+	 * в раскладке, `ＣＧ名` при этом пуст, а рядом лежат `フォントタイプ/
+	 * フォントサイズ/フォント色/フォント縁取り*`). Так у Dohna сделаны все
+	 * счётчики интерфейса — «TALENT 3/3», «Client 1/4» и т.п.; в CG-варианте
+	 * (Tsumamigui 3) эти поля не используются.
+	 */
+	bool use_font;
+	struct text_style ts;
 };
 
 struct parts_gauge {
@@ -220,7 +229,12 @@ enum parts_cp_op_type {
 	PARTS_CP_COPY_TEXT,
 	PARTS_CP_GRAY_FILTER,
 	PARTS_CP_FILL_WITH_ALPHA,
-#define PARTS_NR_CP_TYPES (PARTS_CP_FILL_WITH_ALPHA+1)
+	// ★Новое дописывается ТОЛЬКО В КОНЕЦ: значения уходят числом в сейв
+	// (`save_parts_cp_op` пишет `op->type`), вставка в середину переименует
+	// все последующие операции в уже записанных сейвах.
+	PARTS_CP_FILL_GRADATION_HORIZON,
+	PARTS_CP_MUL_FILTER,
+#define PARTS_NR_CP_TYPES (PARTS_CP_MUL_FILTER+1)
 };
 
 struct parts_cp_create {
@@ -256,6 +270,21 @@ struct parts_cp_filter {
 	bool full_size;
 };
 
+// `Ｐ＿構築手順＿グラデーション横` — заливка прямоугольника градиентом СВЕРХУ ВНИЗ
+// (полосы горизонтальные, цвет меняется по вертикали от верхнего к нижнему).
+struct parts_cp_fill_gradation {
+	int x, y, w, h;
+	int top_r, top_g, top_b;
+	int bot_r, bot_g, bot_b;
+};
+
+// Фильтр умножения: как gray_filter, но с цветом.
+struct parts_cp_color_filter {
+	int x, y, w, h;
+	int r, g, b;
+	bool full_size;
+};
+
 struct parts_cp_op {
 	TAILQ_ENTRY(parts_cp_op) entry;
 	enum parts_cp_op_type type;
@@ -266,6 +295,8 @@ struct parts_cp_op {
 		struct parts_cp_cut_cg cut_cg;
 		struct parts_cp_text text;
 		struct parts_cp_filter filter;
+		struct parts_cp_fill_gradation gradation;
+		struct parts_cp_color_filter color_filter;
 	};
 };
 

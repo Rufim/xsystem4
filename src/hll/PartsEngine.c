@@ -741,6 +741,24 @@ static float PartsEngine_Parts_GetPartsUpperLeftPosY(int parts_no, int state)
 	return PE_GetPartsUpperLeftPosY(parts_no, state);
 }
 
+/*
+ * Двухвыходная форма: `Parts_GetPartsUpperLeftPos(int, wrap<float> PosX,
+ * wrap<float> PosY, int State)`. Обе координаты те же, что у отдельных
+ * `…PosX`/`…PosY` (те реализованы давно) — не хватало ровно этой обёртки, и
+ * `CustomerViewSet@MoveOut` (уход клиента в фазе Hustling у Dohna) падал на
+ * «Unimplemented HLL function» через несколько секунд после входа в фазу.
+ * `wrap<скаляр>` приходит ссылкой на переменную (две ячейки стека), ffi отдаёт
+ * её обычным указателем — как у `TextSurfaceManager.GetFontWidth`.
+ */
+static void PartsEngine_Parts_GetPartsUpperLeftPos(int parts_no, float *pos_x,
+		float *pos_y, int state)
+{
+	if (pos_x)
+		*pos_x = PE_GetPartsUpperLeftPosX(parts_no, state);
+	if (pos_y)
+		*pos_y = PE_GetPartsUpperLeftPosY(parts_no, state);
+}
+
 // Rance 9: return type changed from int to float
 static float PartsEngine_Parts_GetComponentPosX(int parts_no)
 {
@@ -1603,6 +1621,28 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		struct string *cg = act_str(st, "ＣＧ名");
 		if (cg && cg->size)
 			PE_SetNumeralCG(no, cg, state);
+		/*
+		 * `表示タイプ = 2` — цифры рисуются ШРИФТОМ, а не набором CG (`ＣＧ名`
+		 * при таком режиме пуст). У Dohna так сделаны ВСЕ счётчики интерфейса:
+		 * «TALENT 3/3» и «Client 1/4» на экране подбора талантов — это части
+		 * `Remain`/`Max` из `PlayerShopView.pactex` с `表示タイプ = 2`,
+		 * `フォントタイプ = 258`, `フォントサイズ = 24`. Загрузчик режима не знал,
+		 * шрифтовые поля игнорировал — и на месте чисел не было ничего (сверено
+		 * с оригиналом на экране Hustling). У Tsumamigui 3 режим CG-цифр, эти
+		 * поля там не используются.
+		 */
+		if (act_int(st, "表示タイプ", 0) == 2) {
+			PE_SetNumeralFont(no, act_int(st, "フォントタイプ", 0),
+				act_int(st, "フォントサイズ", 16),
+				act_list_int(st, "フォント色", 0, 255),
+				act_list_int(st, "フォント色", 1, 255),
+				act_list_int(st, "フォント色", 2, 255),
+				act_float(st, "フォント太さ", 0.0f),
+				act_list_int(st, "フォント縁取り色", 0, 0),
+				act_list_int(st, "フォント縁取り色", 1, 0),
+				act_list_int(st, "フォント縁取り色", 2, 0),
+				act_float(st, "フォント縁取り", 0.0f), state);
+		}
 		PE_SetNumeralSpace(no, act_int(st, "字間隔", 0), state);
 		PE_SetNumeralShowComma(no, act_int(st, "コンマ表示", 0), state);
 		// 桁数 задаёт разрядность, но дополнять нулями можно только с ゼロパディング=1:
@@ -3320,6 +3360,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetNumeralFont, PartsEngine_SetNumeralFont),
 	    HLL_EXPORT(SetNumeralNumber, PE_SetNumeralNumber),
 	    HLL_EXPORT(SetNumeralShowComma, PE_SetNumeralShowComma),
+	    HLL_EXPORT(SetNumeralFont, PE_SetNumeralFont),
+	    HLL_EXPORT(SetNumeralShowType, PE_SetNumeralShowType),
 	    HLL_EXPORT(SetNumeralSpace, PE_SetNumeralSpace),
 	    HLL_EXPORT(SetNumeralLength, PE_SetNumeralLength),
 	    HLL_EXPORT(SetNumeralSurfaceArea, PE_SetNumeralSurfaceArea),
@@ -3347,13 +3389,13 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(AddFillAlphaColorToPartsConstructionProcess, PE_AddFillAlphaColorToPartsConstructionProcess),
 	    HLL_EXPORT(AddFillAMapToPartsConstructionProcess, PE_AddFillAMapToPartsConstructionProcess),
 	    HLL_EXPORT(AddFillWithAlphaToPartsConstructionProcess, PE_AddFillWithAlphaToPartsConstructionProcess),
-	    HLL_TODO_EXPORT(AddFillGradationHorizonToPartsConstructionProcess, PartsEngine_AddFillGradationHorizonToPartsConstructionProcess),
+	    HLL_EXPORT(AddFillGradationHorizonToPartsConstructionProcess, PE_AddFillGradationHorizonToPartsConstructionProcess),
 	    HLL_EXPORT(AddDrawRectToPartsConstructionProcess, PE_AddDrawRectToPartsConstructionProcess),
 	    HLL_EXPORT(AddDrawCutCGToPartsConstructionProcess, PartsEngine_AddDrawCutCGToPartsConstructionProcess_old),
 	    HLL_EXPORT(AddCopyCutCGToPartsConstructionProcess, PartsEngine_AddCopyCutCGToPartsConstructionProcess_old),
 	    HLL_EXPORT(AddGrayFilterToPartsConstructionProcess, PE_AddGrayFilterToPartsConstructionProcess),
 	    HLL_TODO_EXPORT(AddAddFilterToPartsConstructionProcess, PartsEngine_AddAddFilterToPartsConstructionProcess),
-	    HLL_TODO_EXPORT(AddMulFilterToPartsConstructionProcess, PartsEngine_AddMulFilterToPartsConstructionProcess),
+	    HLL_EXPORT(AddMulFilterToPartsConstructionProcess, PE_AddMulFilterToPartsConstructionProcess),
 	    HLL_EXPORT(BuildPartsConstructionProcess, PE_BuildPartsConstructionProcess),
 	    HLL_EXPORT(AddDrawTextToPartsConstructionProcess, PE_AddDrawTextToPartsConstructionProcess),
 	    HLL_EXPORT(AddCopyTextToPartsConstructionProcess, PE_AddCopyTextToPartsConstructionProcess),
@@ -3624,6 +3666,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentPosX, PartsEngine_Parts_GetComponentPosX),
 	    HLL_EXPORT(GetComponentPosY, PartsEngine_GetComponentPosY),
 	    HLL_EXPORT(GetComponentPosZ, PE_GetPartsZ),
+	    HLL_EXPORT(Parts_GetPartsUpperLeftPos, PartsEngine_Parts_GetPartsUpperLeftPos),
 	    HLL_EXPORT(Parts_GetPartsUpperLeftPosX, PartsEngine_Parts_GetPartsUpperLeftPosX),
 	    HLL_EXPORT(Parts_GetPartsUpperLeftPosY, PartsEngine_Parts_GetPartsUpperLeftPosY),
 	    HLL_EXPORT(SetComponentOriginPosMode, PE_SetPartsOriginPosMode),
@@ -3970,13 +4013,13 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_AddFillAlphaColorToPartsConstructionProcess, PE_AddFillAlphaColorToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddFillAMapToPartsConstructionProcess, PE_AddFillAMapToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddFillWithAlphaToPartsConstructionProcess, PE_AddFillWithAlphaToPartsConstructionProcess),
-	    HLL_TODO_EXPORT(Parts_AddFillGradationHorizonToPartsConstructionProcess, PartsEngine_Parts_AddFillGradationHorizonToPartsConstructionProcess),
+	    HLL_EXPORT(Parts_AddFillGradationHorizonToPartsConstructionProcess, PE_AddFillGradationHorizonToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddDrawRectToPartsConstructionProcess, PE_AddDrawRectToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddDrawCutCGToPartsConstructionProcess, PE_AddDrawCutCGToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddCopyCutCGToPartsConstructionProcess, PE_AddCopyCutCGToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddGrayFilterToPartsConstructionProcess, PE_AddGrayFilterToPartsConstructionProcess),
 	    HLL_TODO_EXPORT(Parts_AddAddFilterToPartsConstructionProcess, PartsEngine_Parts_AddAddFilterToPartsConstructionProcess),
-	    HLL_TODO_EXPORT(Parts_AddMulFilterToPartsConstructionProcess, PartsEngine_Parts_AddMulFilterToPartsConstructionProcess),
+	    HLL_EXPORT(Parts_AddMulFilterToPartsConstructionProcess, PE_AddMulFilterToPartsConstructionProcess),
 	    HLL_TODO_EXPORT(Parts_AddDrawLineToPartsConstructionProcess, PartsEngine_Parts_AddDrawLineToPartsConstructionProcess),
 	    HLL_EXPORT(Parts_BuildPartsConstructionProcess, PE_BuildPartsConstructionProcess),
 	    HLL_EXPORT(Parts_AddDrawTextToPartsConstructionProcess, PE_AddDrawTextToPartsConstructionProcess),

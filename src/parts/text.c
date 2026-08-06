@@ -160,6 +160,12 @@ static void parts_text_clear(struct parts *parts, int state)
 
 bool PE_SetText(int parts_no, struct string *text, int state)
 {
+	// XSYS4_SETTEXT_TRACE=1 — кто и какой текст кладёт в текстовые части.
+	// Отделяет «игра не пишет подпись» от «пишет, но не в ту часть/состояние»
+	// (на экране остаётся образец из раскладки — «パーツテキスト», «TALENT»).
+	if (getenv("XSYS4_SETTEXT_TRACE"))
+		NOTICE("SETTEXT no=%d state=%d text='%s'", parts_no, state,
+		       text ? display_sjis0(text->text) : "(nil)");
 	if (!parts_state_valid(--state))
 		return false;
 

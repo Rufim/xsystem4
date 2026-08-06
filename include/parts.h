@@ -91,6 +91,10 @@ int PE_GetNumeralSpace(int parts_no, int state);
 int PE_GetNumeralLength(int parts_no, int state);
 bool PE_SetNumeralShowComma(int parts_no, bool show_comma, int state);
 bool PE_SetNumeralSpace(int parts_no, int space, int state);
+void PE_SetNumeralFont(int parts_no, int type, int size, int r, int g, int b,
+		float bold_weight, int edge_r, int edge_g, int edge_b,
+		float edge_weight, int state);
+void PE_SetNumeralShowType(int parts_no, int type, int state);
 bool PE_SetNumeralLength(int parts_no, int length, int state);
 bool PE_SetNumeralSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
 void PE_ReleaseParts(int parts_no);
@@ -289,6 +293,11 @@ int PE_GetOnCursorShowLinkPartsNumber(int parts_no);
 bool PE_SetPartsOnCursorSoundNumber(int parts_no, int sound_no);
 bool PE_SetPartsClickSoundNumber(int parts_no, int sound_no);
 bool PE_SetClickMissSoundNumber(int sound_no);
+bool PE_AddFillGradationHorizonToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, int top_r, int top_g, int top_b, int bot_r, int bot_g, int bot_b,
+		int state);
+bool PE_AddMulFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		int r, int g, int b, bool full_size, int state);
 void PE_Parts_SetSoundNumber(int parts_no, int sound_no, int state);
 int PE_Parts_GetSoundNumber(int parts_no, int state);
 void PE_BeginInput(void);
