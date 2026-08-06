@@ -90,6 +90,14 @@ void PE_set_message_types_ixseal(void)
 	msg_ixseal_types = true;
 }
 
+// «Новый message-API» (тот же признак, что и выше: объявлена PartsEngine.SeekMessage).
+// Нужен слою ввода: только в нём `delegate_index` — достоверный признак того, что часть
+// вообще способна получить сообщение (см. parts_can_take_cursor в parts/input.c).
+bool parts_msg_api_new(void)
+{
+	return msg_ixseal_types;
+}
+
 static int msg_type_out(int type)
 {
 	if (!msg_ixseal_types)

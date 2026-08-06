@@ -194,11 +194,12 @@ struct parts_gauge {
 	float rate;
 	/*
 	 * Числитель и знаменатель хранятся ОТДЕЛЬНО от готового отношения: игра
-	 * читает их по-одиночке (`CHGaugeParts@Denominator::set` @0x32b78c сначала
-	 * зовёт `Numerator::get`, чтобы пересчитать заполнение под новый
-	 * знаменатель) — из одного `rate` их не восстановить.
-	 * В сейв частей не пишутся (формат не меняем): при загрузке
-	 * восстанавливаются как (rate, 1).
+	 * читает их по-одиночке — `CHGaugeParts@Denominator::set` (@0x32b78c у Dohna)
+	 * сначала зовёт `Numerator::get`, чтобы пересчитать заполнение под новый
+	 * знаменатель, а `Parts_GetHGaugeNumerator`/`Denominator` зовёт экран
+	 * `行動選択` у Haha Ranman. Из одного `rate` их не восстановить.
+	 * В сейв частей не пишутся (формат не меняем): при загрузке восстанавливаются
+	 * как (rate, 1) — отношение то же.
 	 */
 	float numerator;
 	float denominator;
@@ -671,6 +672,18 @@ struct parts_controller_stack {
 	// просмотра бэк-сцены. Флаг слоя ОТДЕЛЬНЫЙ от `show` партов, иначе обратный
 	// ShowAllFrontScene засветил бы парты, спрятанные игрой поимённо.
 	bool hidden[PARTS_CONTROLLER_STACK_MAX + 1];
+	/*
+	 * ID слоёв в порядке стека (низ → верх). ID УСТОЙЧИВ и НЕ равен позиции:
+	 * игра сносит слой ПО ЕГО НОМЕРУ, в том числе из СЕРЕДИНЫ стека, и если
+	 * приравнять id к позиции, то после такого удаления все номера выше
+	 * съезжают — игра продолжает адресовать старыми, а движок понимает их
+	 * как чужие. Живой случай: Haha Ranman, переход в ADV-сцену — игра просила
+	 * снести слой 2, движок сносил активный 3, и парты слоя 2 (плёночный шум
+	 * титула, рамка юнит-анимации `行動選択`) оставались на экране поверх сцены.
+	 * Новый id — НАИМЕНЬШИЙ СВОБОДНЫЙ, поэтому при чисто стековом использовании
+	 * (все прежние игры) нумерация ровно та же, что была: 0, 1, 2, …
+	 */
+	int stack[PARTS_CONTROLLER_STACK_MAX + 1];
 };
 extern struct parts_controller_stack ctrl_stack;
 extern bool parts_multi_controller;
@@ -798,6 +811,7 @@ enum parts_message_type {
 
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);
 void parts_msg_push_global(int type, const char *fmt, ...);
+bool parts_msg_api_new(void);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
 void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y);
 void PE_OnVScrollbarDragged(int parts_no, float rate);

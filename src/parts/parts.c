@@ -80,6 +80,35 @@ static void parts_init(struct parts *parts)
 	TAILQ_INIT(&parts->motion);
 }
 
+/*
+ * `XSYS4_PART_WATCH=<номер>[,<номер>…]` — следить за конкретными партами: создание (и на
+ * КАКОМ СЛОЕ), освобождение, show. Нужен там, где общий трейс тонет в шуме: у Haha Ranman
+ * на ADV-сцене остаются чужие парты, а сцена создаёт их тысячами (один только дождь —
+ * сотня 1x32), так что «печатать всё» бесполезно.
+ */
+bool parts_watched(int parts_no)
+{
+	// Парт, пойманный по КАРТИНКЕ (XSYS4_CG_WATCH), тоже считается наблюдаемым —
+	// иначе на каждом месте пришлось бы проверять два условия подряд.
+	if (parts_no >= 0 && parts_no == parts_cg_watch_part())
+		return true;
+	static const char *watch = (const char *)1;
+	if (watch == (const char *)1)
+		watch = getenv("XSYS4_PART_WATCH");
+	if (!watch || !*watch)
+		return false;
+	for (const char *p = watch; *p; ) {
+		long v = strtol(p, (char **)&p, 0);
+		if (v == parts_no)
+			return true;
+		while (*p && *p != ',')
+			p++;
+		if (*p == ',')
+			p++;
+	}
+	return false;
+}
+
 static struct parts *parts_alloc(void)
 {
 	struct parts *parts = xcalloc(1, sizeof(struct parts));
@@ -167,6 +196,9 @@ struct parts *parts_get(int parts_no)
 	struct parts *parts = parts_alloc();
 	parts->no = parts_no;
 	parts->controller_no = ctrl_stack.active;
+	if (parts_watched(parts_no))
+		NOTICE("PARTWATCH создан парт %d на слое %d (стек-глубина %d)",
+		       parts_no, parts->controller_no, ctrl_stack.nr_controllers);
 	slot->value = parts;
 	parts_list_insert(parts);
 	return parts;
@@ -1033,7 +1065,7 @@ void parts_release(int parts_no)
 	struct ht_slot *slot = ht_put_int(parts_table, parts_no, NULL);
 	if (!slot->value)
 		return;
-	if (getenv("XSYS4_CTRL_TRACE"))
+	if (getenv("XSYS4_CTRL_TRACE") || parts_watched(parts_no))
 		NOTICE("parts_release(%d)", parts_no);
 
 	struct parts *parts = slot->value;
@@ -1069,14 +1101,22 @@ void parts_debug_dump(void)
 	int n = 0;
 	PARTS_LIST_FOREACH(p) {
 		Rectangle *hb = &p->states[0].common.hitbox;
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d",
+		// Имя CG у состояния 0 — без него в дампе не отличить «наш прямоугольник не
+		// оттуда» от «игра так и задумала»: у Haha Ranman на ADV-сцене поверх фона
+		// висели белый и серый прямоугольники, и опознать их можно было только по CG.
+		const char *cgname = "";
+		if (p->states[0].type == PARTS_CG || p->states[0].type == PARTS_CG_DETECTION) {
+			if (p->states[0].cg.name)
+				cgname = display_sjis0(p->states[0].cg.name->text);
+		}
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
 		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
-		       p->global.alpha);
+		       p->global.alpha, parts_hidden_by_layer(p), cgname);
 		n++;
 	}
 	NOTICE("parts_debug_dump: %d parts total", n);
@@ -1281,8 +1321,10 @@ void PE_SetEventID(int parts_no, int delegate_index, int unique_id)
 }
 
 // Номер части, чей CG совпал с XSYS4_CG_WATCH: за ней потом следят PE_SetShow и
-// PE_ReleaseParts — так видно, гасит/освобождает ли её игра вообще.
+// PE_ReleaseParts — так видно, гасит/освобождает ли её игра вообще. Читается
+// через parts_cg_watch_part(), чтобы условие наблюдения было ОДНО (parts_watched).
 static int cg_watch_part = -1;
+int parts_cg_watch_part(void) { return cg_watch_part; }
 
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state)
 {
@@ -1298,14 +1340,23 @@ bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int 
 		const char *w = getenv("XSYS4_CG_WATCH");
 		// Имя CG хранится в SJIS, а подстрока из env — в UTF-8: сравниваем с
 		// ПЕРЕКОДИРОВАННЫМ именем, иначе не совпадёт никогда.
-		if (w && *w && !cg_watch_done && cg_name) {
+		if (w && *w && cg_name) {
 			const char *utf8 = display_sjis0(cg_name->text);
 			if (strstr(utf8, w)) {
-				cg_watch_done = true;
-				cg_watch_part = parts_no;
-				NOTICE("CGWATCH part=%d cg='%s' — стек вызовов игры:",
-				       parts_no, utf8);
-				vm_stack_trace();
+				// Строка — на КАЖДОЕ совпадение, и обязательно со СЛОЕМ: так
+				// ищется «чьи парты остались на экране» (у Haha Ranman на
+				// ADV-сцене висели чужие — титульная плёнка и рамка `行動選択`).
+				// Номера партов `1000001xxx` выдаются на лету и от прогона к
+				// прогону РАЗНЫЕ, поэтому искать их по номеру бесполезно.
+				NOTICE("CGWATCH part=%d слой %d cg='%s'",
+				       parts_no, parts->controller_no, utf8);
+				// Стек вызовов игры — ОДИН раз: он отвечает «кто её кладёт».
+				if (!cg_watch_done) {
+					cg_watch_done = true;
+					cg_watch_part = parts_no;
+					NOTICE("CGWATCH стек вызовов игры:");
+					vm_stack_trace();
+				}
 			}
 		}
 	}
@@ -1717,37 +1768,44 @@ bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int stat
  * Знаменатель по умолчанию 1: гейдж, которому отношение ещё не задавали, обязан
  * вести себя как «0 из 1», а не делить на ноль.
  */
-static struct parts_gauge *gauge_for_get(int parts_no, int state, bool vert)
+static const struct parts_gauge *gauge_for_get(int parts_no, int state, bool vert)
 {
 	if (!parts_state_valid(--state))
 		return NULL;
 	struct parts *parts = parts_try_get(parts_no);
 	if (!parts)
 		return NULL;
-	return vert ? parts_get_vgauge(parts, state) : parts_get_hgauge(parts, state);
+	// Смотрим, а НЕ заводим: `parts_get_hgauge`/`vgauge` при несовпадении типа
+	// СБРАСЫВАЮТ состояние в гейдж, то есть геттер молча переписал бы часть,
+	// которая гейджем не является. Не нашли — вернём NULL, вызывающий отдаст
+	// дефолты (0 и 1).
+	enum parts_type want = vert ? PARTS_VGAUGE : PARTS_HGAUGE;
+	if (parts->states[state].type != want)
+		return NULL;
+	return &parts->states[state].gauge;
 }
 
 float PE_GetHGaugeNumerator(int parts_no, int state)
 {
-	struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, false);
 	return g ? g->numerator : 0.0f;
 }
 
 float PE_GetHGaugeDenominator(int parts_no, int state)
 {
-	struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, false);
 	return (g && g->denominator != 0.0f) ? g->denominator : 1.0f;
 }
 
 float PE_GetVGaugeNumerator(int parts_no, int state)
 {
-	struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, true);
 	return g ? g->numerator : 0.0f;
 }
 
 float PE_GetVGaugeDenominator(int parts_no, int state)
 {
-	struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, true);
 	return (g && g->denominator != 0.0f) ? g->denominator : 1.0f;
 }
 
@@ -1976,6 +2034,7 @@ void PE_ReleaseAllWithoutSystem(struct page **erase_number_list)
 
 	// Drop all normal controllers and add a fresh default one.
 	ctrl_stack.nr_controllers = 0;
+	memset(ctrl_stack.hidden, 0, sizeof(ctrl_stack.hidden));
 	PE_AddController(-1);
 }
 
@@ -2006,10 +2065,10 @@ int PE_GetComponentAbsoluteMaxPosZ(int comp)
 
 void PE_SetShow(int parts_no, bool show)
 {
-	if (getenv("XSYS4_PARTS_TRACE"))
+	// Одно условие на обе метки наблюдения: parts_watched уже учитывает и
+	// XSYS4_PART_WATCH (по номеру), и XSYS4_CG_WATCH (по картинке).
+	if (getenv("XSYS4_PARTS_TRACE") || parts_watched(parts_no))
 		NOTICE("PARTS SetShow(%d, %d)", parts_no, show);
-	if (parts_no == cg_watch_part)
-		NOTICE("CGWATCH part=%d SetShow(%d)", parts_no, show);
 	parts_set_show(parts_get(parts_no), show);
 }
 
@@ -2589,8 +2648,36 @@ void PE_SetComponentType(int parts_no, int type, int state)
 	case 20: pt = PARTS_FLAT; break;
 	case 21: pt = PARTS_3DLAYER; break;
 	case 22: pt = PARTS_MOVIE; break;
-	default:
-		VM_ERROR("unknown component type %d", type);
+	default: {
+		/*
+		 * ВИДЖЕТ, а не `パーツ`, и притом такой, которому движок не ведёт
+		 * отдельного флага: слайдеры, поля ввода, списки, формы, окно
+		 * сообщения. Своего вида отрисовки у них нет (окно сообщения, например,
+		 * собрано из служебных частей-потомков), а тип состояния обязан
+		 * остаться прежним. Те виджеты, у которых флаг есть, разобраны ВЫШЕ
+		 * поимённо: кнопка (0), чекбокс (1), полосы прокрутки (2/3),
+		 * `パネル` (14 в v14) и `ユーザコンポーネント` (17 в v14).
+		 *
+		 * Раньше здесь была VM_ERROR, и первый же `横スライダーバー` (13) на
+		 * игровом экране Haha Ranman `行動選択` ронял движок в REPL. Сбрасывать
+		 * состояние тоже нельзя: parts_state_reset затёр бы CG, уже загруженный
+		 * раскладкой, — по той же причине этого не делает ветка кнопки.
+		 *
+		 * `パーツ`-семейство (классические id 11..22) сюда попасть не должно —
+		 * там неизвестный тип по-прежнему ошибка.
+		 */
+		int classic = component_type_to_classic(type);
+		if (classic >= 11)
+			VM_ERROR("unknown component type %d", type);
+		static bool warned[32];
+		unsigned w = (unsigned)type < 32 ? (unsigned)type : 31;
+		if (!warned[w]) {
+			warned[w] = true;
+			WARNING("SetComponentType: виджет %d без своего вида отрисовки — "
+				"тип состояния оставлен как есть", type);
+		}
+		return;
+	}
 	}
 	if (parts->states[state].type != pt)
 		parts_state_reset(&parts->states[state], pt);
@@ -3107,6 +3194,27 @@ void PE_SetSpeedupRateByMessageSkip(int parts_no, int rate)
 		UNIMPLEMENTED("(%d, %d)");
 }
 
+// Позиция слоя `id` в стеке (низ = 0) или -1, если такого слоя нет.
+static int ctrl_stack_pos(int id)
+{
+	for (int i = 0; i < ctrl_stack.nr_controllers; i++)
+		if (ctrl_stack.stack[i] == id)
+			return i;
+	return -1;
+}
+
+// Восстановление стека после загрузки сейва: в сейве лежит только ГЛУБИНА (формат
+// менять нельзя), а нумерация там всегда была стековой — значит id = позиции.
+void parts_controller_stack_restore(int nr, int active)
+{
+	if (nr < 0) nr = 0;
+	if (nr > PARTS_CONTROLLER_STACK_MAX) nr = PARTS_CONTROLLER_STACK_MAX;
+	ctrl_stack.nr_controllers = nr;
+	for (int i = 0; i < nr; i++)
+		ctrl_stack.stack[i] = i;
+	ctrl_stack.active = active;
+}
+
 static void ctrl_stack_init(void)
 {
 	memset(&ctrl_stack, 0, sizeof(ctrl_stack));
@@ -3122,16 +3230,19 @@ static void ctrl_stack_init(void)
 // degenerates to a simple push.
 int PE_AddController(int index)
 {
-	// index != -1 у новых игр (напр. 0) — трактуем как обычный push (наш
-	// контроллер-стек прост), чтобы не падать фаталом.
-	(void)index;
 	if (ctrl_stack.nr_controllers >= PARTS_CONTROLLER_STACK_MAX)
 		VM_ERROR("controller stack overflow");
 
-	int no = ctrl_stack.nr_controllers++;
+	// ID — НАИМЕНЬШИЙ СВОБОДНЫЙ (см. struct parts_controller_stack): при чисто
+	// стековом использовании это ровно прежняя нумерация 0,1,2,…, но id не съезжает
+	// при удалении слоя из середины.
+	int no = 0;
+	while (ctrl_stack_pos(no) >= 0)
+		no++;
+	ctrl_stack.stack[ctrl_stack.nr_controllers++] = no;
 	ctrl_stack.active = no;
-	ctrl_stack.hidden[no] = false;  // индекс мог остаться погашенным от прошлого слоя
-	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController -> ctrl %d (nr=%d)", no, ctrl_stack.nr_controllers);
+	ctrl_stack.hidden[no] = false;  // номер мог остаться погашенным от прошлого слоя
+	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController(index=%d) -> ctrl %d (nr=%d)", index, no, ctrl_stack.nr_controllers);
 	return no;
 }
 
@@ -3144,18 +3255,63 @@ int PE_AddController(int index)
 void PE_RemoveController(struct page **erase_number_list, int index)
 {
 	// index != -1 у новых игр — удаляем текущий активный (верх стека).
-	(void)index;
 	if (ctrl_stack.nr_controllers == 0)
 		return;
 
-	int ctrl_no = ctrl_stack.active;
-	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_RemoveController: releasing ctrl %d (nr=%d)", ctrl_no, ctrl_stack.nr_controllers);
+	/*
+	 * ⚠️ АРГУМЕНТ ИГНОРИРУЕТСЯ НАМЕРЕННО — сносим АКТИВНЫЙ слой. Это не «руки не
+	 * дошли», а замер; не «чинить» без нового замера.
+	 *
+	 * По .ain аргумент — ПОЗИЦИЯ В СТЕКЕ, и API различает позицию и ID явно:
+	 *   void RemoveController(wrap<array<int>> EraseNumberList, int Index);
+	 *   int  AddController(int Index);      // возвращает ID
+	 *   int  GetControllerIndex(int ID);    // ID  -> позиция
+	 *   int  GetControllerID(int Index);    // позиция -> ID
+	 * Но ОБЕ честные трактовки ломают Haha Ranman сильнее, чем нынешняя (проверено
+	 * живьём, пролог превращался в чёрный экран):
+	 *   • как ID     — сносятся ПУСТЫЕ слои: в трейсе `освобождено партов 0` почти на
+	 *                  каждом вызове, а экран титула не разбирается вовсе;
+	 *   • как позиция — то же самое.
+	 * Вывод замера: расходится не чтение аргумента, а НАША ПРИВЯЗКА ПАРТОВ К СЛОЯМ
+	 * (`parts_init`: `controller_no = ctrl_stack.active`). Игра адресует слои, в
+	 * которых по-нашему нет ни одного парта, — значит парты попадают не туда. Пока
+	 * это не разобрано, «снести активный» остаётся единственным вариантом, при котором
+	 * экраны разбираются; цена известна и записана: у Haha Ranman на ADV-сцене остаются
+	 * чужие парты (плёночный шум титула, рамка юнит-анимации `行動選択`).
+	 * Мерить так: `XSYS4_CTRL_TRACE=1` печатает и запрошенный index, и сколько партов
+	 * реально освобождено, и пример их CG.
+	 */
+	(void)index;
+	int pos = ctrl_stack_pos(ctrl_stack.active);
+	int ctrl_no = (pos >= 0 && pos < ctrl_stack.nr_controllers)
+			? ctrl_stack.stack[pos] : -1;
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("PE_RemoveController: index=%d -> сношу ctrl %d (позиция %d, nr=%d)",
+		       index, ctrl_no, pos, ctrl_stack.nr_controllers);
+	if (ctrl_no < 0) {
+		// Вместо тихого «снесу что-нибудь» — проверка допущения.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("RemoveController: позиции %d нет в стеке (глубина %d)",
+				pos, ctrl_stack.nr_controllers);
+		}
+		return;
+	}
 
 	// Collect and release parts belonging to this controller
+	int released = 0;
+	const char *sample = "";
 	struct parts *p = TAILQ_FIRST(&parts_list);
 	while (p) {
 		struct parts *next = TAILQ_NEXT(p, parts_list_entry);
 		if (p->controller_no == ctrl_no) {
+			if (getenv("XSYS4_CTRL_TRACE")) {
+				released++;
+				if (!*sample && p->states[0].type == PARTS_CG
+						&& p->states[0].cg.name)
+					sample = display_sjis0(p->states[0].cg.name->text);
+			}
 			*erase_number_list = array_pushback(*erase_number_list,
 					(union vm_value){.i = p->no}, AIN_ARRAY_INT, -1);
 			parts_release(p->no);
@@ -3163,18 +3319,52 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 		p = next;
 	}
 
+	if (getenv("XSYS4_CTRL_TRACE")) {
+		NOTICE("   ctrl %d: освобождено партов %d, напр. cg=\"%s\"", ctrl_no, released, sample);
+		// Снос пустого слоя — признак того, что парты легли не туда: печатаем, где
+		// они на самом деле, и каков стек. Ровно этот вывод показал, что расходится
+		// не чтение аргумента RemoveController, а привязка партов к слоям.
+		if (released == 0) {
+			int cnt[PARTS_CONTROLLER_STACK_MAX + 2] = {0};
+			struct parts *q;
+			PARTS_LIST_FOREACH(q) {
+				int c = q->controller_no;
+				if (c >= 0 && c <= PARTS_CONTROLLER_STACK_MAX)
+					cnt[c]++;
+				else
+					cnt[PARTS_CONTROLLER_STACK_MAX + 1]++;
+			}
+			char buf[256]; int n = 0;
+			for (int i = 0; i <= PARTS_CONTROLLER_STACK_MAX + 1 && n < 200; i++)
+				if (cnt[i])
+					n += snprintf(buf + n, sizeof(buf) - n, "%d:%d ", i, cnt[i]);
+			buf[n] = 0;
+			char st[128]; int m = 0;
+			for (int i = 0; i < ctrl_stack.nr_controllers && m < 100; i++)
+				m += snprintf(st + m, sizeof(st) - m, "%d ", ctrl_stack.stack[i]);
+			st[m] = 0;
+			NOTICE("   ПУСТОЙ СНОС: парты по слоям [%s], стек [%s], активный %d",
+			       buf, st, ctrl_stack.active);
+		}
+	}
+	// Вынимаем из стека, НЕ перенумеровывая остальные (id устойчив).
+	for (int i = pos; i + 1 < ctrl_stack.nr_controllers; i++)
+		ctrl_stack.stack[i] = ctrl_stack.stack[i + 1];
 	ctrl_stack.nr_controllers--;
+	ctrl_stack.hidden[ctrl_no] = false;
 	if (ctrl_stack.nr_controllers == 0) {
 		PE_AddController(-1);
 	} else {
-		ctrl_stack.active = ctrl_stack.nr_controllers - 1;
+		ctrl_stack.active = ctrl_stack.stack[ctrl_stack.nr_controllers - 1];
 	}
 }
 
 void PE_set_active_controller(int controller_no)
 {
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("PE_set_active_controller(%d) (был %d)", controller_no, ctrl_stack.active);
 	if (controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY ||
-			(controller_no >= 0 && controller_no < ctrl_stack.nr_controllers))
+			ctrl_stack_pos(controller_no) >= 0)
 		ctrl_stack.active = controller_no;
 	else
 		VM_ERROR("Invalid controller number: %d", controller_no);
@@ -3192,11 +3382,17 @@ int PE_get_controller_length(void)
 
 int PE_get_controller_id(int index)
 {
-	// Контроллеры адресуются индексом стека (AddController возвращает индекс
-	// как ID), поэтому ID i-го контроллера == его индекс.
 	if (index < 0 || index >= ctrl_stack.nr_controllers)
 		return -1;
-	return index;
+	return ctrl_stack.stack[index];
+}
+
+// ID слоя -> его позиция в стеке. В движке этой функции не было вовсе, хотя .ain её
+// объявляет (`int GetControllerIndex(int ID)`) — просто игры, которые уже работали,
+// её не звали.
+int PE_get_controller_index(int id)
+{
+	return ctrl_stack_pos(id);
 }
 
 int PE_get_system_controller(void)
@@ -3214,7 +3410,7 @@ int PE_get_system_controller(void)
 // поверх живого (FINDINGS §5q).
 bool parts_controller_is_layer(int id)
 {
-	if (id < 0 || id >= ctrl_stack.nr_controllers)
+	if (ctrl_stack_pos(id) < 0)
 		return false;
 	return parts_try_get(id) == NULL;
 }

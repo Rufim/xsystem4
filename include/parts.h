@@ -71,6 +71,11 @@ bool PE_SetVGaugeCG_by_index(int parts_no, int cg_no, int state);
 bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int state);
 bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int state);
 bool PE_SetVGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
+// Дробь заполнения, которой игра задала калибр (она же её и читает обратно).
+float PE_GetHGaugeNumerator(int parts_no, int state);
+float PE_GetHGaugeDenominator(int parts_no, int state);
+float PE_GetVGaugeNumerator(int parts_no, int state);
+float PE_GetVGaugeDenominator(int parts_no, int state);
 bool PE_SetNumeralCG(int parts_no, struct string *cg_name, int state);
 bool PE_SetNumeralCG_by_index(int parts_no, int cg_no, int state);
 bool PE_SetNumeralLinkedCGNumberWidthWidthList_by_index(int parts_no, int cg_no,
@@ -194,6 +199,12 @@ int PE_get_controller_id(int index);
 // «Компонент» в HLL адресует и парт, и слой-контроллер; различение по диапазону ID.
 bool parts_controller_is_layer(int id);
 void parts_controller_set_show(int id, bool show);
+// Восстановить стек слоёв после загрузки сейва (в сейве лежит только его глубина).
+void parts_controller_stack_restore(int nr, int active);
+int PE_get_controller_index(int id);
+// XSYS4_PART_WATCH=<номер>[,…] — следить за конкретными партами.
+bool parts_watched(int parts_no);
+int parts_cg_watch_part(void);
 bool parts_controller_get_show(int id);
 int PE_get_system_controller(void);
 void PE_parts_set_want_save(int parts_no, bool want_save);

@@ -170,6 +170,10 @@ static void load_parts_gauge(struct iarray_reader *r, struct parts *parts,
 {
 	gauge->cg_no = iarray_read(r);
 	gauge->rate = iarray_read_float(r);
+	// Дробь в сейв не пишется (формат менять нельзя) — восстанавливаем с тем же
+	// отношением, см. struct parts_gauge в parts_internal.h.
+	gauge->numerator = gauge->rate;
+	gauge->denominator = 1.0f;
 
 	if (gauge->cg_no >= 0)
 		parts_gauge_set_cg_by_index(parts, gauge, gauge->cg_no);
@@ -883,8 +887,8 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 		int active = iarray_read(&r);
 		int nr_controllers = iarray_read(&r);
 		if (restore_globals) {
-			ctrl_stack.active = active;
-			ctrl_stack.nr_controllers = nr_controllers;
+			// Стек id восстанавливаем целиком: в сейве лежит только глубина.
+			parts_controller_stack_restore(nr_controllers, active);
 		}
 	}
 

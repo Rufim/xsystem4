@@ -322,6 +322,10 @@ static void ix_resize(struct page **self, int n)
 	struct page *a = realloc_array(*self, rank, &dim, dt, st, true);
 	if (!a && dim.i == 0)
 		a = alloc_array(rank, &dim, dt, st, false);
+	if (getenv("XSYS4_ARRAY_TRACE"))
+		NOTICE("ARRAYTRACE resize -> %d: было %d, стало %d (dt=%d st=%d rank=%d)",
+		       n, *self ? array_numof(*self, 1) : -1, a ? array_numof(a, 1) : -1,
+		       dt, st, rank);
 	*self = a;
 }
 
@@ -561,6 +565,39 @@ static void Array_ix_AddRange(struct page **self, struct page **src)
 	}
 	for (int i = 0; i < n; i++)
 		Array_PushBack(self, &(*src)->values[i*slots]);
+}
+
+/*
+ * `void Duplicate(ref array self, wrap<array> src)` — приёмник СТАНОВИТСЯ копией
+ * источника: длину задаёт ИСТОЧНИК. Тоже вело в `Array_ix_Copy` («скопировать,
+ * сколько влезет в НЫНЕШНИЙ размер приёмника»), поэтому на пустом приёмнике не
+ * делало ровно ничего, молча. В .ain это ТРЕТЬЯ отдельная функция — `Copy`
+ * отличается даже типом возврата (int против void).
+ *
+ * Чем это ломало Haha Ranman: `CExecutedCommandParam@InitInstantList` делает
+ * `Array.Duplicate(InstantList, List)` — снимок списка выполненных команд. `List`
+ * конструктор аллоцирует на 12 элементов, `InstantList` пуст, поэтому снимок
+ * оставался ПУСТЫМ. Дальше `GetList` при `Instant = true` отдаёт именно
+ * `InstantList`, а `■実行済コマンド設定` @0x699aae берёт `Array.At(list, nTimezone)`
+ * БЕЗ проверки (в соседней `■実行済コマンド取得` игра его проверяет на -1) и
+ * присваивает по полученной ссылке — то есть по ссылке -1. Итог: SIGSEGV в
+ * `free_string` уже внутри libsys4, в месте, никак не указывающем на виноватую
+ * инструкцию.
+ *
+ * Реализовано ЧЕРЕЗ `Array_ix_AddRange`, а не своим копированием: вся возня с
+ * наследованием типа элемента, многослотовыми элементами и счётчиками ссылок
+ * должна жить в ОДНОМ месте.
+ *
+ * Частота вызовов (`alice ain dump -c` + grep CALLHLL): Haha Ranman — Duplicate 17,
+ * Concat 45; Dohna — Duplicate 14, Concat 62, AddRange 16; Tsumamigui 3 не объявляет
+ * ни одной, так что старых игр правка не касается.
+ */
+static void Array_ix_Duplicate(struct page **self, struct page **src)
+{
+	if (!self)
+		return;
+	ix_resize(self, 0);            // остаётся валидной 0-элементной страницей
+	Array_ix_AddRange(self, src);
 }
 
 static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
@@ -1103,11 +1140,18 @@ static int Array_EmplaceBack(struct page **self)
 // hll_call() supplies the array slot for the AIN_REF_HLL_PARAM return.
 static int Array_At(struct page **self, int index)
 {
-	if (!self || !*self)
+	if (!self || !*self) {
+		if (getenv("XSYS4_ARRAY_TRACE"))
+			NOTICE("ARRAYTRACE At(index=%d) -> -1 (массива нет)", index);
 		return -1;
+	}
 	struct page *a = *self;
-	if (index < 0 || index >= array_numof(a, 1))
+	if (index < 0 || index >= array_numof(a, 1)) {
+		if (getenv("XSYS4_ARRAY_TRACE"))
+			NOTICE("ARRAYTRACE At(index=%d) -> -1 (размер %d)",
+			       index, array_numof(a, 1));
 		return -1;
+	}
 	return index;
 }
 
@@ -1212,7 +1256,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Erase, Array_ix_Erase),
 	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),
-	    HLL_EXPORT(Duplicate, Array_ix_Copy),
+	    HLL_EXPORT(Duplicate, Array_ix_Duplicate),
 	    HLL_EXPORT(Concat, Array_ix_AddRange),
 	    HLL_EXPORT(AddRange, Array_ix_AddRange),
 	    HLL_EXPORT(Reverse, Array_Reverse),
