@@ -938,6 +938,30 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		return;
 	}
 	/*
+	 * `ＣＧ判定パーツ` (классический id 19) — область попадания по форме
+	 * картинки: сама она не рисуется, а её непрозрачные пиксели задают
+	 * hit-область. Игра ищет такие части сравнением типа компонента
+	 * (`CActivityWrap@GetCGDetection` → CompParts(имя, 27, 1)), поэтому без
+	 * своей ветки состояние оставалось обычным CG и падал ассерт
+	 * `FooterButton.jaf:53: (nonnull) m_act.GetCGDetection("Detector")`.
+	 */
+	if (act_parts_type(st) == 19) {
+		struct string *cg = act_str(st, "ＣＧ名");
+		PE_SetPartsCGDetectionSize(no, cg, state);
+		// `サーフェイスエリア` у всех семи таких состояний во всех 195 раскладках
+		// нулевая, а общий сеттер площади пришлось бы звать через parts_get_cg,
+		// который сбросил бы тип состояния обратно в CG. Ненулевую отмечаем.
+		if (act_list_int(st, "サーフェイスエリア", 2, 0) > 0
+		    || act_list_int(st, "サーフェイスエリア", 3, 0) > 0) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("ＣＧ判定パーツ: ненулевая サーフェイスエリア не применяется");
+			}
+		}
+		return;
+	}
+	/*
 	 * Прямоугольная часть (`矩形パーツ`, классический id 17) — не картинка, а
 	 * область определения попадания, заданная ЧЕТЫРЬМЯ УГЛАМИ
 	 * (左上/右上/左下/右下), а не парой ширина-высота.
@@ -1244,6 +1268,64 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			if (parent_no >= 0)
 				PE_SetParentPartsNumber(tno, parent_no);
 			PE_SetShow(tno, 1);
+		}
+	} else if (ti && act_parts_type_v14(ti) == 14) {
+		/*
+		 * Панель (`パネル`, тип компонента v14 = 14) — прямоугольная заливка
+		 * цветом с альфа-градиентом по краям (src/parts/panel.c). Классического
+		 * аналога нет, поэтому act_parts_type отдаёт -1, и раньше панель уходила
+		 * в общую CG-ветку: `CActivityWrap@GetPanel` (сравнение типа с 14)
+		 * получал null, и `StripDialogBase@SetHeight` падал на пустом
+		 * интерфейсе. Узел кладём теми же сеттерами, что зовёт игра.
+		 */
+		PE_SetPanelSize(no, act_list_int(ti, "サイズ", 0, 0),
+			act_list_int(ti, "サイズ", 1, 0));
+		PE_SetPanelColor(no, act_list_int(ti, "色", 0, 255),
+			act_list_int(ti, "色", 1, 255),
+			act_list_int(ti, "色", 2, 255),
+			act_list_int(ti, "色", 3, 255));
+		// Порядок четвёрки `アルファグラデーション` взят из порядка ОБЪЯВЛЕНИЯ пары
+		// сеттеров/геттеров в библиотеке (fn639-646: Top, Bottom, Left, Right).
+		// Значение движок только хранит и на непустом печатает одноразовый
+		// WARNING (src/parts/panel.c) — там же оговорка, что смысл не установлен.
+		PE_SetPanelAlphaGradationTop(no, act_list_int(ti, "アルファグラデーション", 0, 0));
+		PE_SetPanelAlphaGradationBottom(no, act_list_int(ti, "アルファグラデーション", 1, 0));
+		PE_SetPanelAlphaGradationLeft(no, act_list_int(ti, "アルファグラデーション", 2, 0));
+		PE_SetPanelAlphaGradationRight(no, act_list_int(ti, "アルファグラデーション", 3, 0));
+	} else if (ti && act_parts_type_v14(ti) == 17) {
+		/*
+		 * `ユーザコンポーネント` (тип компонента v14 = 17) — место под ОТДЕЛЬНУЮ
+		 * активность (шапка, футер, полоса фазы). Классического аналога нет,
+		 * поэтому act_parts_type отдаёт -1 и часть уходила в CG-ветку, где у
+		 * неё нет ни одного узла состояния; игра же ищет её сравнением типа
+		 * (`CActivityWrap@CompParts(имя, 17, 1)` @0x1fd54) и, не найдя,
+		 * возвращала null-компонент — на нём и падал `SceneAzito@0`
+		 * (`PhaseBar@Text::set`, PUSHSTRUCTPAGE = -1).
+		 *
+		 * Читаем узел теми же сеттерами, которыми потом пользуется игра.
+		 * `データ` — плоский список «ключ, значение» (по всем 195 раскладках
+		 * 270 таких частей, у 152 из них список есть, других полей нет вовсе).
+		 */
+		struct string *uc_name = act_str(ti, "ユーザコンポーネント名");
+		PE_SetUserComponentName(no, uc_name);
+		struct ex_tree *data = act_child(ti, "データ");
+		if (data && data->is_leaf && data->leaf.value.type == EX_LIST) {
+			struct ex_list *l = data->leaf.value.list;
+			if (l->nr_items % 2) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					WARNING("ユーザコンポーネント: нечётный список データ (%u) — "
+						"пары «ключ, значение» не складываются", l->nr_items);
+				}
+			}
+			for (unsigned i = 0; i + 1 < l->nr_items; i += 2) {
+				struct ex_value *k = &l->items[i].value;
+				struct ex_value *v = &l->items[i + 1].value;
+				if (k->type != EX_STRING || v->type != EX_STRING)
+					continue;
+				PE_SetUserComponentData(no, k->s, v->s);
+			}
 		}
 	} else if (ti && act_parts_type_v14(ti) == 10) {
 		/*
@@ -2030,10 +2112,6 @@ static void PE_AddChild(int parent, int child) { PE_SetParentPartsNumber(child, 
 static void PE_InsertChild(int parent, int child, int index) { (void)index; PE_SetParentPartsNumber(child, parent); }
 static void PE_RemoveChild(int parent, int child) { (void)parent; PE_SetParentPartsNumber(child, -1); }
 static bool PE_IsExistChild(int parent, int child) { return PE_GetParentPartsNumber(child) == parent; }
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearChild, int a);
-HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, NumofChild, int a);
-HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChild, int a, int b);
-HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChildIndex, int a, int b);
 // Parts_StopSwipe() — отменяет свайп-инерцию. Зовётся первым в
 // CBackLogView@MouseWheelEvent (и swipe-обработчиках). Свайп-инерцию не
 // моделируем, поэтому no-op; без него колесо в бэклоге падало в REPL.
@@ -2539,10 +2617,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(InsertChild, PE_InsertChild),
 	    HLL_EXPORT(RemoveChild, PE_RemoveChild),
 	    HLL_EXPORT(IsExistChild, PE_IsExistChild),
-	    HLL_EXPORT(ClearChild, PartsEngine_ClearChild),
-	    HLL_EXPORT(NumofChild, PartsEngine_NumofChild),
-	    HLL_EXPORT(GetChild, PartsEngine_GetChild),
-	    HLL_EXPORT(GetChildIndex, PartsEngine_GetChildIndex),
+	    HLL_EXPORT(ClearChild, PE_ClearChild),
+	    HLL_EXPORT(NumofChild, PE_NumofChild),
+	    HLL_EXPORT(GetChild, PE_GetChild),
+	    HLL_EXPORT(GetChildIndex, PE_GetChildIndex),
 	    HLL_EXPORT(SetEventID, PE_SetEventID),
 	    HLL_EXPORT(Parts_StopSwipe, PartsEngine_Parts_StopSwipe),
 	    HLL_EXPORT(Parts_SetComment, PartsEngine_Parts_SetComment),
@@ -2574,6 +2652,14 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetDelegateIndex, PE_SetDelegateIndex),
 	    HLL_EXPORT(SetFocus, PartsEngine_SetFocus),
 	    HLL_EXPORT(IsFocus, PE_IsFocus),
+	    HLL_EXPORT(SetComponentReverseLR, PE_SetComponentReverseLR),
+	    HLL_EXPORT(SetComponentReverseTB, PE_SetComponentReverseTB),
+	    HLL_EXPORT(GetComponentReverseLR, PE_GetComponentReverseLR),
+	    HLL_EXPORT(GetComponentReverseTB, PE_GetComponentReverseTB),
+	    HLL_EXPORT(SetUserComponentName, PE_SetUserComponentName),
+	    HLL_EXPORT(GetUserComponentName, PE_GetUserComponentName),
+	    HLL_EXPORT(SetUserComponentData, PE_SetUserComponentData),
+	    HLL_EXPORT(GetUserComponentData, PE_GetUserComponentData),
 	    HLL_EXPORT(SetComponentType, PE_SetComponentType),
 	    HLL_EXPORT(GetComponentType, PE_GetComponentType),
 	    HLL_EXPORT(SetComponentPos, PartsEngine_SetComponentPos),
@@ -2887,6 +2973,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetPartsRectangleDetectionSize, PE_SetPartsRectangleDetectionSize),
 	    HLL_TODO_EXPORT(Parts_SetPartsRectangleDetectionSurfaceArea, PartsEngine_Parts_SetPartsRectangleDetectionSurfaceArea),
 	    HLL_EXPORT(Parts_SetPartsCGDetectionSize, PE_SetPartsCGDetectionSize),
+	    HLL_EXPORT(Parts_GetNumeralNumber, PE_GetNumeralNumber),
+	    HLL_EXPORT(Parts_IsNumeralShowComma, PE_IsNumeralShowComma),
+	    HLL_EXPORT(Parts_GetNumeralSpace, PE_GetNumeralSpace),
+	    HLL_EXPORT(GetNumeralLength, PE_GetNumeralLength),
 	    HLL_TODO_EXPORT(Parts_SetPartsCGDetectionSurfaceArea, PartsEngine_Parts_SetPartsCGDetectionSurfaceArea),
 	    HLL_EXPORT(Parts_SetPartsFlat, PE_SetPartsFlat),
 	    HLL_EXPORT(Parts_IsPartsFlatEnd, PE_IsPartsFlatEnd),

@@ -243,6 +243,7 @@ static cJSON *parts_state_to_json(struct parts_state *state, bool verbose)
 	case PARTS_UNINITIALIZED:
 		break;
 	case PARTS_CG:
+	case PARTS_CG_DETECTION:
 		parts_cg_to_json(&state->cg, obj, verbose);
 		break;
 	case PARTS_TEXT:
@@ -403,6 +404,8 @@ cJSON *parts_to_json(struct parts *parts, bool recursive, bool verbose)
 	if (parts->delegate_index >= 0)
 		cJSON_AddNumberToObject(obj, "delegate_index", parts->delegate_index);
 	cJSON_AddNumberToObject(obj, "sprite_deform", parts->sprite_deform);
+	cJSON_AddBoolToObject(obj, "reverse_lr", parts->reverse_lr);
+	cJSON_AddBoolToObject(obj, "reverse_tb", parts->reverse_tb);
 	cJSON_AddBoolToObject(obj, "clickable", parts->clickable);
 	cJSON_AddBoolToObject(obj, "pass_cursor", parts->pass_cursor);
 	cJSON_AddBoolToObject(obj, "lock_input_state", parts->lock_input_state);
@@ -586,6 +589,10 @@ static void parts_list_print(struct parts *parts, int indent)
 		break;
 	case PARTS_RECT_DETECTION:
 		sys_message("(rect_detection)");
+		break;
+	case PARTS_CG_DETECTION:
+		sys_message("(cg_detection %s)", state->cg.name
+			? display_sjis0(state->cg.name->text) : "(null)");
 		break;
 	case PARTS_LAYOUT_BOX:
 		sys_message("(layout_box type=%d)", state->layout_box.layout_type);

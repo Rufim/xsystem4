@@ -162,24 +162,30 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 	glm_scale(mw_transform, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0 });
 	glm_translate(mw_transform, (vec3){ common->origin_offset.x, common->origin_offset.y, 0 });
 
+	// `sprite_deform` (0 — нет, 1 — по горизонтали, 2 — по вертикали) и независимые
+	// флаги v14 `SetComponentReverseLR/TB` складываются: одним числом обе оси не
+	// выразить, а игра может зеркалить и ту и другую.
+	bool flip_h = parts->reverse_lr;
+	bool flip_v = parts->reverse_tb;
 	switch (parts->sprite_deform) {
-	// Flip horizontally
 	case 1:
-		glm_translate(mw_transform, (vec3){ common->w, 0.0f, 0.0f });
-		glm_scale(mw_transform, (vec3){ -common->w, common->h, 1.0f });
+		flip_h = !flip_h;
 		break;
-	// Flip vertically
 	case 2:
-		glm_translate(mw_transform, (vec3){ 0.0f, common->h, 0.0f });
-		glm_scale(mw_transform, (vec3){ common->w, -common->h, 1.0f });
+		flip_v = !flip_v;
+		break;
+	case 0:
 		break;
 	default:
 		WARNING("Invalid sprite_deform: %d", parts->sprite_deform);
-	// No deform
-	case 0:
-		glm_scale(mw_transform, (vec3){ common->w, common->h, 1.0 });
 		break;
 	}
+	if (flip_h)
+		glm_translate(mw_transform, (vec3){ common->w, 0.0f, 0.0f });
+	if (flip_v)
+		glm_translate(mw_transform, (vec3){ 0.0f, common->h, 0.0f });
+	glm_scale(mw_transform, (vec3){ flip_h ? -common->w : common->w,
+			flip_v ? -common->h : common->h, 1.0f });
 
 	Rectangle r = common->surface_area;
 	if (!r.w && !r.h) {
@@ -660,6 +666,8 @@ void parts_render(struct parts *parts)
 	switch (state->type) {
 	case PARTS_UNINITIALIZED:
 	case PARTS_RECT_DETECTION:
+	// `ＣＧ判定パーツ`: текстура нужна только hit-тесту, рисовать её нельзя.
+	case PARTS_CG_DETECTION:
 	case PARTS_LAYOUT_BOX:
 		break;
 	case PARTS_CG:

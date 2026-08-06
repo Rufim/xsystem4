@@ -79,7 +79,10 @@ static bool parts_hittest(struct parts *parts, int state, Point pos)
 	}
 	if (!SDL_PointInRect(&pos, &hitbox))
 		return false;
-	if (!parts->pixel_hittest)
+	// `ＣＧ判定パーツ` — это и есть «область по форме картинки»: попиксельная
+	// проверка для него не опция раскладки, а сам смысл типа.
+	if (!parts->pixel_hittest
+	    && parts->states[parts->state].type != PARTS_CG_DETECTION)
 		return true;
 	return parts_pixel_hittest(c, hitbox, pos);
 }

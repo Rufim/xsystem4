@@ -110,7 +110,15 @@ enum parts_type {
 	PARTS_3DLAYER,
 	// System 4 v14 (Ixseal): сплошной цветной прямоугольник (`パネル`).
 	PARTS_PANEL,
-#define PARTS_NR_TYPES (PARTS_PANEL+1)
+	/*
+	 * `ＣＧ判定パーツ` (классический id 19) — область попадания, заданная
+	 * НЕПРОЗРАЧНЫМИ ПИКСЕЛЯМИ картинки. Родня `PARTS_RECT_DETECTION`: сама
+	 * часть НЕ рисуется, но её текстура задаёт форму hit-области. Хранится в
+	 * том же `struct parts_cg`, что и обычная картинка (имя + текстура), —
+	 * различие только в типе состояния и в том, что рендер её пропускает.
+	 */
+	PARTS_CG_DETECTION,
+#define PARTS_NR_TYPES (PARTS_CG_DETECTION+1)
 };
 
 struct parts_common {
@@ -436,6 +444,13 @@ struct parts {
 	// CPartsMessageManager сверяет с сообщением (см. PE_SetEventID). Дефолт -1.
 	int event_unique_id;
 	int sprite_deform;
+	// `SetComponentReverseLR/TB` (v14): НЕЗАВИСИМЫЕ флаги зеркалирования части по
+	// горизонтали и вертикали. Отдельны от `sprite_deform` (0/1/2), потому что тот
+	// одним числом обе оси выразить не может, а игра ставит их порознь
+	// (`parts::detail::CParts@ReverseLR::set` ← `CSpriteParts` ← `AdvStandImage`),
+	// и у обоих есть геттер. В рендере складываются с `sprite_deform`.
+	bool reverse_lr;
+	bool reverse_tb;
 	bool clickable;
 	// True for activity "button" parts (パーツタイプ=0) created by ReadActivityFile.
 	// Such parts render as CG (hover/click state-switch) but must report component
@@ -489,6 +504,23 @@ struct parts {
 	// ("<base>[／チェック]／通常|オン|ダウン"); clicking toggles checkbox_checked.
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
+	/*
+	 * `ユーザコンポーネント` (тип компонента v14 = 17) — часть-место, куда игровой
+	 * фреймворк подставляет ОТДЕЛЬНУЮ активность (шапка, футер, полоса фазы…).
+	 * Своего рендера у неё нет: содержимое создаёт сама игра и вешает потомками.
+	 * Движку нужно хранить ровно то, что у части спрашивают:
+	 *   `ユーザコンポーネント名` → Get/SetUserComponentName (имя класса компонента),
+	 *   `データ` (плоский список «ключ, значение») → Get/SetUserComponentData.
+	 * Обе пары есть в библиотеке ЦЕЛИКОМ (сеттер+геттер), поэтому свойства
+	 * обязаны храниться по-настоящему. У Tsumamigui 3 этих функций нет вовсе.
+	 */
+	bool is_user_component;
+	struct string *user_component_name;
+	struct parts_uc_data {
+		struct string *key;
+		struct string *value;
+	} *user_component_data;
+	int nr_user_component_data;
 	bool pass_cursor;
 	// PartsEngine.SetEnableInputProcess/IsEnableInputProcess: участвует ли часть в
 	// обработке ввода вообще. Отличается от clickable (право на клик) — это ГЛОБАЛЬНЫЙ

@@ -22,7 +22,7 @@
 #include "parts_internal.h"
 #include "../hll/iarray.h"
 
-#define CURRENT_SAVE_VERSION 3
+#define CURRENT_SAVE_VERSION 4
 
 // Насколько глубоко уводится снимок бэк-сцены под UI вьювера (см. load_parts).
 #define BACK_SCENE_Z_SHIFT 1000000
@@ -413,6 +413,8 @@ static void save_parts_state(struct iarray_writer *w, struct parts_state *state)
 		iarray_write(w, state->panel.grad_right);
 		break;
 	case PARTS_CG:
+	// `ＣＧ判定パーツ` держит ту же пару «имя + номер CG», что и картинка.
+	case PARTS_CG_DETECTION:
 		save_parts_cg(w, &state->cg);
 		break;
 	case PARTS_TEXT:
@@ -474,6 +476,12 @@ static void load_parts_state(struct iarray_reader *r, struct parts *parts,
 	}
 	case PARTS_CG:
 		load_parts_cg(r, parts, &state->cg);
+		break;
+	case PARTS_CG_DETECTION:
+		// load_parts_cg грузит картинку общим путём и по дороге переводит
+		// состояние в PARTS_CG — возвращаем тип обратно.
+		load_parts_cg(r, parts, &state->cg);
+		state->type = PARTS_CG_DETECTION;
 		break;
 	case PARTS_TEXT:
 		load_parts_text(r, parts, &state->text);
@@ -600,6 +608,9 @@ static void save_parts(struct iarray_writer *w, struct parts *parts)
 	iarray_write(w, parts->draw_filter);
 	iarray_write(w, parts->message_window);
 	iarray_write(w, parts->alpha_clipper_parts_no);
+	// version 4: независимые флаги зеркалирования (SetComponentReverseLR/TB, v14)
+	iarray_write(w, parts->reverse_lr);
+	iarray_write(w, parts->reverse_tb);
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and save unconditionally
 	if (parts_multi_controller) {
@@ -676,6 +687,10 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 		parts->alpha_clipper_parts_no = iarray_read(r);
 		if (back_scene && parts->alpha_clipper_parts_no >= 0)
 			parts->alpha_clipper_parts_no += BACK_SCENE_PARTS_OFFSET;
+	}
+	if (version > 3) {
+		parts->reverse_lr = iarray_read(r);
+		parts->reverse_tb = iarray_read(r);
 	}
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
