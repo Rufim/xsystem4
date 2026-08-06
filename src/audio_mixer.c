@@ -23,6 +23,8 @@
 #include "system4.h"
 #include "system4/archive.h"
 #include "system4/utfsjis.h"
+#include "system4/string.h"
+#include "system4/ex.h"
 
 #include "asset_manager.h"
 #include "audio.h"
@@ -700,6 +702,80 @@ static void mixer_load_volumes(void)
 	fclose(fp);
 }
 
+/*
+ * ★АВТОРСКИЕ ГРОМКОСТИ ЛЕЖАТ В `.ex` ИГРЫ, ПО ГРУППАМ И РАЗНЫЕ.
+ *
+ * Таблица `Ｅ＿サウンドグループ設定`: строка индексируется `グループ番号` (он же номер
+ * канала микшера — см. раскладку sys4_tree выше), колонка `デフォルトボリューム` — доля
+ * 0..1. У Tsumamigui 3 это 0.8 у большинства групп, но **1.0 у группы 3** (голос) и
+ * **0.177828 у группы 5** (фоновый голос), поэтому «поставить всем 80» было бы просто
+ * другой ошибкой.
+ *
+ * Почему это вообще наша забота: САМА ИГРА эту колонку НЕ ЧИТАЕТ — все четыре места, где
+ * она трогает таблицу (`sound::detail::GetBackVoiceGroupNumber`, `PlaySystemSE`,
+ * `CBGMVolumeCapManager@SeachCalcVolumeList`, `CSoundVolumeCapManager@SeachCalcVolumeList`),
+ * берут из неё другие колонки. Значит колонку читает движок оригинала.
+ *
+ * Пересечения с ini нет: у Tsumamigui нет ни `DefaultVolumeRate`, ни `VolumeValancer`,
+ * а у игр с этими ключами (Escalayer Reboot, Oyako Rankan) нет самой таблицы. Сейв
+ * (`MixerVolume.sav`) применяется ПОСЛЕ и по-прежнему главнее.
+ *
+ * Имена в `.ex` — SJIS (`ex_read_file` не перекодирует, см. MainEXFile), поэтому литералы
+ * переводим на границе.
+ */
+static void apply_ex_default_volumes(int nr_mixers)
+{
+	if (!config.ex_path)
+		return;
+	struct ex *ex = ex_read_file(config.ex_path);
+	if (!ex)
+		return;
+
+	char *t_name = utf2sjis("Ｅ＿サウンドグループ設定", 0);
+	struct ex_table *t = ex_get_table(ex, t_name);
+	free(t_name);
+	if (!t) {
+		ex_free(ex);
+		return;
+	}
+
+	char *c_group = utf2sjis("グループ番号", 0);
+	char *c_vol = utf2sjis("デフォルトボリューム", 0);
+	int col_group = -1, col_vol = -1;
+	for (unsigned i = 0; i < t->nr_fields; i++) {
+		if (!t->fields[i].name)
+			continue;
+		if (col_group < 0 && !strcmp(t->fields[i].name->text, c_group))
+			col_group = i;
+		else if (col_vol < 0 && !strcmp(t->fields[i].name->text, c_vol))
+			col_vol = i;
+	}
+	free(c_group);
+	free(c_vol);
+	if (col_group < 0 || col_vol < 0) {
+		ex_free(ex);
+		return;
+	}
+
+	int applied = 0;
+	for (unsigned row = 0; row < t->nr_rows; row++) {
+		struct ex_value *g = ex_table_get(t, row, col_group);
+		struct ex_value *v = ex_table_get(t, row, col_vol);
+		if (!g || !v || g->type != EX_INT || v->type != EX_FLOAT)
+			continue;
+		if (g->i < 0 || g->i >= nr_mixers)
+			continue;
+		int vol = (int)(v->f * 100.0f + 0.5f);
+		config.mixer_volumes[g->i] = clamp(0, 100, vol);
+		applied++;
+	}
+	// Диагностика под ручкой: постоянная строка в логе сдвинула бы эталон регресса
+	// (он считает строки), а пользы каждый запуск не приносит.
+	if (applied && getenv("XSYS4_MIXER_TRACE"))
+		NOTICE("mixer: applied %d default volumes from .ex", applied);
+	ex_free(ex);
+}
+
 void mixer_init(void)
 {
 	// initialize mixer naming
@@ -808,6 +884,9 @@ void mixer_init(void)
 		free(config.mixer_volumes);
 		config.mixer_volumes = vols;
 	}
+
+	// авторские громкости из .ex игры (переопределяют дефолт, но НЕ сейв)
+	apply_ex_default_volumes(nr_mixers);
 
 	// применить сохранённые громкости (переопределяют значения из .ini)
 	mixer_load_volumes();
