@@ -658,16 +658,54 @@ void hll_call(int libno, int fno, int elem_class)
 			stack_push(r);
 			break;
 		}
+		/*
+		 * `wrap<array<T>>` — возвращается САМ КОНТЕЙНЕР, а не элемент. Отличить
+		 * от `wrap<T>` можно ПО .ain: у обёртки записан вложенный тип, и у
+		 * `Sort/QuickSort/DescSort/Remain` он массив (79), а у `EmplaceBack` —
+		 * элемент (74). Это не мелочь: `ActivityHelper::GetUser<T>` (@0x9c1c6a)
+		 * делает `names = Array.QuickSort(Array.Where(...))` и передаёт результат
+		 * дальше как СПИСОК ИМЁН; с элементной трактовкой туда попадала первая
+		 * строка, список выходил пустым, и `Footer@0` падал на `m_uiButtons[0]`.
+		 * Функции этой группы работают НА МЕСТЕ, поэтому контейнер — тот же
+		 * массив, что пришёл в self; счётчик поднимаем, вызывающий делает DELETE.
+		 */
+		if (f->return_type.data == AIN_WRAP && f->return_type.array_type
+		    && ain_is_array_data_type(f->return_type.array_type[0].data)) {
+			heap_ref(ref_array_slot);
+			stack_push(ref_array_slot);
+			break;
+		}
 		int idx = r.i;
-		// Массив с элементом wrap<интерфейс>: элемент занимает ДВА слота
-		// страницы, поэтому ссылка на него — это всегда пара
-		// (слот массива, idx*2); «своего» heap-слота у такого элемента нет.
+		/*
+		 * Массив с элементом wrap<интерфейс>: элемент занимает ДВА слота
+		 * страницы, и наружу отдаётся САМО ЗНАЧЕНИЕ — пара (heap-слот объекта,
+		 * база интерфейса в его таблице методов), а НЕ ссылка (слот массива,
+		 * idx*2). Форма снята с сайта `AnimateText@AdjustPos` (@0x6303ea):
+		 * сразу после `Array.First` идёт `X_MOV 4 2; X_ASSIGN 2` в локал типа
+		 * `t89<ITextParts>` (интерфейсное ЗНАЧЕНИЕ, 2 слота) без всякого
+		 * `X_REF 2`, а затем оставшиеся на стеке слоты разбираются как
+		 * `vtable = obj[0]; fno = vtable[base + N]; CALLMETHOD 0`. Со ссылочной
+		 * формой «объектом» становился сам массив, а «базой» — индекс, и
+		 * диспетчер уходил в чужую функцию.
+		 *
+		 * Это согласовано и с 1-слотовым объектным элементом ниже: там наружу
+		 * тоже идёт значение (heap-слот), ссылка нужна только скалярам.
+		 * Владение — как у объектного элемента: считанную ссылку берёт на себя
+		 * вызывающий и освобождает своим DELETE.
+		 */
 		int eslots = array_elem_slots(ap);
 		if (eslots != 1) {
-			if (heap_index_valid(ref_array_slot))
-				heap_ref(ref_array_slot);
-			stack_push(ref_array_slot);
-			stack_push(idx >= 0 ? idx * eslots : idx);
+			if (idx < 0 || (idx + 1) * eslots > ap->nr_vars) {
+				// Нет элемента — нулевой интерфейс той же формы (пара),
+				// как её строит X_ICAST на провале.
+				stack_push(-1);
+				stack_push(0);
+				break;
+			}
+			int obj = ap->values[idx * eslots].i;
+			heap_ref(obj);
+			stack_push(obj);
+			stack_push(ap->values[idx * eslots + 1].i);
 			break;
 		}
 		// Тип элемента берём из САМОГО МАССИВА, а не из слота по индексу.

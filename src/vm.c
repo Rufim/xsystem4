@@ -670,13 +670,24 @@ static void function_call(int fno, int return_address)
 	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	if (fn_trace_count != 0) {
 		for (int i = 0; i < fn_trace_count; i++) {
-			if (fn_trace_list[i] == fno) {
-				WARNING("FNARGS fn %d nargs=%d a0=%d a1=%d a2=%d", fno, f->nr_args,
-					f->nr_args>0?heap[slot].page->values[0].i:-1,
-					f->nr_args>1?heap[slot].page->values[1].i:-1,
-					f->nr_args>2?heap[slot].page->values[2].i:-1);
-				break;
+			if (fn_trace_list[i] != fno)
+				continue;
+			// Строковые аргументы печатаем ТЕКСТОМ: слот строки — это номер
+			// в куче, и голое число ничего не говорит, а именно строковые
+			// ключи (id предметов, имена CG) обычно и надо увидеть.
+			char buf[512];
+			int off = 0;
+			for (int a = 0; a < f->nr_args && off < (int)sizeof(buf) - 1; a++) {
+				union vm_value v = heap[slot].page->values[a];
+				if (f->vars[a].type.data == AIN_STRING && v.i > 0) {
+					off += snprintf(buf + off, sizeof(buf) - off, " a%d=\"%s\"",
+							a, display_sjis0(heap_get_string(v.i)->text));
+				} else {
+					off += snprintf(buf + off, sizeof(buf) - off, " a%d=%d", a, v.i);
+				}
 			}
+			WARNING("FNARGS fn %d nargs=%d%s", fno, f->nr_args, buf);
+			break;
 		}
 	}
 }

@@ -23,6 +23,7 @@
 #include "hll.h"
 #include "vm/page.h"
 #include "vm/heap.h"
+#include "xsystem4.h"
 
 static void check_array(struct page *array)
 {
@@ -864,6 +865,36 @@ static int ix_value_cmp(struct page *a, int index, union vm_value *key)
 	}
 }
 
+/*
+ * `XSYS4_BSEARCH_TRACE` — построчный лог зондов BinarySearch/LowerBound.
+ * У элемента-структуры дополнительно печатается член 0: у контейнеров
+ * `IdArray<string, T>` это id-строка, и по ней сразу видно, отсортирован ли
+ * массив (так нашлась порча порядка от `array_insert_n`).
+ */
+static const char *ix_elem_id(struct page *a, int index)
+{
+	if (!a)
+		return NULL;
+	int pgi = a->values[index * array_elem_slots(a)].i;
+	if (pgi <= 0 || (size_t)pgi >= heap_size || heap[pgi].type != VM_PAGE)
+		return NULL;
+	struct page *e = heap[pgi].page;
+	if (!e || e->nr_vars != 1)
+		return NULL;
+	int s0 = e->values[0].i;
+	if (s0 <= 0 || (size_t)s0 >= heap_size || heap[s0].type != VM_STRING)
+		return NULL;
+	return display_sjis0(heap_get_string(s0)->text);
+}
+
+static void ix_probe_trace(const char *what, struct page *a, int n, int lo, int hi,
+			   int mid, int c)
+{
+	const char *id = ix_elem_id(a, mid);
+	NOTICE("%s n=%d lo=%d hi=%d mid=%d cmp=%d%s%s%s", what, n, lo, hi, mid, c,
+		id ? " elem=\"" : "", id ? id : "", id ? "\"" : "");
+}
+
 // Индекс совпавшего элемента (компаратор вернул 0), иначе -1.
 static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
 {
@@ -875,6 +906,7 @@ static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
 	// на отсортированном массиве ответ тот же, на неотсортированном корректнее.
 	if (!ix_arg_is_func(1))
 		return array_find(*self, 0, n, *key, 0);
+	bool trace = getenv("XSYS4_BSEARCH_TRACE");
 	int lo = 0, hi = n - 1;
 	while (lo <= hi) {
 		int mid = lo + (hi - lo) / 2;
@@ -882,6 +914,8 @@ static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
 		if (!*self || mid >= array_numof(*self, 1))
 			return -1;
 		int c = ix_cmp3(key, *self, mid);
+		if (trace)
+			ix_probe_trace("BSEARCH", *self, n, lo, hi, mid, c);
 		if (c == 0)
 			return mid;
 		if (c < 0)
@@ -902,6 +936,7 @@ static int Array_ix_LowerBound(struct page **self, union vm_value *key)
 		return 0;
 	int n = array_numof(*self, 1);
 	bool by_func = ix_arg_is_func(1);
+	bool lb_trace = getenv("XSYS4_BSEARCH_TRACE") && by_func;
 	int lo = 0, hi = n;
 	while (lo < hi) {
 		int mid = lo + (hi - lo) / 2;
@@ -910,11 +945,15 @@ static int Array_ix_LowerBound(struct page **self, union vm_value *key)
 		int c = by_func ? ix_cmp3(key, *self, mid) : ix_value_cmp(*self, mid, key);
 		if (c == INT_MIN)
 			return n;
+		if (lb_trace)
+			ix_probe_trace("LOWERBOUND", *self, n, lo, hi, mid, c);
 		if (c < 0)
 			lo = mid + 1;
 		else
 			hi = mid;
 	}
+	if (lb_trace)
+		NOTICE("LOWERBOUND n=%d -> %d", n, lo);
 	return lo;
 }
 
