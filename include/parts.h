@@ -176,6 +176,8 @@ int PE_get_movie_sprite(int parts_no, int state);
 float PE_parts_get_absolute_x(int parts_no);
 float PE_parts_get_absolute_y(int parts_no);
 int PE_parts_get_absolute_z(int parts_no);
+void PE_set_component_scroll_pos_link(int parts_no, int link_parts_no, bool vertical);
+int PE_get_component_scroll_pos_link(int parts_no, bool vertical);
 void PE_parts_set_lock_input_state(int parts_no, bool lock);
 
 // construction.c
