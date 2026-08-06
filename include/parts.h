@@ -293,6 +293,11 @@ int PE_GetOnCursorShowLinkPartsNumber(int parts_no);
 bool PE_SetPartsOnCursorSoundNumber(int parts_no, int sound_no);
 bool PE_SetPartsClickSoundNumber(int parts_no, int sound_no);
 bool PE_SetClickMissSoundNumber(int sound_no);
+bool PE_AddFillGradationHorizonToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, int top_r, int top_g, int top_b, int bot_r, int bot_g, int bot_b,
+		int state);
+bool PE_AddMulFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		int r, int g, int b, bool full_size, int state);
 void PE_Parts_SetSoundNumber(int parts_no, int sound_no, int state);
 int PE_Parts_GetSoundNumber(int parts_no, int state);
 void PE_BeginInput(void);

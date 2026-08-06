@@ -237,6 +237,28 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->filter.h);
 		iarray_write(w, op->filter.full_size);
 		break;
+	case PARTS_CP_FILL_GRADATION_HORIZON:
+		iarray_write(w, op->gradation.x);
+		iarray_write(w, op->gradation.y);
+		iarray_write(w, op->gradation.w);
+		iarray_write(w, op->gradation.h);
+		iarray_write(w, op->gradation.top_r);
+		iarray_write(w, op->gradation.top_g);
+		iarray_write(w, op->gradation.top_b);
+		iarray_write(w, op->gradation.bot_r);
+		iarray_write(w, op->gradation.bot_g);
+		iarray_write(w, op->gradation.bot_b);
+		break;
+	case PARTS_CP_MUL_FILTER:
+		iarray_write(w, op->color_filter.x);
+		iarray_write(w, op->color_filter.y);
+		iarray_write(w, op->color_filter.w);
+		iarray_write(w, op->color_filter.h);
+		iarray_write(w, op->color_filter.r);
+		iarray_write(w, op->color_filter.g);
+		iarray_write(w, op->color_filter.b);
+		iarray_write(w, op->color_filter.full_size);
+		break;
 	}
 }
 
@@ -294,6 +316,28 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->filter.w = iarray_read(r);
 		op->filter.h = iarray_read(r);
 		op->filter.full_size = !!iarray_read(r);
+		break;
+	case PARTS_CP_FILL_GRADATION_HORIZON:
+		op->gradation.x = iarray_read(r);
+		op->gradation.y = iarray_read(r);
+		op->gradation.w = iarray_read(r);
+		op->gradation.h = iarray_read(r);
+		op->gradation.top_r = iarray_read(r);
+		op->gradation.top_g = iarray_read(r);
+		op->gradation.top_b = iarray_read(r);
+		op->gradation.bot_r = iarray_read(r);
+		op->gradation.bot_g = iarray_read(r);
+		op->gradation.bot_b = iarray_read(r);
+		break;
+	case PARTS_CP_MUL_FILTER:
+		op->color_filter.x = iarray_read(r);
+		op->color_filter.y = iarray_read(r);
+		op->color_filter.w = iarray_read(r);
+		op->color_filter.h = iarray_read(r);
+		op->color_filter.r = iarray_read(r);
+		op->color_filter.g = iarray_read(r);
+		op->color_filter.b = iarray_read(r);
+		op->color_filter.full_size = !!iarray_read(r);
 		break;
 	}
 	return op;
