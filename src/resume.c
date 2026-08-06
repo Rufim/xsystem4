@@ -224,15 +224,25 @@ static struct rsave_heap_array *array_page_to_rsave(struct page *page, int slot)
 	return o;
 }
 
+/*
+ * В файл делегат пишется в ФОРМАТЕ ИГРЫ — тройками (obj, fun, seq). Четвёртый
+ * слот (env, окружение лямбды; см. vm/page.h) внутренний: сохранять его некуда,
+ * а главное — heap-слот локальной страницы после загрузки уже ничего не значит.
+ * После загрузки env = -1, и X_GETENV откатывается на поиск по стеку вызовов.
+ */
 static struct rsave_heap_delegate *delegate_page_to_rsave(struct page *page, int slot)
 {
-	struct rsave_heap_delegate *o = xcalloc(1, sizeof(struct rsave_heap_delegate) + page->nr_vars * sizeof(int32_t));
+	int nr_entries = page->nr_vars / DG_ENTRY_SLOTS;
+	int nr_slots = nr_entries * 3;
+	struct rsave_heap_delegate *o = xcalloc(1, sizeof(struct rsave_heap_delegate) + nr_slots * sizeof(int32_t));
 	o->tag = RSAVE_DELEGATE;
 	o->ref = heap[slot].ref;
 	o->seq = heap[slot].seq;
-	o->nr_slots = page->nr_vars;
-	for (int i = 0; i < o->nr_slots; i++)
-		o->slots[i] = page->values[i].i;
+	o->nr_slots = nr_slots;
+	for (int i = 0; i < nr_entries; i++) {
+		for (int k = 0; k < 3; k++)
+			o->slots[i*3 + k] = page->values[i*DG_ENTRY_SLOTS + k].i;
+	}
 	return o;
 }
 
@@ -686,9 +696,14 @@ static void load_rsave_struct(int slot, struct rsave_heap_struct *s)
 
 static void load_rsave_delegate(int slot, struct rsave_heap_delegate *d)
 {
-	struct page *page = alloc_page(DELEGATE_PAGE, 0, d->nr_slots);
-	for (int i = 0; i < d->nr_slots; i++)
-		page->values[i].i = d->slots[i];
+	// Обратная конверсия к внутреннему формату: тройки файла → четвёрки с env=-1.
+	int nr_entries = d->nr_slots / 3;
+	struct page *page = alloc_page(DELEGATE_PAGE, 0, nr_entries * DG_ENTRY_SLOTS);
+	for (int i = 0; i < nr_entries; i++) {
+		for (int k = 0; k < 3; k++)
+			page->values[i*DG_ENTRY_SLOTS + k].i = d->slots[i*3 + k];
+		page->values[i*DG_ENTRY_SLOTS + 3].i = -1;
+	}
 
 	alloc_heap_slot(slot);
 	heap[slot].ref = d->ref;

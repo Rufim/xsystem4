@@ -382,6 +382,36 @@ static int lambda_parent_fno(int fno)
 	return result;
 }
 
+/*
+ * Окружение, которое надо ЗАХВАТИТЬ в делегат при `DG_NEW_FROM_METHOD`/`DG_ADD`.
+ *
+ * Лямбда с захватом (Ixseal) читает локальные переменные объемлющей функции
+ * идиомой `PUSHLOCALPAGE; X_GETENV; PUSH n; X_REF`, и это НЕ `this`: 718 лямбд
+ * Dohna пользуются и `X_GETENV`, и `PUSHSTRUCTPAGE`, то есть окружение живёт
+ * отдельно от объекта (у 434 из них делегат создаётся с `PUSHSTRUCTPAGE`, у 180
+ * — с `PUSH -1`). Пока лямбда вызывалась синхронно, окружение удавалось найти на
+ * стеке вызовов (lambda_env_page_slot ниже), но обработчик события переживает
+ * породивший его вызов: `ActivityHelper::SetInverseColorText` подписывает лямбду
+ * на MouseEnter кнопки и возвращается, и при наведении мыши `X_GETENV` не
+ * находил ни родителя на стеке, ни `this` — `X_REF` падал с «Out of bounds heap
+ * index: -1» (экран выбора фазы дня Dohna).
+ *
+ * Гейт структурный: `<lambda : ` в имени функции — у v6/v7 лямбд нет вовсе.
+ */
+int vm_lambda_capture_env(int fun)
+{
+	if (fun < 0 || fun >= ain->nr_functions)
+		return -1;
+	static int8_t *is_lambda = NULL;
+	if (!is_lambda) {
+		is_lambda = xcalloc(ain->nr_functions, 1);
+		for (int i = 0; i < ain->nr_functions; i++)
+			is_lambda[i] = ain->functions[i].name
+				&& strstr(ain->functions[i].name, "<lambda : ") ? 1 : 0;
+	}
+	return is_lambda[fun] ? local_page_slot() : -1;
+}
+
 // Return the heap slot of the local page that holds a lambda's captured
 // environment, or -1 if it cannot be located on the current call stack.
 static int lambda_env_page_slot(void)
@@ -628,6 +658,7 @@ static int _function_call(int fno, int return_address)
 		.return_address = return_address,
 		.page_slot = slot,
 		.struct_page = -1,
+		.env_page = -1,
 		// уточняется после снятия аргументов/ресивера (см. function_call/method_call)
 		.entry_sp = stack_ptr,
 	};
@@ -828,7 +859,7 @@ static void delegate_call(int dg_no, int return_address)
 	int return_values = dg_return_slots(dg_no);
 	int dg_page = stack_peek(1 + return_values).i;
 	int dg_index = stack_peek(0 + return_values).i;
-	int obj, fun;
+	int obj, fun, env;
 	// XSYS4_DG_RUNAWAY=<порог>: одноразовый диагноз «DG_CALL не заканчивается».
 	// Печатает страницу делегата, ТЕКУЩЕЕ число элементов и стек VM — так видно,
 	// растёт ли список во время обхода (обработчик дописывает в тот же делегат).
@@ -843,7 +874,7 @@ static void delegate_call(int dg_no, int return_address)
 			vm_stack_trace();
 		}
 	}
-	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun)) {
+	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun, &env)) {
 		if (fn_trace_count != 0)
 			vm_fn_trace(fun, "DG_CALL");
 		vm_fn_trace_ns(fun);
@@ -866,6 +897,9 @@ static void delegate_call(int dg_no, int return_address)
 		}
 
 		set_struct_page(obj);
+		// Окружение лямбды: то, что было захвачено при подписке (см.
+		// vm_lambda_capture_env). Ставится ПОСЛЕ _function_call — кадр уже наш.
+		call_stack[call_stack_ptr-1].env_page = env;
 	} else {
 		// call finished: clean up stack and jump to return address
 		// Слотов у возврата столько, сколько скажет type_slots(): 2 у
@@ -1567,7 +1601,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Идиома `PUSHLOCALPAGE; X_GETENV; PUSH n; X_REF 1` читает env.member_n.
 		// net 0: снять локальную страницу (не нужна), положить env-страницу.
 		stack_pop();
-		int env = lambda_env_page_slot();
+		// Приоритет — окружение, ЗАХВАЧЕННОЕ в делегат при подписке: только оно
+		// верно для отложенного вызова (обработчик события переживает объемлющую
+		// функцию). Поиск по стеку остаётся для лямбд, вызванных синхронно
+		// (алгоритмы вроде array_sort/Find получают функцию не через делегат).
+		int env = call_stack[call_stack_ptr-1].env_page;
+		if (env < 0)
+			env = lambda_env_page_slot();
 		stack_push(env >= 0 ? env : struct_page_slot());
 		break;
 	}
@@ -3254,7 +3294,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int obj = stack_pop().i;
 		int dg_i = stack_pop().i;
 		delete_page(dg_i);
-		heap_set_page(dg_i, delegate_new_from_method(obj, fun));
+		heap_set_page(dg_i, delegate_new_from_method(obj, fun, vm_lambda_capture_env(fun)));
 		break;
 	}
 	case DG_ADD: {
@@ -3262,7 +3302,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int obj = stack_pop().i;
 		int dg_i = stack_pop().i;
 		struct page *dg = heap_get_delegate_page(dg_i);
-		heap_set_page(dg_i, delegate_append(dg, obj, fun));
+		heap_set_page(dg_i, delegate_append(dg, obj, fun, vm_lambda_capture_env(fun)));
 		break;
 	}
 	case DG_CALL: { // DG_TYPE, ADDR
@@ -3426,7 +3466,8 @@ static enum opcode execute_instruction(enum opcode opcode)
 	case DG_NEW_FROM_METHOD: {
 		int fun = stack_pop().i;
 		int obj = stack_pop().i;
-		stack_push(heap_alloc_page(delegate_new_from_method(obj, fun)));
+		stack_push(heap_alloc_page(delegate_new_from_method(obj, fun,
+								   vm_lambda_capture_env(fun))));
 		break;
 	}
 	case DG_CALLBEGIN: { // DG_TYPE
@@ -3444,7 +3485,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 			int cf = call_stack[call_stack_ptr-1].fno;
 			WARNING("DGWATCH callbegin dg_no=%d dg_slot=%d numof=%d this=%d in %s",
 				dg_no, dg_page,
-				(p && p->type == DELEGATE_PAGE) ? p->nr_vars / 2 : -1,
+				(p && p->type == DELEGATE_PAGE) ? p->nr_vars / DG_ENTRY_SLOTS : -1,
 				struct_page_slot(),
 				(cf >= 0 && cf < ain->nr_functions) ? ain->functions[cf].name : "?");
 		}

@@ -106,6 +106,8 @@ struct page *get_struct_page(int frame_no);
 
 int vm_string_ref(struct string *s);
 int vm_copy_page(struct page *page);
+// Окружение, которое надо захватить в делегат при подписке лямбды (см. vm.c).
+int vm_lambda_capture_env(int fun);
 union vm_value vm_copy(union vm_value v, enum ain_data_type type);
 
 int vm_execute_ain(struct ain *program);
@@ -166,6 +168,10 @@ struct function_call {
 	uint32_t return_address;
 	int32_t page_slot;
 	int32_t struct_page;
+	// Захваченное окружение лямбды (heap-слот локальной страницы объемлющей
+	// функции) — приходит из делегата, читается инструкцией X_GETENV. -1 у
+	// всех остальных функций.
+	int32_t env_page;
 	// Диагностика XSYS4_SP_CHECK: stack_ptr сразу после установки кадра, чтобы
 	// на RETURN поймать функцию, которая оставила на стеке лишние слоты
 	// (типичный симптом неверно реализованной инструкции — краш случается
