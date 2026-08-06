@@ -28,6 +28,7 @@
 #include "system4.h"
 #include "system4/string.h"
 
+#include "xsystem4.h"
 #include "parts.h"
 #include "parts_internal.h"
 
@@ -512,6 +513,9 @@ void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
 	mw->msg_func_name = func_name ? string_ref(func_name) : NULL;
 	mw->msg_ver = ver;
 	mw->msg_step = step;
+	if (getenv("XSYS4_MW_TRACE"))
+		NOTICE("MWTEXT part=%d msg=%d ver=%d step=%d raw='%s'", parts_no, msg_num,
+		       ver, step, text ? display_sjis0(text->text) : "(nil)");
 
 	struct string *plain = mw_strip_markup(text);
 	PE_SetText(mw_text_parts(mw), plain, 1);
