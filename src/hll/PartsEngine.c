@@ -741,6 +741,24 @@ static float PartsEngine_Parts_GetPartsUpperLeftPosY(int parts_no, int state)
 	return PE_GetPartsUpperLeftPosY(parts_no, state);
 }
 
+/*
+ * Двухвыходная форма: `Parts_GetPartsUpperLeftPos(int, wrap<float> PosX,
+ * wrap<float> PosY, int State)`. Обе координаты те же, что у отдельных
+ * `…PosX`/`…PosY` (те реализованы давно) — не хватало ровно этой обёртки, и
+ * `CustomerViewSet@MoveOut` (уход клиента в фазе Hustling у Dohna) падал на
+ * «Unimplemented HLL function» через несколько секунд после входа в фазу.
+ * `wrap<скаляр>` приходит ссылкой на переменную (две ячейки стека), ffi отдаёт
+ * её обычным указателем — как у `TextSurfaceManager.GetFontWidth`.
+ */
+static void PartsEngine_Parts_GetPartsUpperLeftPos(int parts_no, float *pos_x,
+		float *pos_y, int state)
+{
+	if (pos_x)
+		*pos_x = PE_GetPartsUpperLeftPosX(parts_no, state);
+	if (pos_y)
+		*pos_y = PE_GetPartsUpperLeftPosY(parts_no, state);
+}
+
 // Rance 9: return type changed from int to float
 static float PartsEngine_Parts_GetComponentPosX(int parts_no)
 {
@@ -3624,6 +3642,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentPosX, PartsEngine_Parts_GetComponentPosX),
 	    HLL_EXPORT(GetComponentPosY, PartsEngine_GetComponentPosY),
 	    HLL_EXPORT(GetComponentPosZ, PE_GetPartsZ),
+	    HLL_EXPORT(Parts_GetPartsUpperLeftPos, PartsEngine_Parts_GetPartsUpperLeftPos),
 	    HLL_EXPORT(Parts_GetPartsUpperLeftPosX, PartsEngine_Parts_GetPartsUpperLeftPosX),
 	    HLL_EXPORT(Parts_GetPartsUpperLeftPosY, PartsEngine_Parts_GetPartsUpperLeftPosY),
 	    HLL_EXPORT(SetComponentOriginPosMode, PE_SetPartsOriginPosMode),
