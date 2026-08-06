@@ -130,11 +130,28 @@ static int KiwiSoundEngine_GetFreeSeID(int min_id, int max_id)
 }
 
 // Load a sound by name from the Sound archive and prepare it on channel `id`.
+/*
+ * Звук по ИМЕНИ ищется в ОБОИХ архивах — сначала эффекты/музыка, затем озвучка.
+ * У Tsumamigui 3 это два разных файла: `Tsumamigui3Sound.afa` (музыка и SE) и
+ * `Tsumamigui3Voice.afa` (18 848 реплик вида `10001.ogg`). Поиск только по
+ * ASSET_SOUND озвучку не находил вовсе: игра писала себе в лог
+ * `警告 VOICE[10001]ロード失敗 ＠ message::detail::VOICE`, и сцены шли молча при
+ * работающей музыке — снаружи это выглядит как «озвучки в игре нет».
+ * Порядок важен: имена SE и реплик не пересекаются, но SE запрашиваются чаще.
+ */
+static struct archive_data *kse_get_sound_by_name(const char *name)
+{
+	struct archive_data *dfile = asset_get_by_name(ASSET_SOUND, name, NULL);
+	if (!dfile)
+		dfile = asset_get_by_name(ASSET_VOICE, name, NULL);
+	return dfile;
+}
+
 static bool kse_prepare_name(int id, struct string *name)
 {
 	if (!name || id < 0)
 		return false;
-	struct archive_data *dfile = asset_get_by_name(ASSET_SOUND, name->text, NULL);
+	struct archive_data *dfile = kse_get_sound_by_name(name->text);
 	if (!dfile) {
 		if (KSE_SND_TRACE()) NOTICE("KSE: sound '%s' not found", name->text);
 		return false;
@@ -143,7 +160,13 @@ static bool kse_prepare_name(int id, struct string *name)
 	return wav_prepare_from_archive_data(id, dfile);
 }
 
-static bool KiwiSoundEngine_flat_IsExistFile(struct string *s) { return s && asset_exists_by_name(ASSET_SOUND, s->text, NULL); }
+static bool KiwiSoundEngine_flat_IsExistFile(struct string *s)
+{
+	// Оба архива — см. комментарий у kse_get_sound_by_name. Игра спрашивает этим
+	// «есть ли реплика», и ответ «нет» гасил озвучку ещё до попытки загрузки.
+	return s && (asset_exists_by_name(ASSET_SOUND, s->text, NULL)
+			|| asset_exists_by_name(ASSET_VOICE, s->text, NULL));
+}
 static bool KiwiSoundEngine_flat_IsExistID(int id) { (void)id; return true; }
 static bool KiwiSoundEngine_flat_IsExistSeID(int id) { (void)id; return true; }
 static bool KiwiSoundEngine_flat_IsPlay(int id) { return wav_is_playing(id); }
