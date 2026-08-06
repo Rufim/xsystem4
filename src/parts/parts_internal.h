@@ -192,6 +192,16 @@ struct parts_gauge {
 	Texture cg;
 	int cg_no;
 	float rate;
+	/*
+	 * Числитель и знаменатель хранятся ОТДЕЛЬНО от готового отношения: игра
+	 * читает их по-одиночке (`CHGaugeParts@Denominator::set` @0x32b78c сначала
+	 * зовёт `Numerator::get`, чтобы пересчитать заполнение под новый
+	 * знаменатель) — из одного `rate` их не восстановить.
+	 * В сейв частей не пишутся (формат не меняем): при загрузке
+	 * восстанавливаются как (rate, 1).
+	 */
+	float numerator;
+	float denominator;
 };
 
 // Serialized in save data. Do not reorder.

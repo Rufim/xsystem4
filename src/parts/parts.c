@@ -1680,6 +1680,8 @@ bool PE_SetHGaugeRate(int parts_no, float numerator, float denominator, int stat
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_gauge *g = parts_get_hgauge(parts, state);
+	g->numerator = numerator;
+	g->denominator = denominator;
 	parts_hgauge_set_rate(parts, g, numerator/denominator);
 	return true;
 }
@@ -1696,6 +1698,8 @@ bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int stat
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_gauge *g = parts_get_vgauge(parts, state);
+	g->numerator = numerator;
+	g->denominator = denominator;
 	parts_vgauge_set_rate(parts, g, (float)numerator/(float)denominator);
 	return true;
 }
@@ -1703,6 +1707,48 @@ bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int stat
 bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int state)
 {
 	return PE_SetVGaugeRate(parts_no, numerator, denominator, state);
+}
+
+/*
+ * Геттеры числителя/знаменателя (`Parts_GetHGaugeNumerator` и соседи). Игра
+ * пользуется ими как обычными свойствами: `RankGauge@Attach` → `WorkerParamView`
+ * читает числитель, чтобы поставить новый знаменатель, — без них экран подбора
+ * работников Dohna падал на «Unimplemented HLL function».
+ * Знаменатель по умолчанию 1: гейдж, которому отношение ещё не задавали, обязан
+ * вести себя как «0 из 1», а не делить на ноль.
+ */
+static struct parts_gauge *gauge_for_get(int parts_no, int state, bool vert)
+{
+	if (!parts_state_valid(--state))
+		return NULL;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return NULL;
+	return vert ? parts_get_vgauge(parts, state) : parts_get_hgauge(parts, state);
+}
+
+float PE_GetHGaugeNumerator(int parts_no, int state)
+{
+	struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	return g ? g->numerator : 0.0f;
+}
+
+float PE_GetHGaugeDenominator(int parts_no, int state)
+{
+	struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	return (g && g->denominator != 0.0f) ? g->denominator : 1.0f;
+}
+
+float PE_GetVGaugeNumerator(int parts_no, int state)
+{
+	struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	return g ? g->numerator : 0.0f;
+}
+
+float PE_GetVGaugeDenominator(int parts_no, int state)
+{
+	struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	return (g && g->denominator != 0.0f) ? g->denominator : 1.0f;
 }
 
 bool PE_SetHGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state)

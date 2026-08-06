@@ -1612,6 +1612,57 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		PE_SetNumeralNumber(no, act_int(st, "数値", 0), state);
 		return;
 	}
+	/*
+	 * Гейдж-состояние (横ゲージパーツ = 14, 縦ゲージパーツ = 15). Загрузчик его не
+	 * разбирал: `ＣＧ名` уходил в общую CG-ветку внизу, часть становилась
+	 * `PARTS_CG` — и игра переставала её НАХОДИТЬ, потому что ищет сравнением
+	 * типа компонента (`CActivityWrap@GetHGauge` @fn603 → `CompParts(имя, 22,
+	 * state)`, у вертикального — 23). На этом падал игровой ассерт
+	 * `DecisionTimerView.jaf:19: (nonnull) m_act.GetHGauge("Gauge")` при входе в
+	 * магазин Dohna: у части «Gauge» узел `通常状態` — как раз 横ゲージパーツ с
+	 * `ＣＧ名 = "システム／ハルウリ／時間ゲージ"`. Тот же класс дефекта, что §5ak,
+	 * но чинится в ЗАГРУЗЧИКЕ: тип компонента у `PARTS_HGAUGE` уже верный.
+	 *
+	 * Порядок важен: `分子/分母` ставятся ПОСЛЕ CG — установка CG заводит
+	 * состояние гейджа заново.
+	 */
+	if (act_parts_type(st) == 14 || act_parts_type(st) == 15) {
+		bool horizontal = act_parts_type(st) == 14;
+		struct string *cg = act_str(st, "ＣＧ名");
+		if (cg && cg->size) {
+			if (horizontal)
+				PE_SetHGaugeCG(no, cg, state);
+			else
+				PE_SetVGaugeCG(no, cg, state);
+		}
+		float denom = act_float(st, "分母", 1.0f);
+		float numer = act_float(st, "分子", 0.0f);
+		if (horizontal)
+			PE_SetHGaugeRate(no, numer, denom, state);
+		else
+			PE_SetVGaugeRate(no, numer, denom, state);
+		int sx = act_list_int(st, "サーフェイスエリア", 0, 0);
+		int sy = act_list_int(st, "サーフェイスエリア", 1, 0);
+		int sw = act_list_int(st, "サーフェイスエリア", 2, 0);
+		int sh = act_list_int(st, "サーフェイスエリア", 3, 0);
+		if (sw > 0 && sh > 0) {
+			if (horizontal)
+				PE_SetHGaugeSurfaceArea(no, sx, sy, sw, sh, state);
+			else
+				PE_SetVGaugeSurfaceArea(no, sx, sy, sw, sh, state);
+		}
+		// 反転 (расти справа налево / снизу вверх) движок не поддерживает вовсе —
+		// соответствующего PE_-вызова нет. Молчать об этом нельзя: гейдж будет
+		// расти не в ту сторону. У всех гейджей Dohna в раскладках стоит 0.
+		if (act_int(st, "反転", 0)) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("act_set_state_cg: гейдж с 反転=1 не поддержан (parts %d)", no);
+			}
+		}
+		return;
+	}
 	// Construction-process viewport (パーツタイプ=18): used as a clip region for
 	// preview content (e.g. the config message-window sample). We don't run the
 	// full compositing procedure; we only need an opaque mask of the viewport
@@ -3840,6 +3891,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetHGaugeRate, PE_SetHGaugeRate),
 	    HLL_EXPORT(Parts_SetVGaugeCG, PE_SetVGaugeCG),
 	    HLL_EXPORT(Parts_SetVGaugeRate, PE_SetVGaugeRate),
+	    HLL_EXPORT(Parts_GetHGaugeNumerator, PE_GetHGaugeNumerator),
+	    HLL_EXPORT(Parts_GetHGaugeDenominator, PE_GetHGaugeDenominator),
+	    HLL_EXPORT(Parts_GetVGaugeNumerator, PE_GetVGaugeNumerator),
+	    HLL_EXPORT(Parts_GetVGaugeDenominator, PE_GetVGaugeDenominator),
 	    HLL_EXPORT(Parts_SetHGaugeSurfaceArea, PE_SetHGaugeSurfaceArea),
 	    HLL_EXPORT(Parts_SetVGaugeSurfaceArea, PE_SetVGaugeSurfaceArea),
 	    HLL_EXPORT(Parts_SetNumeralCG, PE_SetNumeralCG),
