@@ -651,8 +651,31 @@ void parts_render(struct parts *parts)
 	// объявлены `表示 = 0`, поэтому визуально его это не задевает.
 	// ДВА условия независимы: слой гасит ГРУППУ партов, маска — конкретный
 	// непостроенный `構築パーツ`; ни одно не подменяет другое.
-	if (parts->construction_mask)
+	if (parts->construction_mask) {
+		// Тот же XSYS4_BIG_TRACE называет и ПРОПУЩЕННЫЕ непостроенные
+		// `構築パーツ` (по разу на номер): по ним видно, не в них ли «дырка»,
+		// через которую просвечивает лишнее.
+		static const char *ct = (const char *)1;
+		static int cseen[128], nr_cseen = 0;
+		if (ct == (const char *)1)
+			ct = getenv("XSYS4_BIG_TRACE");
+		if (ct && *ct && nr_cseen < 128) {
+			bool dup = false;
+			for (int i = 0; i < nr_cseen; i++)
+				if (cseen[i] == parts->no) dup = true;
+			if (!dup) {
+				cseen[nr_cseen++] = parts->no;
+				struct parts_state *cs = &parts->states[parts->state];
+				NOTICE("BIGPART-SKIP no=%d 構築パーツ не построен: %dx%d pos=%d,%d "
+				       "scale=%.3f,%.3f alpha=%d show=%d",
+				       parts->no, cs->common.w, cs->common.h,
+				       parts->global.pos.x, parts->global.pos.y,
+				       parts->global.scale.x, parts->global.scale.y,
+				       parts->global.alpha, parts->global.show);
+			}
+		}
 		return;
+	}
 	if (parts->message_window && !parts_message_window_show)
 		return;
 	if (parts->linked_to >= 0) {
