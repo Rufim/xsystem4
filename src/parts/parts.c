@@ -440,6 +440,12 @@ static void parts_common_recalculate_hitbox(struct parts *parts, struct parts_co
 			.h = common->h,
 		};
 	}
+	// У окна реплик служебная часть текста стоит от УГЛА окна, а не от его точки
+	// привязки, поэтому её позицию надо пересчитывать вместе с origin_offset —
+	// то есть при смене размера, позиции и 原点座標モード. Это единственная воронка,
+	// через которую проходят все три события.
+	if (parts->mw)
+		parts_message_window_relayout(parts);
 }
 
 void parts_recalculate_hitbox(struct parts *parts)
@@ -1031,6 +1037,8 @@ void parts_release(int parts_no)
 	struct parts *parts = slot->value;
 	parts_input_reset_drag(parts);
 	parts_clear_motion(parts);
+	parts_message_window_free(parts->mw);
+	parts->mw = NULL;
 	for (int i = 0; i < PARTS_NR_STATES; i++) {
 		parts_state_free(&parts->states[i]);
 	}

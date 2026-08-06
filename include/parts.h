@@ -397,4 +397,52 @@ int PE_get_layoutbox_padding_bottom(int parts_no);
 int PE_get_layoutbox_padding_left(int parts_no);
 int PE_get_layoutbox_padding_right(int parts_no);
 
+// message_window.c — окно реплик ADV (`メッセージウィンドウ`, тип компонента v14 = 10).
+void PE_CreateMessageWindow(int parts_no, int text_parts_no);
+void PE_SetMessageWindowActive(int parts_no, bool active);
+void PE_SetMessageWindowInactiveMultipleColor(int parts_no, int r, int g, int b);
+int PE_GetMessageWindowInactiveMultipleColorR(int parts_no);
+int PE_GetMessageWindowInactiveMultipleColorG(int parts_no);
+int PE_GetMessageWindowInactiveMultipleColorB(int parts_no);
+void PE_SetMessageWindowCGName(int parts_no, struct string *name);
+struct string *PE_GetMessageWindowCGName(int parts_no);
+void PE_SetMessageWindowFlatName(int parts_no, struct string *name);
+struct string *PE_GetMessageWindowFlatName(int parts_no);
+void PE_SetMessageWindowFlatShowWaitFrameNumber(int parts_no, int frame);
+int PE_GetMessageWindowFlatShowWaitFrameNumber(int parts_no);
+bool PE_IsOverMessageWindowFlatShowWaitFrame(int parts_no);
+bool PE_BackMessageWindowFlatBeginFrame(int parts_no);
+bool PE_StepMessageWindowFlatFinalFrame(int parts_no);
+void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
+                             struct string *func_name, int ver, int step);
+struct string *PE_GetMessageWindowText(int parts_no);
+void PE_FixMessageWindowText(int parts_no);
+bool PE_IsFixedMessageWindowText(int parts_no);
+void PE_SetMessageWindowTextArea(int parts_no, int x, int y, int w, int h);
+void PE_GetMessageWindowTextArea(int parts_no, int *x, int *y, int *w, int *h);
+void PE_SetMessageWindowTextOriginPosMode(int parts_no, int mode);
+int PE_GetMessageWindowTextOriginPosMode(int parts_no);
+void PE_SetMessageWindowTextFont(int parts_no, int type, int size, int r, int g, int b,
+                                 float bold_weight, int edge_r, int edge_g, int edge_b,
+                                 float edge_weight);
+void PE_GetMessageWindowTextFont(int parts_no, int *type, int *size, int *r, int *g, int *b,
+                                 float *bold_weight, int *edge_r, int *edge_g, int *edge_b,
+                                 float *edge_weight);
+void PE_SetMessageWindowTextSpeed(int parts_no, int speed);
+int PE_GetMessageWindowTextSpeed(int parts_no);
+void PE_SetMessageWindowTextSpace(int parts_no, int letter_space, int line_space);
+void PE_GetMessageWindowTextSpace(int parts_no, int *letter_space, int *line_space);
+void PE_SetMessageWindowRubyFont(int parts_no, int type, int size, int r, int g, int b,
+                                 float bold_weight, int edge_r, int edge_g, int edge_b,
+                                 float edge_weight);
+void PE_GetMessageWindowRubyFont(int parts_no, int *type, int *size, int *r, int *g, int *b,
+                                 float *bold_weight, int *edge_r, int *edge_g, int *edge_b,
+                                 float *edge_weight);
+void PE_SetMessageWindowRubyCharSpace(int parts_no, int space);
+int PE_GetMessageWindowRubyCharSpace(int parts_no);
+void PE_SetMessageWindowRubyLineSpace(int parts_no, int space);
+int PE_GetMessageWindowRubyLineSpace(int parts_no);
+void PE_SetEnableMessageWindowTextWrapping(int parts_no, bool enable);
+bool PE_IsEnableMessageWindowTextWrapping(int parts_no);
+
 #endif /* SYSTEM4_PARTS_H */

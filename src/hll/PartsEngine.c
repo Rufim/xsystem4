@@ -788,6 +788,28 @@ static int act_parts_type(struct ex_tree *t)
 	return v14 - ACT_COMPONENT_TYPE_SHIFT;       // классическое семейство パーツ
 }
 
+/*
+ * Сырой номер типа по нумерации v14 — для виджетов, у которых классического
+ * аналога нет и act_parts_type честно отдаёт -1 (メッセージウィンドウ = 10,
+ * パネル = 14 и т.д.). Отдельная функция, а не новое значение act_parts_type:
+ * её результат сравнивается с классическими id по всему загрузчику.
+ */
+static int act_parts_type_v14(struct ex_tree *t)
+{
+	struct ex_tree *c = act_child(t, "パーツタイプ");
+	if (!c || !c->is_leaf || c->leaf.value.type != EX_STRING || !c->leaf.value.s)
+		return -1;
+	const char *name = c->leaf.value.s->text;
+	for (unsigned i = 0; i < sizeof(act_component_type_names) / sizeof(*act_component_type_names); i++) {
+		char *sjis = utf2sjis(act_component_type_names[i], strlen(act_component_type_names[i]));
+		bool hit = !strcmp(name, sjis);
+		free(sjis);
+		if (hit)
+			return i;
+	}
+	return -1;
+}
+
 // nth element of a list-valued child, as int (floats truncated)
 static int act_list_int(struct ex_tree *t, const char *utf8, int idx, int dflt)
 {
@@ -1223,6 +1245,76 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				PE_SetParentPartsNumber(tno, parent_no);
 			PE_SetShow(tno, 1);
 		}
+	} else if (ti && act_parts_type_v14(ti) == 10) {
+		/*
+		 * Окно реплик ADV (`メッセージウィンドウ`, тип компонента v14 = 10) — тип,
+		 * у которого классического аналога нет вовсе, поэтому act_parts_type
+		 * отдаёт -1 и часть уходила в общую CG-ветку, где у неё нет ни одного
+		 * знакомого узла состояния: окно оставалось пустым, а первое же
+		 * обращение игры (SetMessageWindowActive) роняло движок в REPL.
+		 *
+		 * Узел `種類別情報` один-в-один ложится на HLL-функции, поэтому читаем
+		 * его теми же сеттерами, которыми потом пользуется игра — никакой
+		 * второй дороги к тем же полям.
+		 */
+		PE_CreateMessageWindow(no, ++pe_act_part_seq);
+		PE_SetMessageWindowInactiveMultipleColor(no,
+			act_list_int(ti, "非アクティブ時の乗算カラー", 0, 255),
+			act_list_int(ti, "非アクティブ時の乗算カラー", 1, 255),
+			act_list_int(ti, "非アクティブ時の乗算カラー", 2, 255));
+		struct string *mw_cg = act_str(ti, "ＣＧ名");
+		if (mw_cg)
+			PE_SetMessageWindowCGName(no, mw_cg);
+		struct string *mw_flat = act_str(ti, "フラット名");
+		if (mw_flat)
+			PE_SetMessageWindowFlatName(no, mw_flat);
+		// `フラット表示待ちフレーム数` в раскладке НЕТ (проверено по всем пяти узлам
+		// メッセージウィンドウ во всех 195 .pactex) — это чисто рантаймовое свойство,
+		// игра задаёт его сама через SetMessageWindowFlatShowWaitFrameNumber.
+		PE_SetMessageWindowTextFont(no,
+			act_int(ti, "フォントタイプ", 0),
+			act_int(ti, "フォントサイズ", 16),
+			act_list_int(ti, "フォント色", 0, 255),
+			act_list_int(ti, "フォント色", 1, 255),
+			act_list_int(ti, "フォント色", 2, 255),
+			act_float(ti, "フォント太さ", 0.0f),
+			act_list_int(ti, "フォント縁取り色", 0, 0),
+			act_list_int(ti, "フォント縁取り色", 1, 0),
+			act_list_int(ti, "フォント縁取り色", 2, 0),
+			act_float(ti, "フォント縁取り", 0.0f));
+		PE_SetMessageWindowTextSpace(no, act_int(ti, "文字間隔", 0),
+			act_int(ti, "行間隔", 0));
+		PE_SetMessageWindowTextArea(no,
+			act_list_int(ti, "テキストエリア", 0, 0),
+			act_list_int(ti, "テキストエリア", 1, 0),
+			act_list_int(ti, "テキストエリア", 2, 0),
+			act_list_int(ti, "テキストエリア", 3, 0));
+		PE_SetMessageWindowTextOriginPosMode(no, act_int(ti, "テキスト位置", 1));
+		PE_SetMessageWindowTextSpeed(no, act_int(ti, "字速度", 0));
+		struct ex_tree *ruby = act_child(ti, "ルビ");
+		if (ruby && !ruby->is_leaf) {
+			PE_SetMessageWindowRubyFont(no,
+				act_int(ruby, "フォントタイプ", 0),
+				act_int(ruby, "フォントサイズ", 10),
+				act_list_int(ruby, "フォント色", 0, 255),
+				act_list_int(ruby, "フォント色", 1, 255),
+				act_list_int(ruby, "フォント色", 2, 255),
+				act_float(ruby, "フォント太さ", 0.0f),
+				act_list_int(ruby, "フォント縁取り色", 0, 0),
+				act_list_int(ruby, "フォント縁取り色", 1, 0),
+				act_list_int(ruby, "フォント縁取り色", 2, 0),
+				act_float(ruby, "フォント縁取り", 0.0f));
+			PE_SetMessageWindowRubyCharSpace(no, act_int(ruby, "文字間隔", 0));
+			PE_SetMessageWindowRubyLineSpace(no, act_int(ruby, "行間隔", 0));
+		}
+		PE_SetEnableMessageWindowTextWrapping(no, act_int(ti, "折り返し", 0));
+		/*
+		 * `テキスト` из раскладки — образец для редактора активностей («проверьте
+		 * прозрачность/яркость»), а не реплика: игра выдаёт текст сама через
+		 * SetMessageWindowText. Не подставляем его, иначе на экране висел бы
+		 * японский рыбный текст до первой реплики.
+		 */
+		PE_SetMessageWindowActive(no, act_int(ti, "アクティブ", 0));
 	} else if (ti) {
 		// CG part: per-state CG names
 		act_set_state_cg(no, ti, "通常状態", 1);
@@ -2485,6 +2577,43 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(IsComponentShow, PE_IsComponentShow),
 	    HLL_EXPORT(SetComponentMessageWindowShowLink, PE_SetPartsMessageWindowShowLink),
 	    HLL_EXPORT(IsComponentMessageWindowShowLink, PE_GetPartsMessageWindowShowLink),
+	    // Окно реплик ADV (`メッセージウィンドウ`) — src/parts/message_window.c.
+	    HLL_EXPORT(SetMessageWindowActive, PE_SetMessageWindowActive),
+	    HLL_EXPORT(SetMessageWindowInactiveMultipleColor, PE_SetMessageWindowInactiveMultipleColor),
+	    HLL_EXPORT(GetMessageWindowInactiveMultipleColorR, PE_GetMessageWindowInactiveMultipleColorR),
+	    HLL_EXPORT(GetMessageWindowInactiveMultipleColorG, PE_GetMessageWindowInactiveMultipleColorG),
+	    HLL_EXPORT(GetMessageWindowInactiveMultipleColorB, PE_GetMessageWindowInactiveMultipleColorB),
+	    HLL_EXPORT(SetMessageWindowCGName, PE_SetMessageWindowCGName),
+	    HLL_EXPORT(GetMessageWindowCGName, PE_GetMessageWindowCGName),
+	    HLL_EXPORT(SetMessageWindowFlatName, PE_SetMessageWindowFlatName),
+	    HLL_EXPORT(GetMessageWindowFlatName, PE_GetMessageWindowFlatName),
+	    HLL_EXPORT(SetMessageWindowFlatShowWaitFrameNumber, PE_SetMessageWindowFlatShowWaitFrameNumber),
+	    HLL_EXPORT(GetMessageWindowFlatShowWaitFrameNumber, PE_GetMessageWindowFlatShowWaitFrameNumber),
+	    HLL_EXPORT(IsOverMessageWindowFlatShowWaitFrame, PE_IsOverMessageWindowFlatShowWaitFrame),
+	    HLL_EXPORT(BackMessageWindowFlatBeginFrame, PE_BackMessageWindowFlatBeginFrame),
+	    HLL_EXPORT(StepMessageWindowFlatFinalFrame, PE_StepMessageWindowFlatFinalFrame),
+	    HLL_EXPORT(SetMessageWindowText, PE_SetMessageWindowText),
+	    HLL_EXPORT(GetMessageWindowText, PE_GetMessageWindowText),
+	    HLL_EXPORT(FixMessageWindowText, PE_FixMessageWindowText),
+	    HLL_EXPORT(IsFixedMessageWindowText, PE_IsFixedMessageWindowText),
+	    HLL_EXPORT(SetMessageWindowTextArea, PE_SetMessageWindowTextArea),
+	    HLL_EXPORT(GetMessageWindowTextArea, PE_GetMessageWindowTextArea),
+	    HLL_EXPORT(SetMessageWindowTextOriginPosMode, PE_SetMessageWindowTextOriginPosMode),
+	    HLL_EXPORT(GetMessageWindowTextOriginPosMode, PE_GetMessageWindowTextOriginPosMode),
+	    HLL_EXPORT(SetMessageWindowTextFont, PE_SetMessageWindowTextFont),
+	    HLL_EXPORT(GetMessageWindowTextFont, PE_GetMessageWindowTextFont),
+	    HLL_EXPORT(SetMessageWindowTextSpeed, PE_SetMessageWindowTextSpeed),
+	    HLL_EXPORT(GetMessageWindowTextSpeed, PE_GetMessageWindowTextSpeed),
+	    HLL_EXPORT(SetMessageWindowTextSpace, PE_SetMessageWindowTextSpace),
+	    HLL_EXPORT(GetMessageWindowTextSpace, PE_GetMessageWindowTextSpace),
+	    HLL_EXPORT(SetMessageWindowRubyFont, PE_SetMessageWindowRubyFont),
+	    HLL_EXPORT(GetMessageWindowRubyFont, PE_GetMessageWindowRubyFont),
+	    HLL_EXPORT(SetMessageWindowRubyCharSpace, PE_SetMessageWindowRubyCharSpace),
+	    HLL_EXPORT(GetMessageWindowRubyCharSpace, PE_GetMessageWindowRubyCharSpace),
+	    HLL_EXPORT(SetMessageWindowRubyLineSpace, PE_SetMessageWindowRubyLineSpace),
+	    HLL_EXPORT(GetMessageWindowRubyLineSpace, PE_GetMessageWindowRubyLineSpace),
+	    HLL_EXPORT(SetEnableMessageWindowTextWrapping, PE_SetEnableMessageWindowTextWrapping),
+	    HLL_EXPORT(IsEnableMessageWindowTextWrapping, PE_IsEnableMessageWindowTextWrapping),
 	    HLL_EXPORT(SetComponentAlpha, PE_SetAlpha),
 	    HLL_EXPORT(GetComponentAlpha, PE_GetPartsAlpha),
 	    HLL_EXPORT(SetComponentAddColor, PE_SetAddColor),

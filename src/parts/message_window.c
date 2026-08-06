@@ -1,0 +1,617 @@
+/* Copyright (C) 2026 kichikuou <KichikuouChrome@gmail.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <http://gnu.org/licenses/>.
+ */
+
+/*
+ * Окно реплик ADV (`メッセージウィンドウ`) — см. большой комментарий у
+ * `struct parts_message_window` в parts_internal.h: часть держит фон обычным
+ * состоянием CG/Flat, а текст и мигалку ожидания клика несут служебные
+ * части-потомки.
+ */
+
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "system4.h"
+#include "system4/string.h"
+
+#include "parts.h"
+#include "parts_internal.h"
+
+static struct parts_message_window *mw_get(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->mw : NULL;
+}
+
+/*
+ * Часть создаётся загрузчиком раскладки (act_build_part), поэтому обращение к
+ * окну, которого нет, — это НЕ «игра ошиблась», а «движок не опознал узел».
+ * Молчать нельзя: тихий no-op превратился бы в пустое окно без единой жалобы.
+ */
+static struct parts_message_window *mw_require(int parts_no, const char *fn)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (!mw) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("%s: часть %d не является メッセージウィンドウ "
+			        "(узел раскладки не опознан загрузчиком)", fn, parts_no);
+		}
+	}
+	return mw;
+}
+
+struct parts_message_window *parts_message_window_alloc(void)
+{
+	struct parts_message_window *mw = xcalloc(1, sizeof(*mw));
+	mw->inactive_multiply_color = (SDL_Color) { 255, 255, 255, 255 };
+	mw->text_parts_no = -1;
+	mw->mark_parts_no = -1;
+	mw->text_fixed = true;
+	return mw;
+}
+
+void parts_message_window_free(struct parts_message_window *mw)
+{
+	if (!mw)
+		return;
+	if (mw->cg_name)
+		free_string(mw->cg_name);
+	if (mw->flat_name)
+		free_string(mw->flat_name);
+	if (mw->msg_func_name)
+		free_string(mw->msg_func_name);
+	free(mw);
+}
+
+/*
+ * `非アクティブ時の乗算カラー` применяется к самой части: 乗算色 наследуется
+ * потомками (parts_update_global_multiply_color), поэтому гаснет и фон, и текст —
+ * ровно как в оригинале, где неактивное окно приглушено целиком.
+ */
+static void mw_apply_active(int parts_no, struct parts_message_window *mw)
+{
+	if (mw->active)
+		PE_SetMultiplyColor(parts_no, 255, 255, 255);
+	else
+		PE_SetMultiplyColor(parts_no, mw->inactive_multiply_color.r,
+		                    mw->inactive_multiply_color.g,
+		                    mw->inactive_multiply_color.b);
+}
+
+// ------------------------------------------------------------------ фон окна
+
+/*
+ * Фон окна — либо CG (`ＣＧ名`), либо flat-анимация (`フラット名`). Приоритет у
+ * flat: игра переключается на него, задавая непустое имя, и `IsFlat()` в самой
+ * игре (fn7091) определён ровно как «フラット名 не пусто».
+ */
+static void mw_apply_background(int parts_no, struct parts_message_window *mw)
+{
+	if (mw->flat_name && mw->flat_name->size) {
+		PE_SetPartsFlat(parts_no, mw->flat_name, 1);
+		return;
+	}
+	if (mw->cg_name && mw->cg_name->size)
+		PE_SetPartsCG(parts_no, mw->cg_name, 0, 1);
+}
+
+// ---------------------------------------------------------------------- текст
+
+/*
+ * РАЗМЕТКА В ТЕКСТЕ РЕПЛИКИ. Игра передаёт в SetMessageWindowText строку с
+ * тегами `${…}`; полный их набор снят со строковой секции .ain (16 шаблонов,
+ * тул `alice ain dump -s`):
+ *   ${font type=%d|size=%d|r=%d|g=%d|b=%d|bold=%f|edge=%f|er=%d|eg=%d|eb=%d
+ *          |tracking=%d|leading=%d} … ${/font}
+ *   ${time %d} … ${/time}        (${time 0} — мгновенный вывод, режим скипа)
+ * Других форм в .ain нет.
+ *
+ * Сейчас теги ВЫРЕЗАЮТСЯ, а не исполняются: у части текста один стиль на всю
+ * строку, а `${font …}` меняет его посередине — для этого нужны стилевые
+ * прогоны внутри parts_text. Оставлять теги в тексте нельзя (они нарисовались бы
+ * буквально), поэтому вырезаем и один раз предупреждаем.
+ */
+static struct string *mw_strip_markup(struct string *src)
+{
+	struct string *dst = string_ref(&EMPTY_STRING);
+	const char *p = src->text;
+	const char *end = src->text + src->size;
+	bool seen_tag = false;
+
+	while (p < end) {
+		if (p[0] == '$' && p + 1 < end && p[1] == '{') {
+			const char *close = memchr(p, '}', end - p);
+			if (close) {
+				seen_tag = true;
+				p = close + 1;
+				continue;
+			}
+		}
+		string_push_back(&dst, (unsigned char)*p);
+		p++;
+	}
+
+	if (seen_tag) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("メッセージウィンドウ: разметка ${…} в реплике вырезана, "
+			        "а не исполнена (стилевые прогоны внутри строки не реализованы)");
+		}
+	}
+	return dst;
+}
+
+static int mw_text_parts(struct parts_message_window *mw)
+{
+	return mw->text_parts_no;
+}
+
+/*
+ * ★`テキストエリア` (и `キー待ちマーク／座標`) заданы от ВЕРХНЕГО ЛЕВОГО УГЛА части, а
+ * НЕ от её точки привязки 座標. Позиция потомка же складывается с ГЛОБАЛЬНОЙ
+ * позицией родителя (parts_update_global_pos), то есть с точкой привязки, —
+ * поэтому добавляем origin_offset, сдвиг от привязки к углу (calculate_offset по
+ * 原点座標モード).
+ *
+ * Конвенция снята СЧЁТОМ ПО ДАННЫМ, а не с одной раскладки: у Dohna ровно пять
+ * узлов メッセージウィンドウ на все 195 раскладок, и якоря у них РАЗНЫЕ, так что
+ * вариант «от угла» — единственный, дающий осмысленный результат в обоих:
+ *   AdvMessageWindow_event: 原点座標モード=8 (низ-центр), 座標 (640,720), фон 1280x720
+ *     -> угол (0,0), текст (360,600) — внутри нижней полосы окна (её QNT 1280x185
+ *     лежит на канве с y=535);
+ *   AdvMessageWindow_main:  原点座標モード=5 (центр), 座標 (662,607), фон 862x206
+ *     -> угол (231,504), текст (361,566) — отступ 130x62 от края окна.
+ * Вариант «от точки привязки» даёт во втором случае x=792 при левом крае окна
+ * 231, то есть текст у правой кромки; вариант «экранные координаты» — текст в
+ * левом верхнем углу экрана при окне у нижнего края.
+ *
+ * Ширина/высота области — НЕ обрезка по окну: у main она 940x181 при окне
+ * 862x206, то есть это границы переноса, а не рамка. Поэтому surface area
+ * задаётся только как размер, а не как клип.
+ */
+void parts_message_window_relayout(struct parts *parts)
+{
+	struct parts_message_window *mw = parts->mw;
+	if (!mw || mw->text_parts_no < 0)
+		return;
+	Point off = parts->states[PARTS_STATE_DEFAULT].common.origin_offset;
+	PE_SetPos(mw->text_parts_no, off.x + mw->text_area.x, off.y + mw->text_area.y);
+}
+
+static void mw_apply_text_area(int parts_no, struct parts_message_window *mw)
+{
+	parts_message_window_relayout(parts_get(parts_no));
+	if (mw->text_area.w > 0 && mw->text_area.h > 0)
+		PE_SetPartsTextSurfaceArea(mw->text_parts_no, 0, 0,
+		                           mw->text_area.w, mw->text_area.h, 1);
+}
+
+/*
+ * Создать окно на уже созданной части. Зовётся загрузчиком раскладки
+ * (act_build_part), когда у узла `パーツタイプ = メッセージウィンドウ`.
+ *
+ * Номер служебной части текста берётся из ТОЙ ЖЕ синтетической
+ * последовательности, что и номера частей раскладки: игра спрашивает свои части
+ * ПО ИМЕНИ (GetActivityPartsNumber), поэтому лишний номер посередине ничего не
+ * сдвигает — так же уже сделана подпись чекбокса в act_build_part.
+ */
+void PE_CreateMessageWindow(int parts_no, int text_parts_no)
+{
+	struct parts *parts = parts_get(parts_no);
+	if (parts->mw)
+		parts_message_window_free(parts->mw);
+	parts->mw = parts_message_window_alloc();
+	parts->mw->text_parts_no = text_parts_no;
+
+	PE_SetParentPartsNumber(text_parts_no, parts_no);
+	PE_SetZ(text_parts_no, 1);
+	PE_SetShow(text_parts_no, true);
+}
+
+// ------------------------------------------------------------- HLL: активность
+
+void PE_SetMessageWindowActive(int parts_no, bool active)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowActive");
+	if (!mw)
+		return;
+	mw->active = active;
+	mw_apply_active(parts_no, mw);
+}
+
+void PE_SetMessageWindowInactiveMultipleColor(int parts_no, int r, int g, int b)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowInactiveMultipleColor");
+	if (!mw)
+		return;
+	mw->inactive_multiply_color = (SDL_Color) { r, g, b, 255 };
+	mw_apply_active(parts_no, mw);
+}
+
+int PE_GetMessageWindowInactiveMultipleColorR(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->inactive_multiply_color.r : 255;
+}
+
+int PE_GetMessageWindowInactiveMultipleColorG(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->inactive_multiply_color.g : 255;
+}
+
+int PE_GetMessageWindowInactiveMultipleColorB(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->inactive_multiply_color.b : 255;
+}
+
+// ------------------------------------------------------------------- HLL: фон
+
+void PE_SetMessageWindowCGName(int parts_no, struct string *name)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowCGName");
+	if (!mw)
+		return;
+	if (mw->cg_name)
+		free_string(mw->cg_name);
+	mw->cg_name = string_ref(name);
+	mw_apply_background(parts_no, mw);
+}
+
+struct string *PE_GetMessageWindowCGName(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return string_ref(mw && mw->cg_name ? mw->cg_name : &EMPTY_STRING);
+}
+
+void PE_SetMessageWindowFlatName(int parts_no, struct string *name)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowFlatName");
+	if (!mw)
+		return;
+	if (mw->flat_name)
+		free_string(mw->flat_name);
+	mw->flat_name = string_ref(name);
+	mw_apply_background(parts_no, mw);
+}
+
+struct string *PE_GetMessageWindowFlatName(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return string_ref(mw && mw->flat_name ? mw->flat_name : &EMPTY_STRING);
+}
+
+void PE_SetMessageWindowFlatShowWaitFrameNumber(int parts_no, int frame)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowFlatShowWaitFrameNumber");
+	if (!mw)
+		return;
+	mw->flat_show_wait_frames = frame;
+}
+
+int PE_GetMessageWindowFlatShowWaitFrameNumber(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->flat_show_wait_frames : 0;
+}
+
+/*
+ * Кадр «окно открылось» у flat-фона: игра ждёт, пока анимация появления
+ * доиграет до `フラット表示待ちフレーム数`, и только потом печатает реплику
+ * (message::detail::CMessageWindow@IsOverFlatWaitFrame/BackFlatBeginFrame/
+ * StepFlatFinalFrame). У Dohna フラット名 пусто во ВСЕХ 195 раскладках, то есть
+ * ни одно окно игры не идёт этим путём; чтобы не выдумывать семантику покадровой
+ * перемотки flat, отвечаем «ждать нечего» и предупреждаем один раз, если flat
+ * всё-таки задан.
+ */
+static bool mw_flat_unimplemented(int parts_no, const char *fn)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (!mw || !mw->flat_name || !mw->flat_name->size)
+		return false;
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		WARNING("%s: покадровое ожидание flat-фона окна не реализовано", fn);
+	}
+	return true;
+}
+
+bool PE_IsOverMessageWindowFlatShowWaitFrame(int parts_no)
+{
+	mw_flat_unimplemented(parts_no, "IsOverMessageWindowFlatShowWaitFrame");
+	return true;
+}
+
+bool PE_BackMessageWindowFlatBeginFrame(int parts_no)
+{
+	return !mw_flat_unimplemented(parts_no, "BackMessageWindowFlatBeginFrame");
+}
+
+bool PE_StepMessageWindowFlatFinalFrame(int parts_no)
+{
+	return !mw_flat_unimplemented(parts_no, "StepMessageWindowFlatFinalFrame");
+}
+
+// ----------------------------------------------------------------- HLL: текст
+
+void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
+                             struct string *func_name, int ver, int step)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowText");
+	if (!mw)
+		return;
+
+	mw->msg_num = msg_num;
+	if (mw->msg_func_name)
+		free_string(mw->msg_func_name);
+	mw->msg_func_name = func_name ? string_ref(func_name) : NULL;
+	mw->msg_ver = ver;
+	mw->msg_step = step;
+
+	struct string *plain = mw_strip_markup(text);
+	PE_SetText(mw_text_parts(mw), plain, 1);
+	free_string(plain);
+
+	/*
+	 * `字速度` (скорость посимвольного проявления) пока не исполняется: текст
+	 * появляется целиком. Это НЕ тихий дефолт — режим мгновенного вывода у игры
+	 * законный (тег `${time 0}` и скип), но раскладки задают 23, поэтому
+	 * предупреждаем, что видимое поведение отличается от оригинального.
+	 */
+	if (mw->text_speed > 0) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("メッセージウィンドウ: 字速度 %d не исполняется, реплика "
+			        "показывается целиком", mw->text_speed);
+		}
+	}
+	mw->text_fixed = true;
+}
+
+struct string *PE_GetMessageWindowText(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (!mw || mw->text_parts_no < 0)
+		return string_ref(&EMPTY_STRING);
+	return PE_GetTextPartsText(mw->text_parts_no, 1);
+}
+
+void PE_FixMessageWindowText(int parts_no)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "FixMessageWindowText");
+	if (!mw)
+		return;
+	mw->text_fixed = true;
+}
+
+bool PE_IsFixedMessageWindowText(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->text_fixed : true;
+}
+
+void PE_SetMessageWindowTextArea(int parts_no, int x, int y, int w, int h)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowTextArea");
+	if (!mw)
+		return;
+	mw->text_area = (Rectangle) { x, y, w, h };
+	mw_apply_text_area(parts_no, mw);
+}
+
+void PE_GetMessageWindowTextArea(int parts_no, int *x, int *y, int *w, int *h)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (x) *x = mw ? mw->text_area.x : 0;
+	if (y) *y = mw ? mw->text_area.y : 0;
+	if (w) *w = mw ? mw->text_area.w : 0;
+	if (h) *h = mw ? mw->text_area.h : 0;
+}
+
+/*
+ * `テキスト位置` — выравнивание текста внутри テキストエリア по той же сетке 1-9,
+ * что и 原点座標モード частей (1 = верх-лево … 5 = центр … 9 = низ-право). Во всех
+ * 195 раскладках Dohna значение равно 1, и игра переустанавливает его тем же 1
+ * (message::detail::CMessageTextView@CreateDrawChar), поэтому реализовано только
+ * оно; на любое другое — одноразовый WARNING вместо выдуманного выравнивания.
+ */
+void PE_SetMessageWindowTextOriginPosMode(int parts_no, int mode)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowTextOriginPosMode");
+	if (!mw)
+		return;
+	mw->text_origin_pos_mode = mode;
+	if (mode != 1) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("メッセージウィンドウ: テキスト位置 %d не реализовано "
+			        "(текст выравнивается по верхнему левому углу области)", mode);
+		}
+	}
+}
+
+int PE_GetMessageWindowTextOriginPosMode(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->text_origin_pos_mode : 0;
+}
+
+void PE_SetMessageWindowTextFont(int parts_no, int type, int size, int r, int g, int b,
+                                 float bold_weight, int edge_r, int edge_g, int edge_b,
+                                 float edge_weight)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowTextFont");
+	if (!mw)
+		return;
+	PE_SetFont(mw_text_parts(mw), type, size, r, g, b, bold_weight,
+	           edge_r, edge_g, edge_b, edge_weight, 1);
+}
+
+void PE_GetMessageWindowTextFont(int parts_no, int *type, int *size, int *r, int *g, int *b,
+                                 float *bold_weight, int *edge_r, int *edge_g, int *edge_b,
+                                 float *edge_weight)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (!mw || mw->text_parts_no < 0)
+		return;
+	PE_GetTextFontProps(mw->text_parts_no, 1, type, size, r, g, b, bold_weight,
+	                    edge_weight, edge_r, edge_g, edge_b);
+}
+
+void PE_SetMessageWindowTextSpeed(int parts_no, int speed)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowTextSpeed");
+	if (!mw)
+		return;
+	mw->text_speed = speed;
+}
+
+int PE_GetMessageWindowTextSpeed(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->text_speed : 0;
+}
+
+void PE_SetMessageWindowTextSpace(int parts_no, int letter_space, int line_space)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowTextSpace");
+	if (!mw)
+		return;
+	int tno = mw_text_parts(mw);
+	PE_SetTextCharSpace(tno, letter_space, 1);
+	PE_SetTextLineSpace(tno, line_space, 1);
+}
+
+void PE_GetMessageWindowTextSpace(int parts_no, int *letter_space, int *line_space)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (!mw || mw->text_parts_no < 0) {
+		if (letter_space) *letter_space = 0;
+		if (line_space) *line_space = 0;
+		return;
+	}
+	if (letter_space) *letter_space = PE_GetTextCharSpace(mw->text_parts_no, 1);
+	if (line_space) *line_space = PE_GetTextLineSpace(mw->text_parts_no, 1);
+}
+
+// ------------------------------------------------------------------ HLL: руби
+
+/*
+ * Руби (фуригана) хранится, но не рисуется: во всей строковой секции .ain Dohna
+ * НЕТ ни одного тега руби (единственные формы разметки — `${font …}` и
+ * `${time …}`), то есть чем именно реплика помечает чтение над иероглифом,
+ * доказательств нет. Геттеры игрой читаются, поэтому значения обязаны храниться
+ * по-настоящему.
+ */
+void PE_SetMessageWindowRubyFont(int parts_no, int type, int size, int r, int g, int b,
+                                 float bold_weight, int edge_r, int edge_g, int edge_b,
+                                 float edge_weight)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowRubyFont");
+	if (!mw)
+		return;
+	mw->ruby_ts.face = type;
+	mw->ruby_ts.size = size;
+	mw->ruby_ts.color = (SDL_Color) { r, g, b, 255 };
+	mw->ruby_ts.weight = bold_weight * 1000;
+	mw->ruby_ts.edge_color = (SDL_Color) { edge_r, edge_g, edge_b, 255 };
+	text_style_set_edge_width(&mw->ruby_ts, edge_weight);
+}
+
+void PE_GetMessageWindowRubyFont(int parts_no, int *type, int *size, int *r, int *g, int *b,
+                                 float *bold_weight, int *edge_r, int *edge_g, int *edge_b,
+                                 float *edge_weight)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	if (!mw)
+		return;
+	if (type) *type = mw->ruby_ts.face;
+	if (size) *size = (int)mw->ruby_ts.size;
+	if (r) *r = mw->ruby_ts.color.r;
+	if (g) *g = mw->ruby_ts.color.g;
+	if (b) *b = mw->ruby_ts.color.b;
+	if (bold_weight) *bold_weight = mw->ruby_ts.weight / 1000.0f;
+	if (edge_r) *edge_r = mw->ruby_ts.edge_color.r;
+	if (edge_g) *edge_g = mw->ruby_ts.edge_color.g;
+	if (edge_b) *edge_b = mw->ruby_ts.edge_color.b;
+	if (edge_weight) *edge_weight = mw->ruby_ts.edge_left;
+}
+
+void PE_SetMessageWindowRubyCharSpace(int parts_no, int space)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowRubyCharSpace");
+	if (mw)
+		mw->ruby_char_space = space;
+}
+
+int PE_GetMessageWindowRubyCharSpace(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->ruby_char_space : 0;
+}
+
+void PE_SetMessageWindowRubyLineSpace(int parts_no, int space)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowRubyLineSpace");
+	if (mw)
+		mw->ruby_line_space = space;
+}
+
+int PE_GetMessageWindowRubyLineSpace(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->ruby_line_space : 0;
+}
+
+// -------------------------------------------------------------- HLL: перенос
+
+/*
+ * `折り返し` — автоперенос по ширине テキストエリア. Ни одна из 195 раскладок
+ * Dohna его не включает, и обе функции не вызываются игрой ни разу (тул xscan по
+ * CALLHLL: 0 сайтов), то есть реплики приходят с авторскими переносами `\n` —
+ * ровно как у Tsumamigui 3 (см. память system4-ain-linebreaks). Значение
+ * хранится; на попытку включить — одноразовый WARNING, потому что переносить
+ * движок пока не умеет.
+ */
+void PE_SetEnableMessageWindowTextWrapping(int parts_no, bool enable)
+{
+	struct parts_message_window *mw = mw_require(parts_no, "SetEnableMessageWindowTextWrapping");
+	if (!mw)
+		return;
+	mw->text_wrapping = enable;
+	if (enable) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("メッセージウィンドウ: 折り返し включён, но автоперенос по "
+			        "ширине текстовой области не реализован");
+		}
+	}
+}
+
+bool PE_IsEnableMessageWindowTextWrapping(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw->text_wrapping : false;
+}
