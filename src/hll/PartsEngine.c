@@ -793,7 +793,8 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		int char_space, int line_space, int font_type, int font_size,
 		int font_r, int font_g, int font_b, int edge_r, int edge_g, int edge_b,
 		int full_size, float bold_weight, float edge_weight,
-		struct string *text, struct string *cg_name)
+		struct string *text, struct string *cg_name,
+		int radius_x, int radius_y, int start_angle, int sweep_angle)
 {
 	(void)interp_type; (void)sw; (void)sh;
 	switch (command) {
@@ -914,6 +915,12 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 				edge_r, edge_g, edge_b, edge_weight,
 				char_space, line_space, state);
 		break;
+	case 122:  // CASConstructionProcess::SetFillPieAMap (v14)
+		// Сектор в альфа-карту: из четырёх таких углов и двух прямоугольников
+		// собрана каждая скруглённая подложка интерфейса Dohna.
+		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
+				radius_x, radius_y, start_angle, sweep_angle, a, state);
+		break;
 	default:
 		WARNING("AddConstructProcess: unknown command %d", command);
 		break;
@@ -922,7 +929,7 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 
 
 static void PartsEngine_add_construction_process(union vm_value *ints,
-		union vm_value *floats, union vm_value *strings)
+		union vm_value *floats, union vm_value *strings, int nr_ints)
 {
 	int parts_no    = ints[0].i;
 	int state       = ints[1].i;
@@ -958,6 +965,12 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 	float edge_weight = floats[1].f;
 	struct string *text    = heap_get_string(strings[0].i);
 	struct string *cg_name = heap_get_string(strings[1].i);
+	// Поля векторных фигур v14 живут за 32-м слотом классической раскладки —
+	// сюда они приходят только из ix-варианта (см. PE_AddPartsConstructionProcess_ix).
+	int radius_x = nr_ints > 34 ? ints[34].i : 0;
+	int radius_y = nr_ints > 35 ? ints[35].i : 0;
+	int start_angle = nr_ints > 36 ? ints[36].i : 0;
+	int sweep_angle = nr_ints > 37 ? ints[37].i : 0;
 
 	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
 		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
@@ -969,7 +982,7 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 			dx, dy, dw, dh, r, g, b, a, r2, g2, b2, char_space, line_space,
 			font_type, font_size, font_r, font_g, font_b,
 			edge_r, edge_g, edge_b, full_size, bold_weight, edge_weight,
-			text, cg_name);
+			text, cg_name, radius_x, radius_y, start_angle, sweep_angle);
 }
 
 // Generic dispatch function for PartsEngine operations.
@@ -1073,7 +1086,7 @@ static int PartsEngine_PartsFunc(int func_id, struct page **array_int,
 		REQUIRE_INTS(32);
 		REQUIRE_FLOATS(2);
 		REQUIRE_STRINGS(2);
-		PartsEngine_add_construction_process(ints, floats, strings);
+		PartsEngine_add_construction_process(ints, floats, strings, 32);
 		return 1;
 	case 162:  // bool InitPartsMovie(int parts_no, int width, int height, int bg_r, int bg_g, int bg_b, int state)
 		REQUIRE_INTS(8);
@@ -1187,7 +1200,7 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 		NOTICE("AddPartsConstructionProcess part=%d state=%d cmd=%d dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
 		       ints[0].i, ints[1].i, ints[2].i, ints[8].i, ints[9].i,
 		       ints[12].i, ints[13].i, ints[14].i, ints[15].i, ints[16].i, ints[17].i);
-	PartsEngine_add_construction_process(ints, floats, strings);
+	PartsEngine_add_construction_process(ints, floats, strings, nr_ints);
 }
 
 // Ixseal (System 4 v14) form of the batch construction interface. The classic
@@ -1230,14 +1243,15 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	}
 	union vm_value *src = (*ai)->values;
 	int command = src[0].i;
-	if (command < 0 || command >= NR_CLASSIC_CONSTRUCTION_COMMANDS) {
+	// 122 (SetFillPieAMap) реализована, хотя и лежит за классическим набором.
+	if (command < 0 || (command >= NR_CLASSIC_CONSTRUCTION_COMMANDS && command != 122)) {
 		if (trace)
 			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d)",
 			       command, parts_no);
 		return;
 	}
 
-	union vm_value ints[32] = {0};
+	union vm_value ints[38] = {0};
 	ints[0].i = parts_no;
 	ints[1].i = state;
 	ints[2].i = command;
@@ -1252,7 +1266,13 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 		       ints[4].i, ints[5].i, ints[6].i, ints[7].i,
 		       ints[8].i, ints[9].i, ints[12].i, ints[13].i,
 		       ints[14].i, ints[15].i, ints[16].i, ints[17].i);
-	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values);
+	// Слоты 34..37 — наши, для полей фигур v14 (радиусы и углы дуги): классическая
+	// раскладка их не знает, а команде 122 они необходимы.
+	ints[34] = src[32];  // RadiusX
+	ints[35] = src[33];  // RadiusY
+	ints[36] = src[38];  // StartAngle
+	ints[37] = src[39];  // SweepAngle
+	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values, 38);
 }
 
 // --- Подсистема Activity (именованные наборы parts) ---
@@ -1568,9 +1588,10 @@ static float act_float(struct ex_tree *t, const char *utf8, float dflt);
  * `construction_op`. Возвращает число ВЫПОЛНЕННЫХ операций (неизвестные команды
  * не в счёт) — вызывающему это нужно, чтобы понять, осталась ли часть пустой.
  */
-static int act_construction_run(int no, int state, struct ex_tree *proc)
+static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped)
 {
 	int done = 0;
+	*skipped = 0;
 	for (int i = 1; ; i++) {
 		char key[32];
 		snprintf(key, sizeof(key), "手順%d", i);
@@ -1583,13 +1604,14 @@ static int act_construction_run(int no, int state, struct ex_tree *proc)
 		// Команды за пределами реализованного набора (у Dohna в раскладках
 		// встречаются 28 и 122 — расширения v14) пропускаем ЯВНО: пусть их
 		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
-		if (command > 24) {
+		if (command > 24 && command != 122) {
 			static bool warned = false;
 			if (!warned) {
 				warned = true;
 				WARNING("構築パーツ: команда %d раскладки не реализована "
 					"(часть %d) — этот шаг пропущен", command, no);
 			}
+			(*skipped)++;
 			continue;
 		}
 		struct string *text = act_str(op, "テキスト");
@@ -1611,7 +1633,9 @@ static int act_construction_run(int no, int state, struct ex_tree *proc)
 			act_list_int(op, "フォント縁取り色", 1, 0),
 			act_list_int(op, "フォント縁取り色", 2, 0),
 			act_int(op, "全体", 0), act_float(op, "フォント太さ", 0.0f),
-			act_float(op, "フォント縁取り", 0.0f), text, cg);
+			act_float(op, "フォント縁取り", 0.0f), text, cg,
+			act_list_int(op, "半径", 0, 0), act_list_int(op, "半径", 1, 0),
+			act_list_int(op, "円弧角度", 0, 0), act_list_int(op, "円弧角度", 1, 0));
 		done++;
 	}
 	return done;
@@ -1803,13 +1827,46 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		PE_ClearPartsConstructionProcess(no, state);
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
+		/*
+		 * Операции процедуры ЗАПИСЫВАЕМ всегда, а СОБИРАЕМ поверхность — нет.
+		 * Разделение не косметическое, оно доказано A/B-прогонами:
+		 *  • только запись (сборку делает сама игра, когда ей нужно) — на экране
+		 *    появляются логотип магазина, эмблемы над карточками, подпись
+		 *    «TIME LEFT» и стрелки навигации, всё как у оригинала;
+		 *  • плюс наша сборка прямо из загрузчика — добавляются скруглённые
+		 *    подложки счётчиков, НО часть процедур создаёт полноэкранные
+		 *    поверхности (`CP BUILD` показывает 1380×820 и 1480×920), они
+		 *    перекрывают верхние слои, и логотип пропадает.
+		 * Поэтому сборка из загрузчика — под ручкой XSYS4_CP_ACT_BUILD=1, пока
+		 * не разобрана видимость/z таких полноэкранных частей (у Tsumamigui 3
+		 * подобные клипперы объявлены `表示 = 0`, у Dohna — `表示 = 1`).
+		 */
 		if (step1) {
-			int nr = act_construction_run(no, state, proc);
+			int skipped = 0;
+			int nr = act_construction_run(no, state, proc, &skipped);
+			// Операции только НАКАПЛИВАЮТСЯ; поверхность появляется лишь после
+			// сборки. В рантайме её запускает сама игра
+			// (`Parts_BuildPartsConstructionProcess`), а для процедуры из
+			// раскладки звать некому — иначе часть остаётся пустой, и вся работа
+			// выше не видна на экране.
+			/*
+			 * Собираем и ПОКАЗЫВАЕМ часть только если выполнены ВСЕ шаги её
+			 * процедуры. Недостроенная поверхность — это не «частично верная
+			 * картинка», а чёрный непрозрачный прямоугольник: у титула Dohna
+			 * есть такая часть 1480×920 с `表示 = 1, アルファ = 255, z = 29`,
+			 * и, построенная наполовину, она накрывала весь экран (логотип
+			 * магазина и эмблемы на экране подбора талантов исчезали).
+			 * Пропущен хоть один шаг — ведём себя как раньше, прямоугольной
+			 * маской альфа-клиппера.
+			 * XSYS4_CP_NO_ACT_BUILD=1 — A/B-ручка, отключает сборку целиком.
+			 */
+			if (nr > 0 && skipped == 0 && getenv("XSYS4_CP_ACT_BUILD"))
+				PE_BuildPartsConstructionProcess(no, state);
 			// Процедуры без единой ВЫПОЛНЕННОЙ операции (все команды
 			// неизвестны) оставляем прежним поведением — прямоугольной
 			// маской альфа-клиппера: лучше клип по габаритам, чем пустая
 			// часть. Заодно так ведут себя `表示 = 0`-клипперы Tsumamigui 3.
-			if (nr == 0) {
+			if (nr == 0 || skipped > 0) {
 				int w = act_list_int(step1, "先矩形", 4, 0);
 				int h = act_list_int(step1, "先矩形", 5, 0);
 				if (w > 0 && h > 0) {

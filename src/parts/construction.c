@@ -39,6 +39,7 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_CG:
 	case PARTS_CP_FILL:
 	case PARTS_CP_FILL_ALPHA_COLOR:
+	case PARTS_CP_FILL_PIE_AMAP:
 	case PARTS_CP_FILL_AMAP:
 	case PARTS_CP_FILL_WITH_ALPHA:
 	case PARTS_CP_DRAW_RECT:
@@ -158,6 +159,29 @@ bool PE_AddFillAMapToPartsConstructionProcess(int parts_no, int x, int y, int w,
 	op->fill = (struct parts_cp_fill) {
 		.x = x, .y = y, .w = w, .h = h,
 		.r = 0, .g = 0, .b = 0, .a = a
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
+/*
+ * `SetFillPieAMap` (команда 122) — сектор эллипса в АЛЬФА-КАРТУ. Скруглённые
+ * подложки интерфейса Dohna строятся именно так: два прямоугольника крестом плюс
+ * четыре четверти круга по углам (см. «Round128x40» в PlayerShopView.pactex).
+ */
+bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int rx, int ry,
+		int start_angle, int sweep_angle, int a, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_FILL_PIE_AMAP;
+	op->pie = (struct parts_cp_pie) {
+		.x = x, .y = y, .rx = rx, .ry = ry,
+		.start_angle = start_angle, .sweep_angle = sweep_angle, .a = a
 	};
 
 	parts_add_cp_op(cproc, op);
@@ -445,11 +469,90 @@ static bool build_fill_alpha_color(struct parts_construction_process *cproc, str
 	return true;
 }
 
+/*
+ * `全体 = 1` («на весь размер»): раскладка при этом флаге кладёт в `先矩形` нули,
+ * а в рантайме флаг приходит отдельным полем FullSize — но размеры там точно так
+ * же нулевые. Заливка нулевого прямоугольника не значит ничего (no-op), поэтому
+ * нули трактуем как «вся поверхность»: без этого белая подложка «Round128x40»
+ * оставалась чёрной — шаг `FillWithAlpha(255,255,255, a=0, 全体=1)` не срабатывал,
+ * и RGB под альфа-маской оставался нулевым.
+ */
+static void cp_fill_rect(struct parts_construction_process *cproc, int *x, int *y, int *w, int *h)
+{
+	if (*w > 0 && *h > 0)
+		return;
+	if (getenv("XSYS4_CP_NO_FULLFILL"))  // A/B-ручка
+		return;
+	*x = 0;
+	*y = 0;
+	*w = cproc->common.texture.w;
+	*h = cproc->common.texture.h;
+}
+
 static bool build_fill_amap(struct parts_construction_process *cproc, struct parts_cp_fill *op)
 {
 	if (!cproc->common.texture.handle)
 		return false;
-	gfx_fill_amap(&cproc->common.texture, op->x, op->y, op->w, op->h, op->a);
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	cp_fill_rect(cproc, &x, &y, &w, &h);
+	gfx_fill_amap(&cproc->common.texture, x, y, w, h, op->a);
+	return true;
+}
+
+/*
+ * Растеризация сектора в альфа-карту. Пишем МАКСИМУМОМ (`gfx_copy_amap_max`):
+ * фигура кладётся поверх уже собранной маски и не должна затирать соседние
+ * куски прозрачностью за пределами дуги — у «Round128x40» углы дорисовываются
+ * к уже залитому кресту.
+ *
+ * Края сглаживаем суперсэмплингом 3×3: без него скруглённые подложки заметно
+ * «лесенкой» отличаются от оригинала.
+ */
+static bool build_fill_pie_amap(struct parts_construction_process *cproc, struct parts_cp_pie *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int rx = abs(op->rx), ry = abs(op->ry);
+	if (rx <= 0 || ry <= 0)
+		return false;
+	int w = rx * 2, h = ry * 2;
+	uint8_t *amap = xcalloc(1, (size_t)w * h);
+	float a0 = op->start_angle * (float)M_PI / 180.0f;
+	float a1 = a0 + op->sweep_angle * (float)M_PI / 180.0f;
+	if (a1 < a0) { float t = a0; a0 = a1; a1 = t; }
+	float sweep = a1 - a0;
+	const int SS = 3;
+	for (int py = 0; py < h; py++) {
+		for (int px = 0; px < w; px++) {
+			int hits = 0;
+			for (int sy = 0; sy < SS; sy++) {
+				for (int sx = 0; sx < SS; sx++) {
+					float fx = px + (sx + 0.5f) / SS - rx;
+					float fy = py + (sy + 0.5f) / SS - ry;
+					float nx = fx / rx, ny = fy / ry;
+					if (nx * nx + ny * ny > 1.0f)
+						continue;
+					if (sweep < 2.0f * (float)M_PI - 0.001f) {
+						// atan2(y, x) при экранном Y (вниз) уже даёт угол по
+						// часовой стрелке — ровно соглашение раскладки.
+						float ang = atan2f(fy, fx);
+						while (ang < a0)
+							ang += 2.0f * (float)M_PI;
+						if (ang > a1)
+							continue;
+					}
+					hits++;
+				}
+			}
+			if (hits)
+				amap[py * w + px] = op->a * hits / (SS * SS);
+		}
+	}
+	Texture tmp;
+	gfx_init_texture_amap(&tmp, w, h, amap, (SDL_Color){0, 0, 0, 0});
+	gfx_copy_amap_max(&cproc->common.texture, op->x - rx, op->y - ry, &tmp, 0, 0, w, h);
+	gfx_delete_texture(&tmp);
+	free(amap);
 	return true;
 }
 
@@ -457,7 +560,9 @@ static bool build_fill_with_alpha(struct parts_construction_process *cproc, stru
 {
 	if (!cproc->common.texture.handle)
 		return false;
-	gfx_fill_with_alpha(&cproc->common.texture, op->x, op->y, op->w, op->h, op->r, op->g, op->b, op->a);
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	cp_fill_rect(cproc, &x, &y, &w, &h);
+	gfx_fill_with_alpha(&cproc->common.texture, x, y, w, h, op->r, op->g, op->b, op->a);
 	return true;
 }
 
@@ -684,6 +789,10 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_FILL_ALPHA_COLOR:
 			if (!build_fill_alpha_color(cproc, &op->fill))
+				return false;
+			break;
+		case PARTS_CP_FILL_PIE_AMAP:
+			if (!build_fill_pie_amap(cproc, &op->pie))
 				return false;
 			break;
 		case PARTS_CP_FILL_AMAP:
