@@ -2480,6 +2480,27 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		parts->is_button = true;
 		return;
 	}
+	// Чекбокс (id 1 в обеих нумерациях) — ровно тот же случай, что кнопка: у
+	// движка это ФЛАГ на CG-части, а состояние сбрасывать нельзя (загрузчик
+	// раскладок уже положил в него CG рамки, см. PE_InitPartsCheckBox).
+	// Ixseal конструирует его сама: `parts::detail::CCheckBoxParts@0` (@0x2fc894)
+	// завершается вызовом `SetComponentType(no, 1, 1)` — без этой ветки первый же
+	// чекбокс валил движок («unknown component type 1»).
+	if (type == 1) {
+		parts->is_checkbox = true;
+		return;
+	}
+	// Полосы прокрутки (2/3) — тоже ФЛАГ на CG-части (геометрию кладёт загрузчик
+	// раскладок, PE_InitPartsVScrollbar/HScrollbar). Игра выставляет тип сама:
+	// `CVScrollBarParts@0` (@0x3c6b9c) → SetComponentType(no, 2, 1),
+	// `CHScrollBarParts@0` (@0x32bd1e) → 3.
+	if (type == 2 || type == 3) {
+		if (type == 2)
+			parts->is_vscrollbar = true;
+		else
+			parts->is_hscrollbar = true;
+		return;
+	}
 	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
@@ -2508,6 +2529,26 @@ int PE_GetComponentType(int parts_no, int state)
 	struct parts *parts = parts_try_get(parts_no);
 	if (!parts)
 		return -1;
+
+	// Чекбокс (パーツタイプ=1) тоже рисуется CG-частью, но обязан отвечать своим
+	// типом: `CActivityWrap@GetCheckBox` (@0x200c8) отдаёт часть только если
+	// `CompParts(имя, 1, 1)`, иначе возвращает null. Из-за отсутствия этой ветки
+	// `SceneYesNoDialog@Close` читал `GetCheckBox("CheckDontShowAgain").Checked`
+	// у null-интерфейса и падал на `X_REF` (диалог «Save the game?» → Yes).
+	// Id 1 из v14-части перечисления — сдвиг его не касается (он с 18).
+	// Проверяется РАНЬШЕ is_button: чекбокс кликабелен, но кнопкой не является.
+	if (parts->is_checkbox)
+		return 1;
+
+	// Полосы прокрутки (縦=2, 横=3) — тот же случай: рисуются CG-ползунком, а
+	// тип обязаны отдавать свой, иначе `CActivityWrap@GetVScrollBar` (@0x202f0,
+	// `CompParts(имя, 2, 1)`) и `GetHScrollBar` (@0x20500, тип 3) возвращают
+	// null. На этом падал ассерт игры `ScrollBarUnit.jaf:26:
+	// (nonnull) m_act.GetVScrollBar("Scroll")` при входе на экран «Items».
+	if (parts->is_vscrollbar)
+		return 2;
+	if (parts->is_hscrollbar)
+		return 3;
 
 	// Activity "button" parts (パーツタイプ=0) render as CG but report type 0 so
 	// the game recognizes them as buttons (e.g. C_TITLE@Enable registers click
