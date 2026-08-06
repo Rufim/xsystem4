@@ -468,6 +468,23 @@ void PE_UpdateInputState(int passed_time)
 		}
 	}
 
+	// «Whole» (глобальные) обработчики левого клика регистрируются на parts_no 0
+	// (AddWholeMouseLClickEvent), и CallDelegate отдаёт сообщение с parts_no == 0
+	// в m_wholeFunctionSet, минуя проверки delegateIndex/uniqueID. Через них игра
+	// принимает КЛИКИ СЦЕН: SceneStack@RegisterEvent вешает туда свой <LClickEvent>,
+	// а тот уже зовёт LClickEvent активной сцены. Пер-партовое MOUSE_CLICK этот путь
+	// не покрывает — оно уходит в набор функций конкретной части, где обработчика нет.
+	// Без этого сообщения Haha Ranman навсегда вставала на экране 注意: CautionScene
+	// доходила до Process == 1 («жду клик»), клик доезжал до части-фона CG, а сцена
+	// его не видела — main не добирался ни до сети, ни до титула.
+	// Шлём на ОТПУСКАНИЕ кнопки и БЕЗУСЛОВНО (даже если клик съела часть): whole-набор
+	// по смыслу «клик куда угодно», и его m_partsNumber всё равно 0. Если whole-обработчика
+	// нет, диспетчер съедает сообщение безвредно.
+	if (parts_began_click && prev_clicking && !cur_clicking) {
+		parts_msg_push_global(PARTS_MSG_MOUSE_CLICK,
+				"iii", cur_pos.x, cur_pos.y, VK_LBUTTON);
+	}
+
 	// Release handling
 	if (prev_clicking && !cur_clicking) {
 		if (is_dragging && drag_parts && drag_parts->draggable) {
