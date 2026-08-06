@@ -317,6 +317,24 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 	case AIN_REF_TYPE:
 		if (v.i == -1)
 			break;
+		// Heap-слот 0 — это ГЛОБАЛЬНАЯ СТРАНИЦА (heap_free_ptr начинается с 1,
+		// т.е. слот 0 никогда не выдаётся аллокатором), поэтому им не может
+		// владеть НИ ОДНА переменная. Ноль тут — всегда чужое число, попавшее
+		// в объектный слот: так рассинхрон формы HLL-функции
+		// (FileOperation.GetFileList вернула bool=0 туда, где игра ждала
+		// массив) уничтожал глобалы, а падало это далеко от причины —
+		// «Out of bounds heap index: 0/<любой глобал>». Вместо тихого
+		// разрушения — одноразовый WARNING с типом переменной.
+		if (v.i == 0) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("variable_fini: попытка освободить heap-слот 0 "
+					"(глобальная страница) как значение типа %d — "
+					"в объектный слот попало чужое число", type);
+			}
+			break;
+		}
 		if (call_dtor)
 			heap_unref(v.i);
 		else
