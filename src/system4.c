@@ -126,6 +126,10 @@ static void read_mixer_channels(struct ini_entry *entry)
 	}
 }
 
+// Задал ли размер вида сам .ini игры. Если нет — дефолт зависит от поколения
+// рантайма, см. apply_default_view_size ниже.
+static bool view_size_from_ini = false;
+
 static bool read_config(const char *path)
 {
 	int ini_size;
@@ -146,8 +150,10 @@ static bool read_config(const char *path)
 			config.save_dir = strdup(ini_string(&ini[i])->text);
 		} else if (!strcmp(ini[i].name->text, "ViewWidth")) {
 			config.view_width = ini_integer(&ini[i]);
+			view_size_from_ini = true;
 		} else if (!strcmp(ini[i].name->text, "ViewHeight")) {
 			config.view_height = ini_integer(&ini[i]);
+			view_size_from_ini = true;
 		} else if (!strcmp(ini[i].name->text, "VolumeValancer")) {
 			read_mixer_channels(&ini[i]);
 		} else if (!strcmp(ini[i].name->text, "DefaultVolumeRate")) {
@@ -327,6 +333,37 @@ static bool config_init_with_dir(const char *dir)
 			return false;
 	}
 	return config_init_with_ini(path);
+}
+
+/*
+ * Размер вида, когда его не задал .ini игры.
+ *
+ * Дефолт 800×600 — это v6-поколение. У свежих DL-релизов System4 (14.x) файла
+ * System40.ini нет вовсе, а в AliceStart.ini ключей ViewWidth/ViewHeight не бывает
+ * (проверено: Haha Ranman, Healing Touch), — сам `Haharanman.exe` эти ключи ищет
+ * (видны в его строках), не находит и берёт СВОЙ встроенный дефолт. Он равен
+ * 1280×720: ровно такого размера полноэкранные ассеты (`タイトル／フィルムフィルター.qnt`
+ * = 1280×720), и ровно это стоит в System40.ini у Dohna Dohna — той же генерации,
+ * но с ini в комплекте.
+ *
+ * С 800×600 игра раскладывала UI по 1280×720 (она спрашивает GetDefaultViewWidth),
+ * и панели уезжали за край окна — у Haha Ranman экран разрешения сети был обрезан
+ * справа вместе с кнопками.
+ *
+ * Гейт структурный и тот же, что у нумерации parts-сообщений (см. parts/message.c):
+ * `PartsEngine.SeekMessage` объявлена только в новом message-API этой генерации.
+ * Игры с ViewWidth в ini не затрагиваются вовсе.
+ */
+static void apply_default_view_size(struct ain *ain)
+{
+	if (view_size_from_ini)
+		return;
+	int libno = ain_get_library(ain, "PartsEngine");
+	if (libno < 0 || ain_get_library_function(ain, libno, "SeekMessage") < 0)
+		return;
+	config.view_width = 1280;
+	config.view_height = 720;
+	NOTICE("размер вида не задан в .ini — беру дефолт поколения 14.x: 1280x720");
 }
 
 static void config_init_with_ain(const char *ain_path)
@@ -614,6 +651,7 @@ int main(int argc, char *argv[])
 	}
 
 	mkdir_p(config.save_dir);
+	apply_default_view_size(ain);
 	apply_game_specific_hacks(ain);
 	if (config.msgskip_delay)
 		set_msgskip_delay(ain, config.msgskip_delay);
