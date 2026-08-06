@@ -147,12 +147,22 @@ static void flat_process_layer_scripts(struct flat_layer_state *state,
 		if (timelines[i].type != FLAT_TIMELINE_SCRIPT)
 			continue;
 
-		// Find last key where frame_index <= current_frame
+		/*
+		 * Ключ срабатывает при ВХОДЕ РОВНО В СВОЙ КАДР, а не «последний ключ с
+		 * frame_index <= текущего». Прежнее правило ломало любой обратный прыжок:
+		 * у титульного фона Tsumamigui 3 скрипт флэта на кадре 270 прыгает на
+		 * кадр 30 (заставка — это кадры 0..29, а 30..270 — цикл смены дня и ночи),
+		 * но сразу после прыжка «последним подходящим» снова оказывался ключ
+		 * кадра 0 — с прыжком на 0. Плейхед улетал в начало, и заставка титула
+		 * проигрывалась заново каждые 9 секунд. В оригинале этого нет.
+		 * Кадры мы проходим по одному (и при обычном ходе, и при перемотке через
+		 * pending_seek_delta), поэтому точное сравнение ключей не теряет.
+		 */
 		int matched = -1;
 		for (size_t j = 0; j < timelines[i].script.count; j++) {
-			if ((int)timelines[i].script.keys[j].frame_index <= state->current_frame)
+			if ((int)timelines[i].script.keys[j].frame_index == state->current_frame)
 				matched = (int)j;
-			else
+			else if ((int)timelines[i].script.keys[j].frame_index > state->current_frame)
 				break;
 		}
 
@@ -164,6 +174,11 @@ static void flat_process_layer_scripts(struct flat_layer_state *state,
 			continue;
 
 		struct flat_script_key *key = &timelines[i].script.keys[matched];
+		if (getenv("XSYS4_FLAT_TRACE"))
+			NOTICE("FLAT script key: timeline=%zu idx=%d frame_index=%u jump=%d target=%d stop=%d cur=%d",
+			       i, matched, key->frame_index, (int)key->has_jump,
+			       key->has_jump ? key->jump_frame : -1, (int)key->is_stop,
+			       state->current_frame);
 		if (key->has_jump) {
 			state->jump_target = key->jump_frame;
 		} else if (key->is_stop) {
@@ -397,7 +412,10 @@ bool parts_flat_load(struct parts *parts, struct parts_flat *f, struct string *f
 
 bool parts_flat_update(struct parts_flat *f, int passed_time)
 {
-	if (!f->flat || f->flat->hdr.fps <= 0)
+	if (!f->flat)
+		return false;
+	float fps = (float)f->flat->hdr.fps;
+	if (fps <= 0.0f)
 		return false;
 
 	// Consume pending forward seek (from GoFramePartsFlat).
@@ -424,11 +442,14 @@ bool parts_flat_update(struct parts_flat *f, int passed_time)
 		return false;
 
 	f->elapsed += passed_time;
-	int delta = (int)((int64_t)f->elapsed * f->flat->hdr.fps / 1000);
+	int delta = (int)(f->elapsed * fps / 1000.0f);
 	if (!delta)
 		return false;
-	f->elapsed -= (unsigned)((int64_t)delta * 1000 / f->flat->hdr.fps);
+	f->elapsed -= (unsigned)(delta * 1000.0f / fps);
 
+	if (getenv("XSYS4_FLAT_TRACE"))
+		NOTICE("FLAT auto-advance +%d (frame=%d, fps=%.2f)", delta,
+		       f->root_state ? f->root_state->current_frame : -1, fps);
 	bool any_changed = false;
 	for (int i = 0; i < delta; i++) {
 		if (flat_advance_layer(f->flat, f->root_state,
@@ -1002,6 +1023,8 @@ bool PE_StartPartsFlat(int parts_no, int state)
 
 bool PE_GoFramePartsFlat(int parts_no, int frame_no, int state)
 {
+	if (getenv("XSYS4_FLAT_TRACE"))
+		NOTICE("FLAT GoFrame ВХОД part=%d frame=%d state=%d", parts_no, frame_no, state);
 	if (!parts_state_valid(--state))
 		return false;
 

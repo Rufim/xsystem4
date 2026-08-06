@@ -94,6 +94,41 @@ static struct font_size *fnl_font_get_size(struct font *_font, float size)
 			closest = &font->sizes[i];
 		}
 	}
+	/*
+	 * ВЫБОР FACE. Точное совпадение размера НЕЛЬЗЯ покупать любой ценой: у
+	 * Tsumamigui 3 для кегля 14 «точный» кандидат — это натив 42 (face_h=168),
+	 * сжатый в 12 раз, и цифра в нём вырождается в 3×4 пикселя чернил на блок
+	 * 5×14 (трейс `XSYS4_GLYPH_TRACE`). Ближайший по духу кандидат — натив 18
+	 * (face_h=72) при denominator 5, то есть кегль 14.4: там цифра 4×6 на блоке
+	 * 6×14, и на экране она читается. Поэтому среди кандидатов, попадающих в
+	 * допуск по размеру (±15 %), берём того, у кого denominator ближе к 4
+	 * (нативный рендер), и лишь при равенстве — того, кто ближе по размеру.
+	 * Кегли, у которых face есть нативно (18, 22, 24, 26, 30, 34, 36, 40, 42, 48
+	 * у Tsumamigui), правило НЕ трогает: у них denominator и так 4. Проверено:
+	 * строка окна сообщений бит в бит прежняя (509 px, 47 групп).
+	 * Замер по эталону слота SAVE: COMMENT 41 → 48 px при эталоне 47.
+	 * `XSYS4_FNL_RANK=<доля>` меняет допуск, `XSYS4_FNL_RANK=0` возвращает
+	 * прежнее правило «точный размер любой ценой».
+	 */
+	{
+		const char *e = getenv("XSYS4_FNL_RANK");
+		float tol = size * (e ? strtof(e, NULL) : 0.15f);
+		if (tol > 0.0f) {
+		struct fnl_font_size *best = NULL;
+		for (unsigned i = 0; i < font->nr_sizes; i++) {
+			if (fabsf(font->sizes[i].super.size - size) > tol)
+				continue;
+			if (!best) { best = &font->sizes[i]; continue; }
+			int co = abs((int)font->sizes[i].denominator - 4);
+			int bo = abs((int)best->denominator - 4);
+			if (co < bo || (co == bo &&
+			    fabsf(font->sizes[i].super.size - size) < fabsf(best->super.size - size)))
+				best = &font->sizes[i];
+		}
+		if (best)
+			closest = best;
+		}
+	}
 	if (getenv("XSYS4_FNL_TRACE"))
 		NOTICE("FNL get_size req=%.1f -> chosen=%.2f (denom=%u, face_h=%u)",
 		       size, closest->super.size, closest->denominator, closest->bitmap_size->face->height);
@@ -138,6 +173,9 @@ static struct fnl_bitmap_glyph *fnl_get_bitmap_glyph(struct fnl_bitmap_size *bit
 
 	const int glyph_w = fnl_glyph_stride(glyph) * 8;
 	const int glyph_h = bitmap->face->height;
+	if (getenv("XSYS4_GLYPH_TRACE"))
+		NOTICE("GLYPHDATA idx=%u: face_h=%u glyph_h=%u glyph_w(advance)=%u stride*8=%d",
+		       index, bitmap->face->height, glyph->height, glyph->width, glyph_w);
 
 	struct fnl_bitmap_glyph *out = xmalloc(sizeof(struct fnl_bitmap_glyph));
 	out->width = glyph_w;
@@ -246,6 +284,19 @@ static bool fnl_font_get_glyph(struct font_size *_size, struct glyph *glyph, uin
 		pixels[(dst_row+off_y)*width + (dst_col+off_x)] = p;
 	}
 
+	if (getenv("XSYS4_GLYPH_TRACE") && code >= '0' && code <= '9') {
+		int ix0=9999,ix1=-1,iy0=9999,iy1=-1;
+		for (unsigned y = 0; y < height; y++)
+			for (unsigned x = 0; x < width; x++)
+				if (pixels[y*width+x] > 32) {
+					if ((int)x<ix0) ix0=x; if ((int)x>ix1) ix1=x;
+					if ((int)y<iy0) iy0=y; if ((int)y>iy1) iy1=y;
+				}
+		NOTICE("GLYPH '%c': face_h=%u denom=%u block=%ux%u чернила %dx%d (y %d..%d)",
+		       (char)code, size->bitmap_size->face->height, size->denominator,
+		       block_width, block_height,
+		       ix1>=0?ix1-ix0+1:0, iy1>=0?iy1-iy0+1:0, iy0, iy1);
+	}
 	gfx_init_texture_rmap(&glyph->t[weight], width, height, pixels);
 	glyph->rect.x = off_x;
 	glyph->rect.y = off_y;
@@ -310,6 +361,18 @@ struct font *fnl_font_load(struct fnl *lib, unsigned index)
 		}
 	}
 
+	if (getenv("XSYS4_FNL_TRACE")) {
+		// Сверяем ДВА «размера» face: по высоте битмапа и по advance глифов.
+		unsigned i_zero = fnl_char_to_index('0');
+		unsigned i_kanji = fnl_char_to_index(0x8c8e);  // 月 в Shift-JIS
+		for (unsigned i = 0; i < font->nr_bitmap_sizes; i++) {
+			struct fnl_font_face *f = font->bitmap_sizes[i].face;
+			unsigned a0 = i_zero < f->nr_glyphs ? f->glyphs[i_zero].width : 0;
+			unsigned ak = i_kanji < f->nr_glyphs ? f->glyphs[i_kanji].width : 0;
+			NOTICE("FNL face[%u]: height=%u (h/4=%u)  advance '0'=%u (/4=%.1f)  advance 月=%u (/4=%.1f)",
+			       i, f->height, f->height / 4, a0, a0 / 4.0, ak, ak / 4.0);
+		}
+	}
 	font->super.charmap = CHARMAP_SJIS;
 	font->super.get_size = fnl_font_get_size;
 	font->super.get_actual_size = fnl_font_get_actual_size;

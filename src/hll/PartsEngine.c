@@ -16,8 +16,11 @@
 
 #include <assert.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <SDL.h>
 
 #include "system4/ain.h"
 #include "system4/hashtable.h"
@@ -30,6 +33,8 @@
 #include "vm/page.h"
 #include "parts.h"
 #include "asset_manager.h"
+#include "gfx/font.h"
+#include "input.h"
 #include "xsystem4.h"
 #include "hll.h"
 
@@ -38,13 +43,648 @@ static void PartsEngine_ModuleInit(void)
 	PE_Init();
 }
 
+static void textbox_reset_all(void);
+
 static void PartsEngine_ModuleFini(void)
 {
 	PE_Reset();
+	textbox_reset_all();
 }
+
+/*
+ * ТЕКСТОВЫЕ ПОЛЯ ввода GUI-тулкита: `TextBox` (однострочное) и `MultiTextBox`
+ * (многострочное). Настоящего виджета ввода у движка нет и в обозримом будущем не
+ * будет — это полноценный редактор с кареткой, выделением и IME.
+ *
+ * Но ВСЕ функции обоих семейств были `HLL_TODO_EXPORT`, то есть `.fun = NULL`, а
+ * это не заглушка, а ДЫРА: вызов уводит движок в отладочный REPL (FINDINGS §5y).
+ * И они достижимы: у Tsumamigui 3 `SetTextBoxText`/`GetTextBoxText` — это поле
+ * комментария на экране SAVE, у Escalayer всё семейство `MultiTextBox` строго
+ * достижимо (экран анкеты).
+ *
+ * Реализация — ЧЕСТНОЕ ХРАНИЛИЩЕ: что игра записала, то геттер и вернёт. Так
+ * поле ведёт себя как пустая (или заранее заполненная игрой) строка, которую
+ * пользователь не может отредактировать. Это заметно меньшее зло, чем и REPL,
+ * и выдуманный ввод. О том, что поле не рисуется и не принимает ввод, говорим
+ * ВСЛУХ один раз — приём из `SetComponentScrollPos*LinkNumber` (§5x).
+ */
+#define MAX_TEXTBOXES 64
+
+struct textbox_state {
+	bool used;
+	bool multi;              // MultiTextBox против TextBox — пространства номеров разные
+	int parts_no;
+	struct string *text;
+	struct string *cg_name;
+	int max_length;
+	int sel_r, sel_g, sel_b;
+	int bg_r, bg_g, bg_b;             // 背景色
+	int ro_bg_r, ro_bg_g, ro_bg_b;    // 読み取り専用背景色
+	int frame_r, frame_g, frame_b;    // 枠色
+	int width, height;
+	int char_space;
+	bool read_only;
+	int caret;               // позиция каретки В СИМВОЛАХ (не в байтах: текст UTF-8)
+	// свойства шрифта, как их задаёт Set*FontProperty
+	int font_type, font_size, r, g, b, edge_r, edge_g, edge_b;
+	float bold_weight, edge_weight;
+};
+
+static struct textbox_state textboxes[MAX_TEXTBOXES];
+static struct textbox_state *focused_textbox = NULL;
+
+static struct textbox_state *textbox_get(int parts_no, bool multi, bool create)
+{
+	struct textbox_state *free_slot = NULL;
+	for (int i = 0; i < MAX_TEXTBOXES; i++) {
+		if (textboxes[i].used && textboxes[i].parts_no == parts_no
+		    && textboxes[i].multi == multi)
+			return &textboxes[i];
+		if (!textboxes[i].used && !free_slot)
+			free_slot = &textboxes[i];
+	}
+	if (!create)
+		return NULL;
+	if (!free_slot) {
+		WARNING("PartsEngine: текстовых полей больше %d, часть %d пропущена",
+			MAX_TEXTBOXES, parts_no);
+		return NULL;
+	}
+	*free_slot = (struct textbox_state){
+		.used = true, .multi = multi, .parts_no = parts_no,
+		// Дефолты как у пустого поля: пределов нет, цвет выделения — системный синий.
+		.max_length = 0, .sel_r = 0, .sel_g = 0, .sel_b = 128,
+		.font_size = 16, .r = 255, .g = 255, .b = 255,
+		.ro_bg_r = 150, .ro_bg_g = 150, .ro_bg_b = 150,
+	};
+	return free_slot;
+}
+
+static void textbox_reset_all(void)
+{
+	focused_textbox = NULL;
+	for (int i = 0; i < MAX_TEXTBOXES; i++) {
+		if (textboxes[i].text)
+			free_string(textboxes[i].text);
+		if (textboxes[i].cg_name)
+			free_string(textboxes[i].cg_name);
+		textboxes[i] = (struct textbox_state){0};
+	}
+}
+
+static void textbox_set_string(struct string **dst, struct string *src)
+{
+	if (*dst)
+		free_string(*dst);
+	*dst = src ? string_ref(src) : NULL;
+}
+
+static void textbox_out_string(struct string **out, struct string *src)
+{
+	if (!out)
+		return;
+	if (*out)
+		free_string(*out);
+	*out = src ? string_ref(src) : string_ref(&EMPTY_STRING);
+}
+
+/*
+ * ОТРИСОВКА поля. Геометрия снята ЗАМЕРОМ с эталона оригинала
+ * (`screenshots/orig-textbox-zoom.png` — экран SAVE Tsumamigui 3, поле COMMENT
+ * диалога «Do you want to save here?»), а не подобрана на глаз:
+ *   • подложка ровно 186×22 px = `サイズ` того же парта в `セーブ確認.pactex`,
+ *     цвет (61,149,220) = его же `背景色` — совпал побитово;
+ *   • каретка — ЧЁРНЫЙ столбик шириной 1 px и высотой ровно `フォントサイズ` (16),
+ *     левый край на 3 px правее края подложки, по вертикали по центру:
+ *     (22 − 16)/2 = 3 px сверху и снизу.
+ * Мигание каретки по ОДНОМУ кадру эталона определить нельзя, поэтому рисуем её
+ * постоянной. Это не догадка, а отказ гадать: постоянная каретка отличается от
+ * мигающей только фазой, а выдуманный период был бы виден.
+ */
+#define TEXTBOX_INSET 3
+
+/*
+ * Мигание каретки. Пользователь смотрел оригинал живьём: каретка мигает,
+ * полупериод — полсекунды (полный цикл ≈ 1 с). Это же почти совпадает с системным
+ * дефолтом Windows `GetCaretBlinkTime()` = 530 мс, откуда оригинал её и берёт,
+ * так что число согласовано с двумя независимыми источниками.
+ * Ручка `XSYS4_CARET_BLINK_MS` — для сверки (0 = не мигать).
+ */
+#define TEXTBOX_BLINK_MS 500
+static int caret_blink_timer = 0;
+static bool caret_visible = true;
+
+static int textbox_blink_ms(void)
+{
+	static int ms = -1;
+	if (ms < 0) {
+		const char *e = getenv("XSYS4_CARET_BLINK_MS");
+		ms = e ? atoi(e) : TEXTBOX_BLINK_MS;
+		if (ms < 0)
+			ms = 0;
+	}
+	return ms;
+}
+
+/*
+ * КЕГЛЬ ГЛИФОВ ≠ КЕГЛЬ ПОЛЯ. `フォントサイズ` в `.pactex` — НОМИНАЛ (им считается
+ * геометрия: высота каретки ровно 16 и по эталону совпала), а глифы рисуются в
+ * `実サイズ`, который в полтора раза больше. Это ровно та же пара чисел, что §5f
+ * нашёл у BACK LOG (боксы 34 при номинале 32, глифы 48). Замер поля подтвердил
+ * множитель независимо: ink «privet» у оригинала 54 px против наших 37 (1.46×),
+ * высота ink 11 против 7 (1.57×). Плюс 16 × 1.5 = 24 — а `XSYS4_FNL_TRACE` даёт
+ * для 24 НАТИВНЫЙ face (denom=4, face_h=96), тогда как для 16 приходилось мельчить
+ * тот же face денominatorом 6. Ручка `XSYS4_TB_SIZE_MUL` — для сверки.
+ */
+static float textbox_size_mul(void)
+{
+	static float mul = -1.0f;
+	if (mul < 0.0f) {
+		const char *e = getenv("XSYS4_TB_SIZE_MUL");
+		mul = e ? strtof(e, NULL) : 2.0f;
+		if (mul <= 0.0f)
+			mul = 2.0f;
+	}
+	return mul;
+}
+
+static struct text_style textbox_style(const struct textbox_state *t)
+{
+	struct text_style style = {
+		.face = t->font_type,
+		.size = t->font_size * textbox_size_mul(),
+		.bold_width = t->bold_weight,
+		.weight = FW_NORMAL,
+		.edge_left = t->edge_weight, .edge_up = t->edge_weight,
+		.edge_right = t->edge_weight, .edge_down = t->edge_weight,
+		.color = { t->r, t->g, t->b, 255 },
+		.edge_color = { t->edge_r, t->edge_g, t->edge_b, 255 },
+		.scale_x = 1.0f,
+		.space_scale_x = 1.0f,
+		.font_spacing = t->char_space,
+		.font_size = NULL,
+	};
+	return style;
+}
+
+/*
+ * Ширина первых `nr_chars` символов — РОВНО тем же `gfx_size_text`, которым меряет
+ * себя путь отрисовки (`build_copy_text` → `gfx_render_text`). Считать по формуле
+ * `TSM.GetFontWidth` тут нельзя: она с надбавкой на обводку на КАЖДЫЙ глиф, и на
+ * шести символах давала ~180 px вместо 60 — каретка уезжала за правый край поля и
+ * молча не рисовалась (проверено замером против эталона).
+ */
+static int textbox_text_width(const struct textbox_state *t, int nr_chars)
+{
+	if (!t->text || !t->text->size || nr_chars <= 0)
+		return 0;
+	struct text_style style = textbox_style(t);
+	const char *p = t->text->text;
+	for (int i = 0; *p && i < nr_chars; i++)
+		p += SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
+	if (p == t->text->text)
+		return 0;
+	/*
+	 * Меряем `gfx_size_text` — ровно тем, чем меряет себя путь отрисовки. Две
+	 * другие формулы проверены замером и ОТБРОШЕНЫ: сумма
+	 * `ceil(gfx_size_char)` даёт 7 px на символ (каретка на 45 вместо 63, эта
+	 * величина не несёт надбавки), а формула `TSM.GetFontWidth` с надбавкой на
+	 * обводку на каждый глиф — наоборот, ~30 px на символ.
+	 * Остаток: у оригинала 10 px на символ, у нас 9.5 — каретка отстаёт на 3 px
+	 * к шестому символу. Причина та же, что у сдвига ink на 2 px влево:
+	 * наш левый бэринг под обводку 1 px против 3 у оригинала (класс §5f, ФИКС 3).
+	 */
+	int len = p - t->text->text;
+	char *prefix = xmalloc(len + 1);
+	memcpy(prefix, t->text->text, len);
+	prefix[len] = '\0';
+	int w = (int)ceilf(gfx_size_text(&style, prefix));
+	free(prefix);
+	return w;
+}
+
+static int textbox_nr_chars(const struct textbox_state *t)
+{
+	if (!t->text)
+		return 0;
+	int n = 0;
+	for (const char *p = t->text->text; *p; n++)
+		p += SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
+	return n;
+}
+
+static void textbox_render(struct textbox_state *t)
+{
+	if (!t || t->width <= 0 || t->height <= 0)
+		return;
+	int no = t->parts_no;
+	PE_ClearPartsConstructionProcess(no, 1);
+
+	// Подложка: либо CG (если игра его задала), либо сплошная заливка 背景色 /
+	// 読み取り専用背景色 — так же, как выбирает оригинал.
+	if (t->cg_name && t->cg_name->size) {
+		PE_AddCreateCGToProcess(no, t->cg_name, 1);
+	} else {
+		int r = t->read_only ? t->ro_bg_r : t->bg_r;
+		int g = t->read_only ? t->ro_bg_g : t->bg_g;
+		int b = t->read_only ? t->ro_bg_b : t->bg_b;
+		PE_AddCreateToPartsConstructionProcess(no, t->width, t->height, 1);
+		PE_AddFillToPartsConstructionProcess(no, 0, 0, t->width, t->height, r, g, b, 1);
+	}
+
+	/*
+	 * Вертикаль текста. Центрируем ЯЧЕЙКУ шрифта по её же метрике
+	 * (`text_style_height`, та самая, которой меряет себя `build_copy_text`), а
+	 * затем поднимаем на size/16: чернила сидят в ячейке НИЖЕ её середины.
+	 * Дробь перекалибрована после починки выбора face (§5ab): раньше при кегле 32
+	 * нужно было поднимать на 4 px, теперь запрошенные 32 ложатся на НАТИВНЫЙ
+	 * face 30, и хватает 2 px.
+	 * У оригинала ink стоит ровно по центру поля (6..16 в поле 0..21, центр 11).
+	 * Дробь 4/32 = 1/8 калибрована на ЕДИНСТВЕННОМ эталоне (поле COMMENT
+	 * Tsumamigui 3) — на MultiTextBox Escalayer её надо перепроверить.
+	 */
+	struct text_style vstyle = textbox_style(t);
+	int glyph_size = (int)(t->font_size * textbox_size_mul());
+	int text_y = (int)((t->height - text_style_height(&vstyle)) / 2.0f) - glyph_size / 16;
+	{	// ручка калибровки вертикали поля против эталона (свип, см. §5z)
+		const char *e = getenv("XSYS4_TB_TEXT_Y");
+		if (e)
+			text_y = atoi(e);
+	}
+	if (t->text && t->text->size) {
+		/*
+		 * DrawText, а НЕ CopyText. `CopyText` перед отрисовкой обнуляет альфу
+		 * под текстом (`gfx_fill_with_alpha(..., 0)`) — он для текстовых партов,
+		 * где под текстом ничего своего нет. В поле ввода это пробивало дыру в
+		 * нашей подложке: между буквами просвечивала рамка CG, а не 背景色.
+		 * `DrawText` кладёт глифы поверх с блендингом — ровно то, что нужно.
+		 */
+		PE_AddDrawTextToPartsConstructionProcess(no, TEXTBOX_INSET, text_y, t->text,
+			t->font_type, (int)(t->font_size * textbox_size_mul()),
+			t->r, t->g, t->b, t->bold_weight,
+			t->edge_r, t->edge_g, t->edge_b, t->edge_weight,
+			t->char_space, 0, 1);
+	}
+	// Каретка — только у поля с фокусом: в оригинале её видно ровно в том поле,
+	// куда идёт ввод.
+	if (getenv("XSYS4_TB_TRACE"))
+		NOTICE("TBRENDER part=%d focus=%s caret_visible=%d caret=%d text='%s' w=%d size=%d",
+		       no, focused_textbox == t ? "да" : "нет", (int)caret_visible, t->caret,
+		       t->text ? t->text->text : "(nil)", t->width, t->font_size);
+	if (focused_textbox == t && !t->read_only && caret_visible) {
+		int cx = TEXTBOX_INSET + textbox_text_width(t, t->caret);
+		// Не даём каретке исчезнуть, если текст упёрся в правый край: настоящее
+		// поле в такой ситуации прокручивает содержимое, у нас пока прижимаем
+		// каретку к краю — молча пропадать она не должна.
+		if (cx > t->width - 2)
+			cx = t->width - 2;
+		if (cx < 0)
+			cx = 0;
+		/*
+		 * Заливка С АЛЬФОЙ, а не обычная. `build_copy_text` перед отрисовкой
+		 * ОБНУЛЯЕТ альфу под текстом (`gfx_fill_with_alpha(..., 0)`), а
+		 * `AddFill` красит только RGB и альфу не трогает (§5u) — каретка,
+		 * попавшая в очищенную область, выходила полностью прозрачной. На
+		 * ПУСТОМ поле её было видно, потому что операции CopyText там нет, и
+		 * ровно поэтому дефект так долго выглядел как «каретка пропадает
+		 * после набора текста».
+		 */
+		/*
+		 * Каретка живёт по НОМИНАЛУ, а не по кеглю глифов: у эталона она ровно
+		 * 16 px (= `フォントサイズ`) и центрирована в поле ((22−16)/2 = 3).
+		 * От вертикали текста её надо отвязать — та считается по ячейке кегля 32
+		 * и уходит в минус.
+		 */
+		int caret_y = (t->height - t->font_size) / 2;
+		if (caret_y < 0)
+			caret_y = 0;
+		PE_AddFillWithAlphaToPartsConstructionProcess(no, cx, caret_y, 1, t->font_size,
+							      0, 0, 0, 255, 1);
+	}
+	PE_BuildPartsConstructionProcess(no, 1);
+}
+
+/*
+ * ВВОД. Пока поле в фокусе, символы SDL идут сюда через `register_input_handler`
+ * (тот же механизм, которым пользуется библиотека `InputString`). Список
+ * завершающих клавиш игра держит у себя (`終了キー = { 2, 27 }` в `セーブ確認.pactex`
+ * — правая кнопка мыши и ESC), поэтому Enter/Escape мы не перехватываем: их
+ * обрабатывает игровой диспетчер, а поле лишь теряет фокус.
+ */
+static void textbox_input_handler(const char *utf8)
+{
+	struct textbox_state *t = focused_textbox;
+	if (!t || t->read_only || !utf8 || !*utf8)
+		return;
+	char *sjis = utf2sjis(utf8, strlen(utf8));
+	if (!sjis)
+		return;
+	// 最大文字数 = 0 означает «без предела».
+	if (t->max_length > 0 && textbox_nr_chars(t) >= t->max_length) {
+		free(sjis);
+		return;
+	}
+	struct string *ins = make_string(sjis, strlen(sjis));
+	char ins_text[64];
+	snprintf(ins_text, sizeof(ins_text), "%s", sjis);
+	free(sjis);
+	if (!t->text)
+		t->text = string_ref(&EMPTY_STRING);
+	// Вставка в позицию каретки — в БАЙТАХ, посчитанных по символам.
+	int byte_pos = 0;
+	{
+		const char *p = t->text->text;
+		for (int i = 0; i < t->caret && *p; i++)
+			p += SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
+		byte_pos = p - t->text->text;
+	}
+	struct string *head = string_copy(t->text, 0, byte_pos);
+	struct string *tail = string_copy(t->text, byte_pos, t->text->size - byte_pos);
+	struct string *joined = string_concatenate(head, ins);
+	struct string *full = string_concatenate(joined, tail);
+	free_string(head); free_string(tail); free_string(joined); free_string(ins);
+	free_string(t->text);
+	t->text = full;
+	// Каретка двигается на СТОЛЬКО СИМВОЛОВ, сколько пришло: одно событие
+	// SDL_TEXTINPUT несёт целую строку (составной ввод, вставка, наш тестовый
+	// `text <строка>`), а не один символ. Инкремент на единицу оставлял каретку
+	// после первой буквы — замер против эталона это и поймал.
+	for (const char *q = ins_text; *q; t->caret++)
+		q += SJIS_2BYTE((unsigned char)*q) ? 2 : 1;
+	caret_visible = true;
+	caret_blink_timer = 0;
+	textbox_render(t);
+}
+
+/*
+ * Фаза мигания. Зовётся из PartsEngine.Update, поэтому идёт по игровому времени
+ * (`passed_time`), а не по стенным часам: на паузе и при промотке каретка ведёт
+ * себя так же, как остальная анимация партов.
+ */
+static void textbox_update_caret(int passed_time)
+{
+	if (!focused_textbox)
+		return;
+	int period = textbox_blink_ms();
+	if (period == 0) {
+		if (!caret_visible) {
+			caret_visible = true;
+			textbox_render(focused_textbox);
+		}
+		return;
+	}
+	caret_blink_timer += passed_time;
+	if (caret_blink_timer < period)
+		return;
+	caret_blink_timer %= period;
+	caret_visible = !caret_visible;
+	textbox_render(focused_textbox);
+}
+
+static void textbox_set_focus(struct textbox_state *t)
+{
+	if (focused_textbox == t)
+		return;
+	struct textbox_state *old = focused_textbox;
+	focused_textbox = t;
+	if (t) {
+		// Свежий фокус — каретка видна сразу, фаза с нуля (иначе поле могло бы
+		// «открыться» в невидимой половине цикла и выглядеть неактивным).
+		caret_visible = true;
+		caret_blink_timer = 0;
+		register_input_handler(textbox_input_handler);
+		SDL_StartTextInput();
+	} else {
+		clear_input_handler();
+		SDL_StopTextInput();
+	}
+	/*
+	 * Уход фокуса = подтверждение ввода. Игра ждёт сообщение FIXED (тип 25),
+	 * чтобы прочитать введённое: `C_SAVE_CONFIRM@CommentFixedEvent` (FUNC 7975)
+	 * зовёт `Ｐ＿テキストボックス＿テキスト取得`, прячет поле и возвращает подсказку.
+	 * Без него набранный комментарий в сейв не попадал вовсе.
+	 */
+	if (old)
+		PE_SendFixedEvent(old->parts_no);
+	// Каретка появляется/исчезает — перерисовать оба поля.
+	if (old)
+		textbox_render(old);
+	if (t)
+		textbox_render(t);
+}
+
+/*
+ * Клик по части: если это текстовое поле — забирает фокус, если любая другая —
+ * фокус снимается. Зовётся из `parts_update_mouse` (src/parts/input.c) там же,
+ * где рассылается MOUSE_CLICK.
+ */
+void PE_textbox_click(int parts_no)
+{
+	struct textbox_state *t = textbox_get(parts_no, false, false);
+	if (!t)
+		t = textbox_get(parts_no, true, false);
+	textbox_set_focus(t);
+}
+
+// Backspace/Delete приходят не текстом, а кодом клавиши, поэтому их снимает
+// PE_Update (движок опрашивает клавиатуру сам).
+void PE_textbox_key(int vk)
+{
+	struct textbox_state *t = focused_textbox;
+	if (!t || t->read_only)
+		return;
+	int nr = textbox_nr_chars(t);
+	switch (vk) {
+	case VK_RETURN:
+		// Штатное подтверждение однострочного поля. У многострочного Enter — это
+		// перевод строки, поэтому подтверждаем только TextBox.
+		if (!t->multi)
+			PE_SendFixedEvent(t->parts_no);
+		return;
+	case VK_BACK:
+		if (t->caret <= 0)
+			return;
+		t->caret--;
+		break;
+	case VK_DELETE:
+		if (t->caret >= nr)
+			return;
+		break;
+	case VK_LEFT:
+		if (t->caret > 0) { t->caret--; textbox_render(t); }
+		return;
+	case VK_RIGHT:
+		if (t->caret < nr) { t->caret++; textbox_render(t); }
+		return;
+	default:
+		return;
+	}
+	// Удаление символа в позиции каретки.
+	const char *p = t->text ? t->text->text : NULL;
+	if (!p)
+		return;
+	for (int i = 0; i < t->caret && *p; i++)
+		p += SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
+	int start = p - t->text->text;
+	int len = SJIS_2BYTE((unsigned char)*p) ? 2 : 1;
+	struct string *head = string_copy(t->text, 0, start);
+	struct string *tail = string_copy(t->text, start + len, t->text->size - start - len);
+	struct string *full = string_concatenate(head, tail);
+	free_string(head); free_string(tail); free_string(t->text);
+	t->text = full;
+	textbox_render(t);
+}
+
+// Общие тела: `multi` разводит два семейства, всё остальное совпадает дословно.
+static void tb_set_size(int no, bool multi, int w, int h)
+{
+	struct textbox_state *t = textbox_get(no, multi, true);
+	if (t) { t->width = w; t->height = h; textbox_render(t); }
+}
+
+static void tb_set_font_property(int no, bool multi, int type, int size, int r, int g, int b,
+				 float bold, int er, int eg, int eb, float ew)
+{
+	struct textbox_state *t = textbox_get(no, multi, true);
+	if (!t)
+		return;
+	t->font_type = type; t->font_size = size;
+	t->r = r; t->g = g; t->b = b;
+	t->bold_weight = bold;
+	t->edge_r = er; t->edge_g = eg; t->edge_b = eb;
+	t->edge_weight = ew;
+	textbox_render(t);
+}
+
+static void tb_get_font_property(int no, bool multi, int *type, int *size, int *r, int *g, int *b,
+				 float *bold, int *er, int *eg, int *eb, float *ew)
+{
+	// Ref-выходы заполняем ВСЕГДА, даже если поля нет: незаполненный выход
+	// заставляет игру читать мусор (§7 FINDINGS — так пропадал текст кнопок).
+	struct textbox_state *t = textbox_get(no, multi, false);
+	static const struct textbox_state empty = { .font_size = 16, .r = 255, .g = 255, .b = 255 };
+	if (!t)
+		t = (struct textbox_state *)&empty;
+	if (type) *type = t->font_type;
+	if (size) *size = t->font_size;
+	if (r) *r = t->r;
+	if (g) *g = t->g;
+	if (b) *b = t->b;
+	if (bold) *bold = t->bold_weight;
+	if (er) *er = t->edge_r;
+	if (eg) *eg = t->edge_g;
+	if (eb) *eb = t->edge_b;
+	if (ew) *ew = t->edge_weight;
+}
+
+static void tb_set_text(int no, bool multi, struct string *text)
+{
+	struct textbox_state *t = textbox_get(no, multi, true);
+	if (!t)
+		return;
+	textbox_set_string(&t->text, text);
+	t->caret = textbox_nr_chars(t);   // как в оригинале: курсор в конец подставленного текста
+	textbox_render(t);
+}
+
+static void tb_get_text(int no, bool multi, struct string **out)
+{
+	struct textbox_state *t = textbox_get(no, multi, false);
+	textbox_out_string(out, t ? t->text : NULL);
+}
+
+static void tb_set_max_length(int no, bool multi, int len)
+{
+	struct textbox_state *t = textbox_get(no, multi, true);
+	if (t)
+		t->max_length = len;
+}
+
+static int tb_get_max_length(int no, bool multi)
+{
+	struct textbox_state *t = textbox_get(no, multi, false);
+	return t ? t->max_length : 0;
+}
+
+static void tb_set_select_color(int no, bool multi, int r, int g, int b)
+{
+	struct textbox_state *t = textbox_get(no, multi, true);
+	if (t) { t->sel_r = r; t->sel_g = g; t->sel_b = b; }
+}
+
+static void tb_set_cg_name(int no, bool multi, struct string *name)
+{
+	struct textbox_state *t = textbox_get(no, multi, true);
+	if (!t)
+		return;
+	textbox_set_string(&t->cg_name, name);
+	textbox_render(t);
+}
+
+static void tb_get_cg_name(int no, bool multi, struct string **out)
+{
+	struct textbox_state *t = textbox_get(no, multi, false);
+	textbox_out_string(out, t ? t->cg_name : NULL);
+}
+
+// --- TextBox ---
+static void PE_SetTextBoxSize(int no, int w, int h) { tb_set_size(no, false, w, h); }
+static void PE_SetTextBoxFontProperty(int no, int type, int size, int r, int g, int b,
+	float bold, int er, int eg, int eb, float ew)
+	{ tb_set_font_property(no, false, type, size, r, g, b, bold, er, eg, eb, ew); }
+static void PE_GetTextBoxFontProperty(int no, int *type, int *size, int *r, int *g, int *b,
+	float *bold, int *er, int *eg, int *eb, float *ew)
+	{ tb_get_font_property(no, false, type, size, r, g, b, bold, er, eg, eb, ew); }
+static void PE_SetTextBoxText(int no, struct string *s) { tb_set_text(no, false, s); }
+static void PE_GetTextBoxText(int no, struct string **s) { tb_get_text(no, false, s); }
+static void PE_SetTextBoxMaxTextLength(int no, int len) { tb_set_max_length(no, false, len); }
+static int PE_GetTextBoxMaxTextLength(int no) { return tb_get_max_length(no, false); }
+static void PE_SetTextBoxSelectColor(int no, int r, int g, int b) { tb_set_select_color(no, false, r, g, b); }
+static int PE_GetTextBoxSelectR(int no) { struct textbox_state *t = textbox_get(no, false, false); return t ? t->sel_r : 0; }
+static int PE_GetTextBoxSelectG(int no) { struct textbox_state *t = textbox_get(no, false, false); return t ? t->sel_g : 0; }
+static int PE_GetTextBoxSelectB(int no) { struct textbox_state *t = textbox_get(no, false, false); return t ? t->sel_b : 128; }
+static void PE_SetTextBoxCGName(int no, struct string *s) { tb_set_cg_name(no, false, s); }
+static void PE_GetTextBoxCGName(int no, struct string **s) { tb_get_cg_name(no, false, s); }
+static void PE_SetTextBoxReadOnly(int no, bool flg)
+	{ struct textbox_state *t = textbox_get(no, false, true); if (t) t->read_only = flg; }
+static bool PE_IsTextBoxReadOnly(int no)
+	{ struct textbox_state *t = textbox_get(no, false, false); return t && t->read_only; }
+static void PE_SetTextBoxCharSpace(int no, int space)
+	{ struct textbox_state *t = textbox_get(no, false, true); if (t) t->char_space = space; }
+static int PE_GetTextBoxCharSpace(int no)
+	{ struct textbox_state *t = textbox_get(no, false, false); return t ? t->char_space : 0; }
+// Выделение и IME: выделять нечего (каретки нет), переключать тоже нечего.
+static void PE_SelectTextBoxAll(int no) { (void)no; }
+static void PE_OpenTextBoxIME(int no) { (void)no; }
+static void PE_CloseTextBoxIME(int no) { (void)no; }
+static bool PE_IsOpenTextBoxIME(int no) { (void)no; return false; }
+
+// --- MultiTextBox ---
+static void PE_SetMultiTextBoxSize(int no, int w, int h) { tb_set_size(no, true, w, h); }
+static void PE_SetMultiTextBoxFontProperty(int no, int type, int size, int r, int g, int b,
+	float bold, int er, int eg, int eb, float ew)
+	{ tb_set_font_property(no, true, type, size, r, g, b, bold, er, eg, eb, ew); }
+static void PE_GetMultiTextBoxFontProperty(int no, int *type, int *size, int *r, int *g, int *b,
+	float *bold, int *er, int *eg, int *eb, float *ew)
+	{ tb_get_font_property(no, true, type, size, r, g, b, bold, er, eg, eb, ew); }
+static void PE_SetMultiTextBoxText(int no, struct string *s) { tb_set_text(no, true, s); }
+static void PE_GetMultiTextBoxText(int no, struct string **s) { tb_get_text(no, true, s); }
+static void PE_SetMultiTextBoxMaxTextLength(int no, int len) { tb_set_max_length(no, true, len); }
+static int PE_GetMultiTextBoxMaxTextLength(int no) { return tb_get_max_length(no, true); }
+static void PE_SetMultiTextBoxSelectColor(int no, int r, int g, int b) { tb_set_select_color(no, true, r, g, b); }
+static int PE_GetMultiTextBoxSelectR(int no) { struct textbox_state *t = textbox_get(no, true, false); return t ? t->sel_r : 0; }
+static int PE_GetMultiTextBoxSelectG(int no) { struct textbox_state *t = textbox_get(no, true, false); return t ? t->sel_g : 0; }
+static int PE_GetMultiTextBoxSelectB(int no) { struct textbox_state *t = textbox_get(no, true, false); return t ? t->sel_b : 128; }
+static void PE_SetMultiTextBoxCGName(int no, struct string *s) { tb_set_cg_name(no, true, s); }
+static void PE_GetMultiTextBoxCGName(int no, struct string **s) { tb_get_cg_name(no, true, s); }
+static void PE_SetMultiTextBoxReadOnly(int no, bool flg)
+	{ struct textbox_state *t = textbox_get(no, true, true); if (t) t->read_only = flg; }
+static bool PE_IsMultiTextBoxReadOnly(int no)
+	{ struct textbox_state *t = textbox_get(no, true, false); return t && t->read_only; }
 
 static void PartsEngine_Update(int passed_time, bool is_skip, bool message_window_show)
 {
+	textbox_update_caret(passed_time);
 	PE_Update(passed_time, message_window_show);
 }
 
@@ -577,6 +1217,18 @@ struct pe_activity {
 	int nr_parts;
 	struct string *ex_text;
 	int ex_id;
+	/*
+	 * `終了キー` — список виртуальных кодов клавиш, закрывающих активность
+	 * (у `セーブ確認` это `{ 2, 27 }`: правая кнопка мыши и ESC). Лежит на ВЕРХНЕМ
+	 * уровне файла активности, рядом с `アクティビティ`, и в коде игры не
+	 * упоминается ни разу — его читает движок и отдаёт наружу этими четырьмя
+	 * функциями. Игра сама вешает на каждую клавишу `CASClick`
+	 * (`CASPartsActivity@BindEndType`) и по срабатыванию делает `activity::End`.
+	 * Пока мы отдавали «клавиш нет», ESC и правая кнопка не закрывали ни один
+	 * диалог.
+	 */
+	int *end_keys;
+	int nr_end_keys;
 };
 static struct hash_table *pe_activities;
 
@@ -599,6 +1251,7 @@ static void PE_Activity_free(void *p)
 	free(a->parts);
 	if (a->ex_text)
 		free_string(a->ex_text);
+	free(a->end_keys);
 	free(a);
 }
 
@@ -833,6 +1486,20 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	struct string *flat = act_str(st, "フラット名");
 	if (flat && flat->size) {
 		PE_SetPartsFlat(no, flat, state);
+		/*
+		 * `FPS` из описания состояния мы НЕ применяем как скорость
+		 * воспроизведения — проверено и опровергнуто. У титульного фона
+		 * Tsumamigui 3 там стоит 1.0, и при такой скорости заставка растягивается
+		 * на минуту: игра не листает флэт сама, а ЧИТАЕТ его текущий кадр
+		 * (`AFL_Parts_GetPartsFlatCurrentFrameNumber` в цикле
+		 * `C_TITLE@LoadedActivityEvent`) и по нему подгоняет прозрачность и
+		 * отступы кнопок. То есть темп задаёт сам флэт своим заголовком, а что
+		 * означает это поле — пока не установлено.
+		 */
+		// Начальный кадр состояния (`カレントフレーム`).
+		int cur = act_int(st, "カレントフレーム", 0);
+		if (cur > 0)
+			PE_GoFramePartsFlat(no, cur, state);
 		return;
 	}
 	// Text state: テキスト + テキスト装飾 (font). Used e.g. by the config sample
@@ -852,10 +1519,23 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 					act_list_int(fd, "フォント縁取り色", 1, 0),
 					act_list_int(fd, "フォント縁取り色", 2, 0),
 					act_float(fd, "フォント縁取り", 0.0f), state);
-				// 字間隔/行間隔 (char/line spacing) — often negative to tighten the
-				// layout (the config sample message uses 行間隔=-5). Set before
-				// SetText so the char advances are built with the right spacing.
-				PE_SetTextCharSpace(no, act_int(fd, "字間隔", 0), state);
+				/*
+				 * 行間隔 (межстрочный) применяем, 字間隔 (межбуквенный) — НЕТ.
+				 * Замер против эталона (экран SAVE, `Снимок экрана_20260806_140007.png`,
+				 * слот 3): у оригинала строка DATE «8月01日 朝» занимает 96 px, а
+				 * COMMENT «1231231» — 47 px. В данных у обеих частей
+				 * `フォントサイズ = 14` и `字間隔 = -4`. Без вычитания получается
+				 * 7 знаков × 14 px = 98 для полноширинной строки и 7 × 7 px = 49
+				 * для полуширинных цифр — обе сходятся с эталоном. С вычитанием
+				 * −4 не сходится НИ ОДНА: 70 и 21 соответственно, а у нас на
+				 * экране выходило 57 и 17, и комментарий превращался в
+				 * нечитаемую кляксу (буквы налезали друг на друга).
+				 * Что означает `字間隔` в декорации активности — не установлено;
+				 * пиксельной надбавкой к каждому глифу оно точно не является.
+				 * Ручка `XSYS4_ACT_CHARSPACE=1` возвращает прежнее поведение для A/B.
+				 */
+				if (getenv("XSYS4_ACT_CHARSPACE"))
+					PE_SetTextCharSpace(no, act_int(fd, "字間隔", 0), state);
 				PE_SetTextLineSpace(no, act_int(fd, "行間隔", 0), state);
 			}
 			PE_SetText(no, txt, state);
@@ -1099,6 +1779,52 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			act_int(ti, "全体スクロール量", 0), act_int(ti, "表示量", 1),
 			act_float(ti, "スクロールレート", 0.0f));
 		PE_SetClickable(no, true);
+	} else if (ptype == 4 && ti) {
+		/*
+		 * Текстовое поле ввода (パーツタイプ=4). Всё описание лежит прямо здесь,
+		 * гадать не нужно — образец из `セーブ確認.pactex` (поле COMMENT диалога
+		 * «сохранить сюда?» у Tsumamigui 3): サイズ 186×22, шрифт 16 белый с
+		 * обводкой 1.25, 背景色 (61,149,220), 最大文字数 10.
+		 */
+		struct textbox_state *t = textbox_get(no, false, true);
+		if (t) {
+			t->width  = act_list_int(ti, "サイズ", 0, 0);
+			t->height = act_list_int(ti, "サイズ", 1, 0);
+			t->font_type   = act_int(ti, "フォントタイプ", 0);
+			t->font_size   = act_int(ti, "フォントサイズ", 16);
+			t->r = act_list_int(ti, "フォント色", 0, 255);
+			t->g = act_list_int(ti, "フォント色", 1, 255);
+			t->b = act_list_int(ti, "フォント色", 2, 255);
+			t->bold_weight = act_float(ti, "フォント太さ", 0.0f);
+			t->edge_weight = act_float(ti, "フォント縁取り", 0.0f);
+			t->edge_r = act_list_int(ti, "フォント縁取り色", 0, 0);
+			t->edge_g = act_list_int(ti, "フォント縁取り色", 1, 0);
+			t->edge_b = act_list_int(ti, "フォント縁取り色", 2, 0);
+			t->read_only  = act_int(ti, "読み取り専用", 0) != 0;
+			t->max_length = act_int(ti, "最大文字数", 0);
+			t->bg_r = act_list_int(ti, "背景色", 0, 0);
+			t->bg_g = act_list_int(ti, "背景色", 1, 0);
+			t->bg_b = act_list_int(ti, "背景色", 2, 0);
+			t->ro_bg_r = act_list_int(ti, "読み取り専用背景色", 0, 150);
+			t->ro_bg_g = act_list_int(ti, "読み取り専用背景色", 1, 150);
+			t->ro_bg_b = act_list_int(ti, "読み取り専用背景色", 2, 150);
+			t->frame_r = act_list_int(ti, "枠色", 0, 0);
+			t->frame_g = act_list_int(ti, "枠色", 1, 0);
+			t->frame_b = act_list_int(ti, "枠色", 2, 0);
+			t->sel_r = act_list_int(ti, "選択色", 0, 200);
+			t->sel_g = act_list_int(ti, "選択色", 1, 200);
+			t->sel_b = act_list_int(ti, "選択色", 2, 200);
+			t->char_space = act_int(ti, "文字間隔", 0);
+			struct string *cg = act_str(ti, "ＣＧ名");
+			if (cg && cg->size)
+				textbox_set_string(&t->cg_name, cg);
+			struct string *txt = act_str(ti, "テキスト");
+			if (txt)
+				textbox_set_string(&t->text, txt);
+			t->caret = textbox_nr_chars(t);
+			textbox_render(t);
+		}
+		PE_SetClickable(no, true);
 	} else if (ptype == 2 && ti) {
 		// vertical scrollbar (パーツタイプ=2). Geometry from 種類別情報: 長さ=track
 		// length (Y), 幅=track width (X), 前/次サイズ=∧/∨ arrow-button heights,
@@ -1271,6 +1997,18 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetPartsMagY(no, sy);
 	if (act_int(node, "クリック許可", 0))
 		PE_SetClickable(no, true);
+	/*
+	 * `オンカーソル透過` — «пропускать курсор сквозь себя». Загрузчик его НЕ ЧИТАЛ,
+	 * поэтому каждая часть перехватывала hover и клик у всего, что под ней, хотя
+	 * данные игры говорят обратное. Стоило это целого механизма: в диалоге
+	 * «сохранить сюда?» подсказка `コメント` (z=7, `オンカーソル透過 = 1`) лежит
+	 * поверх рамки-кнопки `文字入力` (z=6) и съедала клик по ней — а именно её
+	 * `ButtonLClickEvent` показывает поле ввода и ставит на него фокус
+	 * (байткод `C_SAVE_CONFIRM@ButtonLClickEvent`, FUNC 7974). Из-за одного
+	 * непрочитанного поля поле ввода комментария не появлялось вообще.
+	 */
+	if (act_int(node, "オンカーソル透過", 0))
+		PE_SetPassCursor(no, true);
 	if (parent_no >= 0)
 		PE_SetParentPartsNumber(no, parent_no);
 	PE_SetShow(no, act_int(node, "表示", 1));
@@ -1315,6 +2053,30 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 		return false;
 	}
 
+	/*
+	 * `終了キー` лежит на верхнем уровне файла, отдельным списком рядом с
+	 * `アクティビティ`. Читаем ДО постройки частей, чтобы игра увидела клавиши,
+	 * когда позовёт `BindEndType`.
+	 */
+	{
+		char *k = utf2sjis("終了キー", strlen("終了キー"));
+		struct ex_value *keys = ex_get(ex, k);
+		free(k);
+		if (a && keys && keys->type == EX_LIST && keys->list) {
+			free(a->end_keys);
+			a->nr_end_keys = 0;
+			a->end_keys = xcalloc(keys->list->nr_items, sizeof(int));
+			for (unsigned i = 0; i < keys->list->nr_items; i++) {
+				struct ex_value *v = &keys->list->items[i].value;
+				if (v->type == EX_INT)
+					a->end_keys[a->nr_end_keys++] = v->i;
+			}
+			if (getenv("XSYS4_ACT_TRACE"))
+				NOTICE("ACT '%s': завершающих клавиш %d",
+				       display_sjis0(file_name->text), a->nr_end_keys);
+		}
+	}
+
 	char *sjis = utf2sjis("アクティビティ", strlen("アクティビティ"));
 	struct ex_value *act = ex_get(ex, sjis);
 	free(sjis);
@@ -1336,14 +2098,57 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 	return true;
 }
 
-// Activity "end keys" are optional keyboard shortcuts that close an activity
-// (e.g. ESC to cancel). Not tracked yet — report none so BindEndType proceeds
-// and the activity is driven by its on-screen buttons instead.
-static void PE_SetActivityEndKey(struct string *act, int key) { (void)act; (void)key; }
-static void PE_EraseActivityEndKey(struct string *act, int key) { (void)act; (void)key; }
-static bool PE_IsExistActivityEndKey(struct string *act, int key) { (void)act; (void)key; return false; }
-static int PE_NumofActivityEndKey(struct string *act) { (void)act; return 0; }
-static int PE_GetActivityEndKey(struct string *act, int index) { (void)act; (void)index; return 0; }
+// Клавиши, закрывающие активность (см. комментарий у `end_keys` в struct pe_activity).
+static int act_end_key_index(struct pe_activity *a, int key)
+{
+	for (int i = 0; i < a->nr_end_keys; i++) {
+		if (a->end_keys[i] == key)
+			return i;
+	}
+	return -1;
+}
+
+static void PE_SetActivityEndKey(struct string *act, int key)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a || act_end_key_index(a, key) >= 0)
+		return;
+	a->end_keys = xrealloc_array(a->end_keys, a->nr_end_keys, a->nr_end_keys + 1,
+				     sizeof(int));
+	a->end_keys[a->nr_end_keys++] = key;
+}
+
+static void PE_EraseActivityEndKey(struct string *act, int key)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a)
+		return;
+	int i = act_end_key_index(a, key);
+	if (i < 0)
+		return;
+	memmove(&a->end_keys[i], &a->end_keys[i + 1], (a->nr_end_keys - i - 1) * sizeof(int));
+	a->nr_end_keys--;
+}
+
+static bool PE_IsExistActivityEndKey(struct string *act, int key)
+{
+	struct pe_activity *a = pe_act_find(act);
+	return a && act_end_key_index(a, key) >= 0;
+}
+
+static int PE_NumofActivityEndKey(struct string *act)
+{
+	struct pe_activity *a = pe_act_find(act);
+	return a ? a->nr_end_keys : 0;
+}
+
+static int PE_GetActivityEndKey(struct string *act, int index)
+{
+	struct pe_activity *a = pe_act_find(act);
+	if (!a || index < 0 || index >= a->nr_end_keys)
+		return 0;
+	return a->end_keys[index];
+}
 
 // Recompute transform matrices for the frame. Our renderer derives transforms
 // from part params directly, so this is a no-op.
@@ -1614,10 +2419,35 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 }
 // Фокус ввода (клавиатурная навигация по кнопкам) в движке не реализован —
 // косметика. Явные заглушки, видимые в исходнике.
-static int PE_GetFocusPartsNumber(void) { return -1; }
-static bool PE_IsFocus(int a) { (void)a; return false; }
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetFocus, int a);
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetFocusPartsNumber, int a);
+/*
+ * ФОКУС ВВОДА. Раньше все четыре функции были вечными заглушками (-1 / false /
+ * no-op), и это ломало не «клавиатурную навигацию по кнопкам», как считалось, а
+ * ТЕКСТОВЫЕ ПОЛЯ: диалог «сохранить сюда?» у Tsumamigui 3 держит поле ввода
+ * (`コメント編集`, часть 90000105) погашенным и показывает его, только когда движок
+ * подтвердит, что фокус на нём. С `IsFocus() == false` поле не появлялось никогда —
+ * в оригинале же каретка в нём видна.
+ */
+static int focus_parts_no = -1;
+
+static void PE_SetFocusPartsNumber(int parts_no)
+{
+	focus_parts_no = parts_no;
+	/*
+	 * Фокус ставит САМА ИГРА, и для текстового поля это и есть команда «начинай
+	 * принимать ввод». Разобрано по байткоду `C_SAVE_CONFIRM@ButtonLClickEvent`
+	 * (FUNC 7974): клик по рамке `文字入力` → `Ｐ＿ボタン＿有効設定(文字入力, 0)`
+	 * → `Ｐ＿表示設定(コメント, 0)` (спрятать подсказку «■１０文字まで！！■»)
+	 * → `Ｐ＿表示設定(コメント編集, 1)` (показать поле) → `Ｐ＿フォーカス設定(コメント編集)`.
+	 * То есть поле оживает не от нашего клика по нему, а вот отсюда.
+	 */
+	struct textbox_state *t = textbox_get(parts_no, false, false);
+	if (!t)
+		t = textbox_get(parts_no, true, false);
+	textbox_set_focus(t);
+}
+
+static int PE_GetFocusPartsNumber(void) { return focus_parts_no; }
+static bool PE_IsFocus(int parts_no) { return focus_parts_no == parts_no; }
 
 // `GetActiveParts` — «номер активной части», 0 = нет такой. У Tsumamigui 3 её зовёт
 // РОВНО одно место: `activityeditor::detail::CAESelectOriginDialog@MouseLClickEvent`
@@ -1631,6 +2461,7 @@ static int PE_GetActiveParts(void) { return 0; }
 // IME (переключение на полноширинный ввод в текстовом поле) — у нас ввод идёт через
 // SDL без IME, переключать нечего. Настоящий no-op, а не заглушка-недоделка.
 static void PE_SetOpenTextBoxIME(int parts_no, bool open) { (void)parts_no; (void)open; }
+
 
 static void PE_SetComponentScrollPosXLinkNumber(int parts_no, int link)
 {
@@ -2294,7 +3125,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(EndInput, PE_EndInput),
 	    HLL_EXPORT(GetClickPartsNumber, PE_GetClickPartsNumber),
 	    HLL_EXPORT(GetFocusPartsNumber, PE_GetFocusPartsNumber),
-	    HLL_EXPORT(SetFocusPartsNumber, PartsEngine_SetFocusPartsNumber),
+	    HLL_EXPORT(SetFocusPartsNumber, PE_SetFocusPartsNumber),
 	    HLL_EXPORT(GetPartsTextFontProperty, PE_GetPartsTextFontProperty),
 	    HLL_TODO_EXPORT(PushGUIController, PartsEngine_PushGUIController),
 	    HLL_TODO_EXPORT(PopGUIController, PartsEngine_PopGUIController),
@@ -2460,7 +3291,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetMessageVariableBool, PE_GetMessageVariableBool),
 	    HLL_EXPORT(GetMessageVariableString, PE_GetMessageVariableString),
 	    HLL_EXPORT(SetDelegateIndex, PE_SetDelegateIndex),
-	    HLL_EXPORT(SetFocus, PartsEngine_SetFocus),
+	    HLL_EXPORT(SetFocus, PE_SetFocusPartsNumber),
 	    HLL_EXPORT(IsFocus, PE_IsFocus),
 	    HLL_EXPORT(SetComponentType, PE_SetComponentType),
 	    HLL_EXPORT(GetComponentType, PE_GetComponentType),
@@ -2602,21 +3433,27 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetHScrollbarCGName, PartsEngine_GetHScrollbarCGName),
 	    HLL_EXPORT(SetHScrollbarFlatName, PartsEngine_SetHScrollbarFlatName),
 	    HLL_EXPORT(GetHScrollbarFlatName, PartsEngine_GetHScrollbarFlatName),
-	    HLL_TODO_EXPORT(SetTextBoxSize, PartsEngine_SetTextBoxSize),
-	    HLL_TODO_EXPORT(SetTextBoxFontProperty, PartsEngine_SetTextBoxFontProperty),
-	    HLL_TODO_EXPORT(GetTextBoxFontProperty, PartsEngine_GetTextBoxFontProperty),
-	    HLL_TODO_EXPORT(SetTextBoxText, PartsEngine_SetTextBoxText),
-	    HLL_TODO_EXPORT(GetTextBoxText, PartsEngine_GetTextBoxText),
-	    HLL_TODO_EXPORT(SetTextBoxMaxTextLength, PartsEngine_SetTextBoxMaxTextLength),
-	    HLL_TODO_EXPORT(GetTextBoxMaxTextLength, PartsEngine_GetTextBoxMaxTextLength),
-	    HLL_TODO_EXPORT(SetTextBoxSelectColor, PartsEngine_SetTextBoxSelectColor),
-	    HLL_TODO_EXPORT(GetTextBoxSelectR, PartsEngine_GetTextBoxSelectR),
-	    HLL_TODO_EXPORT(GetTextBoxSelectG, PartsEngine_GetTextBoxSelectG),
-	    HLL_TODO_EXPORT(GetTextBoxSelectB, PartsEngine_GetTextBoxSelectB),
-	    HLL_TODO_EXPORT(SetTextBoxCGName, PartsEngine_SetTextBoxCGName),
-	    HLL_TODO_EXPORT(GetTextBoxCGName, PartsEngine_GetTextBoxCGName),
-	    HLL_TODO_EXPORT(OpenTextBoxIME, PartsEngine_OpenTextBoxIME),
-	    HLL_TODO_EXPORT(CloseTextBoxIME, PartsEngine_CloseTextBoxIME),
+	    HLL_EXPORT(SetTextBoxSize, PE_SetTextBoxSize),
+	    HLL_EXPORT(SetTextBoxFontProperty, PE_SetTextBoxFontProperty),
+	    HLL_EXPORT(GetTextBoxFontProperty, PE_GetTextBoxFontProperty),
+	    HLL_EXPORT(SetTextBoxText, PE_SetTextBoxText),
+	    HLL_EXPORT(GetTextBoxText, PE_GetTextBoxText),
+	    HLL_EXPORT(SetTextBoxMaxTextLength, PE_SetTextBoxMaxTextLength),
+	    HLL_EXPORT(GetTextBoxMaxTextLength, PE_GetTextBoxMaxTextLength),
+	    HLL_EXPORT(SetTextBoxSelectColor, PE_SetTextBoxSelectColor),
+	    HLL_EXPORT(GetTextBoxSelectR, PE_GetTextBoxSelectR),
+	    HLL_EXPORT(GetTextBoxSelectG, PE_GetTextBoxSelectG),
+	    HLL_EXPORT(GetTextBoxSelectB, PE_GetTextBoxSelectB),
+	    HLL_EXPORT(SetTextBoxCGName, PE_SetTextBoxCGName),
+	    HLL_EXPORT(GetTextBoxCGName, PE_GetTextBoxCGName),
+	    HLL_EXPORT(OpenTextBoxIME, PE_OpenTextBoxIME),
+	    HLL_EXPORT(CloseTextBoxIME, PE_CloseTextBoxIME),
+	    HLL_EXPORT(IsOpenTextBoxIME, PE_IsOpenTextBoxIME),
+	    HLL_EXPORT(SelectTextBoxAll, PE_SelectTextBoxAll),
+	    HLL_EXPORT(SetTextBoxReadOnly, PE_SetTextBoxReadOnly),
+	    HLL_EXPORT(IsTextBoxReadOnly, PE_IsTextBoxReadOnly),
+	    HLL_EXPORT(SetTextBoxCharSpace, PE_SetTextBoxCharSpace),
+	    HLL_EXPORT(GetTextBoxCharSpace, PE_GetTextBoxCharSpace),
 	    HLL_TODO_EXPORT(SetListBoxSize, PartsEngine_SetListBoxSize),
 	    HLL_TODO_EXPORT(SetListBoxLineHeight, PartsEngine_SetListBoxLineHeight),
 	    HLL_TODO_EXPORT(GetListBoxLineHeight, PartsEngine_GetListBoxLineHeight),
@@ -2650,19 +3487,21 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(GetComboBoxText, PartsEngine_GetComboBoxText),
 	    HLL_TODO_EXPORT(SetComboBoxFontProperty, PartsEngine_SetComboBoxFontProperty),
 	    HLL_TODO_EXPORT(GetComboBoxFontProperty, PartsEngine_GetComboBoxFontProperty),
-	    HLL_TODO_EXPORT(SetMultiTextBoxSize, PartsEngine_SetMultiTextBoxSize),
-	    HLL_TODO_EXPORT(SetMultiTextBoxFontProperty, PartsEngine_SetMultiTextBoxFontProperty),
-	    HLL_TODO_EXPORT(GetMultiTextBoxFontProperty, PartsEngine_GetMultiTextBoxFontProperty),
-	    HLL_TODO_EXPORT(SetMultiTextBoxText, PartsEngine_SetMultiTextBoxText),
-	    HLL_TODO_EXPORT(GetMultiTextBoxText, PartsEngine_GetMultiTextBoxText),
-	    HLL_TODO_EXPORT(SetMultiTextBoxMaxTextLength, PartsEngine_SetMultiTextBoxMaxTextLength),
-	    HLL_TODO_EXPORT(GetMultiTextBoxMaxTextLength, PartsEngine_GetMultiTextBoxMaxTextLength),
-	    HLL_TODO_EXPORT(SetMultiTextBoxSelectColor, PartsEngine_SetMultiTextBoxSelectColor),
-	    HLL_TODO_EXPORT(GetMultiTextBoxSelectR, PartsEngine_GetMultiTextBoxSelectR),
-	    HLL_TODO_EXPORT(GetMultiTextBoxSelectG, PartsEngine_GetMultiTextBoxSelectG),
-	    HLL_TODO_EXPORT(GetMultiTextBoxSelectB, PartsEngine_GetMultiTextBoxSelectB),
-	    HLL_TODO_EXPORT(SetMultiTextBoxCGName, PartsEngine_SetMultiTextBoxCGName),
-	    HLL_TODO_EXPORT(GetMultiTextBoxCGName, PartsEngine_GetMultiTextBoxCGName),
+	    HLL_EXPORT(SetMultiTextBoxSize, PE_SetMultiTextBoxSize),
+	    HLL_EXPORT(SetMultiTextBoxFontProperty, PE_SetMultiTextBoxFontProperty),
+	    HLL_EXPORT(GetMultiTextBoxFontProperty, PE_GetMultiTextBoxFontProperty),
+	    HLL_EXPORT(SetMultiTextBoxText, PE_SetMultiTextBoxText),
+	    HLL_EXPORT(GetMultiTextBoxText, PE_GetMultiTextBoxText),
+	    HLL_EXPORT(SetMultiTextBoxMaxTextLength, PE_SetMultiTextBoxMaxTextLength),
+	    HLL_EXPORT(GetMultiTextBoxMaxTextLength, PE_GetMultiTextBoxMaxTextLength),
+	    HLL_EXPORT(SetMultiTextBoxSelectColor, PE_SetMultiTextBoxSelectColor),
+	    HLL_EXPORT(GetMultiTextBoxSelectR, PE_GetMultiTextBoxSelectR),
+	    HLL_EXPORT(GetMultiTextBoxSelectG, PE_GetMultiTextBoxSelectG),
+	    HLL_EXPORT(GetMultiTextBoxSelectB, PE_GetMultiTextBoxSelectB),
+	    HLL_EXPORT(SetMultiTextBoxCGName, PE_SetMultiTextBoxCGName),
+	    HLL_EXPORT(GetMultiTextBoxCGName, PE_GetMultiTextBoxCGName),
+	    HLL_EXPORT(SetMultiTextBoxReadOnly, PE_SetMultiTextBoxReadOnly),
+	    HLL_EXPORT(IsMultiTextBoxReadOnly, PE_IsMultiTextBoxReadOnly),
 	    HLL_EXPORT(SetLayoutBoxLayoutType, PE_SetLayoutBoxLayoutType),
 	    HLL_EXPORT(GetLayoutBoxLayoutType, PE_GetLayoutBoxLayoutType),
 	    HLL_EXPORT(SetLayoutBoxReturn, PE_SetLayoutBoxReturn),

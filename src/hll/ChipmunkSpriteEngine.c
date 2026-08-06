@@ -284,7 +284,44 @@ static bool ChipmunkSpriteEngine_SP_IsSuspend(int sp_no)
 	return sp && sp->suspended;
 }
 
-//static bool ChipmunkSpriteEngine_Debug_GetVideoMemoryInfo(int *max_size, int *use_size, int *use_max_size);
+/*
+ * Debug_*-счётчики отладочного оверлея спрайтового движка. Своего учёта
+ * видеопамяти и fill rate у нас нет (переносимо их не спросить ни у GL-ES, ни
+ * у SDL), поэтому все четыре отдают нули — «не измеряю».
+ *
+ * Отдельно: раньше они были `HLL_TODO_EXPORT`, то есть `.fun = NULL`, а это не
+ * заглушка, а ДЫРА — вызов уводит движок в REPL (FINDINGS §5y). У Daiteikoku
+ * все четыре СТРОГО достижимы: они висят на отладочном оверлее, который игра
+ * собирает на старте.
+ */
+static int ChipmunkSpriteEngine_Debug_GetCurrentAllocatedMemorySize(void) { return 0; }
+static int ChipmunkSpriteEngine_Debug_GetMaxAllocatedMemorySize(void) { return 0; }
+static int ChipmunkSpriteEngine_Debug_GetFillRate(void) { return 0; }
+
+static bool ChipmunkSpriteEngine_Debug_GetVideoMemoryInfo(int *max_size, int *use_size,
+							  int *use_max_size)
+{
+	// Выходы заполняем даже при false: незаполненный ref-выход = игра читает
+	// мусор (§7 FINDINGS).
+	if (max_size)
+		*max_size = 0;
+	if (use_size)
+		*use_size = 0;
+	if (use_max_size)
+		*use_max_size = 0;
+	return false;
+}
+
+/*
+ * Настройка «пропускать кадры целиком во время промотки текста». Свой пропуск
+ * кадров у нас не реализован, читать значение игре нечем (геттера в библиотеке
+ * нет), так что запоминать его негде и незачем.
+ */
+static void ChipmunkSpriteEngine_SYSTEM_SetConfigFrameSkipAllWhileMessageSkip(bool skip)
+{
+	(void)skip;
+}
+
 //static void ChipmunkSpriteEngine_CombineTexture(void);
 //static void ChipmunkSpriteEngine_ReleaseCombinedTexture(void);
 
@@ -414,17 +451,18 @@ HLL_LIBRARY(ChipmunkSpriteEngine,
 	    HLL_EXPORT(SYSTEM_SetReadMessageSkipping, StoatSpriteEngine_SYSTEM_SetReadMessageSkipping),
 	    HLL_EXPORT(SYSTEM_GetReadMessageSkipping, StoatSpriteEngine_SYSTEM_GetReadMessageSkipping),
 	    HLL_EXPORT(SYSTEM_SetConfigFrameSkipWhileMessageSkip, StoatSpriteEngine_SYSTEM_SetConfigFrameSkipWhileMessageSkip),
+	    HLL_EXPORT(SYSTEM_SetConfigFrameSkipAllWhileMessageSkip, ChipmunkSpriteEngine_SYSTEM_SetConfigFrameSkipAllWhileMessageSkip),
 	    HLL_EXPORT(SYSTEM_GetConfigFrameSkipWhileMessageSkip, StoatSpriteEngine_SYSTEM_GetConfigFrameSkipWhileMessageSkip),
 	    HLL_EXPORT(SYSTEM_SetInvalidateFrameSkipWhileMessageSkip, StoatSpriteEngine_SYSTEM_SetInvalidateFrameSkipWhileMessageSkip),
 	    HLL_EXPORT(SYSTEM_GetInvalidateFrameSkipWhileMessageSkip, StoatSpriteEngine_SYSTEM_GetInvalidateFrameSkipWhileMessageSkip),
-	    HLL_TODO_EXPORT(Debug_GetCurrentAllocatedMemorySize, StoatSpriteEngine_Debug_GetCurrentAllocatedMemorySize),
-	    HLL_TODO_EXPORT(Debug_GetMaxAllocatedMemorySize, StoatSpriteEngine_Debug_GetMaxAllocatedMemorySize),
-	    HLL_TODO_EXPORT(Debug_GetFillRate, StoatSpriteEngine_Debug_GetFillRate),
+	    HLL_EXPORT(Debug_GetCurrentAllocatedMemorySize, ChipmunkSpriteEngine_Debug_GetCurrentAllocatedMemorySize),
+	    HLL_EXPORT(Debug_GetMaxAllocatedMemorySize, ChipmunkSpriteEngine_Debug_GetMaxAllocatedMemorySize),
+	    HLL_EXPORT(Debug_GetFillRate, ChipmunkSpriteEngine_Debug_GetFillRate),
 	    HLL_TODO_EXPORT(MUSIC_ReloadParam, StoatSpriteEngine_MUSIC_ReloadParam),
 	    HLL_EXPORT(SP_Suspend, ChipmunkSpriteEngine_SP_Suspend),
 	    HLL_EXPORT(SP_Resume, ChipmunkSpriteEngine_SP_Resume),
 	    HLL_EXPORT(SP_IsSuspend, ChipmunkSpriteEngine_SP_IsSuspend),
-	    HLL_TODO_EXPORT(Debug_GetVideoMemoryInfo, ChipmunkSpriteEngine_Debug_GetVideoMemoryInfo),
+	    HLL_EXPORT(Debug_GetVideoMemoryInfo, ChipmunkSpriteEngine_Debug_GetVideoMemoryInfo),
 	    HLL_TODO_EXPORT(CombineTexture, ChipmunkSpriteEngine_CombineTexture),
 	    HLL_TODO_EXPORT(ReleaseCombinedTexture, ChipmunkSpriteEngine_ReleaseCombinedTexture));
 

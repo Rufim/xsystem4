@@ -1,8 +1,11 @@
 # CMakeLists.txt for Android build
 
 cmake_minimum_required(VERSION 3.14)
-project(xsystem4 LANGUAGES C)
+# C++ нужен ровно для одного модуля — src/regex_ecma.cpp (ECMAScript-регулярки
+# библиотеки String, в POSIX ERE их нет).
+project(xsystem4 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 
 include(FetchContent)
 
@@ -65,6 +68,7 @@ target_sources(xsystem4 PRIVATE
   src/movie_plmpeg.c
   src/msgqueue.c
   src/page.c
+  src/regex_ecma.cpp
   src/resume.c
   src/savedata.c
   src/scene.c
@@ -106,6 +110,7 @@ target_sources(xsystem4 PRIVATE
   src/parts/layoutbox.c
   src/parts/message.c
   src/parts/motion.c
+  src/parts/panel.c
   src/parts/parts.c
   src/parts/render.c
   src/parts/text.c
@@ -138,6 +143,7 @@ target_sources(xsystem4 PRIVATE
   src/hll/DALKEDemo.c
   src/hll/Data.c
   src/hll/DataFile.c
+  src/hll/Delegate.c
   src/hll/Discord.c
   src/hll/DrawDungeon.c
   src/hll/DrawEffect.c
@@ -194,9 +200,12 @@ target_sources(xsystem4 PRIVATE
   src/hll/Sound2ex.c
   src/hll/StoatSpriteEngine.c
   src/hll/StretchHelper.c
+  src/hll/String.c
+  src/hll/Sys43VM.c
   src/hll/System.c
   src/hll/SystemService.c
   src/hll/SystemServiceEx.c
+  src/hll/TextFile.c
   src/hll/TextSurfaceManager.c
   src/hll/Timer.c
   src/hll/Toushin3Loader.c

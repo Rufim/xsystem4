@@ -1182,6 +1182,33 @@ void gfx_draw_quadrilateral(Texture *dst, Texture *src, struct gfx_vertex vertic
 	restore_blend_mode();
 }
 
+/*
+ * Смешивающие варианты того же четырёхугольника — под семейство
+ * `DrawGraph.*DeformedSprite*`. Режимы смешивания взяты ровно те же, что у
+ * прямоугольных собратьев в этом файле, чтобы деформированный спрайт ложился на
+ * приёмник так же, как недеформированный:
+ *   blend      — равномерная альфа, альфа-канал приёмника не трогается (gfx_blend);
+ *   blend_amap — альфа из самой текстуры (gfx_blend_amap).
+ */
+void gfx_blend_quadrilateral(Texture *dst, Texture *src, struct gfx_vertex vertices[4], int a)
+{
+	glBlendFuncSeparate(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA, GL_ZERO, GL_ONE);
+	glBlendColor(0, 0, 0, a / 255.0);
+	GLuint fbo = gfx_set_framebuffer(GL_DRAW_FRAMEBUFFER, dst, 0, 0, dst->w, dst->h);
+	gfx_render_quadrilateral(src, vertices);
+	gfx_reset_framebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+	restore_blend_mode();
+}
+
+void gfx_blend_amap_quadrilateral(Texture *dst, Texture *src, struct gfx_vertex vertices[4])
+{
+	glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	GLuint fbo = gfx_set_framebuffer(GL_DRAW_FRAMEBUFFER, dst, 0, 0, dst->w, dst->h);
+	gfx_render_quadrilateral(src, vertices);
+	gfx_reset_framebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+	restore_blend_mode();
+}
+
 // XXX: Not an actual DrawGraph function; used for rendering text
 void gfx_draw_glyph(Texture *dst, float dx, int dy, Texture *glyph, SDL_Color color, float scale_x, float bold_width, bool blend)
 {

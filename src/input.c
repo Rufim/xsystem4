@@ -45,8 +45,16 @@ bool key_state[VK_NR_KEYCODES];
  *   key <name>       press+release a key (RETURN, SPACE, Z, ESCAPE, UP, DOWN, LEFT, RIGHT)
  *   click <x> <y>    left click at window coords (x,y)
  *   move <x> <y>     set reported mouse position (window coords)
+ *   text <строка>    ввод ТЕКСТА (SDL_TEXTINPUT) — им набирается текст в полях
+ *                    ввода PartsEngine: печатные символы приходят виджету не
+ *                    кодами клавиш, а событием текста, и `key <name>` их не
+ *                    заменяет. Без этой команды поле ввода headless не проверить.
  * A press is held for a few frames then released so edge-triggered logic fires.
  */
+// Объявлен ниже вместе с остальными обработчиками; тестовому вводу он нужен
+// раньше, чтобы команда `text` шла ровно тем же путём, что настоящий SDL_TEXTINPUT.
+static void(*input_handler)(const char*);
+
 static bool test_input_enabled;
 static int test_mouse_x = -1, test_mouse_y = -1;
 // Mouse-wheel delivery: accumulate notch counts (forward = wheel up/away,
@@ -212,6 +220,17 @@ static void test_input_update(void)
 			// for every consumer (poll + parts message).
 			wheel_add(x);
 			NOTICE("TEST_INPUT: wheel %d", x);
+		} else if (!strncmp(line, "text ", 5)) {
+			// Через тот же обработчик, что и настоящий SDL_TEXTINPUT: пушить
+			// событие нельзя по той же причине, что и колесо (sdl2-compat
+			// теряет полезную нагрузку на круге SDL2->SDL3->SDL2).
+			char *txt = line + 5;
+			size_t n = strlen(txt);
+			while (n && (txt[n-1] == '\n' || txt[n-1] == '\r'))
+				txt[--n] = '\0';
+			if (input_handler)
+				input_handler(txt);
+			NOTICE("TEST_INPUT: text '%s'", txt);
 		}
 	}
 }
@@ -460,7 +479,6 @@ bool mouse_show_cursor(bool show)
 	return SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE) >= 0;
 }
 
-static void(*input_handler)(const char*);
 static void(*editing_handler)(const char*, int, int);
 static void(*key_handler)(int);
 

@@ -27,6 +27,12 @@ void PE_enable_multi_controller(void);
 void PE_set_message_empty_type_minus_one(void);
 bool PE_Init(void);
 void PE_Reset(void);
+// Текстовые поля ввода (TextBox/MultiTextBox) живут в src/hll/PartsEngine.c,
+// но фокус и клавиши им приносит общий ввод партов.
+void PE_textbox_click(int parts_no);
+void PE_textbox_key(int vk);
+// Сообщение «ввод подтверждён» (тип 25) текстовому полю.
+void PE_SendFixedEvent(int parts_no);
 void PE_Update(int passed_time, bool message_window_show);
 void PE_UpdateComponent(int passed_time);
 void PE_UpdateParts(int passed_time, bool is_skip, bool message_window_show);

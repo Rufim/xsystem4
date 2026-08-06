@@ -24,6 +24,7 @@
 #include "hll.h"
 #include "asset_manager.h"
 #include "audio.h"
+#include "mixer.h"
 
 HLL_WARN_UNIMPLEMENTED( , void, KiwiSoundEngine, SetGlobalFocus, possibly_unused int nNum);
 
@@ -256,6 +257,11 @@ HLL_LIBRARY(KiwiSoundEngine,
 	    HLL_EXPORT(Sound_GetGroupNumFromDataNum, wav_get_group_num_from_data_num),
 	    HLL_TODO_EXPORT(Sound_PrepareFromFile, KiwiSoundEngine_Sound_PrepareFromFile),
 	    HLL_EXPORT(Sound_GetDataLength, wav_get_data_length),
+	    // Единственная СТРОГО достижимая дыра Dohna Dohna (FINDINGS §5y).
+	    // Тот же микшер, что у `SystemService.GetMixerMute` — Ixseal просто
+	    // объявляет его ещё и здесь, реализация общая.
+	    HLL_EXPORT(GetMixerMute, mixer_get_mute),
+	    HLL_EXPORT(SetMixerMute, mixer_set_mute),
 	    HLL_EXPORT(GetMasterGroup, KiwiSoundEngine_GetMasterGroup),
 	    HLL_EXPORT(GetBGMGroup, KiwiSoundEngine_GetBGMGroup),
 	    HLL_EXPORT(GetSEGroup, KiwiSoundEngine_GetSEGroup),

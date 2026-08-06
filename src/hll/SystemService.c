@@ -16,6 +16,11 @@
 
 #include <string.h>
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+
+#include <SDL.h>
 
 #include "system4/ain.h"
 #include "system4/string.h"
@@ -614,7 +619,19 @@ static void SystemService_OpenPlayingManual(void) {
 
 //static bool SystemService_IsExistSystemMessage(void);
 HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, IsExistSystemMessage);
-//static bool SystemService_PopSystemMessage(int *message);
+/*
+ * Очередь системных сообщений рантайма. `IsExistSystemMessage` у нас уже
+ * отвечает «пусто», поэтому единственный честный ответ здесь — тоже «пусто»:
+ * игра вызывает пару в цикле `while (IsExistSystemMessage()) PopSystemMessage(&m)`,
+ * и `true` без сообщения увёл бы её в вечный цикл. Выход НЕ трогаем только при
+ * false — но ref-выходы обязаны быть заполнены (см. §7 FINDINGS), поэтому 0.
+ */
+static bool SystemService_PopSystemMessage(int *message)
+{
+	if (message)
+		*message = 0;
+	return false;
+}
 
 static void SystemService_RestrainScreensaver(void) { }
 
@@ -686,7 +703,125 @@ static void SystemService_BackupSaveFile(void)
 	}
 }
 
-//static int SystemService_Debug_GetUseVideoMemorySize(void);
+/*
+ * Сведения о машине для экрана «Questionnaire» (アンケート) — той самой анкеты,
+ * которую игра предлагает отправить по сети. Четыре геттера ниже плюс семь
+ * функций `HTTPDownloader` — единственные СТРОГО достижимые дыры Tsumamigui
+ * (FINDINGS §5y), и попадают в них по одному пути: пользователь соглашается
+ * на «подключиться к сети?».
+ *
+ * Оригинал брал их из WinAPI (`GlobalMemoryStatus`, CPUID, `GetVersionEx`).
+ * Здесь — настоящие значения Linux/Android из `/proc`, а не выдуманные:
+ * анкета их только ПОКАЗЫВАЕТ и отправляет, поэтому враньё было бы видно
+ * пользователю, а неверный формат — нет.
+ */
+static char *proc_field(const char *path, const char *key)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return NULL;
+	char line[512];
+	size_t keylen = strlen(key);
+	char *out = NULL;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, key, keylen))
+			continue;
+		char *colon = strchr(line, ':');
+		if (!colon)
+			continue;
+		char *v = colon + 1;
+		while (*v == ' ' || *v == '\t')
+			v++;
+		char *end = v + strlen(v);
+		while (end > v && (end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+		*end = '\0';
+		out = xstrdup(v);
+		break;
+	}
+	fclose(f);
+	return out;
+}
+
+static void set_out_string(struct string **dst, const char *text)
+{
+	if (!dst)
+		return;
+	if (*dst)
+		free_string(*dst);
+	*dst = cstr_to_string(text ? text : "");
+}
+
+static void SystemService_GetCPUInfo(struct string **vendor, int *signature,
+				     int *cpu_flag, struct string **brand)
+{
+	char *v = proc_field("/proc/cpuinfo", "vendor_id");
+	char *b = proc_field("/proc/cpuinfo", "model name");
+	if (!b)
+		b = proc_field("/proc/cpuinfo", "Processor");   // ARM/Android
+	set_out_string(vendor, v ? v : "unknown");
+	set_out_string(brand, b ? b : "unknown");
+	free(v);
+	free(b);
+	// CPUID-signature и битовая маска расширений: своего CPUID у нас нет, а
+	// выдуманные биты игра могла бы показать в анкете как правду. Ноль честнее.
+	if (signature)
+		*signature = 0;
+	if (cpu_flag)
+		*cpu_flag = 0;
+}
+
+static void SystemService_GetMemoryInfo(int *max, int *use)
+{
+	long total_kb = 0, avail_kb = 0;
+	char *t = proc_field("/proc/meminfo", "MemTotal");
+	char *a = proc_field("/proc/meminfo", "MemAvailable");
+	if (t)
+		total_kb = strtol(t, NULL, 10);
+	if (a)
+		avail_kb = strtol(a, NULL, 10);
+	free(t);
+	free(a);
+	// В БАЙТАХ, как `MEMORYSTATUS.dwTotalPhys` у оригинала. Значения int, и на
+	// машине с >2 ГБ они переполнились бы — Windows-версия в такой же ситуации
+	// сама возвращала мусор, поэтому насыщаем по INT_MAX, а не заворачиваем.
+	long long total_b = (long long)total_kb * 1024;
+	long long used_b = (long long)(total_kb - avail_kb) * 1024;
+	if (max)
+		*max = total_b > INT_MAX ? INT_MAX : (int)total_b;
+	if (use)
+		*use = used_b > INT_MAX ? INT_MAX : (used_b < 0 ? 0 : (int)used_b);
+}
+
+static void SystemService_GetOSInfo(struct string **text)
+{
+	char buf[256];
+	snprintf(buf, sizeof(buf), "%s (xsystem4)", SDL_GetPlatform());
+	set_out_string(text, buf);
+}
+
+static void SystemService_GetScreenInfo(struct string **text)
+{
+	char buf[128];
+	SDL_DisplayMode mode;
+	if (SDL_GetCurrentDisplayMode(0, &mode) == 0) {
+		snprintf(buf, sizeof(buf), "%dx%d %dbpp %dHz", mode.w, mode.h,
+			 SDL_BITSPERPIXEL(mode.format), mode.refresh_rate);
+	} else {
+		snprintf(buf, sizeof(buf), "unknown");
+	}
+	set_out_string(text, buf);
+}
+
+/*
+ * Видеопамять: ни SDL, ни GL-ES её переносимо не отдают (расширения
+ * `NVX_gpu_memory_info`/`ATI_meminfo` вендорные и на Android отсутствуют).
+ * Ноль = «не знаю»; выдуманный объём в анкете был бы ложью.
+ */
+static int SystemService_Debug_GetUseVideoMemorySize(void)
+{
+	return 0;
+}
 
 // Rance 01
 static void SystemService_Rance0123456789(struct string **text)
@@ -831,12 +966,16 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(OpenPlayingManual, SystemService_OpenPlayingManual),
 	    HLL_EXPORT(IsExistPlayingManual, SystemService_IsExistPlayingManual),
 	    HLL_EXPORT(IsExistSystemMessage, SystemService_IsExistSystemMessage),
-	    HLL_TODO_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
+	    HLL_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
 	    HLL_EXPORT(RestrainScreensaver, SystemService_RestrainScreensaver),
 	    HLL_EXPORT(ShowWaitMessage, SystemService_ShowWaitMessage),
 	    HLL_EXPORT(AddBackupSaveFileName, SystemService_AddBackupSaveFileName),
 	    HLL_EXPORT(BackupSaveFile, SystemService_BackupSaveFile),
-	    HLL_TODO_EXPORT(Debug_GetUseVideoMemorySize, SystemService_Debug_GetUseVideoMemorySize),
+	    HLL_EXPORT(Debug_GetUseVideoMemorySize, SystemService_Debug_GetUseVideoMemorySize),
+	    HLL_EXPORT(GetCPUInfo, SystemService_GetCPUInfo),
+	    HLL_EXPORT(GetMemoryInfo, SystemService_GetMemoryInfo),
+	    HLL_EXPORT(GetOSInfo, SystemService_GetOSInfo),
+	    HLL_EXPORT(GetScreenInfo, SystemService_GetScreenInfo),
 	    HLL_EXPORT(Rance0123456789, SystemService_Rance0123456789),
 	    HLL_EXPORT(XXXXX01XXXXXXXX, SystemService_XXXXX01XXXXXXXX),
 	    HLL_EXPORT(XXX, SystemService_XXX),

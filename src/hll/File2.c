@@ -339,6 +339,17 @@ static bool File2_WriteString(struct string *str)
 	return file2_write(str->text, str->size+1);
 }
 
+/*
+ * То же, но БЕЗ завершающего нуля — вся разница с `WriteString` в единице в
+ * длине. Нужна там, где игра склеивает файл из кусков текста (у Daiteikoku эта
+ * функция СТРОГО достижима, FINDINGS §5y), и лишний `\0` посреди файла всё бы
+ * испортил. Была `HLL_TODO_EXPORT`, то есть дырой с уходом в REPL.
+ */
+static bool File2_WriteStringWithoutNull(struct string *str)
+{
+	return file2_write(str->text, str->size);
+}
+
 static bool File2_ReadByte(int *data)
 {
 	uint8_t b;
@@ -400,6 +411,7 @@ HLL_LIBRARY(File2,
 	    HLL_EXPORT(WriteInt, File2_WriteInt),
 	    HLL_EXPORT(WriteFloat, File2_WriteFloat),
 	    HLL_EXPORT(WriteString, File2_WriteString),
+	    HLL_EXPORT(WriteStringWithoutNull, File2_WriteStringWithoutNull),
 	    HLL_EXPORT(ReadByte, File2_ReadByte),
 	    HLL_EXPORT(ReadInt, File2_ReadInt),
 	    HLL_EXPORT(ReadFloat, File2_ReadFloat),

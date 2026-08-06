@@ -431,10 +431,91 @@ static bool DrawGraph_GetAlphaColor(int surface, int x, int y, int *a)
 
 //void DrawGraph_DrawPolygon(int dst, int tex, float x0, float y0, float z0, float u0, float v0, float x1, float y1, float z1, float u1, float v1, float x2, float y2, float z2, float u2, float v2);
 //void DrawGraph_DrawColorPolygon(int dst, int tex, float x0, float y0, float z0, int r0, int g0, int b0, int a0, float x1, float y1, float z1, int r1, int g1, int b1, int a1, float x2, float y2, float z2, int r2, int g2, int b2, int a2);
-//void DrawGraph_DrawDeformedSprite(int dst, int tex, float x0, float y0, float z0, float u0, float v0, float x1, float y1, float z1, float u1, float v1, float x2, float y2, float z2, float u2, float v2, float x3, float y3, float z3, float u3, float v3);
-//void DrawGraph_BlendDeformedSprite(int dst, int tex, float x0, float y0, float z0, float u0, float v0, float x1, float y1, float z1, float u1, float v1, float x2, float y2, float z2, float u2, float v2, float x3, float y3, float z3, float u3, float v3, int rate);
-//void DrawGraph_BlendAMapDeformedSprite(int dst, int tex, float x0, float y0, float z0, float u0, float v0, float x1, float y1, float z1, float u1, float v1, float x2, float y2, float z2, float u2, float v2, float x3, float y3, float z3, float u3, float v3);
-//void DrawGraph_BlendAMapAlphaDeformedSprite(int dst, int tex, float x0, float y0, float z0, float u0, float v0, float x1, float y1, float z1, float u1, float v1, float x2, float y2, float z2, float u2, float v2, float x3, float y3, float z3, float u3, float v3, int rate);
+
+/*
+ * Деформированный спрайт со смешиванием. Три функции ниже — СТРОГО достижимые
+ * дыры Daiteikoku (FINDINGS §5y): были `HLL_TODO_EXPORT`, то есть вызов уводил
+ * движок в REPL. Геометрия та же, что у уже работавшей
+ * `DrawDeformedSpriteBilinear`, отличается только режим смешивания.
+ */
+#define DEFORMED_VERTICES()						\
+	struct gfx_vertex vertices[4] = {				\
+		{x0, y0, z0, 1.f, u0, v0},				\
+		{x1, y1, z1, 1.f, u1, v1},				\
+		{x2, y2, z2, 1.f, u2, v2},				\
+		{x3, y3, z3, 1.f, u3, v3}				\
+	}
+
+static void DrawGraph_BlendDeformedSprite(int dst, int tex,
+	float x0, float y0, float z0, float u0, float v0,
+	float x1, float y1, float z1, float u1, float v1,
+	float x2, float y2, float z2, float u2, float v2,
+	float x3, float y3, float z3, float u3, float v3, int rate)
+{
+	DEFORMED_VERTICES();
+	gfx_blend_quadrilateral(DTEX(dst), STEX(tex), vertices, rate);
+}
+
+static void DrawGraph_BlendAMapAlphaDeformedSprite(int dst, int tex,
+	float x0, float y0, float z0, float u0, float v0,
+	float x1, float y1, float z1, float u1, float v1,
+	float x2, float y2, float z2, float u2, float v2,
+	float x3, float y3, float z3, float u3, float v3, int rate)
+{
+	DEFORMED_VERTICES();
+	/*
+	 * Здесь альфа = альфа текстуры × rate, а такое произведение
+	 * фиксированный конвейер смешивания не умеет (перемножить `GL_SRC_ALPHA`
+	 * и `GL_CONSTANT_ALPHA` нечем), нужен свой шейдер. При rate = 255 —
+	 * а это подавляющее большинство вызовов — формула вырождается в обычное
+	 * amap-смешивание, его и делаем. Про остальные случаи говорим ВСЛУХ,
+	 * один раз: молча рисовать не той прозрачностью хуже, чем сказать.
+	 */
+	static bool warned = false;
+	if (rate < 255 && !warned) {
+		warned = true;
+		WARNING("DrawGraph.BlendAMapAlphaDeformedSprite: rate=%d игнорируется "
+			"(нужен отдельный шейдер), рисую как при rate=255", rate);
+	}
+	gfx_blend_amap_quadrilateral(DTEX(dst), STEX(tex), vertices);
+}
+
+/*
+ * Соседи по семейству: те же вершины без смешивания (`Draw`) и с amap-смешиванием
+ * без множителя. Достижимы только по слабому обходу, но стоят одной строки.
+ */
+static void DrawGraph_DrawDeformedSprite(int dst, int tex,
+	float x0, float y0, float z0, float u0, float v0,
+	float x1, float y1, float z1, float u1, float v1,
+	float x2, float y2, float z2, float u2, float v2,
+	float x3, float y3, float z3, float u3, float v3)
+{
+	DEFORMED_VERTICES();
+	gfx_draw_quadrilateral(DTEX(dst), STEX(tex), vertices);
+}
+
+static void DrawGraph_BlendAMapDeformedSprite(int dst, int tex,
+	float x0, float y0, float z0, float u0, float v0,
+	float x1, float y1, float z1, float u1, float v1,
+	float x2, float y2, float z2, float u2, float v2,
+	float x3, float y3, float z3, float u3, float v3)
+{
+	DEFORMED_VERTICES();
+	gfx_blend_amap_quadrilateral(DTEX(dst), STEX(tex), vertices);
+}
+
+static void DrawGraph_BlendAMapDeformedSpriteBilinear(int dst, int tex,
+	float x0, float y0, float z0, float u0, float v0,
+	float x1, float y1, float z1, float u1, float v1,
+	float x2, float y2, float z2, float u2, float v2,
+	float x3, float y3, float z3, float u3, float v3)
+{
+	DEFORMED_VERTICES();
+	// «Bilinear» — это фильтрация выборки, и у нас она и так билинейная
+	// (GL_LINEAR на текстурах), поэтому отличие от небилинейного варианта
+	// исчерпывается названием.
+	gfx_blend_amap_quadrilateral(DTEX(dst), STEX(tex), vertices);
+}
 
 static void DrawGraph_DrawDeformedSpriteBilinear(int dst, int tex,
 	float x0, float y0, float z0, float u0, float v0,
@@ -571,12 +652,12 @@ HLL_LIBRARY(DrawGraph,
 	    HLL_EXPORT(GetAlphaColor, DrawGraph_GetAlphaColor),
 	    //HLL_EXPORT(DrawPolygon, DrawGraph_DrawPolygon),
 	    //HLL_EXPORT(DrawColorPolygon, DrawGraph_DrawColorPolygon)
-	    HLL_TODO_EXPORT(DrawDeformedSprite, DrawGraph_DrawDeformedSprite),
-	    HLL_TODO_EXPORT(BlendDeformedSprite, DrawGraph_BlendDeformedSprite),
-	    HLL_TODO_EXPORT(BlendAMapDeformedSprite, DrawGraph_BlendAMapDeformedSprite),
-	    HLL_TODO_EXPORT(BlendAMapAlphaDeformedSprite, DrawGraph_BlendAMapAlphaDeformedSprite),
+	    HLL_EXPORT(DrawDeformedSprite, DrawGraph_DrawDeformedSprite),
+	    HLL_EXPORT(BlendDeformedSprite, DrawGraph_BlendDeformedSprite),
+	    HLL_EXPORT(BlendAMapDeformedSprite, DrawGraph_BlendAMapDeformedSprite),
+	    HLL_EXPORT(BlendAMapAlphaDeformedSprite, DrawGraph_BlendAMapAlphaDeformedSprite),
 	    HLL_EXPORT(DrawDeformedSpriteBilinear, DrawGraph_DrawDeformedSpriteBilinear),
-	    HLL_TODO_EXPORT(BlendAMapDeformedSpriteBilinear, DrawGraph_BlendAMapDeformedSpriteBilinear),
+	    HLL_EXPORT(BlendAMapDeformedSpriteBilinear, DrawGraph_BlendAMapDeformedSpriteBilinear),
 	    HLL_EXPORT(CopyWithAlphaMap, DrawGraph_CopyWithAlphaMap),
 	    HLL_EXPORT(FillWithAlpha, DrawGraph_FillWithAlpha),
 	    HLL_EXPORT(CopyStretchWithAlphaMap, DrawGraph_CopyStretchWithAlphaMap),

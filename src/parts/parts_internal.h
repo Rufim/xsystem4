@@ -659,6 +659,16 @@ enum parts_message_type {
 	// the visible line window from this; without it the list stayed at the initial
 	// bottom-anchored 1-line window and showed nothing.
 	PARTS_MSG_SCROLL         = 20,
+	/*
+	 * FIXED — «ввод подтверждён» у текстового поля, БЕЗ аргументов. Номер снят из
+	 * того же диспетчера игры: `.CASE 50:24 25` → `CallDelegateFixed`, а
+	 * `CallDelegateFixed` требует `GetMessageVariableCount() == 0`.
+	 * На него игра вешает чтение введённого текста: у Tsumamigui 3 это
+	 * `C_SAVE_CONFIRM@CommentFixedEvent` (FUNC 7975) — он зовёт
+	 * `Ｐ＿テキストボックス＿テキスト取得`, прячет поле и возвращает подсказку.
+	 * Пока движок это сообщение не слал, комментарий в сейв не попадал вообще.
+	 */
+	PARTS_MSG_FIXED          = 25,
 };
 
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);

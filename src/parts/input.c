@@ -20,6 +20,7 @@
 #include "audio.h"
 #include "input.h"
 #include "xsystem4.h"
+#include "parts.h"
 #include "parts_internal.h"
 
 // true while at least one BeginClick/BeginInput session is open
@@ -221,6 +222,11 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		if (parts->is_checkbox)
 			parts_checkbox_toggle(parts);
 
+		// Текстовое поле ввода забирает фокус клавиатуры по клику (и отдаёт
+		// его, если кликнули мимо) — как в оригинале, где каретка видна ровно
+		// в том поле, куда идёт ввод.
+		PE_textbox_click(parts->no);
+
 		parts_msg_push(parts, PARTS_MSG_MOUSE_CLICK,
 				"iii", cur_pos.x, cur_pos.y, VK_LBUTTON);
 		parts_msg_push(parts, PARTS_MSG_KEY_UP, "i", VK_LBUTTON);
@@ -244,6 +250,24 @@ void PE_UpdateInputState(int passed_time)
 		if ((dcnt++ % 120) == 5) {
 			NOTICE("--- PARTS DUMP (live) ---");
 			parts_debug_dump();
+		}
+	}
+
+	/*
+	 * Редактирующие клавиши текстового поля. Печатные символы приходят полю
+	 * событием SDL_TEXTINPUT (register_input_handler), а Backspace/Delete/стрелки
+	 * текстом не приходят вовсе — их приходится опрашивать здесь. Реагируем на
+	 * ФРОНТ нажатия, иначе одно нажатие съело бы всю строку за несколько кадров.
+	 */
+	{
+		// RETURN здесь же: им поле подтверждает ввод (сообщение FIXED).
+		static const int edit_keys[] = { VK_BACK, VK_DELETE, VK_LEFT, VK_RIGHT, VK_RETURN };
+		static bool was_down[5];
+		for (int i = 0; i < 5; i++) {
+			bool down = key_is_down(edit_keys[i]);
+			if (down && !was_down[i])
+				PE_textbox_key(edit_keys[i]);
+			was_down[i] = down;
 		}
 	}
 
@@ -405,6 +429,18 @@ void PE_UpdateInputState(int passed_time)
 
 	prev_clicking = cur_clicking;
 	parts_prev_pos = cur_pos;
+}
+
+/*
+ * «Ввод подтверждён» текстовому полю. Живёт здесь, а не в PartsEngine.c: очередь
+ * сообщений частей — внутренняя кухня parts, наружу торчит только этот вызов.
+ */
+void PE_SendFixedEvent(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	parts_msg_push(parts, PARTS_MSG_FIXED, "");
 }
 
 void PE_SetPassCursor(int parts_no, bool pass)
