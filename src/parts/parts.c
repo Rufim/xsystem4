@@ -1280,6 +1280,10 @@ void PE_SetEventID(int parts_no, int delegate_index, int unique_id)
 	parts->event_unique_id = unique_id;
 }
 
+// Номер части, чей CG совпал с XSYS4_CG_WATCH: за ней потом следят PE_SetShow и
+// PE_ReleaseParts — так видно, гасит/освобождает ли её игра вообще.
+static int cg_watch_part = -1;
+
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state)
 {
 	if (!parts_state_valid(--state))
@@ -1287,6 +1291,24 @@ bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int 
 
 	struct parts *parts = parts_get(parts_no);
 	parts->sprite_deform = sprite_deform;
+	// XSYS4_CG_WATCH=<подстрока имени CG> — ОДНОРАЗОВЫЙ стек вызовов игры на
+	// первой установке подходящего CG: отвечает «кто эту картинку кладёт».
+	{
+		static bool cg_watch_done = false;
+		const char *w = getenv("XSYS4_CG_WATCH");
+		// Имя CG хранится в SJIS, а подстрока из env — в UTF-8: сравниваем с
+		// ПЕРЕКОДИРОВАННЫМ именем, иначе не совпадёт никогда.
+		if (w && *w && !cg_watch_done && cg_name) {
+			const char *utf8 = display_sjis0(cg_name->text);
+			if (strstr(utf8, w)) {
+				cg_watch_done = true;
+				cg_watch_part = parts_no;
+				NOTICE("CGWATCH part=%d cg='%s' — стек вызовов игры:",
+				       parts_no, utf8);
+				vm_stack_trace();
+			}
+		}
+	}
 	if (!cg_name || *(cg_name->text) == '\0') {
 		parts_state_reset(&parts->states[state], PARTS_CG);
 		parts_dirty(parts);
@@ -1874,6 +1896,10 @@ bool PE_SetNumeralSurfaceArea(int parts_no, int x, int y, int w, int h, int stat
 
 void PE_ReleaseParts(int parts_no)
 {
+	if (parts_no == cg_watch_part) {
+		NOTICE("CGWATCH part=%d ReleaseParts — стек вызовов игры:", parts_no);
+		vm_stack_trace();
+	}
 	parts_release(parts_no);
 }
 
@@ -1936,6 +1962,8 @@ void PE_SetShow(int parts_no, bool show)
 {
 	if (getenv("XSYS4_PARTS_TRACE"))
 		NOTICE("PARTS SetShow(%d, %d)", parts_no, show);
+	if (parts_no == cg_watch_part)
+		NOTICE("CGWATCH part=%d SetShow(%d)", parts_no, show);
 	parts_set_show(parts_get(parts_no), show);
 }
 
