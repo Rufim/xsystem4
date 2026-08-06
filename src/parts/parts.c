@@ -1351,6 +1351,27 @@ void PE_GetPartsCGName(int parts_no, struct string **cg_name, int state)
 	}
 }
 
+/*
+ * Пара к четвёртому аргументу PE_SetPartsCG (`sprite_deform`): 0 — без
+ * искажения, 1 — отражение по горизонтали, 2 — по вертикали (так его и
+ * трактует render_parts). Сеттер значение хранит по-настоящему и оно даже
+ * попадает в сейв, а геттер отсутствовал — на нём вставала ADV-сцена Dohna:
+ * `CCGParts@ReverseLR::get` — это ровно `Deform::get() == 1`
+ * (@0x2fc18a: CALLMETHOD Deform; PUSH 1; EQUALE), и его читает
+ * `CCGParts@CGName::set`, чтобы восстановить отражение после смены CG.
+ * Функция объявлена и у Tsumamigui 3 (fn411), т.е. это не разница версий, а
+ * пробел движка для обеих.
+ *
+ * Аргумент состояния движок не различает: deform хранится на САМОЙ ЧАСТИ (так
+ * же его пишет сеттер, читает рендер и сохраняет parts/save.c), а не в
+ * состоянии.
+ */
+int PE_GetPartsCGDeform(int parts_no, possibly_unused int state)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->sprite_deform : 0;
+}
+
 bool PE_SetPartsCGSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
 {
 	if (!parts_state_valid(--state))
