@@ -300,6 +300,24 @@ int channel_is_playing(struct channel *ch)
 	return ch->voice >= 0;
 }
 
+/*
+ * Канал микшера, на котором играет звук = его ЗВУКОВАЯ ГРУППА (FINDINGS §5ag).
+ * Прежде номер брался только из `.wai`/`.bgi` (путь загрузки по НОМЕРУ трека), а у
+ * игр, грузящих звук ПО ИМЕНИ, оставался нулём из `init_channel` — то есть музыка,
+ * эффекты и озвучка сидели на одном канале, и ползунки громкости не могли развести
+ * их в принципе. Группу для имени даёт таблица `SoundInfo` из `timemap_*.ex`.
+ * Ставить ДО `channel_play`: воспроизведение цепляет поток к `mixers[mixer_no]`.
+ */
+int channel_set_mixer(struct channel *ch, int mixer_no)
+{
+	if (!ch || mixer_no < 0 || mixer_no >= nr_mixers)
+		return 0;
+	if (channel_is_playing(ch))
+		return 0;   // поток уже привязан к прежнему микшеру
+	ch->mixer_no = mixer_no;
+	return 1;
+}
+
 int channel_set_loop_count(struct channel *ch, int count)
 {
 	SDL_LockAudioDevice(audio_device);
@@ -731,6 +749,21 @@ void mixer_init(void)
 		}
 	}
 
+	/*
+	 * ИЕРАРХИЯ ГРУПП System4 в фолбэке. Из данных игры следует, что она
+	 * ТРЁХУРОВНЕВАЯ: ни одному ФАЙЛУ не назначены группы 3 (音声) и 5 (背景音声) —
+	 * это родительские категории, а сами звуки лежат в 6…9 (голоса персонажей) и
+	 * 10…13 (их фоновые близнецы). Ровно так и проверяет игра: `IsMuteVoice`
+	 * смотрит мастер (0), затем 3, затем собственную группу файла. Без этой связи
+	 * ползунок «音声» не глушил бы ничего — на группе 3 не играет ни один звук.
+	 * FINDINGS §5ag.
+	 */
+	static const struct { int child, parent; } sys4_tree[] = {
+		{ 6, 3 }, { 7, 3 }, { 8, 3 }, { 9, 3 },
+		{ 10, 5 }, { 11, 5 }, { 12, 5 }, { 13, 5 },
+	};
+	bool sys4_layout = !config.mixer_nr_channels && nr_mixers > 13;
+
 	// initialize mixer hierarchy
 	// NOTE: "Master" and "Voice" are special nodes; all channels following
 	//       them in the list become their children. This appears to be
@@ -739,9 +772,21 @@ void mixer_init(void)
 	for (int i = 0; i < nr_mixers; i++) {
 		if (&mixers[i] == master)
 			continue;
-		mixers[i].parent = parent;
-		parent->children = xrealloc_array(parent->children, parent->nr_children, parent->nr_children+1, sizeof(struct mixer*));
-		parent->children[parent->nr_children++] = &mixers[i];
+		// Родитель по умолчанию — текущий узел последовательного обхода;
+		// раскладка System4 переопределяет его для голосовых групп.
+		struct mixer *my_parent = parent;
+		if (sys4_layout) {
+			for (size_t k = 0; k < sizeof(sys4_tree) / sizeof(sys4_tree[0]); k++) {
+				if (sys4_tree[k].child == i) {
+					my_parent = &mixers[sys4_tree[k].parent];
+					break;
+				}
+			}
+		}
+		mixers[i].parent = my_parent;
+		my_parent->children = xrealloc_array(my_parent->children, my_parent->nr_children,
+				my_parent->nr_children + 1, sizeof(struct mixer*));
+		my_parent->children[my_parent->nr_children++] = &mixers[i];
 		if (!strcmp(mixers[i].name, "Voice") || !strcmp(mixers[i].name, SJIS_VOICE)) {
 			parent = &mixers[i];
 		}

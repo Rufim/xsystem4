@@ -70,6 +70,7 @@ void channel_close(struct channel *ch);
 int channel_play(struct channel *ch);
 int channel_stop(struct channel *ch);
 int channel_is_playing(struct channel *ch);
+int channel_set_mixer(struct channel *ch, int mixer_no);
 int channel_set_loop_count(struct channel *ch, int count);
 int channel_get_loop_count(struct channel *ch);
 int channel_set_loop_start_pos(struct channel *ch, int pos);

@@ -198,6 +198,16 @@ static int audio_get_loop_count(struct id_pool *pool, int id)
 int wav_get_loop_count(int id) { return audio_get_loop_count(&wav, id); }
 int bgm_get_loop_count(int id) { return audio_get_loop_count(&bgm, id); }
 
+static int audio_set_mixer(struct id_pool *pool, int id, int mixer_no)
+{
+	struct channel *ch = id_pool_get(pool, id);
+	if (!ch)
+		return 0;
+	return channel_set_mixer(ch, mixer_no);
+}
+int wav_set_mixer(int id, int mixer_no) { return audio_set_mixer(&wav, id, mixer_no); }
+int bgm_set_mixer(int id, int mixer_no) { return audio_set_mixer(&bgm, id, mixer_no); }
+
 static int audio_set_loop_start_pos(struct id_pool *pool, int id, int pos)
 {
 	struct channel *ch = id_pool_get(pool, id);

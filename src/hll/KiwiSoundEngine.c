@@ -19,6 +19,9 @@
 
 #include "system4.h"
 #include "system4/ain.h"
+#include "system4/archive.h"
+#include "system4/ex.h"
+#include "system4/hashtable.h"
 #include "system4/string.h"
 
 #include "vm.h"
@@ -142,6 +145,100 @@ static int KiwiSoundEngine_GetFreeSeID(int min_id, int max_id)
  * работающей музыке — снаружи это выглядит как «озвучки в игре нет».
  * Порядок важен: имена SE и реплик не пересекаются, но SE запрашиваются чаще.
  */
+/*
+ * ТАБЛИЦА «ИМЯ ФАЙЛА → ЗВУКОВАЯ ГРУППА» (FINDINGS §5ag).
+ *
+ * Игра спрашивает группу файла через `GetGroupNumFromFile`, и у оригинала ответ
+ * лежит ДАННЫМИ: внутри самих звуковых архивов есть по файлу `.ex` —
+ * `timemap_sound.ex` в архиве музыки/эффектов и `timemap_voice.ex` в архиве
+ * озвучки, оба с одной таблицей:
+ *
+ *   table SoundInfo = {
+ *       { indexed string Name, int Group, int LoopBeginSample = 0, int LoopEndSample = 0 },
+ *       { "03_日常_05_TD_4416_ST_BPM114", 1, 0, 4456422 },
+ *       { "10001",                        6, 0,  262446 },
+ *
+ * Никакой эвристики по префиксам имён не нужно. У Tsumamigui 3 сходится точно:
+ * 25 записей с группой 1 (музыка) и 119 с группой 2 (эффекты) в `timemap_sound`,
+ * а в `timemap_voice` — 6/7/8/9 для четырёх персонажей и 10…13 для их «фоновых»
+ * близнецов. Нумерация подтверждена кодом игры (`config::GetBGMVolume` → группа 1,
+ * `GetSEVolume` → 2, `GetVoiceVolume` → 3, `GetBackVoiceVolume` → 5).
+ *
+ * Оттуда же берутся точки петли: у игр, грузящих звук ПО ИМЕНИ, файла `.bgi` нет
+ * вовсе, поэтому иначе музыка зацикливалась бы не по авторским точкам.
+ */
+struct kse_sound_info {
+	int group;
+	int loop_begin;
+	int loop_end;
+};
+
+static struct hash_table *kse_sound_info;   // имя → struct kse_sound_info*
+static bool kse_sound_info_loaded = false;
+
+static void kse_load_timemap(enum asset_type type, const char *name)
+{
+	struct archive_data *dfile = asset_get_by_name(type, name, NULL);
+	if (!dfile) {
+		if (KSE_SND_TRACE()) NOTICE("KSE: %s отсутствует в архиве", name);
+		return;
+	}
+	struct ex *ex = ex_read(dfile->data, dfile->size);
+	archive_free_data(dfile);
+	if (!ex) {
+		WARNING("KiwiSoundEngine: не разобрать %s", name);
+		return;
+	}
+	struct ex_value *v = ex_get(ex, "SoundInfo");
+	if (!v || v->type != EX_TABLE) {
+		WARNING("KiwiSoundEngine: в %s нет таблицы SoundInfo", name);
+		ex_free(ex);
+		return;
+	}
+	struct ex_table *t = v->t;
+	int nr = 0;
+	// Столбцы по порядку схемы: Name, Group, LoopBeginSample, LoopEndSample.
+	// `rows` — массив указателей на массивы значений, ширина одна для всех строк.
+	if (t->nr_columns < 2) {
+		WARNING("KiwiSoundEngine: у SoundInfo в %s мало столбцов (%u)", name, t->nr_columns);
+		ex_free(ex);
+		return;
+	}
+	for (unsigned row = 0; row < t->nr_rows; row++) {
+		struct ex_value *cols = t->rows[row];
+		if (!cols)
+			continue;
+		struct ex_value *nm = &cols[0];
+		if (nm->type != EX_STRING || !nm->s)
+			continue;
+		struct kse_sound_info *si = xcalloc(1, sizeof(*si));
+		si->group      = cols[1].type == EX_INT ? cols[1].i : 0;
+		si->loop_begin = t->nr_columns > 2 && cols[2].type == EX_INT ? cols[2].i : 0;
+		si->loop_end   = t->nr_columns > 3 && cols[3].type == EX_INT ? cols[3].i : 0;
+		struct ht_slot *slot = ht_put(kse_sound_info, nm->s->text, NULL);
+		if (slot->value)
+			free(slot->value);
+		slot->value = si;
+		nr++;
+	}
+	if (KSE_SND_TRACE()) NOTICE("KSE: %s — записей %d", name, nr);
+	ex_free(ex);
+}
+
+static const struct kse_sound_info *kse_get_sound_info(const char *name)
+{
+	if (!kse_sound_info_loaded) {
+		kse_sound_info_loaded = true;
+		kse_sound_info = ht_create(4096);
+		kse_load_timemap(ASSET_SOUND, "timemap_sound");
+		kse_load_timemap(ASSET_VOICE, "timemap_voice");
+	}
+	if (!name)
+		return NULL;
+	struct ht_slot *slot = ht_put(kse_sound_info, name, NULL);
+	return slot->value;
+}
+
 static struct archive_data *kse_get_sound_by_name(const char *name)
 {
 	struct archive_data *dfile = asset_get_by_name(ASSET_SOUND, name, NULL);
@@ -160,7 +257,23 @@ static bool kse_prepare_name(int id, struct string *name)
 		return false;
 	}
 	// wav_prepare_from_archive_data takes ownership of dfile.
-	return wav_prepare_from_archive_data(id, dfile);
+	if (!wav_prepare_from_archive_data(id, dfile))
+		return false;
+	// Канал микшера = звуковая группа файла, и точки петли — из той же таблицы.
+	// Без этого весь звук играл на канале 0 и ползунки не могли развести музыку,
+	// эффекты и озвучку (FINDINGS §5ag).
+	const struct kse_sound_info *si = kse_get_sound_info(name->text);
+	if (si) {
+		wav_set_mixer(id, si->group);
+		if (si->loop_end > 0) {
+			wav_set_loop_start_pos(id, si->loop_begin);
+			wav_set_loop_end_pos(id, si->loop_end);
+		}
+		if (KSE_SND_TRACE())
+			NOTICE("KSE route id=%d '%s' -> группа %d (петля %d..%d)",
+			       id, name->text, si->group, si->loop_begin, si->loop_end);
+	}
+	return true;
 }
 
 static bool KiwiSoundEngine_flat_IsExistFile(struct string *s)
@@ -212,7 +325,13 @@ static int KiwiSoundEngine_flat_GetLengthFromFile(struct string *s) { (void)s; r
 static int KiwiSoundEngine_flat_GetPos(int id) { return wav_get_pos(id); }
 static int KiwiSoundEngine_flat_GetLoopCount(int id) { return wav_get_loop_count(id); }
 static int KiwiSoundEngine_flat_GetGroupNum(int id) { (void)id; return 0; }
-static int KiwiSoundEngine_flat_GetGroupNumFromFile(struct string *s) { (void)s; return 0; }
+static int KiwiSoundEngine_flat_GetGroupNumFromFile(struct string *s)
+{
+	// Была заглушка `return 0`, из-за которой игра считала все звуки группой 0
+	// (мастер) — в частности `IsMuteVoice` проверяла мьют не той группы.
+	const struct kse_sound_info *si = kse_get_sound_info(s ? s->text : NULL);
+	return si ? si->group : 0;
+}
 static float KiwiSoundEngine_flat_GetGroupVolume(int id) { (void)id; return 1.0f; }
 static int KiwiSoundEngine_flat_MillisecondsToSamples(int a, int b) { (void)a; (void)b; return 0; }
 static int KiwiSoundEngine_flat_GetSoundFileName(int id, struct string **out) { (void)id; if (out) { if (*out) free_string(*out); *out = string_ref(&EMPTY_STRING); } return 0; }
