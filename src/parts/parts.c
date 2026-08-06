@@ -3381,8 +3381,11 @@ void parts_controller_stack_restore(int nr, int active)
 	if (nr < 0) nr = 0;
 	if (nr > PARTS_CONTROLLER_STACK_MAX) nr = PARTS_CONTROLLER_STACK_MAX;
 	ctrl_stack.nr_controllers = nr;
-	for (int i = 0; i < nr; i++)
+	for (int i = 0; i < nr; i++) {
 		ctrl_stack.stack[i] = i;
+		ctrl_stack.hidden[i] = false;
+	}
+	ctrl_stack.next_id = nr;
 	ctrl_stack.active = active;
 }
 
@@ -3404,16 +3407,13 @@ int PE_AddController(int index)
 	if (ctrl_stack.nr_controllers >= PARTS_CONTROLLER_STACK_MAX)
 		VM_ERROR("controller stack overflow");
 
-	// ID — НАИМЕНЬШИЙ СВОБОДНЫЙ (см. struct parts_controller_stack): при чисто
-	// стековом использовании это ровно прежняя нумерация 0,1,2,…, но id не съезжает
-	// при удалении слоя из середины.
-	int no = 0;
-	while (ctrl_stack_pos(no) >= 0)
-		no++;
-	ctrl_stack.stack[ctrl_stack.nr_controllers++] = no;
+	// ID монотонный (см. struct parts_controller_stack): номера НЕ переиспользуются.
+	int no = ctrl_stack.next_id++;
+	int pos = ctrl_stack.nr_controllers++;
+	ctrl_stack.stack[pos] = no;
+	ctrl_stack.hidden[pos] = false;
 	ctrl_stack.active = no;
 	ctrl_stack_resort_all();   // позиции слоёв — ключ порядка, см. parts_get_sprite_z
-	ctrl_stack.hidden[no] = false;  // номер мог остаться погашенным от прошлого слоя
 	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController(index=%d) -> ctrl %d (nr=%d)", index, no, ctrl_stack.nr_controllers);
 	return no;
 }
@@ -3527,11 +3527,13 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 			       buf, st, ctrl_stack.active);
 		}
 	}
-	// Вынимаем из стека, НЕ перенумеровывая остальные (id устойчив).
-	for (int i = pos; i + 1 < ctrl_stack.nr_controllers; i++)
+	// Вынимаем из стека, НЕ перенумеровывая остальные (id устойчив). Признак
+	// «погашен» живёт по позиции, поэтому сдвигается вместе со стеком.
+	for (int i = pos; i + 1 < ctrl_stack.nr_controllers; i++) {
 		ctrl_stack.stack[i] = ctrl_stack.stack[i + 1];
+		ctrl_stack.hidden[i] = ctrl_stack.hidden[i + 1];
+	}
 	ctrl_stack.nr_controllers--;
-	ctrl_stack.hidden[ctrl_no] = false;
 	ctrl_stack_resort_all();
 	if (ctrl_stack.nr_controllers == 0) {
 		PE_AddController(-1);
@@ -3601,9 +3603,10 @@ bool parts_controller_is_layer(int id)
 
 void parts_controller_set_show(int id, bool show)
 {
-	if (id < 0 || id > PARTS_CONTROLLER_STACK_MAX)
-		return;
-	ctrl_stack.hidden[id] = !show;
+	int pos = ctrl_stack_pos(id);
+	if (pos < 0)
+		return;   // слоя уже нет — гасить нечего
+	ctrl_stack.hidden[pos] = !show;
 	if (getenv("XSYS4_CTRL_TRACE"))
 		NOTICE("CTRL слой %d -> show=%d", id, show);
 	struct parts *parts;
@@ -3615,17 +3618,16 @@ void parts_controller_set_show(int id, bool show)
 
 bool parts_controller_get_show(int id)
 {
-	if (id < 0 || id > PARTS_CONTROLLER_STACK_MAX)
-		return false;
-	return !ctrl_stack.hidden[id];
+	int pos = ctrl_stack_pos(id);
+	return pos < 0 ? false : !ctrl_stack.hidden[pos];
 }
 
 bool parts_hidden_by_layer(struct parts *parts)
 {
-	int no = parts->controller_no;
-	if (no < 0 || no > PARTS_CONTROLLER_STACK_MAX)
-		return false;
-	return ctrl_stack.hidden[no];
+	int pos = ctrl_stack_pos(parts->controller_no);
+	// Слоя уже нет: парт его пережил. Погашенным он не считается (иначе исчез бы
+	// совсем) — он и так уходит под всё, см. parts_get_sprite_z.
+	return pos < 0 ? false : ctrl_stack.hidden[pos];
 }
 
 void PE_parts_set_want_save(int parts_no, bool want_save)

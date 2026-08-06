@@ -75,6 +75,7 @@ void scene_unregister_sprite(struct sprite *sp)
 
 void scene_render(void)
 {
+	scene_trace_once();
 	gfx_clear();
 	if (wp.handle) {
 		Rectangle r = RECT(0, 0, wp.w, wp.h);
@@ -142,6 +143,36 @@ void scene_set_sprite_z2(struct sprite *sp, int z, int z2)
 		scene_unregister_sprite(sp);
 		scene_register_sprite(sp);
 	}
+}
+
+/*
+ * `XSYS4_SCENE_TRACE=1` — один раз (через ~20 с после старта) выписать ПОРЯДОК СЦЕНЫ:
+ * z каждого спрайта и его тип. Нужно там, где на экране лишнее, а по дампу партов всё
+ * верно: части и спрайты игры (фоны ChipmunkSpriteEngine) лежат в ОДНОМ списке, а
+ * ключи z у них из разных числовых пространств — глазами это не сопоставить.
+ */
+void scene_trace_once(void)
+{
+	static bool done = false;
+	static int frames = 0;
+	const char *e = getenv("XSYS4_SCENE_TRACE");
+	if (done || !e)
+		return;
+	// Значение переменной — НОМЕР КАДРА, на котором снять срез (по умолчанию 1200,
+	// ~20 с при 60 к/с). Момент важен: до постройки экрана в сцене почти пусто.
+	int at = atoi(e);
+	if (at < 1)
+		at = 1200;
+	if (++frames < at)
+		return;
+	done = true;
+	struct sprite *p;
+	int n = 0;
+	TAILQ_FOREACH(p, &sprite_list, entry) {
+		NOTICE("SCENE #%d z=%d z2=%d id=%d %s", n++, p->z, p->z2, p->id,
+		       p->render ? "(свой рендер)" : "(обычный)");
+	}
+	NOTICE("SCENE всего спрайтов: %d", n);
 }
 
 void scene_print(void)
