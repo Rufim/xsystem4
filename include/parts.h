@@ -91,6 +91,10 @@ int PE_GetNumeralSpace(int parts_no, int state);
 int PE_GetNumeralLength(int parts_no, int state);
 bool PE_SetNumeralShowComma(int parts_no, bool show_comma, int state);
 bool PE_SetNumeralSpace(int parts_no, int space, int state);
+void PE_SetNumeralFont(int parts_no, int type, int size, int r, int g, int b,
+		float bold_weight, int edge_r, int edge_g, int edge_b,
+		float edge_weight, int state);
+void PE_SetNumeralShowType(int parts_no, int type, int state);
 bool PE_SetNumeralLength(int parts_no, int length, int state);
 bool PE_SetNumeralSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
 void PE_ReleaseParts(int parts_no);

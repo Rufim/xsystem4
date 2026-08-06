@@ -1621,6 +1621,28 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		struct string *cg = act_str(st, "ＣＧ名");
 		if (cg && cg->size)
 			PE_SetNumeralCG(no, cg, state);
+		/*
+		 * `表示タイプ = 2` — цифры рисуются ШРИФТОМ, а не набором CG (`ＣＧ名`
+		 * при таком режиме пуст). У Dohna так сделаны ВСЕ счётчики интерфейса:
+		 * «TALENT 3/3» и «Client 1/4» на экране подбора талантов — это части
+		 * `Remain`/`Max` из `PlayerShopView.pactex` с `表示タイプ = 2`,
+		 * `フォントタイプ = 258`, `フォントサイズ = 24`. Загрузчик режима не знал,
+		 * шрифтовые поля игнорировал — и на месте чисел не было ничего (сверено
+		 * с оригиналом на экране Hustling). У Tsumamigui 3 режим CG-цифр, эти
+		 * поля там не используются.
+		 */
+		if (act_int(st, "表示タイプ", 0) == 2) {
+			PE_SetNumeralFont(no, act_int(st, "フォントタイプ", 0),
+				act_int(st, "フォントサイズ", 16),
+				act_list_int(st, "フォント色", 0, 255),
+				act_list_int(st, "フォント色", 1, 255),
+				act_list_int(st, "フォント色", 2, 255),
+				act_float(st, "フォント太さ", 0.0f),
+				act_list_int(st, "フォント縁取り色", 0, 0),
+				act_list_int(st, "フォント縁取り色", 1, 0),
+				act_list_int(st, "フォント縁取り色", 2, 0),
+				act_float(st, "フォント縁取り", 0.0f), state);
+		}
 		PE_SetNumeralSpace(no, act_int(st, "字間隔", 0), state);
 		PE_SetNumeralShowComma(no, act_int(st, "コンマ表示", 0), state);
 		// 桁数 задаёт разрядность, но дополнять нулями можно только с ゼロパディング=1:
@@ -3338,6 +3360,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetNumeralFont, PartsEngine_SetNumeralFont),
 	    HLL_EXPORT(SetNumeralNumber, PE_SetNumeralNumber),
 	    HLL_EXPORT(SetNumeralShowComma, PE_SetNumeralShowComma),
+	    HLL_EXPORT(SetNumeralFont, PE_SetNumeralFont),
+	    HLL_EXPORT(SetNumeralShowType, PE_SetNumeralShowType),
 	    HLL_EXPORT(SetNumeralSpace, PE_SetNumeralSpace),
 	    HLL_EXPORT(SetNumeralLength, PE_SetNumeralLength),
 	    HLL_EXPORT(SetNumeralSurfaceArea, PE_SetNumeralSurfaceArea),

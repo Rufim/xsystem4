@@ -185,6 +185,15 @@ struct parts_numeral {
 	int show_comma;
 	int length;
 	int font_no;
+	/*
+	 * Второй способ рисовать число — ШРИФТОМ, а не набором CG (`表示タイプ = 2`
+	 * в раскладке, `ＣＧ名` при этом пуст, а рядом лежат `フォントタイプ/
+	 * フォントサイズ/フォント色/フォント縁取り*`). Так у Dohna сделаны все
+	 * счётчики интерфейса — «TALENT 3/3», «Client 1/4» и т.п.; в CG-варианте
+	 * (Tsumamigui 3) эти поля не используются.
+	 */
+	bool use_font;
+	struct text_style ts;
 };
 
 struct parts_gauge {
