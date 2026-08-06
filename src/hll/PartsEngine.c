@@ -2763,9 +2763,38 @@ static int PE_GetComponentScrollPosYLinkNumber(int parts_no)
 // default/hovered/clicked). Setting a button's flat/CG name must actually
 // load the resource into all states so the button renders — otherwise the
 // title menu (built entirely from flat buttons) stays invisible (black).
+/*
+ * ★ИМЯ У КНОПКИ — БАЗОВОЕ, состояния лежат в архиве с СУФФИКСОМ:
+ * `<base>／通常`, `<base>／オン`, `<base>／ダウン`. Ровно эту конвенцию уже применяет
+ * загрузчик раскладок к `パーツタイプ=0` (см. act_build_part), а рантайм-путь клал во все
+ * три состояния ОДНО И ТО ЖЕ базовое имя — CG с таким именем в архиве нет вовсе, парт
+ * оставался с нулевой текстурой.
+ *
+ * Живой случай: у Haha Ranman системные кнопки ADV (`ＡＤＶ／システムボタン／クイックセーブ`
+ * и ещё 15) создаются игрой в рантайме, а не из раскладки. На эталонном кадре оригинала
+ * у нижней панели и правого пульта есть подписи Quick Save / Save / Load / Backlog /
+ * Back Scene и Auto / Skip / Voice / Config, а у нас были голые плашки: части были
+ * созданы (`btn=1`), но размера 0×0 — картинка не грузилась.
+ *
+ * Если суффиксного CG нет, откатываемся на голое имя: у части игр (и у `無効`-состояний)
+ * ассет лежит ровно под базовым именем.
+ */
 static void PE_SetButtonCGName(int parts_no, struct string *name) {
-	for (int st = 1; st <= 3; st++)  // default/hovered/clicked
-		PE_SetPartsCG(parts_no, name, 0, st);
+	static const char *const sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+	for (int st = 1; st <= 3; st++) {  // default/hovered/clicked
+		bool ok = false;
+		if (name && name->size) {
+			char *sjis = utf2sjis(sfx[st], strlen(sfx[st]));
+			struct string *suf = make_string(sjis, strlen(sjis));
+			struct string *full = string_concatenate(name, suf);
+			ok = PE_SetPartsCG(parts_no, full, 0, st);
+			free_string(full);
+			free_string(suf);
+			free(sjis);
+		}
+		if (!ok)
+			PE_SetPartsCG(parts_no, name, 0, st);
+	}
 }
 static void PE_SetButtonFlatName(int parts_no, struct string *name) {
 	for (int st = 1; st <= 3; st++)  // default/hovered/clicked

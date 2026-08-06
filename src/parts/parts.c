@@ -80,6 +80,31 @@ static void parts_init(struct parts *parts)
 	TAILQ_INIT(&parts->motion);
 }
 
+/*
+ * `XSYS4_PART_WATCH=<номер>[,<номер>…]` — следить за конкретными партами: создание (и на
+ * КАКОМ СЛОЕ), освобождение, show. Нужен там, где общий трейс тонет в шуме: у Haha Ranman
+ * на ADV-сцене остаются чужие парты, а сцена создаёт их тысячами (один только дождь —
+ * сотня 1x32), так что «печатать всё» бесполезно.
+ */
+bool parts_watched(int parts_no)
+{
+	static const char *watch = (const char *)1;
+	if (watch == (const char *)1)
+		watch = getenv("XSYS4_PART_WATCH");
+	if (!watch || !*watch)
+		return false;
+	for (const char *p = watch; *p; ) {
+		long v = strtol(p, (char **)&p, 0);
+		if (v == parts_no)
+			return true;
+		while (*p && *p != ',')
+			p++;
+		if (*p == ',')
+			p++;
+	}
+	return false;
+}
+
 static struct parts *parts_alloc(void)
 {
 	struct parts *parts = xcalloc(1, sizeof(struct parts));
@@ -167,6 +192,9 @@ struct parts *parts_get(int parts_no)
 	struct parts *parts = parts_alloc();
 	parts->no = parts_no;
 	parts->controller_no = ctrl_stack.active;
+	if (parts_watched(parts_no))
+		NOTICE("PARTWATCH создан парт %d на слое %d (стек-глубина %d)",
+		       parts_no, parts->controller_no, ctrl_stack.nr_controllers);
 	slot->value = parts;
 	parts_list_insert(parts);
 	return parts;
@@ -741,6 +769,21 @@ bool parts_cg_set_by_index(struct parts *parts, struct parts_cg *cg, int cg_no)
 bool parts_cg_set(struct parts *parts, struct parts_cg *parts_cg, struct string *cg_name)
 {
 	assert(cg_name && *(cg_name->text) != '\0');
+	/*
+	 * `XSYS4_CG_WATCH=<подстрока имени CG>` — следить за партом ПО КАРТИНКЕ, а не по
+	 * номеру: номера `1000001xxx` выдаются на лету и от прогона к прогону РАЗНЫЕ,
+	 * так что `XSYS4_PART_WATCH` по номеру для них бесполезен. Печатает номер парта и
+	 * СЛОЙ, на котором он живёт, — этим ищется «чей это парт остался на экране».
+	 */
+	{
+		static const char *w = (const char *)1;
+		if (w == (const char *)1)
+			w = getenv("XSYS4_CG_WATCH");
+		if (w && *w && strstr(cg_name->text, w)) {
+			NOTICE("CGWATCH парт %d слой %d cg=\"%s\"",
+			       parts->no, parts->controller_no, display_sjis0(cg_name->text));
+		}
+	}
 	int no;
 	struct cg *cg;
 	if (!memcmp(cg_name->text, "<save>", 6)) {
@@ -1033,7 +1076,7 @@ void parts_release(int parts_no)
 	struct ht_slot *slot = ht_put_int(parts_table, parts_no, NULL);
 	if (!slot->value)
 		return;
-	if (getenv("XSYS4_CTRL_TRACE"))
+	if (getenv("XSYS4_CTRL_TRACE") || parts_watched(parts_no))
 		NOTICE("parts_release(%d)", parts_no);
 
 	struct parts *parts = slot->value;
@@ -1991,7 +2034,7 @@ int PE_GetComponentAbsoluteMaxPosZ(int comp)
 
 void PE_SetShow(int parts_no, bool show)
 {
-	if (getenv("XSYS4_PARTS_TRACE"))
+	if (getenv("XSYS4_PARTS_TRACE") || parts_watched(parts_no))
 		NOTICE("PARTS SetShow(%d, %d)", parts_no, show);
 	parts_set_show(parts_get(parts_no), show);
 }
@@ -3202,8 +3245,34 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 		p = next;
 	}
 
-	if (getenv("XSYS4_CTRL_TRACE"))
+	if (getenv("XSYS4_CTRL_TRACE")) {
 		NOTICE("   ctrl %d: освобождено партов %d, напр. cg=\"%s\"", ctrl_no, released, sample);
+		// Снос пустого слоя — признак того, что парты легли не туда: печатаем, где
+		// они на самом деле, и каков стек. Ровно этот вывод показал, что расходится
+		// не чтение аргумента RemoveController, а привязка партов к слоям.
+		if (released == 0) {
+			int cnt[PARTS_CONTROLLER_STACK_MAX + 2] = {0};
+			struct parts *q;
+			PARTS_LIST_FOREACH(q) {
+				int c = q->controller_no;
+				if (c >= 0 && c <= PARTS_CONTROLLER_STACK_MAX)
+					cnt[c]++;
+				else
+					cnt[PARTS_CONTROLLER_STACK_MAX + 1]++;
+			}
+			char buf[256]; int n = 0;
+			for (int i = 0; i <= PARTS_CONTROLLER_STACK_MAX + 1 && n < 200; i++)
+				if (cnt[i])
+					n += snprintf(buf + n, sizeof(buf) - n, "%d:%d ", i, cnt[i]);
+			buf[n] = 0;
+			char st[128]; int m = 0;
+			for (int i = 0; i < ctrl_stack.nr_controllers && m < 100; i++)
+				m += snprintf(st + m, sizeof(st) - m, "%d ", ctrl_stack.stack[i]);
+			st[m] = 0;
+			NOTICE("   ПУСТОЙ СНОС: парты по слоям [%s], стек [%s], активный %d",
+			       buf, st, ctrl_stack.active);
+		}
+	}
 	// Вынимаем из стека, НЕ перенумеровывая остальные (id устойчив).
 	for (int i = pos; i + 1 < ctrl_stack.nr_controllers; i++)
 		ctrl_stack.stack[i] = ctrl_stack.stack[i + 1];
@@ -3218,6 +3287,8 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 
 void PE_set_active_controller(int controller_no)
 {
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("PE_set_active_controller(%d) (был %d)", controller_no, ctrl_stack.active);
 	if (controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY ||
 			ctrl_stack_pos(controller_no) >= 0)
 		ctrl_stack.active = controller_no;

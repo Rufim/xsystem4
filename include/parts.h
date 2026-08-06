@@ -198,6 +198,8 @@ void parts_controller_set_show(int id, bool show);
 // Восстановить стек слоёв после загрузки сейва (в сейве лежит только его глубина).
 void parts_controller_stack_restore(int nr, int active);
 int PE_get_controller_index(int id);
+// XSYS4_PART_WATCH=<номер>[,…] — следить за конкретными партами.
+bool parts_watched(int parts_no);
 bool parts_controller_get_show(int id);
 int PE_get_system_controller(void);
 void PE_parts_set_want_save(int parts_no, bool want_save);
