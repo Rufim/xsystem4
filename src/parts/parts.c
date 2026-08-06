@@ -2899,6 +2899,37 @@ int PE_parts_get_absolute_z(int parts_no)
 	return parts ? parts->global.z : 0;
 }
 
+/*
+ * Привязка позиции прокрутки к другой части. Значение только ХРАНИТСЯ — см.
+ * комментарий у `scroll_pos_x_link` в parts_internal.h. Одноразовый WARNING на
+ * непустую привязку: допущение должно быть видно, а не прятаться за тихим
+ * дефолтом (тот же приём, что у `クリップ領域`).
+ */
+void PE_set_component_scroll_pos_link(int parts_no, int link_parts_no, bool vertical)
+{
+	struct parts *parts = parts_get(parts_no);
+	if (vertical)
+		parts->scroll_pos_y_link = link_parts_no;
+	else
+		parts->scroll_pos_x_link = link_parts_no;
+	if (link_parts_no) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("привязка прокрутки (часть %d -> %d): значение сохранено, "
+				"само следование не реализовано", parts_no, link_parts_no);
+		}
+	}
+}
+
+int PE_get_component_scroll_pos_link(int parts_no, bool vertical)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return 0;
+	return vertical ? parts->scroll_pos_y_link : parts->scroll_pos_x_link;
+}
+
 void PE_parts_set_lock_input_state(int parts_no, bool lock)
 {
 	parts_get(parts_no)->lock_input_state = lock;

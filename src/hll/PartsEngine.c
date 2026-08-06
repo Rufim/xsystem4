@@ -1624,6 +1624,39 @@ static bool PE_IsFocus(int a) { (void)a; return false; }
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetFocus, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetFocusPartsNumber, int a);
 
+// `GetActiveParts` — «номер активной части», 0 = нет такой. У Tsumamigui 3 её зовёт
+// РОВНО одно место: `activityeditor::detail::CAESelectOriginDialog@MouseLClickEvent`
+// (встроенный редактор активностей AliceSoft), где `== 0` закрывает диалог. Редактор
+// в обычной игре не открывается, а понятия «активной» части у нас нет вовсе (фокус —
+// заглушка выше), поэтому честнее вернуть 0, чем выдумать семантику: 0 означает «нет
+// активной части», и это согласовано с нашей нумерацией (номера начинаются от 9e7).
+// Экспорт нужен потому, что ОТСУТСТВИЕ функции уводит движок в REPL (FINDINGS §5x).
+static int PE_GetActiveParts(void) { return 0; }
+
+// IME (переключение на полноширинный ввод в текстовом поле) — у нас ввод идёт через
+// SDL без IME, переключать нечего. Настоящий no-op, а не заглушка-недоделка.
+static void PE_SetOpenTextBoxIME(int parts_no, bool open) { (void)parts_no; (void)open; }
+
+static void PE_SetComponentScrollPosXLinkNumber(int parts_no, int link)
+{
+	PE_set_component_scroll_pos_link(parts_no, link, false);
+}
+
+static void PE_SetComponentScrollPosYLinkNumber(int parts_no, int link)
+{
+	PE_set_component_scroll_pos_link(parts_no, link, true);
+}
+
+static int PE_GetComponentScrollPosXLinkNumber(int parts_no)
+{
+	return PE_get_component_scroll_pos_link(parts_no, false);
+}
+
+static int PE_GetComponentScrollPosYLinkNumber(int parts_no)
+{
+	return PE_get_component_scroll_pos_link(parts_no, true);
+}
+
 // Button parts are backed by the normal parts state machine (3 states:
 // default/hovered/clicked). Setting a button's flat/CG name must actually
 // load the resource into all states so the button renders — otherwise the
@@ -2293,6 +2326,34 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetActiveController, PE_get_active_controller),
 	    HLL_EXPORT(GetControllerLength, PE_get_controller_length),
 	    HLL_EXPORT(GetControllerID, PE_get_controller_id),
+	    // Слой системного оверлея — на нём игра рисует полноэкранные эффекты
+	    // (`全画面色` → `■フラッシュ`, вспышка при событии). Реализация была, но
+	    // висела ТОЛЬКО на диспетчере `PartsFunc` (func_id 2, GetSystemOverlayLayer);
+	    // Tsumamigui 3 зовёт HLL-функцию напрямую, и её отсутствие уводило движок в
+	    // отладочный REPL посреди сцены — со стороны это выглядит как зависание игры
+	    // (процесс жив и крутит 100 % CPU).
+	    HLL_EXPORT(GetSystemOverlayController, PE_get_system_controller),
+	    // Ниже — функции, ДОСТИЖИМЫЕ у Tsumamigui 3 по графу вызовов от `main`
+	    // (scripts/ain_reachable.py, FINDINGS §5x). Первые три уже были реализованы
+	    // и висели только на диспетчере `PartsFunc`, как и GetSystemOverlayController.
+	    HLL_EXPORT(SetLayoutBoxPadding, PE_set_layoutbox_padding),
+	    HLL_EXPORT(GetLayoutBoxPaddingTop, PE_get_layoutbox_padding_top),
+	    HLL_EXPORT(GetLayoutBoxPaddingBottom, PE_get_layoutbox_padding_bottom),
+	    HLL_EXPORT(GetLayoutBoxPaddingLeft, PE_get_layoutbox_padding_left),
+	    HLL_EXPORT(GetLayoutBoxPaddingRight, PE_get_layoutbox_padding_right),
+	    HLL_EXPORT(GetComponentAbsolutePosX, PE_parts_get_absolute_x),
+	    HLL_EXPORT(GetComponentAbsolutePosY, PE_parts_get_absolute_y),
+	    HLL_EXPORT(GetComponentAbsolutePosZ, PE_parts_get_absolute_z),
+	    // Реализация есть и используется диспетчером PartsFunc (case 103); у
+	    // Tsumamigui 3 по графу вызовов НЕдостижима, но экспорт бесплатный и
+	    // страхует другие игры — ref-выходы функция заполняет сама.
+	    HLL_EXPORT(GetPartsCGSurfaceArea, PE_GetPartsCGSurfaceArea),
+	    HLL_EXPORT(GetActiveParts, PE_GetActiveParts),
+	    HLL_EXPORT(SetOpenTextBoxIME, PE_SetOpenTextBoxIME),
+	    HLL_EXPORT(SetComponentScrollPosXLinkNumber, PE_SetComponentScrollPosXLinkNumber),
+	    HLL_EXPORT(SetComponentScrollPosYLinkNumber, PE_SetComponentScrollPosYLinkNumber),
+	    HLL_EXPORT(GetComponentScrollPosXLinkNumber, PE_GetComponentScrollPosXLinkNumber),
+	    HLL_EXPORT(GetComponentScrollPosYLinkNumber, PE_GetComponentScrollPosYLinkNumber),
 	    HLL_EXPORT(CreateActivity, PE_CreateActivity),
 	    HLL_EXPORT(IsExistActivity, PE_IsExistActivity),
 	    HLL_EXPORT(ReleaseActivity, PE_ReleaseActivity),
