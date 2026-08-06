@@ -47,10 +47,11 @@ static int SystemService_GetMixerName(int n, struct string **name)
 
 static bool SystemService_GetMixerDefaultVolume(int n, int *volume)
 {
-	if (n < 0 || (unsigned)n >= config.mixer_nr_channels)
-		return false;
-	*volume = config.mixer_volumes[n];
-	return true;
+	// Граница — по фактическому числу микшеров (mixer_get_default_volume).
+	// Прежде считалась по длине ini-списка, а без ключа `VolumeValancer` она
+	// НОЛЬ, поэтому геттер проваливался всегда и игра видела громкость 0,
+	// что она трактует как мьют (FINDINGS §5ag).
+	return mixer_get_default_volume(n, volume);
 }
 
 static bool SystemService_SetMixerName(int n, struct string *name)

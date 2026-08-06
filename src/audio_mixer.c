@@ -620,6 +620,11 @@ void channel_close(struct channel *ch)
 // микшер брал громкость из AliceStart.ini -> настройки звука «не сохранялись».
 #include <stdio.h>
 char *savedir_path(const char *path);  // из savedata.c
+// Сколько каналов микшера поднимать, когда списка каналов в ini нет.
+// 14 — размер таблицы групп Tsumamigui 3 (шесть движковых 0…5 + четыре голосовые
+// группы персонажей 6…9 + их «фоновые» близнецы 10…13); берём с запасом.
+#define MIXER_FALLBACK_CHANNELS 16
+
 #define MIXER_VOL_FILE "MixerVolume.sav"
 
 // Временные изменения громкости/мьюта (приглушение музыки и заглушение голоса
@@ -668,7 +673,7 @@ static void mixer_load_volumes(void)
 			int32_t v, m;
 			if (fread(&v, 4, 1, fp) != 1 || fread(&m, 4, 1, fp) != 1)
 				break;
-			if (i < (int)config.mixer_nr_channels)
+			if (i < nr_mixers)
 				config.mixer_volumes[i] = clamp(0, 100, v);
 			if (i < nr_mixers)
 				mixers[i].muted = !!m;
@@ -681,12 +686,31 @@ void mixer_init(void)
 {
 	// initialize mixer naming
 	if (!config.mixer_nr_channels) {
-		nr_mixers = 3;
+		/*
+		 * Ни у одной из наших System4-игр в ini НЕТ ключа `VolumeValancer`
+		 * (проверено у Tsumamigui 3, Escalayer, Daiteikoku и Dohna), а
+		 * адресуют они СВОИ номера звуковых групп: у Tsumamigui это 0…13 из
+		 * таблицы `Ｅ＿サウンドグループ設定`, причём группу 3 (голос) игра
+		 * проверяет напрямую (`IsMuteVoice` → `IsMute(0)` и `IsMute(3)`).
+		 * При трёх каналах всё выше второго не существовало вовсе, а игра
+		 * трактует «громкость не прочиталась» как МЬЮТ и молча глушит звук —
+		 * так пропадал голос-комментарий после сохранения (FINDINGS §5ag).
+		 * Поэтому каналов сразу столько, сколько может спросить игра.
+		 * Первые три имени и их ПОРЯДОК сохранены: номер канала для звука
+		 * берётся из `.wai`/`.bgi` и индексирует этот же массив, так что
+		 * переставлять их — значит менять маршрутизацию у старых игр.
+		 */
+		nr_mixers = MIXER_FALLBACK_CHANNELS;
 		mixers = xcalloc(nr_mixers, sizeof(struct mixer));
 		mixers[0].name = strdup("Music");
 		mixers[1].name = strdup("Sound");
 		mixers[2].name = strdup("Master");
 		master = &mixers[2];
+		// Остальные — безымянные потомки мастера: имя игре не нужно
+		// (Tsumamigui не зовёт ни GetMixerName, ни GetNumofMixer), а разбор
+		// иерархии ниже делает strcmp и требует непустой строки.
+		for (int i = 3; i < nr_mixers; i++)
+			mixers[i].name = strdup("Unnamed");
 	} else {
 		// NOTE: Older games don't have an explicit master channel.
 		//       We add an extra mixer in this case for consistency.
@@ -723,13 +747,30 @@ void mixer_init(void)
 		}
 	}
 
+	/*
+	 * `config.mixer_volumes[]` выделяется ТОЛЬКО при разборе ini-списка
+	 * (`read_mixer_channels`), поэтому без ключа `VolumeValancer` он был NULL, и
+	 * первый же `SetMixerVolume` писал бы по нулевому указателю (спасала лишь
+	 * проверка границ, которая отсекала всё). А в ini-случае массив на элемент
+	 * КОРОЧЕ числа микшеров — синтетический Master не имел своей ячейки.
+	 * Приводим его к nr_mixers в обоих случаях.
+	 */
+	{
+		int *vols = xcalloc(nr_mixers, sizeof(int));
+		for (int i = 0; i < nr_mixers; i++)
+			vols[i] = i < (int)config.mixer_nr_channels && config.mixer_volumes
+				? config.mixer_volumes[i] : config.default_volume;
+		free(config.mixer_volumes);
+		config.mixer_volumes = vols;
+	}
+
 	// применить сохранённые громкости (переопределяют значения из .ini)
 	mixer_load_volumes();
 
 	// initialize mixers
 	for (int i = 0; i < nr_mixers; i++) {
 		sts_mixer_init(&mixers[i].mixer, 44100, STS_MIXER_SAMPLE_FORMAT_FLOAT);
-		int volume = i < (int)config.mixer_nr_channels ? config.mixer_volumes[i] : config.default_volume;
+		int volume = config.mixer_volumes[i];
 		mixers[i].mixer.gain = clamp(0.0f, 1.0f, (float)volume / 100.0f);
 	}
 
@@ -774,14 +815,14 @@ int mixer_get_numof(void)
 
 const char *mixer_get_name(int n)
 {
-	if (n < 0 || n >= config.mixer_nr_channels)
+	if (n < 0 || n >= nr_mixers)
 		return NULL;
 	return mixers[n].name;
 }
 
 int mixer_set_name(int n, const char *name)
 {
-	if (n < 0 || n >= config.mixer_nr_channels)
+	if (n < 0 || n >= nr_mixers)
 		return 0;
 	free(mixers[n].name);
 	mixers[n].name = strdup(name);
@@ -790,7 +831,7 @@ int mixer_set_name(int n, const char *name)
 
 int mixer_get_volume(int n, int *volume)
 {
-	if (n < 0 || n >= config.mixer_nr_channels) {
+	if (n < 0 || n >= nr_mixers) {
 		return 0;
 	}
 	SDL_LockAudioDevice(audio_device);
@@ -801,7 +842,7 @@ int mixer_get_volume(int n, int *volume)
 
 int mixer_set_volume(int n, int volume)
 {
-	if (n < 0 || n >= config.mixer_nr_channels)
+	if (n < 0 || n >= nr_mixers)
 		return 0;
 	SDL_LockAudioDevice(audio_device);
 	mixers[n].mixer.gain = clamp(0.0f, 1.0f, (float)volume / 100.0f);
@@ -810,9 +851,20 @@ int mixer_set_volume(int n, int volume)
 	mixer_save_volumes();                             // персистить настройку
 	return 1;
 }
+// Дефолтная громкость канала. Живёт здесь, а не в HLL-обёртках: только тут
+// известно фактическое число микшеров (в HLL проверялось по длине ini-списка,
+// то есть по нулю, и геттер всегда проваливался).
+int mixer_get_default_volume(int n, int *volume)
+{
+	if (n < 0 || n >= nr_mixers)
+		return 0;
+	*volume = config.mixer_volumes[n];
+	return 1;
+}
+
 int mixer_get_mute(int n, int *mute)
 {
-	if (n < 0 || n >= config.mixer_nr_channels)
+	if (n < 0 || n >= nr_mixers)
 		return 0;
 	*mute = mixers[n].muted;
 	return 1;
@@ -820,7 +872,7 @@ int mixer_get_mute(int n, int *mute)
 
 int mixer_set_mute(int n, int mute)
 {
-	if (n < 0 || n >= config.mixer_nr_channels)
+	if (n < 0 || n >= nr_mixers)
 		return 0;
 	mixers[n].muted = !!mute;
 	mixer_save_volumes();   // персистить мьют
