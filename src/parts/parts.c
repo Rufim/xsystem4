@@ -88,6 +88,10 @@ static void parts_init(struct parts *parts)
  */
 bool parts_watched(int parts_no)
 {
+	// Парт, пойманный по КАРТИНКЕ (XSYS4_CG_WATCH), тоже считается наблюдаемым —
+	// иначе на каждом месте пришлось бы проверять два условия подряд.
+	if (parts_no >= 0 && parts_no == parts_cg_watch_part())
+		return true;
 	static const char *watch = (const char *)1;
 	if (watch == (const char *)1)
 		watch = getenv("XSYS4_PART_WATCH");
@@ -769,21 +773,6 @@ bool parts_cg_set_by_index(struct parts *parts, struct parts_cg *cg, int cg_no)
 bool parts_cg_set(struct parts *parts, struct parts_cg *parts_cg, struct string *cg_name)
 {
 	assert(cg_name && *(cg_name->text) != '\0');
-	/*
-	 * `XSYS4_CG_WATCH=<подстрока имени CG>` — следить за партом ПО КАРТИНКЕ, а не по
-	 * номеру: номера `1000001xxx` выдаются на лету и от прогона к прогону РАЗНЫЕ,
-	 * так что `XSYS4_PART_WATCH` по номеру для них бесполезен. Печатает номер парта и
-	 * СЛОЙ, на котором он живёт, — этим ищется «чей это парт остался на экране».
-	 */
-	{
-		static const char *w = (const char *)1;
-		if (w == (const char *)1)
-			w = getenv("XSYS4_CG_WATCH");
-		if (w && *w && strstr(cg_name->text, w)) {
-			NOTICE("CGWATCH парт %d слой %d cg=\"%s\"",
-			       parts->no, parts->controller_no, display_sjis0(cg_name->text));
-		}
-	}
 	int no;
 	struct cg *cg;
 	if (!memcmp(cg_name->text, "<save>", 6)) {
@@ -1331,6 +1320,12 @@ void PE_SetEventID(int parts_no, int delegate_index, int unique_id)
 	parts->event_unique_id = unique_id;
 }
 
+// Номер части, чей CG совпал с XSYS4_CG_WATCH: за ней потом следят PE_SetShow и
+// PE_ReleaseParts — так видно, гасит/освобождает ли её игра вообще. Читается
+// через parts_cg_watch_part(), чтобы условие наблюдения было ОДНО (parts_watched).
+static int cg_watch_part = -1;
+int parts_cg_watch_part(void) { return cg_watch_part; }
+
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state)
 {
 	if (!parts_state_valid(--state))
@@ -1338,6 +1333,33 @@ bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int 
 
 	struct parts *parts = parts_get(parts_no);
 	parts->sprite_deform = sprite_deform;
+	// XSYS4_CG_WATCH=<подстрока имени CG> — ОДНОРАЗОВЫЙ стек вызовов игры на
+	// первой установке подходящего CG: отвечает «кто эту картинку кладёт».
+	{
+		static bool cg_watch_done = false;
+		const char *w = getenv("XSYS4_CG_WATCH");
+		// Имя CG хранится в SJIS, а подстрока из env — в UTF-8: сравниваем с
+		// ПЕРЕКОДИРОВАННЫМ именем, иначе не совпадёт никогда.
+		if (w && *w && cg_name) {
+			const char *utf8 = display_sjis0(cg_name->text);
+			if (strstr(utf8, w)) {
+				// Строка — на КАЖДОЕ совпадение, и обязательно со СЛОЕМ: так
+				// ищется «чьи парты остались на экране» (у Haha Ranman на
+				// ADV-сцене висели чужие — титульная плёнка и рамка `行動選択`).
+				// Номера партов `1000001xxx` выдаются на лету и от прогона к
+				// прогону РАЗНЫЕ, поэтому искать их по номеру бесполезно.
+				NOTICE("CGWATCH part=%d слой %d cg='%s'",
+				       parts_no, parts->controller_no, utf8);
+				// Стек вызовов игры — ОДИН раз: он отвечает «кто её кладёт».
+				if (!cg_watch_done) {
+					cg_watch_done = true;
+					cg_watch_part = parts_no;
+					NOTICE("CGWATCH стек вызовов игры:");
+					vm_stack_trace();
+				}
+			}
+		}
+	}
 	if (!cg_name || *(cg_name->text) == '\0') {
 		parts_state_reset(&parts->states[state], PARTS_CG);
 		parts_dirty(parts);
@@ -1738,6 +1760,55 @@ bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int stat
 	return PE_SetVGaugeRate(parts_no, numerator, denominator, state);
 }
 
+/*
+ * Геттеры числителя/знаменателя (`Parts_GetHGaugeNumerator` и соседи). Игра
+ * пользуется ими как обычными свойствами: `RankGauge@Attach` → `WorkerParamView`
+ * читает числитель, чтобы поставить новый знаменатель, — без них экран подбора
+ * работников Dohna падал на «Unimplemented HLL function».
+ * Знаменатель по умолчанию 1: гейдж, которому отношение ещё не задавали, обязан
+ * вести себя как «0 из 1», а не делить на ноль.
+ */
+static const struct parts_gauge *gauge_for_get(int parts_no, int state, bool vert)
+{
+	if (!parts_state_valid(--state))
+		return NULL;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return NULL;
+	// Смотрим, а НЕ заводим: `parts_get_hgauge`/`vgauge` при несовпадении типа
+	// СБРАСЫВАЮТ состояние в гейдж, то есть геттер молча переписал бы часть,
+	// которая гейджем не является. Не нашли — вернём NULL, вызывающий отдаст
+	// дефолты (0 и 1).
+	enum parts_type want = vert ? PARTS_VGAUGE : PARTS_HGAUGE;
+	if (parts->states[state].type != want)
+		return NULL;
+	return &parts->states[state].gauge;
+}
+
+float PE_GetHGaugeNumerator(int parts_no, int state)
+{
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	return g ? g->numerator : 0.0f;
+}
+
+float PE_GetHGaugeDenominator(int parts_no, int state)
+{
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	return (g && g->denominator != 0.0f) ? g->denominator : 1.0f;
+}
+
+float PE_GetVGaugeNumerator(int parts_no, int state)
+{
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	return g ? g->numerator : 0.0f;
+}
+
+float PE_GetVGaugeDenominator(int parts_no, int state)
+{
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	return (g && g->denominator != 0.0f) ? g->denominator : 1.0f;
+}
+
 bool PE_SetHGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
 {
 	if (!parts_state_valid(--state))
@@ -1747,50 +1818,6 @@ bool PE_SetHGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state
 	struct parts_gauge *g = parts_get_hgauge(parts, state);
 	parts_set_surface_area(parts, &g->common, x, y, w, h);
 	return true;
-}
-
-/*
- * Числитель и знаменатель заполнения — игра читает их обратно (у Haha Ranman это
- * делает экран `行動選択`). Храним ровно то, что задал `SetHGaugeRate`; после
- * загрузки сейва восстановлено как (rate, 1.0) — отношение то же, см. parts_internal.h.
- * Отдельный getter на состояние, поэтому тип состояния тут НЕ навязываем: у части,
- * которая калибром не является, честнее отдать 0, чем молча переписать ей состояние.
- */
-static const struct parts_gauge *parts_peek_gauge(int parts_no, int state, bool vert)
-{
-	if (!parts_state_valid(--state))
-		return NULL;
-	struct parts *parts = parts_try_get(parts_no);
-	if (!parts)
-		return NULL;
-	enum parts_type want = vert ? PARTS_VGAUGE : PARTS_HGAUGE;
-	if (parts->states[state].type != want)
-		return NULL;
-	return &parts->states[state].gauge;
-}
-
-float PE_GetHGaugeNumerator(int parts_no, int state)
-{
-	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, false);
-	return g ? g->numerator : 0.0f;
-}
-
-float PE_GetHGaugeDenominator(int parts_no, int state)
-{
-	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, false);
-	return g ? g->denominator : 0.0f;
-}
-
-float PE_GetVGaugeNumerator(int parts_no, int state)
-{
-	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, true);
-	return g ? g->numerator : 0.0f;
-}
-
-float PE_GetVGaugeDenominator(int parts_no, int state)
-{
-	const struct parts_gauge *g = parts_peek_gauge(parts_no, state, true);
-	return g ? g->denominator : 0.0f;
 }
 
 bool PE_SetVGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
@@ -1973,6 +2000,10 @@ bool PE_SetNumeralSurfaceArea(int parts_no, int x, int y, int w, int h, int stat
 
 void PE_ReleaseParts(int parts_no)
 {
+	if (parts_no == cg_watch_part) {
+		NOTICE("CGWATCH part=%d ReleaseParts — стек вызовов игры:", parts_no);
+		vm_stack_trace();
+	}
 	parts_release(parts_no);
 }
 
@@ -2034,6 +2065,8 @@ int PE_GetComponentAbsoluteMaxPosZ(int comp)
 
 void PE_SetShow(int parts_no, bool show)
 {
+	// Одно условие на обе метки наблюдения: parts_watched уже учитывает и
+	// XSYS4_PART_WATCH (по номеру), и XSYS4_CG_WATCH (по картинке).
 	if (getenv("XSYS4_PARTS_TRACE") || parts_watched(parts_no))
 		NOTICE("PARTS SetShow(%d, %d)", parts_no, show);
 	parts_set_show(parts_get(parts_no), show);
@@ -2580,6 +2613,27 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		parts->is_button = true;
 		return;
 	}
+	// Чекбокс (id 1 в обеих нумерациях) — ровно тот же случай, что кнопка: у
+	// движка это ФЛАГ на CG-части, а состояние сбрасывать нельзя (загрузчик
+	// раскладок уже положил в него CG рамки, см. PE_InitPartsCheckBox).
+	// Ixseal конструирует его сама: `parts::detail::CCheckBoxParts@0` (@0x2fc894)
+	// завершается вызовом `SetComponentType(no, 1, 1)` — без этой ветки первый же
+	// чекбокс валил движок («unknown component type 1»).
+	if (type == 1) {
+		parts->is_checkbox = true;
+		return;
+	}
+	// Полосы прокрутки (2/3) — тоже ФЛАГ на CG-части (геометрию кладёт загрузчик
+	// раскладок, PE_InitPartsVScrollbar/HScrollbar). Игра выставляет тип сама:
+	// `CVScrollBarParts@0` (@0x3c6b9c) → SetComponentType(no, 2, 1),
+	// `CHScrollBarParts@0` (@0x32bd1e) → 3.
+	if (type == 2 || type == 3) {
+		if (type == 2)
+			parts->is_vscrollbar = true;
+		else
+			parts->is_hscrollbar = true;
+		return;
+	}
 	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
@@ -2596,13 +2650,13 @@ void PE_SetComponentType(int parts_no, int type, int state)
 	case 22: pt = PARTS_MOVIE; break;
 	default: {
 		/*
-		 * ВИДЖЕТ, а не `パーツ`: чекбокс, скроллбары, слайдеры, поля ввода,
-		 * списки, формы, окно сообщения. Своего вида отрисовки у них нет —
-		 * движок ведёт их отдельными механизмами поверх обычной CG-части
-		 * (`is_hscrollbar` + `PE_InitPartsHScrollbar`, `is_checkbox`,
-		 * окно сообщения собрано из служебных частей-потомков), а сам тип
-		 * состояния при этом обязан остаться прежним. Ровно так уже сделаны
-		 * кнопка (0) и `ユーザコンポーネント` (17) выше.
+		 * ВИДЖЕТ, а не `パーツ`, и притом такой, которому движок не ведёт
+		 * отдельного флага: слайдеры, поля ввода, списки, формы, окно
+		 * сообщения. Своего вида отрисовки у них нет (окно сообщения, например,
+		 * собрано из служебных частей-потомков), а тип состояния обязан
+		 * остаться прежним. Те виджеты, у которых флаг есть, разобраны ВЫШЕ
+		 * поимённо: кнопка (0), чекбокс (1), полосы прокрутки (2/3),
+		 * `パネル` (14 в v14) и `ユーザコンポーネント` (17 в v14).
 		 *
 		 * Раньше здесь была VM_ERROR, и первый же `横スライダーバー` (13) на
 		 * игровом экране Haha Ranman `行動選択` ронял движок в REPL. Сбрасывать
@@ -2636,6 +2690,26 @@ int PE_GetComponentType(int parts_no, int state)
 	struct parts *parts = parts_try_get(parts_no);
 	if (!parts)
 		return -1;
+
+	// Чекбокс (パーツタイプ=1) тоже рисуется CG-частью, но обязан отвечать своим
+	// типом: `CActivityWrap@GetCheckBox` (@0x200c8) отдаёт часть только если
+	// `CompParts(имя, 1, 1)`, иначе возвращает null. Из-за отсутствия этой ветки
+	// `SceneYesNoDialog@Close` читал `GetCheckBox("CheckDontShowAgain").Checked`
+	// у null-интерфейса и падал на `X_REF` (диалог «Save the game?» → Yes).
+	// Id 1 из v14-части перечисления — сдвиг его не касается (он с 18).
+	// Проверяется РАНЬШЕ is_button: чекбокс кликабелен, но кнопкой не является.
+	if (parts->is_checkbox)
+		return 1;
+
+	// Полосы прокрутки (縦=2, 横=3) — тот же случай: рисуются CG-ползунком, а
+	// тип обязаны отдавать свой, иначе `CActivityWrap@GetVScrollBar` (@0x202f0,
+	// `CompParts(имя, 2, 1)`) и `GetHScrollBar` (@0x20500, тип 3) возвращают
+	// null. На этом падал ассерт игры `ScrollBarUnit.jaf:26:
+	// (nonnull) m_act.GetVScrollBar("Scroll")` при входе на экран «Items».
+	if (parts->is_vscrollbar)
+		return 2;
+	if (parts->is_hscrollbar)
+		return 3;
 
 	// Activity "button" parts (パーツタイプ=0) render as CG but report type 0 so
 	// the game recognizes them as buttons (e.g. C_TITLE@Enable registers click

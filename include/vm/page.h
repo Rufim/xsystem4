@@ -134,6 +134,7 @@ void create_struct(int no, union vm_value *var);
 // Тип элемента — ссылка на интерфейс (пара «объект, база интерфейса»)?
 // Это `ref <интерфейс>` (AIN_IFACE) и `wrap<интерфейс>` (AIN_IFACE_WRAP).
 bool array_iface_pair_type(enum ain_data_type a_type);
+bool array_handle_elem_type(enum ain_data_type a_type);
 // Число слотов страницы на ОДИН элемент массива: 1 для всех обычных массивов и
 // 2 для Ixseal-массива с интерфейсным элементом (см. выше).
 // Индексы элементов во всех array_*-функциях — в ЭЛЕМЕНТАХ.
@@ -158,14 +159,25 @@ void array_reverse(struct page *page);
 void array_shuffle(struct page *page, int seed);
 
 // delegates
-struct page *delegate_new_from_method(int obj, int fun);
+/*
+ * Ixseal (System4 v14) добавил ЛЯМБДЫ С ЗАХВАТОМ: тело лямбды читает локальные
+ * переменные объемлющей функции идиомой `PUSHLOCALPAGE; X_GETENV; PUSH n; X_REF`.
+ * Делегат такую лямбду ПЕРЕЖИВАЕТ (подписался на событие — объемлющая функция
+ * вернулась), поэтому окружение приходится хранить в самом делегате: элемент
+ * стал ЧЕТВЁРКОЙ (obj, fun, seq, env), где env — heap-слот локальной страницы
+ * той функции, в которой лямбда была создана (-1 у всех прочих обработчиков).
+ * НАРУЖУ формат не протекает: в rsave по-прежнему пишутся тройки (см. resume.c).
+ */
+#define DG_ENTRY_SLOTS 4
+struct page *delegate_new_from_method(int obj, int fun, int env);
 int delegate_numof(struct page *page);
 bool delegate_contains(struct page *dst, int obj, int fun);
 void delegate_erase(struct page *page, int obj, int fun);
-struct page *delegate_append(struct page *dst, int obj, int fun);
+struct page *delegate_append(struct page *dst, int obj, int fun, int env);
 struct page *delegate_plusa(struct page *dst, struct page *add);
 struct page *delegate_minusa(struct page *dst, struct page *minus);
 struct page *delegate_clear(struct page *page);
-bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out);
+bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out, int *env_out);
+void delegate_release_env(struct page *page);
 
 #endif /* SYSTEM4_PAGE_H */

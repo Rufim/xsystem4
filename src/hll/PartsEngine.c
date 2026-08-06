@@ -187,23 +187,36 @@ static int textbox_blink_ms(void)
 }
 
 /*
- * КЕГЛЬ ГЛИФОВ ≠ КЕГЛЬ ПОЛЯ. `フォントサイズ` в `.pactex` — НОМИНАЛ (им считается
- * геометрия: высота каретки ровно 16 и по эталону совпала), а глифы рисуются в
- * `実サイズ`, который в полтора раза больше. Это ровно та же пара чисел, что §5f
- * нашёл у BACK LOG (боксы 34 при номинале 32, глифы 48). Замер поля подтвердил
- * множитель независимо: ink «privet» у оригинала 54 px против наших 37 (1.46×),
- * высота ink 11 против 7 (1.57×). Плюс 16 × 1.5 = 24 — а `XSYS4_FNL_TRACE` даёт
- * для 24 НАТИВНЫЙ face (denom=4, face_h=96), тогда как для 16 приходилось мельчить
- * тот же face денominatorом 6. Ручка `XSYS4_TB_SIZE_MUL` — для сверки.
+ * КЕГЛЬ ГЛИФОВ ≠ КЕГЛЬ ПОЛЯ: у поля ввода глифы МЕЛЬЧЕ объявленного номинала.
+ * `フォントサイズ` в `.pactex` — номинал, им считается геометрия (высота каретки
+ * ровно 16 и по эталону совпала), а глифы оригинал рисует кеглем 12.
+ *
+ * ★МНОЖИТЕЛЬ ПЕРЕСЧИТАН 2.0 → 0.75 (FINDINGS §5af). Прежние 2.0 калибровались,
+ * когда лица 0/1 подменялись шрифтом из `.fnl`: у FNL ASCII приземистый, и
+ * увеличение вдвое компенсировало это по одному измерению. После возврата лиц 0/1
+ * системному шрифту тот же множитель давал В ДВА РАЗА КРУПНЕЕ оригинала (нашёл
+ * пользователь живьём). Направление оказалось ОБРАТНЫМ, и это видно сразу по двум
+ * эталонам: текст слота при номинале 14 даёт чернила 11 и шаг 7, а поле при
+ * номинале 16 — чернила 9 и шаг 10, то есть объявляет БОЛЬШЕ, а рисует МЕНЬШЕ.
+ * Оба числа поля сходятся на кегле 12 одновременно: у системного гротеска на 12 px
+ * чернила цифры 9, advance 6, плюс надбавка за обводку `2×ceil(1.25) = 4` даёт
+ * шаг ровно 10. Отсюда 12/16 = 0.75.
+ * ЗАМЕР ПОСЛЕ: шаг 10.00 = 10.00, суммарная ширина строки `1231231` 60 = 60,
+ * групп 7 = 7, чернила 8 против 9 (порогозависимый пиксель).
+ * ХВОСТ: чернила стоят на 1 px выше эталона (отн. 5..12 против 6..14 в подложке
+ * 22 px). Поправка вертикали ниже — эмпирическая доля от кегля, и она
+ * калибровалась при множителе 2.0. Специально НЕ подкручиваю: это тот же класс,
+ * что горизонтальный остаток §5z, а подгонка по одному измерению здесь уже
+ * приводила к ложным выводам. Ручка `XSYS4_TB_SIZE_MUL` — для сверки.
  */
 static float textbox_size_mul(void)
 {
 	static float mul = -1.0f;
 	if (mul < 0.0f) {
 		const char *e = getenv("XSYS4_TB_SIZE_MUL");
-		mul = e ? strtof(e, NULL) : 2.0f;
+		mul = e ? strtof(e, NULL) : 0.75f;
 		if (mul <= 0.0f)
-			mul = 2.0f;
+			mul = 0.75f;
 	}
 	return mul;
 }
@@ -1556,7 +1569,19 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 				 * пиксельной надбавкой к каждому глифу оно точно не является.
 				 * Ручка `XSYS4_ACT_CHARSPACE=1` возвращает прежнее поведение для A/B.
 				 */
-				if (getenv("XSYS4_ACT_CHARSPACE"))
+				// ★ВЫВОД ВЫШЕ ПЕРЕСМОТРЕН (FINDINGS §5af): `字間隔` — это ИМЕННО
+				// пиксельная поправка к шагу глифа, применять её НАДО. Не сходилась
+				// она из-за ДВУХ других ошибок, обе с тех пор закрыты: GUI-части
+				// рисовались шрифтом из `.fnl` вместо системного (лица 0/1 —
+				// встроенные, см. `get_font` в `src/text.c`), и обводка входила в шаг
+				// ДРОБНОЙ величиной вместо целой на сторону. С обеими правками
+				// арифметика сходится сразу на трёх эталонах: слот
+				// `14 + 2×2 − 4 = 14` и `7 + 2×2 − 4 = 7`, бэклог `ceil(A) + 2×2 − 1`.
+				// Отключение `字間隔` попутно РАЗЪЕЗЖАЛО бэклог: у его текста
+				// `字間隔 = −1`, и без поправки строки выходили на 1 px на глиф шире
+				// оригинала (462 px против 420 на строке из 43 знаков).
+				// Ручка `XSYS4_ACT_NO_CHARSPACE=1` возвращает прежнее поведение.
+				if (!getenv("XSYS4_ACT_NO_CHARSPACE"))
 					PE_SetTextCharSpace(no, act_int(fd, "字間隔", 0), state);
 				PE_SetTextLineSpace(no, act_int(fd, "行間隔", 0), state);
 			}
@@ -1585,6 +1610,57 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		if (act_int(st, "ゼロパディング", 0))
 			PE_SetNumeralLength(no, act_int(st, "桁数", 0), state);
 		PE_SetNumeralNumber(no, act_int(st, "数値", 0), state);
+		return;
+	}
+	/*
+	 * Гейдж-состояние (横ゲージパーツ = 14, 縦ゲージパーツ = 15). Загрузчик его не
+	 * разбирал: `ＣＧ名` уходил в общую CG-ветку внизу, часть становилась
+	 * `PARTS_CG` — и игра переставала её НАХОДИТЬ, потому что ищет сравнением
+	 * типа компонента (`CActivityWrap@GetHGauge` @fn603 → `CompParts(имя, 22,
+	 * state)`, у вертикального — 23). На этом падал игровой ассерт
+	 * `DecisionTimerView.jaf:19: (nonnull) m_act.GetHGauge("Gauge")` при входе в
+	 * магазин Dohna: у части «Gauge» узел `通常状態` — как раз 横ゲージパーツ с
+	 * `ＣＧ名 = "システム／ハルウリ／時間ゲージ"`. Тот же класс дефекта, что §5ak,
+	 * но чинится в ЗАГРУЗЧИКЕ: тип компонента у `PARTS_HGAUGE` уже верный.
+	 *
+	 * Порядок важен: `分子/分母` ставятся ПОСЛЕ CG — установка CG заводит
+	 * состояние гейджа заново.
+	 */
+	if (act_parts_type(st) == 14 || act_parts_type(st) == 15) {
+		bool horizontal = act_parts_type(st) == 14;
+		struct string *cg = act_str(st, "ＣＧ名");
+		if (cg && cg->size) {
+			if (horizontal)
+				PE_SetHGaugeCG(no, cg, state);
+			else
+				PE_SetVGaugeCG(no, cg, state);
+		}
+		float denom = act_float(st, "分母", 1.0f);
+		float numer = act_float(st, "分子", 0.0f);
+		if (horizontal)
+			PE_SetHGaugeRate(no, numer, denom, state);
+		else
+			PE_SetVGaugeRate(no, numer, denom, state);
+		int sx = act_list_int(st, "サーフェイスエリア", 0, 0);
+		int sy = act_list_int(st, "サーフェイスエリア", 1, 0);
+		int sw = act_list_int(st, "サーフェイスエリア", 2, 0);
+		int sh = act_list_int(st, "サーフェイスエリア", 3, 0);
+		if (sw > 0 && sh > 0) {
+			if (horizontal)
+				PE_SetHGaugeSurfaceArea(no, sx, sy, sw, sh, state);
+			else
+				PE_SetVGaugeSurfaceArea(no, sx, sy, sw, sh, state);
+		}
+		// 反転 (расти справа налево / снизу вверх) движок не поддерживает вовсе —
+		// соответствующего PE_-вызова нет. Молчать об этом нельзя: гейдж будет
+		// расти не в ту сторону. У всех гейджей Dohna в раскладках стоит 0.
+		if (act_int(st, "反転", 0)) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("act_set_state_cg: гейдж с 反転=1 не поддержан (parts %d)", no);
+			}
+		}
 		return;
 	}
 	// Construction-process viewport (パーツタイプ=18): used as a clip region for
@@ -1688,81 +1764,6 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 			// картинки, а значит и сеттера, который создал бы её попутно.
 			PE_EnsureParts(no);
 			PE_SetPartsRectangleDetectionSize(no, w, h, state);
-		}
-		return;
-	}
-	/*
-	 * Калибры: `横ゲージパーツ` (классический id 14) и `縦ゲージパーツ` (15).
-	 *
-	 * Без своей ветки состояние оставалось обычным CG, и игра, которая гейтится по
-	 * типу компонента, получала из `GetHGauge`/`GetVGauge` ПУСТОЙ wrap. Ровно так
-	 * падал ассерт Haha Ranman на первом же игровом экране:
-	 *   CMentalGauge.jaf:21: (nonnull) lpIActivity.GetHGauge("横ゲージ：診療所：精神力")
-	 * — причём ПОИСК ПО ИМЕНИ проходил (`GetActivityPartsNumber -> 90000075`),
-	 * падала именно обёртка по типу. Тот же класс, что уже лечили у `構築パーツ`
-	 * (`GetConstruction("PlayerC")`), `ＣＧ判定パーツ` и `矩形パーツ` выше.
-	 *
-	 * Поля состояния: `ＣＧ名` — картинка полного калибра, `分子`/`分母` — начальное
-	 * заполнение (дробь, float), `反転` — заполнение с другого конца,
-	 * `サーフェイスエリア` — площадь.
-	 *
-	 * Замер по всем раскладкам: Haha Ranman — 12 состояний (11 горизонтальных,
-	 * 1 вертикальное), у ВСЕХ `分子 = 分母 = 100`, `反転 = 0`, площадь нулевая.
-	 * Dohna — 33 горизонтальных и ни одного вертикального, там `分母` бывает
-	 * 1/20/100/1000, `分子` — вплоть до 0, а `反転 = 1` у ДЕВЯТИ; площадь нулевая тоже.
-	 */
-	int gauge = act_parts_type(st);
-	if (gauge == 14 || gauge == 15) {
-		bool horiz = (gauge == 14);
-		struct string *gcg = act_str(st, "ＣＧ名");
-		if (gcg && gcg->size) {
-			if (horiz)
-				PE_SetHGaugeCG(no, gcg, state);
-			else
-				PE_SetVGaugeCG(no, gcg, state);
-		} else {
-			// Тип состояния нужен ВСЕГДА (иначе тот же пустой wrap), а рисовать
-			// нечего — ставим тип через площадь: она, в отличие от SetRate, не
-			// ругается на отсутствующую текстуру.
-			if (horiz)
-				PE_SetHGaugeSurfaceArea(no, 0, 0, 0, 0, state);
-			else
-				PE_SetVGaugeSurfaceArea(no, 0, 0, 0, 0, state);
-			static bool warned_nocg = false;
-			if (!warned_nocg) {
-				warned_nocg = true;
-				WARNING("ゲージパーツ: пустое ＣＧ名, тип состояния выставлен без картинки");
-			}
-		}
-		float den = act_float(st, "分母", 100.0f);
-		float num = act_float(st, "分子", 100.0f);
-		if (gcg && gcg->size && den != 0.0f) {
-			if (horiz)
-				PE_SetHGaugeRate(no, num, den, state);
-			else
-				PE_SetVGaugeRate(no, num, den, state);
-		}
-		// `反転` движок не умеет: заполнение всегда идёт от левого/верхнего края,
-		// а признак «с другого конца» хранить негде — `struct parts_gauge` пишется
-		// в сейв, и новое поле сломало бы формат. Вместо тихого дефолта — проверка
-		// допущения (у Haha Ranman таких состояний нет вовсе).
-		if (act_int(st, "反転", 0)) {
-			static bool warned_flip = false;
-			if (!warned_flip) {
-				warned_flip = true;
-				WARNING("ゲージパーツ: 反転=1 не поддержан — калибр заполняется "
-					"от начала, а не с другого конца");
-			}
-		}
-		int sw = act_list_int(st, "サーフェイスエリア", 2, 0);
-		int sh = act_list_int(st, "サーフェイスエリア", 3, 0);
-		if (sw > 0 && sh > 0) {
-			int sx = act_list_int(st, "サーフェイスエリア", 0, 0);
-			int sy = act_list_int(st, "サーフェイスエリア", 1, 0);
-			if (horiz)
-				PE_SetHGaugeSurfaceArea(no, sx, sy, sw, sh, state);
-			else
-				PE_SetVGaugeSurfaceArea(no, sx, sy, sw, sh, state);
 		}
 		return;
 	}
@@ -2656,15 +2657,24 @@ static void PE_GetPartsTextFontProperty(int a, int *type, int *size, int *r, int
 	// Tsumamigui 3 reads THIS on the message-window text parts to pick the BACK LOG
 	// font size, then builds the log construction ops at the returned size. Return
 	// the part's ACTUAL font SIZE so the log matches the message window (30) instead
-	// of a hardcoded 16. We deliberately take ONLY the size: the part's internal
-	// ts.face is an engine face id (e.g. 256), not the HLL font TYPE the caller
-	// expects, and feeding it back as `type` makes the game build the log in an
-	// unrenderable font (blank log). Type/color/weight stay at the safe defaults.
-	int real_size = 16;
+	// of a hardcoded 16.
+	//
+	// ТИП ТОЖЕ ОТДАЁМ НАСТОЯЩИЙ (FINDINGS §5af). Прежде здесь стояло 0 с
+	// объяснением «ts.face — внутренний id движка (256), а не HLL-тип, и от него
+	// лог выходит нерисуемым». Посылка неверна: 256 и ЕСТЬ HLL-тип — игра сама его
+	// так вычисляет (`parts::detail::GetFontNumber` возвращает `256 + индекс` в
+	// `Ｅ＿外部フォント名`). Симптом «пустой лог» шёл от другой причины — выбор face
+	// FNL был сломан (§5f/§5ab) и на запрошенный кегль приходил вырожденный глиф.
+	// А с нулём лог просил ВСТРОЕННЫЙ системный шрифт: пока лица 0/1 подменялись на
+	// FNL, это случайно совпадало, но после возврата их системному шрифту текст лога
+	// поехал (кегль 30 у TTF против ~20 эффективных у коробки FNL — строки полезли
+	// за панель).
+	int real_size = 16, real_type = 0;
 	float real_weight = 0.0f, real_edge = 0.0f;
 	int real_er = 0, real_eg = 0, real_eb = 0;
-	PE_GetTextFontProps(a, state, NULL, &real_size, NULL, NULL, NULL,
+	PE_GetTextFontProps(a, state, &real_type, &real_size, NULL, NULL, NULL,
 			&real_weight, &real_edge, &real_er, &real_eg, &real_eb);
+	if (type) *type = real_type;
 	// Размер отдаём как есть: у лога Tsumamigui 3 это 30 — значение テキストパーツ
 	// из バックログ.pactex, и оригинал рисует лог именно этим кеглем (сверено по
 	// ink-габаритам 【 】 и cap-height, FINDINGS §5j). Ручка для перебора кеглей
@@ -3568,6 +3578,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetChildIndex, PE_GetChildIndex),
 	    HLL_EXPORT(SetEventID, PE_SetEventID),
 	    HLL_EXPORT(Parts_StopSwipe, PartsEngine_Parts_StopSwipe),
+	    HLL_EXPORT(Parts_SetSwipeType, PE_SetSwipeType),
+	    HLL_EXPORT(Parts_GetSwipeType, PE_GetSwipeType),
 	    HLL_EXPORT(Parts_SetComment, PartsEngine_Parts_SetComment),
 	    HLL_EXPORT(RemoveController, PE_RemoveController),
 	    HLL_EXPORT(UpdateComponent, PartsEngine_Update),

@@ -26,6 +26,9 @@
 #define NR_CACHES 8
 #define CACHE_SIZE 64
 
+static void delegate_env_ref(int env);
+static void delegate_env_unref(int env);
+
 static const char *pagetype_strtab[] = {
 	[GLOBAL_PAGE] = "GLOBAL_PAGE",
 	[LOCAL_PAGE] = "LOCAL_PAGE",
@@ -256,7 +259,19 @@ enum ain_data_type array_resolve_var_type(struct page *container, int varno, int
 			return vt->array_type->array_type->data;
 		if (array_iface_pair_type(et))
 			return et;
-		if (et == AIN_WRAP || et == AIN_OPTION)
+		// `array<wrap<структура>>` — ОДИН слот на элемент, как у классического
+		// `array<структура>`, и владеет им так же. Но СЕМАНТИКА КОПИРОВАНИЯ
+		// другая: `wrap<T>` — ХЭНДЛ, копия контейнера обязана ссылаться на ТЕ ЖЕ
+		// объекты, тогда как у классического struct-массива элементы копируются
+		// ПО ЗНАЧЕНИЮ (`vm_copy(AIN_STRUCT)` → `vm_copy_page`). Различить их
+		// можно только маркером на странице, поэтому храним свой `a_type`
+		// (AIN_WRAP самостоятельным типом массива больше нигде не рождается —
+		// тот же приём, что с AIN_OPTION выше). `array_type()` отдаёт по нему
+		// AIN_STRUCT, поэтому владение, шаг и инициализация элементов не
+		// меняются — расходится только copy_page().
+		if (et == AIN_WRAP)
+			return (*struct_type >= 0) ? AIN_WRAP : AIN_ARRAY_INT;
+		if (et == AIN_OPTION)
 			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
 		// `array<ref Структура>` (элемент AIN_REF_STRUCT, 21 — 208 объявлений
 		// у Dohna, ни одного у v6/v7). Ссылка на СТРУКТУРУ, в отличие от ссылки
@@ -404,6 +419,11 @@ enum ain_data_type array_type(enum ain_data_type type)
 	// Тот же случай, только элемент — `option<wrap<интерфейс>>` (ТРИ слота).
 	case AIN_OPTION:
 		return type;
+	// Ixseal: маркер массива ОДНОСЛОТОВЫХ элементов-хэндлов `wrap<структура>`.
+	// Владение и шаг у него в точности как у AIN_ARRAY_STRUCT, отличается только
+	// копирование (см. array_resolve_var_type/copy_page).
+	case AIN_WRAP:
+		return AIN_STRUCT;
 	default:
 		WARNING("Unknown/invalid array type: %d", type);
 		return type;
@@ -428,6 +448,18 @@ enum ain_data_type array_type(enum ain_data_type type)
  * обычный heap-слот, — шаг равен одному слоту, так что для старых игр
  * (у которых типов 89/100 в массивах нет вовсе) поведение не меняется.
  */
+/*
+ * Элемент generic-контейнера Ixseal объявлен ОБЁРТКОЙ (`wrap<структура>`,
+ * `wrap<интерфейс>`, `ref <интерфейс>`, `option<wrap<интерфейс>>`) — то есть это
+ * ХЭНДЛ, а не значение. Копия такого контейнера обязана ссылаться на ТЕ ЖЕ
+ * объекты; глубокая копия (как у классического `array<структура>`) их клонирует.
+ */
+bool array_handle_elem_type(enum ain_data_type a_type)
+{
+	return a_type == AIN_WRAP || a_type == AIN_OPTION
+		|| a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
+}
+
 bool array_iface_pair_type(enum ain_data_type a_type)
 {
 	return a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
@@ -519,6 +551,9 @@ void delete_page(int slot)
 	if (page->type == STRUCT_PAGE) {
 		delete_struct(page->index, slot);
 	}
+	// Окружения лямбд — единственное, чем страница делегата ВЛАДЕЕТ.
+	if (page->type == DELEGATE_PAGE)
+		delegate_release_env(page);
 	delete_page_vars(page);
 	free_page(page);
 }
@@ -532,6 +567,40 @@ struct page *copy_page(struct page *src)
 		return NULL;
 	struct page *dst = alloc_page(src->type, src->index, src->nr_vars);
 	dst->array = src->array;
+
+	/*
+	 * Ixseal: у контейнера с элементами-ХЭНДЛАМИ копируются САМИ ХЭНДЛЫ —
+	 * копия ссылается на те же объекты, ей нужен только свой счётчик.
+	 *
+	 * `variable_type()` отдаёт для владеющего слота такого элемента AIN_STRUCT
+	 * (владение как у struct-элемента), а `vm_copy(AIN_STRUCT)` делает ГЛУБОКУЮ
+	 * копию — верную для классического `array<структура>` со значимой семантикой
+	 * и разрушительную здесь. Наблюдалось на `Footer@0`: возврат
+	 * `ActivityHelper::GetUser<FooterButton>` идёт через `A_REF` (copy_page), и
+	 * `m_uiButtons` получал КЛОНЫ кнопок — подписка на их `OnClickEvent` уходила
+	 * в клонов, а живые кнопки футера (Save/Load/Items/Next) вызывали делегат без
+	 * подписчиков: клик отрабатывал, экран не открывался.
+	 */
+	// Копия делегата ссылается на ТЕ ЖЕ окружения — каждой нужен свой счётчик.
+	if (src->type == DELEGATE_PAGE) {
+		for (int i = 0; i < src->nr_vars; i++)
+			dst->values[i] = src->values[i];
+		for (int i = 0; i + DG_ENTRY_SLOTS <= src->nr_vars; i += DG_ENTRY_SLOTS)
+			delegate_env_ref(src->values[i+3].i);
+		return dst;
+	}
+
+	if (src->type == ARRAY_PAGE && array_handle_elem_type(src->a_type)) {
+		for (int i = 0; i < src->nr_vars; i++) {
+			dst->values[i] = src->values[i];
+			// Владеет только слот объекта (у многослотового элемента —
+			// нулевой); слот 0 кучи — глобальная страница, ею не владеют.
+			if (variable_type(src, i, NULL, NULL) == AIN_STRUCT
+			    && dst->values[i].i > 0)
+				heap_ref(dst->values[i].i);
+		}
+		return dst;
+	}
 
 	for (int i = 0; i < src->nr_vars; i++) {
 		dst->values[i] = vm_copy(src->values[i], variable_type(src, i, NULL, NULL));
@@ -623,7 +692,9 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 	// Ixseal: маркер массива двухслотовых интерфейсных элементов (89/100).
 	case AIN_IFACE:
 	case AIN_IFACE_WRAP:
-	case AIN_OPTION:              return type;
+	case AIN_OPTION:
+	// ...и массива однослотовых хэндлов wrap<структура>.
+	case AIN_WRAP:                return type;
 	default: VM_ERROR("Attempt to array allocate non-array type");
 	}
 }
@@ -1184,22 +1255,71 @@ void array_shuffle(struct page *page, int seed)
 	}
 }
 
-struct page *delegate_new_from_method(int obj, int fun)
+/*
+ * Окружение лямбды живёт в делегате ДОЛЬШЕ породившего его вызова, поэтому
+ * страницу приходится удерживать самим: обычный учёт ссылок для содержимого
+ * делегата выключен (variable_type() отдаёт AIN_VOID — «objects in a delegate
+ * page aren't reference counted»), и без ref локальная страница объемлющей
+ * функции была бы освобождена на её RETURN.
+ */
+static void delegate_env_ref(int env)
+{
+	if (env >= 0)
+		heap_ref(env);
+}
+
+static void delegate_env_unref(int env)
+{
+	// XSYS4_DG_ENV_KEEP=1 — диагностический выключатель освобождения окружений:
+	// отделяет «страница умерла из-за нашего unref» от прочих причин ценой утечки.
+	static int keep = -1;
+	if (keep < 0)
+		keep = getenv("XSYS4_DG_ENV_KEEP") ? 1 : 0;
+	if (env >= 0 && !keep)
+		heap_unref(env);
+}
+
+// Отпустить окружения всех элементов: вызывается при удалении страницы делегата.
+void delegate_release_env(struct page *page)
+{
+	if (!page || page->type != DELEGATE_PAGE)
+		return;
+	for (int i = 0; i + DG_ENTRY_SLOTS <= page->nr_vars; i += DG_ENTRY_SLOTS)
+		delegate_env_unref(page->values[i+3].i);
+}
+
+struct page *delegate_new_from_method(int obj, int fun, int env)
 {
 	if (fun < 1)
 		return alloc_page(DELEGATE_PAGE, 0, 0);
-	struct page *page = alloc_page(DELEGATE_PAGE, 0, 3);
+	struct page *page = alloc_page(DELEGATE_PAGE, 0, DG_ENTRY_SLOTS);
 	page->values[0].i = obj;
 	page->values[1].i = fun;
 	page->values[2].i = heap_get_seq(obj);
+	page->values[3].i = env;
+	delegate_env_ref(env);
 	return page;
+}
+
+static bool delegate_contains_env(struct page *dst, int obj, int fun, int env)
+{
+	if (!dst)
+		return false;
+	for (int i = 0; i < dst->nr_vars; i += DG_ENTRY_SLOTS) {
+		if (dst->values[i].i == obj &&
+		    dst->values[i+1].i == fun &&
+		    dst->values[i+2].i == heap_get_seq(obj) &&
+		    dst->values[i+3].i == env)
+			return true;
+	}
+	return false;
 }
 
 bool delegate_contains(struct page *dst, int obj, int fun)
 {
 	if (!dst)
 		return false;
-	for (int i = 0; i < dst->nr_vars; i += 3) {
+	for (int i = 0; i < dst->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (dst->values[i].i == obj &&
 		    dst->values[i+1].i == fun &&
 		    dst->values[i+2].i == heap_get_seq(obj))
@@ -1208,23 +1328,38 @@ bool delegate_contains(struct page *dst, int obj, int fun)
 	return false;
 }
 
-struct page *delegate_append(struct page *dst, int obj, int fun)
+struct page *delegate_append(struct page *dst, int obj, int fun, int env)
 {
 	if (fun < 1)
 		return dst;
 	if (!dst)
-		return delegate_new_from_method(obj, fun);
+		return delegate_new_from_method(obj, fun, env);
 	if (dst->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
-	if (delegate_contains(dst, obj, fun))
+	// Одна и та же лямбда с РАЗНЫМ окружением — это разные обработчики
+	// (по обработчику на элемент в foreach), поэтому env входит в сравнение.
+	if (delegate_contains_env(dst, obj, fun, env))
 		return dst;
 
-	dst = xrealloc(dst, sizeof(struct page) + sizeof(union vm_value) * (dst->nr_vars + 3));
+	dst = xrealloc(dst, sizeof(struct page) + sizeof(union vm_value) * (dst->nr_vars + DG_ENTRY_SLOTS));
 	dst->values[dst->nr_vars+0].i = obj;
 	dst->values[dst->nr_vars+1].i = fun;
 	dst->values[dst->nr_vars+2].i = heap_get_seq(obj);
-	dst->nr_vars += 3;
+	dst->values[dst->nr_vars+3].i = env;
+	delegate_env_ref(env);
+	dst->nr_vars += DG_ENTRY_SLOTS;
 	return dst;
+}
+
+// Убрать элемент i (в СЛОТАХ, кратно DG_ENTRY_SLOTS), сдвинув хвост влево.
+static void delegate_remove_slot(struct page *page, int i)
+{
+	delegate_env_unref(page->values[i+3].i);
+	for (int j = i + DG_ENTRY_SLOTS; j < page->nr_vars; j += DG_ENTRY_SLOTS) {
+		for (int k = 0; k < DG_ENTRY_SLOTS; k++)
+			page->values[j-DG_ENTRY_SLOTS+k].i = page->values[j+k].i;
+	}
+	page->nr_vars -= DG_ENTRY_SLOTS;
 }
 
 int delegate_numof(struct page *page)
@@ -1235,18 +1370,13 @@ int delegate_numof(struct page *page)
 		VM_ERROR("Not a delegate");
 
 	// garbage collection
-	for (int i = 0; i < page->nr_vars; i += 3) {
+	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (heap_get_seq(page->values[i].i) != page->values[i+2].i) {
-			for (int j = i+3; j < page->nr_vars; j += 3) {
-				page->values[j-3].i = page->values[j+0].i;
-				page->values[j-2].i = page->values[j+1].i;
-				page->values[j-1].i = page->values[j+2].i;
-			}
-			page->nr_vars -= 3;
-			i -= 3;
+			delegate_remove_slot(page, i);
+			i -= DG_ENTRY_SLOTS;
 		}
 	}
-	return page->nr_vars / 3;
+	return page->nr_vars / DG_ENTRY_SLOTS;
 }
 
 void delegate_erase(struct page *page, int obj, int fun)
@@ -1255,14 +1385,9 @@ void delegate_erase(struct page *page, int obj, int fun)
 		return;
 	if (page->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
-	for (int i = 0; i < page->nr_vars; i += 3) {
+	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (page->values[i].i == obj && page->values[i+1].i == fun) {
-			for (int j = i+3; j < page->nr_vars; j += 3) {
-				page->values[j-3].i = page->values[j+0].i;
-				page->values[j-2].i = page->values[j+1].i;
-				page->values[j-1].i = page->values[j+2].i;
-			}
-			page->nr_vars -= 3;
+			delegate_remove_slot(page, i);
 			break;
 		}
 	}
@@ -1275,9 +1400,10 @@ struct page *delegate_plusa(struct page *dst, struct page *add)
 	if ((dst && dst->type != DELEGATE_PAGE) || add->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
 
-	for (int i = 0; i < add->nr_vars; i += 3) {
+	for (int i = 0; i < add->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (heap_get_seq(add->values[i].i) == add->values[i+2].i)
-			dst = delegate_append(dst, add->values[i].i, add->values[i+1].i);
+			dst = delegate_append(dst, add->values[i].i, add->values[i+1].i,
+					      add->values[i+3].i);
 	}
 	return dst;
 }
@@ -1291,7 +1417,7 @@ struct page *delegate_minusa(struct page *dst, struct page *minus)
 	if (dst->type != DELEGATE_PAGE || minus->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
 
-	for (int i = 0; i < minus->nr_vars; i += 3) {
+	for (int i = 0; i < minus->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (heap_get_seq(minus->values[i].i) == minus->values[i+2].i)
 			delegate_erase(dst, minus->values[i].i, minus->values[i+1].i);
 	}
@@ -1305,34 +1431,33 @@ struct page *delegate_clear(struct page *page)
 		return NULL;
 	if (page->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
-	for (int i = 0; i < page->nr_vars; i += 3) {
+	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
+		delegate_env_unref(page->values[i+3].i);
 		page->values[i].i = -1;
 		page->values[i+1].i = -1;
 		page->values[i+2].i = 0;
+		page->values[i+3].i = -1;
 	}
 	page->index = 0;
 	page->nr_vars = 0;
 	return page;
 }
 
-bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out)
+bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out, int *env_out)
 {
 	if (!page)
 		return false;
 	if (page->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
-	while (i*3 < page->nr_vars) {
-		if (heap_get_seq(page->values[i*3].i) == page->values[i*3+2].i) {
-			*obj_out = page->values[i*3].i;
-			*fun_out = page->values[i*3+1].i;
+	while (i*DG_ENTRY_SLOTS < page->nr_vars) {
+		int at = i * DG_ENTRY_SLOTS;
+		if (heap_get_seq(page->values[at].i) == page->values[at+2].i) {
+			*obj_out = page->values[at].i;
+			*fun_out = page->values[at+1].i;
+			*env_out = page->values[at+3].i;
 			return true;
 		}
-		for (int j = (i + 1) * 3; j < page->nr_vars; j += 3) {
-			page->values[j-3].i = page->values[j+0].i;
-			page->values[j-2].i = page->values[j+1].i;
-			page->values[j-1].i = page->values[j+2].i;
-		}
-		page->nr_vars -= 3;
+		delegate_remove_slot(page, at);
 	}
 	return false;
 }

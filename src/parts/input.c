@@ -176,6 +176,21 @@ static bool parts_can_take_cursor(struct parts *parts)
 	return r;
 }
 
+/*
+ * Звук наведения/клика части: НЕ ЗАДАН — это −1 (`parts_init` в `parts.c`), и такие
+ * поля у Tsumamigui 3 почти у всех частей (`オンカーソル効果音 = ""` в раскладках).
+ * Прежде номер уходил в `audio_play_sound` без проверки, тот доходил до
+ * `channel_open(ASSET_SOUND, -1)` и печатал `Failed to load WAV -1` на КАЖДОЕ
+ * наведение — 368 предупреждений за живой прогон пользователя. Помимо шума это
+ * лишний поиск в архиве на каждый ховер и, что хуже, маскировка НАСТОЯЩИХ
+ * «Failed to load WAV N» в логе. Та же проверка `>= 0` уже стоит в `parts/debug.c`.
+ */
+static void parts_play_sound(int sound_no)
+{
+	if (sound_no >= 0)
+		audio_play_sound(sound_no);
+}
+
 static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clicking,
 		int passed_time, bool *hover_consumed, bool *click_consumed)
 {
@@ -274,7 +289,7 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	bool click_eligible = parts->clickable || !parts->pass_cursor;
 	if (!click_eligible || *click_consumed) {
 		if (!was_hovered)
-			audio_play_sound(parts->on_cursor_sound);
+			parts_play_sound(parts->on_cursor_sound);
 		parts_set_state(parts, PARTS_STATE_HOVERED);
 		return;
 	}
@@ -305,7 +320,7 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		parts_set_state(parts, PARTS_STATE_CLICKED);
 	} else {
 		if (!was_hovered) {
-			audio_play_sound(parts->on_cursor_sound);
+			parts_play_sound(parts->on_cursor_sound);
 		}
 		parts_set_state(parts, PARTS_STATE_HOVERED);
 	}
@@ -321,7 +336,7 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	// нажатие доходило (KEY_TRIGGER), клик — нет, и вьювер невозможно было закрыть.
 	if (click_eligible && prev_clicking && !cur_clicking
 			&& click_down_parts == parts->no) {
-		audio_play_sound(parts->on_click_sound);
+		parts_play_sound(parts->on_click_sound);
 		clicked_parts = parts->no;
 
 		// Checkbox: flip state on click; the game reads it via IsCheckBoxChecked.
@@ -695,6 +710,24 @@ void parts_input_reset(void)
 void PE_SetDrag(int parts_no, bool enable)
 {
 	parts_get(parts_no)->draggable = !!enable;
+}
+
+/*
+ * `スワイプ` — вид инерционного перетаскивания. Геттер у пары есть
+ * (Parts_GetSwipeType), то есть no-op отличим: значение обязано хранИться
+ * и возвращаться. Само поведение свайпа не реализовано — см. комментарий у
+ * поля swipe_type. Без этой пары `ScrollBase@0` (список предметов) падал на
+ * «Unimplemented HLL function: PartsEngine.Parts_SetSwipeType».
+ */
+void PE_SetSwipeType(int parts_no, int type)
+{
+	parts_get(parts_no)->swipe_type = type;
+}
+
+int PE_GetSwipeType(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->swipe_type : 0;
 }
 
 int PE_GetClickPartsNumber(void)

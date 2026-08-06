@@ -36,8 +36,8 @@
  * заметно, а не врут.
  */
 
-#include "vm.h"
 #include "hll.h"
+#include "vm.h"
 #include "vm/page.h"
 #include "vm/heap.h"
 
@@ -48,14 +48,14 @@ static void Delegate_Set(struct page **self, union vm_value *fn)
 	// «Set», а не «Add»: содержимое заменяется целиком (в старых играх это
 	// опкод DG_SET). delegate_clear() оставляет страницу валидной и пустой.
 	*self = delegate_clear(*self);
-	*self = delegate_append(*self, fn[0].i, fn[1].i);
+	*self = delegate_append(*self, fn[0].i, fn[1].i, vm_lambda_capture_env(fn[1].i));
 }
 
 static void Delegate_Add(struct page **self, union vm_value *fn)
 {
 	if (!self || !fn)
 		return;
-	*self = delegate_append(*self, fn[0].i, fn[1].i);
+	*self = delegate_append(*self, fn[0].i, fn[1].i, vm_lambda_capture_env(fn[1].i));
 }
 
 static int Delegate_Numof(struct page **self)

@@ -44,6 +44,8 @@ int wav_set_loop_count(int id, int count);
 int bgm_set_loop_count(int id, int count);
 int wav_get_loop_count(int id);
 int bgm_get_loop_count(int id);
+int wav_set_mixer(int id, int mixer_no);
+int bgm_set_mixer(int id, int mixer_no);
 int wav_set_loop_start_pos(int id, int pos);
 int bgm_set_loop_start_pos(int id, int pos);
 int wav_set_loop_end_pos(int id, int pos);

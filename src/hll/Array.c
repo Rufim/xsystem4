@@ -411,7 +411,19 @@ static void Array_PushBack(struct page **self, union vm_value *value)
 		heap_ref(value->i);
 	// `value` указывает на первый из слотов значения на стеке VM: у
 	// wrap<интерфейс> их два (объект, база интерфейса) — оба идут в элемент.
-	*self = array_pushback_n(*self, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
+	int pb_slots = ix_value_slots(self);
+	enum ain_data_type pb_dt = ix_dtype(*self);
+	int pb_st = ix_stype(*self);
+	*self = array_pushback_n(*self, value, pb_slots, pb_dt, pb_st);
+	const char *w = getenv("XSYS4_PB_WATCH");
+	if (w && pb_st == atoi(w)) {
+		NOTICE("PBWATCH push value=%d dtype=%d stype=%d slots=%d -> nr_vars=%d elems: %d %d %d %d",
+		       value->i, pb_dt, pb_st, pb_slots, *self ? (*self)->nr_vars : -1,
+		       (*self && (*self)->nr_vars > 0) ? (*self)->values[0].i : -1,
+		       (*self && (*self)->nr_vars > 1) ? (*self)->values[1].i : -1,
+		       (*self && (*self)->nr_vars > 2) ? (*self)->values[2].i : -1,
+		       (*self && (*self)->nr_vars > 3) ? (*self)->values[3].i : -1);
+	}
 }
 
 static void Array_PopBack(struct page **self)
@@ -507,62 +519,85 @@ static int Array_ix_Copy(struct page **self, struct page **src)
 }
 
 /*
- * `void Duplicate(ref array self, wrap<array> src)` — приёмник СТАНОВИТСЯ копией
- * источника: его размер задаёт ИСТОЧНИК. `void Concat(...)` / `AddRange(...)` —
- * ДОПИСАТЬ источник в конец приёмника.
+ * `AddRange(dst, src)` и `Concat(dst, src)` (fn13/fn12, оба `(80,82)`) —
+ * ДОПИСАТЬ все элементы src В КОНЕЦ dst, а не переписать начало. Раньше обе
+ * вели в `Array_ix_Copy`, который копирует лишь в пределах уже имеющейся длины
+ * приёмника; `SceneWorkMatching@GetAllShop` строит список магазинов как
+ * «`Add`(свой) + `AddRange`(чужие)», то есть приёмник тут длиной 1 — чужие
+ * магазины не добавились бы вовсе, а свой был бы затёрт. Падало раньше: у
+ * пустого приёмника, созданного `X_A_INIT 0`, тип элемента ещё не установлен,
+ * и `array_copy` отказывался сверять его с типом источника.
  *
- * Обе были повешены на `Array_ix_Copy` (это `int Copy(self, src)` — «скопировать,
- * сколько влезет в НЫНЕШНИЙ размер приёмника»), и на пустом приёмнике обе не делали
- * ровно ничего, молча и без ошибки. В .ain это три РАЗНЫЕ функции, и `Copy` даже
- * отличается типом возврата (int против void).
- *
- * Чем это ломало Haha Ranman: `CExecutedCommandParam@InitInstantList` делает
- * `Array.Duplicate(InstantList, List)` — снимок списка выполненных команд. `List`
- * конструктор аллоцирует на 12 элементов, `InstantList` пуст, поэтому снимок
- * оставался ПУСТЫМ. Дальше `GetList` при `Instant = true` отдаёт именно `InstantList`,
- * а `■実行済コマンド設定` @0x699aae берёт `Array.At(list, nTimezone)` БЕЗ проверки
- * (в соседней `■実行済コマンド取得` игра его проверяет на -1) и присваивает по
- * полученной ссылке — то есть по ссылке -1. Итог: SIGSEGV в `free_string` уже внутри
- * libsys4, в месте, никак не указывающем на виноватую инструкцию.
- *
- * Частота вызовов (тул: `alice ain dump -c` + grep CALLHLL): Haha Ranman —
- * Duplicate 17, Concat 45; Dohna — Duplicate 14, Concat 62, AddRange 16;
- * Tsumamigui 3 не объявляет ни одной, так что старых игр правка не касается.
+ * Элементы кладём через PushBack — он один знает про многослотовый элемент
+ * (wrap<интерфейс> — два слота) и про то, что объектный элемент берёт СВОЙ
+ * счётчик ссылок.
  */
-static void Array_ix_Duplicate(struct page **self, struct page **src)
-{
-	if (!self)
-		return;
-	int n = (src && *src) ? array_numof(*src, 1) : 0;
-	if (!*self && n > 0) {
-		// Приёмника ещё нет: тип элемента берём У ИСТОЧНИКА. Через ix_resize
-		// нельзя — `ix_dtype(NULL)` даёт AIN_ARRAY_INT, и `array_copy` потом
-		// свалился бы на несовпадении типов массивов.
-		union vm_value dim = { .i = n };
-		*self = alloc_array(ix_rank(*src), &dim, ix_dtype(*src), ix_stype(*src), true);
-	} else {
-		ix_resize(self, n);
-	}
-	if (n > 0 && *self)
-		array_copy(*self, 0, *src, 0, n);
-}
-
-static void Array_ix_Concat(struct page **self, struct page **src)
+static void Array_ix_AddRange(struct page **self, struct page **src)
 {
 	if (!self || !src || !*src)
 		return;
 	int n = array_numof(*src, 1);
 	if (n <= 0)
 		return;
-	int base = *self ? array_numof(*self, 1) : 0;
-	if (!*self) {
-		union vm_value dim = { .i = n };
-		*self = alloc_array(ix_rank(*src), &dim, ix_dtype(*src), ix_stype(*src), true);
-	} else {
-		ix_resize(self, base + n);
+	// Приёмник, ещё не знающий своего типа элемента (пустой generic-контейнер),
+	// наследует тип источника: иначе PushBack положит слоты объектов как сырые
+	// int'ы (без владения), и первое же чтение уйдёт в освобождённую страницу.
+	if (*self && array_numof(*self, 1) == 0 && ix_dtype(*self) != ix_dtype(*src)) {
+		(*self)->a_type = ix_dtype(*src);
+		(*self)->array.struct_type = ix_stype(*src);
+	} else if (*self && ix_dtype(*self) != ix_dtype(*src)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("Array.AddRange: тип приёмника %d(s%d) ≠ типа источника %d(s%d)",
+				ix_dtype(*self), ix_stype(*self), ix_dtype(*src), ix_stype(*src));
+		}
 	}
-	if (*self)
-		array_copy(*self, base, *src, 0, n);
+	// Элементы кладутся слот-в-слот, поэтому ширина элемента обязана совпадать
+	// (wrap<структура> и array<структура> — оба по слоту; пара wrap<интерфейс> —
+	// два). Разной ширины у Dohna не встречалось; если встретится, лучше громко
+	// ничего не сделать, чем сдвинуть содержимое приёмника.
+	int slots = array_elem_slots(*src);
+	if (*self && array_elem_slots(*self) != slots) {
+		WARNING("Array.AddRange: элемент приёмника %d слотов, источника %d — пропущено",
+			array_elem_slots(*self), slots);
+		return;
+	}
+	for (int i = 0; i < n; i++)
+		Array_PushBack(self, &(*src)->values[i*slots]);
+}
+
+/*
+ * `void Duplicate(ref array self, wrap<array> src)` — приёмник СТАНОВИТСЯ копией
+ * источника: длину задаёт ИСТОЧНИК. Тоже вело в `Array_ix_Copy` («скопировать,
+ * сколько влезет в НЫНЕШНИЙ размер приёмника»), поэтому на пустом приёмнике не
+ * делало ровно ничего, молча. В .ain это ТРЕТЬЯ отдельная функция — `Copy`
+ * отличается даже типом возврата (int против void).
+ *
+ * Чем это ломало Haha Ranman: `CExecutedCommandParam@InitInstantList` делает
+ * `Array.Duplicate(InstantList, List)` — снимок списка выполненных команд. `List`
+ * конструктор аллоцирует на 12 элементов, `InstantList` пуст, поэтому снимок
+ * оставался ПУСТЫМ. Дальше `GetList` при `Instant = true` отдаёт именно
+ * `InstantList`, а `■実行済コマンド設定` @0x699aae берёт `Array.At(list, nTimezone)`
+ * БЕЗ проверки (в соседней `■実行済コマンド取得` игра его проверяет на -1) и
+ * присваивает по полученной ссылке — то есть по ссылке -1. Итог: SIGSEGV в
+ * `free_string` уже внутри libsys4, в месте, никак не указывающем на виноватую
+ * инструкцию.
+ *
+ * Реализовано ЧЕРЕЗ `Array_ix_AddRange`, а не своим копированием: вся возня с
+ * наследованием типа элемента, многослотовыми элементами и счётчиками ссылок
+ * должна жить в ОДНОМ месте.
+ *
+ * Частота вызовов (`alice ain dump -c` + grep CALLHLL): Haha Ranman — Duplicate 17,
+ * Concat 45; Dohna — Duplicate 14, Concat 62, AddRange 16; Tsumamigui 3 не объявляет
+ * ни одной, так что старых игр правка не касается.
+ */
+static void Array_ix_Duplicate(struct page **self, struct page **src)
+{
+	if (!self)
+		return;
+	ix_resize(self, 0);            // остаётся валидной 0-элементной страницей
+	Array_ix_AddRange(self, src);
 }
 
 static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
@@ -1222,8 +1257,8 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),
 	    HLL_EXPORT(Duplicate, Array_ix_Duplicate),
-	    HLL_EXPORT(Concat, Array_ix_Concat),
-	    HLL_EXPORT(AddRange, Array_ix_Concat),
+	    HLL_EXPORT(Concat, Array_ix_AddRange),
+	    HLL_EXPORT(AddRange, Array_ix_AddRange),
 	    HLL_EXPORT(Reverse, Array_Reverse),
 	    HLL_EXPORT(Shuffle, Array_Shuffle),
 	    HLL_EXPORT(Fill, Array_ix_Fill),

@@ -651,8 +651,31 @@ void parts_render(struct parts *parts)
 	// объявлены `表示 = 0`, поэтому визуально его это не задевает.
 	// ДВА условия независимы: слой гасит ГРУППУ партов, маска — конкретный
 	// непостроенный `構築パーツ`; ни одно не подменяет другое.
-	if (parts->construction_mask)
+	if (parts->construction_mask) {
+		// Тот же XSYS4_BIG_TRACE называет и ПРОПУЩЕННЫЕ непостроенные
+		// `構築パーツ` (по разу на номер): по ним видно, не в них ли «дырка»,
+		// через которую просвечивает лишнее.
+		static const char *ct = (const char *)1;
+		static int cseen[128], nr_cseen = 0;
+		if (ct == (const char *)1)
+			ct = getenv("XSYS4_BIG_TRACE");
+		if (ct && *ct && nr_cseen < 128) {
+			bool dup = false;
+			for (int i = 0; i < nr_cseen; i++)
+				if (cseen[i] == parts->no) dup = true;
+			if (!dup) {
+				cseen[nr_cseen++] = parts->no;
+				struct parts_state *cs = &parts->states[parts->state];
+				NOTICE("BIGPART-SKIP no=%d 構築パーツ не построен: %dx%d pos=%d,%d "
+				       "scale=%.3f,%.3f alpha=%d show=%d",
+				       parts->no, cs->common.w, cs->common.h,
+				       parts->global.pos.x, parts->global.pos.y,
+				       parts->global.scale.x, parts->global.scale.y,
+				       parts->global.alpha, parts->global.show);
+			}
+		}
 		return;
+	}
 	if (parts->message_window && !parts_message_window_show)
 		return;
 	if (parts->linked_to >= 0) {
@@ -663,6 +686,63 @@ void parts_render(struct parts *parts)
 
 	// render
 	struct parts_state *state = &parts->states[parts->state];
+	/*
+	 * XSYS4_BIG_TRACE=<мин.ширина>x<мин.высота> — назвать КРУПНЫЕ рисуемые части
+	 * (по одной строке на номер части). Нужен, когда на экране лежит большой
+	 * непонятный прямоугольник и надо узнать, ЧТО это: тип состояния, размер с
+	 * учётом масштаба, позиция, альфа и — у панели — её собственный цвет RGBA.
+	 * Env-gated, по разу на часть, поэтому лог не пухнет.
+	 */
+	{
+		static const char *bt = (const char *)1;
+		static int seen[512], nr_seen = 0;
+		if (bt == (const char *)1)
+			bt = getenv("XSYS4_BIG_TRACE");
+		if (bt && *bt) {
+			// Формат: <мин.ширина>x<мин.высота>[:<мин.номер части>]. Фильтр по
+			// НОМЕРУ нужен, чтобы не забить список частями предыдущих экранов:
+			// каждая активность берёт номера из возрастающей последовательности,
+			// поэтому «номер >= N» = «только этот экран и позже».
+			int minw = 0, minh = 0, minno = 0;
+			sscanf(bt, "%dx%d:%d", &minw, &minh, &minno);
+			int dw = (int)(state->common.w * parts->global.scale.x);
+			int dh = (int)(state->common.h * parts->global.scale.y);
+			// Части БЕЗ текстуры не рисуются вовсе (см. switch ниже), а у Dohna
+			// их сотни с объявленным размером 1280x720 — они только забивали
+			// список. Исключение: flat/текст рисуются не через common.texture.
+			bool drawable = state->common.texture.handle
+				|| state->type == PARTS_FLAT || state->type == PARTS_TEXT;
+			if (drawable && parts->no >= minno && dw >= minw && dh >= minh
+			    && nr_seen < 512) {
+				bool dup = false;
+				for (int i = 0; i < nr_seen; i++)
+					if (seen[i] == parts->no) dup = true;
+				if (!dup && nr_seen < 512) {
+					seen[nr_seen++] = parts->no;
+					char extra[160] = "";
+					if (state->type == PARTS_CG && state->cg.name)
+						snprintf(extra, sizeof extra, " cg='%s'",
+							display_sjis0(state->cg.name->text));
+					else if (state->type == PARTS_PANEL)
+						snprintf(extra, sizeof extra, " panel_rgba=%d,%d,%d,%d",
+							state->panel.color.r, state->panel.color.g,
+							state->panel.color.b, state->panel.color.a);
+					NOTICE("BIGPART no=%d type=%d drawn=%dx%d (tex %dx%d h=%u) pos=%d,%d "
+					       "scale=%.3f,%.3f alpha=%d mul=%d,%d,%d filt=%d%s",
+					       parts->no, state->type, dw, dh,
+					       state->common.texture.w, state->common.texture.h,
+					       state->common.texture.handle,
+					       parts->global.pos.x, parts->global.pos.y,
+					       parts->global.scale.x, parts->global.scale.y,
+					       parts->global.alpha,
+					       parts->global.multiply_color.r,
+					       parts->global.multiply_color.g,
+					       parts->global.multiply_color.b,
+					       parts->draw_filter, extra);
+				}
+			}
+		}
+	}
 	switch (state->type) {
 	case PARTS_UNINITIALIZED:
 	case PARTS_RECT_DETECTION:

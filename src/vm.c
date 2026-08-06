@@ -27,6 +27,7 @@
 
 #include "system4.h"
 #include "system4/ain.h"
+#include "system4/dasm.h"
 #include "system4/instructions.h"
 #include "system4/file.h"
 #include "system4/little_endian.h"
@@ -106,9 +107,30 @@ static int type_slots(struct ain_type *t)
 	}
 	return 1;
 }
-// Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr> logs every entered
-// function whose name contains <substr>. Env-gated, harmless.
+// Namespace-filtered call trace: XSYS4_FN_TRACE_NS=<substr>[,<substr>...] logs
+// every entered function whose name contains any of the substrings.
+// Env-gated, harmless.
 static const char *fn_trace_ns = (const char *)1; // 1 = not-yet-resolved
+static int32_t struct_page_slot(void);
+static bool fn_trace_ns_match(const char *n)
+{
+	const char *p = fn_trace_ns;
+	while (*p) {
+		const char *comma = strchr(p, ',');
+		size_t len = comma ? (size_t)(comma - p) : strlen(p);
+		if (len) {
+			// strstr with a bounded needle
+			for (const char *h = n; *h; h++) {
+				if (!strncmp(h, p, len))
+					return true;
+			}
+		}
+		if (!comma)
+			break;
+		p = comma + 1;
+	}
+	return false;
+}
 static void vm_fn_trace_ns(int fno)
 {
 	if (fn_trace_ns == (const char *)1)
@@ -118,8 +140,31 @@ static void vm_fn_trace_ns(int fno)
 	if (fno < 0 || fno >= ain->nr_functions)
 		return;
 	const char *n = ain->functions[fno].name;
-	if (n && strstr(n, fn_trace_ns))
-		WARNING("NSTRACE fn %d %s", fno, n);
+	if (n && fn_trace_ns_match(n))
+		WARNING("NSTRACE fn %d this=%d %s", fno, struct_page_slot(), n);
+}
+// Delegate watch: XSYS4_DG_WATCH=<dg_no>[,<dg_no>...] logs every DG_PLUSA
+// (subscription) and every DG_CALLBEGIN of the listed delegate types together
+// with the owning heap slot and the subscriber count. Answers "who subscribed
+// to which object" when a click handler silently never runs. Env-gated.
+static const char *dg_watch = (const char *)1;
+static bool dg_watch_on(void)
+{
+	if (dg_watch == (const char *)1)
+		dg_watch = getenv("XSYS4_DG_WATCH");
+	return dg_watch && *dg_watch;
+}
+static bool dg_watch_type(int dg_no)
+{
+	if (!dg_watch_on())
+		return false;
+	for (const char *p = dg_watch; p && *p; ) {
+		if (strtol(p, (char**)&p, 0) == dg_no)
+			return true;
+		while (*p == ',' || *p == ' ') p++;
+		if (*p && !(*p >= '0' && *p <= '9')) break;
+	}
+	return false;
 }
 static void vm_fn_trace(int fno, const char *via)
 {
@@ -336,6 +381,49 @@ static int lambda_parent_fno(int fno)
 	}
 	cache[fno] = result;
 	return result;
+}
+
+/*
+ * Окружение, которое надо ЗАХВАТИТЬ в делегат при `DG_NEW_FROM_METHOD`/`DG_ADD`.
+ *
+ * Лямбда с захватом (Ixseal) читает локальные переменные объемлющей функции
+ * идиомой `PUSHLOCALPAGE; X_GETENV; PUSH n; X_REF`, и это НЕ `this`: 718 лямбд
+ * Dohna пользуются и `X_GETENV`, и `PUSHSTRUCTPAGE`, то есть окружение живёт
+ * отдельно от объекта (у 434 из них делегат создаётся с `PUSHSTRUCTPAGE`, у 180
+ * — с `PUSH -1`). Пока лямбда вызывалась синхронно, окружение удавалось найти на
+ * стеке вызовов (lambda_env_page_slot ниже), но обработчик события переживает
+ * породивший его вызов: `ActivityHelper::SetInverseColorText` подписывает лямбду
+ * на MouseEnter кнопки и возвращается, и при наведении мыши `X_GETENV` не
+ * находил ни родителя на стеке, ни `this` — `X_REF` падал с «Out of bounds heap
+ * index: -1» (экран выбора фазы дня Dohna).
+ *
+ * Гейт структурный: `<lambda : ` в имени функции — у v6/v7 лямбд нет вовсе.
+ */
+int vm_lambda_capture_env(int fun)
+{
+	if (fun < 0 || fun >= ain->nr_functions)
+		return -1;
+	// Отмечаем не «лямбду вообще», а лямбду, которая ЧИТАЕТ окружение: захват
+	// удерживает локальную страницу до самой смерти делегата, и удержание всех
+	// подряд обходится дорого (у Dohna X_GETENV пользуются 1029 функций — все
+	// до одной лямбды). Один проход по коду при первом обращении.
+	static int8_t *uses_env = NULL;
+	if (!uses_env) {
+		uses_env = xcalloc(ain->nr_functions, 1);
+		struct dasm dasm;
+		dasm_init(&dasm, ain);
+		int cur = -1;
+		for (dasm_jump(&dasm, 0); !dasm_eof(&dasm); dasm_next(&dasm)) {
+			int op = dasm_opcode(&dasm);
+			if (op == FUNC) {
+				int no = dasm_arg(&dasm, 0);
+				cur = (no >= 0 && no < ain->nr_functions) ? no : -1;
+			} else if (op == X_GETENV && cur >= 0) {
+				uses_env[cur] = 1;
+			}
+		}
+	}
+	return uses_env[fun] ? local_page_slot() : -1;
 }
 
 // Return the heap slot of the local page that holds a lambda's captured
@@ -584,6 +672,7 @@ static int _function_call(int fno, int return_address)
 		.return_address = return_address,
 		.page_slot = slot,
 		.struct_page = -1,
+		.env_page = -1,
 		// уточняется после снятия аргументов/ресивера (см. function_call/method_call)
 		.entry_sp = stack_ptr,
 	};
@@ -784,7 +873,7 @@ static void delegate_call(int dg_no, int return_address)
 	int return_values = dg_return_slots(dg_no);
 	int dg_page = stack_peek(1 + return_values).i;
 	int dg_index = stack_peek(0 + return_values).i;
-	int obj, fun;
+	int obj, fun, env;
 	// XSYS4_DG_RUNAWAY=<порог>: одноразовый диагноз «DG_CALL не заканчивается».
 	// Печатает страницу делегата, ТЕКУЩЕЕ число элементов и стек VM — так видно,
 	// растёт ли список во время обхода (обработчик дописывает в тот же делегат).
@@ -799,7 +888,7 @@ static void delegate_call(int dg_no, int return_address)
 			vm_stack_trace();
 		}
 	}
-	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun)) {
+	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun, &env)) {
 		if (fn_trace_count != 0)
 			vm_fn_trace(fun, "DG_CALL");
 		vm_fn_trace_ns(fun);
@@ -822,6 +911,9 @@ static void delegate_call(int dg_no, int return_address)
 		}
 
 		set_struct_page(obj);
+		// Окружение лямбды: то, что было захвачено при подписке (см.
+		// vm_lambda_capture_env). Ставится ПОСЛЕ _function_call — кадр уже наш.
+		call_stack[call_stack_ptr-1].env_page = env;
 	} else {
 		// call finished: clean up stack and jump to return address
 		// Слотов у возврата столько, сколько скажет type_slots(): 2 у
@@ -1523,7 +1615,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Идиома `PUSHLOCALPAGE; X_GETENV; PUSH n; X_REF 1` читает env.member_n.
 		// net 0: снять локальную страницу (не нужна), положить env-страницу.
 		stack_pop();
-		int env = lambda_env_page_slot();
+		// Приоритет — окружение, ЗАХВАЧЕННОЕ в делегат при подписке: только оно
+		// верно для отложенного вызова (обработчик события переживает объемлющую
+		// функцию). Поиск по стеку остаётся для лямбд, вызванных синхронно
+		// (алгоритмы вроде array_sort/Find получают функцию не через делегат).
+		int env = call_stack[call_stack_ptr-1].env_page;
+		if (env < 0)
+			env = lambda_env_page_slot();
 		stack_push(env >= 0 ? env : struct_page_slot());
 		break;
 	}
@@ -1712,6 +1810,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 					}
 				}
 			}
+		}
+		if (getenv("XSYS4_ICAST_WATCH")
+		    && target == atoi(getenv("XSYS4_ICAST_WATCH"))) {
+			struct page *sp = (heap_index_valid(src) && src > 0) ? heap[src].page : NULL;
+			WARNING("ICAST target=%d src=%d src_type=%d src_struct=%d base=%d",
+				target, src, sp ? (int)sp->type : -1,
+				sp ? sp->index : -1, base);
 		}
 		if (base < 0) {
 			// Не удалось: null-объект и тег «пусто».
@@ -3203,7 +3308,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int obj = stack_pop().i;
 		int dg_i = stack_pop().i;
 		delete_page(dg_i);
-		heap_set_page(dg_i, delegate_new_from_method(obj, fun));
+		heap_set_page(dg_i, delegate_new_from_method(obj, fun, vm_lambda_capture_env(fun)));
 		break;
 	}
 	case DG_ADD: {
@@ -3211,7 +3316,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int obj = stack_pop().i;
 		int dg_i = stack_pop().i;
 		struct page *dg = heap_get_delegate_page(dg_i);
-		heap_set_page(dg_i, delegate_append(dg, obj, fun));
+		heap_set_page(dg_i, delegate_append(dg, obj, fun, vm_lambda_capture_env(fun)));
 		break;
 	}
 	case DG_CALL: { // DG_TYPE, ADDR
@@ -3293,8 +3398,22 @@ static enum opcode execute_instruction(enum opcode opcode)
 			// An empty delegate lvalue holds 0 and has no page yet, so we must
 			// allocate a fresh one instead of dereferencing slot 0.
 			int add_i = stack_pop().i;
+			int dg_member = stack_peek(0).i;  // member/variable index
+			int dg_owner = stack_peek(1).i;   // heap slot of the owning page
 			union vm_value *dst = stack_pop_var();
 			struct page *add = heap_get_delegate_page(add_i);
+			if (dg_watch_on()) {
+				struct page *ap = heap_get_delegate_page(add_i);
+				struct page *op = (dg_owner > 0 && heap_index_valid(dg_owner))
+					? heap[dg_owner].page : NULL;
+				WARNING("DGWATCH plusa owner=%d(t%d s%d) member=%d dg_slot=%d add_fn=%d (%s)",
+					dg_owner, op ? (int)op->type : -1, op ? op->index : -1,
+					dg_member, dst->i,
+					(ap && ap->nr_vars >= 2) ? ap->values[1].i : -1,
+					(ap && ap->nr_vars >= 2 && ap->values[1].i >= 0
+					 && ap->values[1].i < ain->nr_functions)
+						? ain->functions[ap->values[1].i].name : "?");
+			}
 			if (dst->i > 0 && heap_index_valid(dst->i) && heap[dst->i].page &&
 			    heap[dst->i].page->type == DELEGATE_PAGE) {
 				heap_set_page(dst->i, delegate_plusa(heap[dst->i].page, add));
@@ -3361,7 +3480,8 @@ static enum opcode execute_instruction(enum opcode opcode)
 	case DG_NEW_FROM_METHOD: {
 		int fun = stack_pop().i;
 		int obj = stack_pop().i;
-		stack_push(heap_alloc_page(delegate_new_from_method(obj, fun)));
+		stack_push(heap_alloc_page(delegate_new_from_method(obj, fun,
+								   vm_lambda_capture_env(fun))));
 		break;
 	}
 	case DG_CALLBEGIN: { // DG_TYPE
@@ -3373,6 +3493,16 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Stack before: [dg_page, arg0, ...]
 		// Stack after:  [arg0, ..., dg_page, 0(dg_index)]
 		int dg_page = stack_peek(dg->nr_arguments).i;
+		if (dg_watch_type(dg_no)) {
+			struct page *p = (dg_page > 0 && heap_index_valid(dg_page))
+				? heap[dg_page].page : NULL;
+			int cf = call_stack[call_stack_ptr-1].fno;
+			WARNING("DGWATCH callbegin dg_no=%d dg_slot=%d numof=%d this=%d in %s",
+				dg_no, dg_page,
+				(p && p->type == DELEGATE_PAGE) ? p->nr_vars / DG_ENTRY_SLOTS : -1,
+				struct_page_slot(),
+				(cf >= 0 && cf < ain->nr_functions) ? ain->functions[cf].name : "?");
+		}
 		for (int i = 0; i < dg->nr_arguments; i++) {
 			int pos = (stack_ptr - dg->nr_arguments) + i;
 			stack[pos-1] = stack[pos];
