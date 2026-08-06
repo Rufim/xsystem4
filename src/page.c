@@ -256,7 +256,19 @@ enum ain_data_type array_resolve_var_type(struct page *container, int varno, int
 			return vt->array_type->array_type->data;
 		if (array_iface_pair_type(et))
 			return et;
-		if (et == AIN_WRAP || et == AIN_OPTION)
+		// `array<wrap<структура>>` — ОДИН слот на элемент, как у классического
+		// `array<структура>`, и владеет им так же. Но СЕМАНТИКА КОПИРОВАНИЯ
+		// другая: `wrap<T>` — ХЭНДЛ, копия контейнера обязана ссылаться на ТЕ ЖЕ
+		// объекты, тогда как у классического struct-массива элементы копируются
+		// ПО ЗНАЧЕНИЮ (`vm_copy(AIN_STRUCT)` → `vm_copy_page`). Различить их
+		// можно только маркером на странице, поэтому храним свой `a_type`
+		// (AIN_WRAP самостоятельным типом массива больше нигде не рождается —
+		// тот же приём, что с AIN_OPTION выше). `array_type()` отдаёт по нему
+		// AIN_STRUCT, поэтому владение, шаг и инициализация элементов не
+		// меняются — расходится только copy_page().
+		if (et == AIN_WRAP)
+			return (*struct_type >= 0) ? AIN_WRAP : AIN_ARRAY_INT;
+		if (et == AIN_OPTION)
 			return (*struct_type >= 0) ? AIN_ARRAY_STRUCT : AIN_ARRAY_INT;
 		// `array<ref Структура>` (элемент AIN_REF_STRUCT, 21 — 208 объявлений
 		// у Dohna, ни одного у v6/v7). Ссылка на СТРУКТУРУ, в отличие от ссылки
@@ -404,6 +416,11 @@ enum ain_data_type array_type(enum ain_data_type type)
 	// Тот же случай, только элемент — `option<wrap<интерфейс>>` (ТРИ слота).
 	case AIN_OPTION:
 		return type;
+	// Ixseal: маркер массива ОДНОСЛОТОВЫХ элементов-хэндлов `wrap<структура>`.
+	// Владение и шаг у него в точности как у AIN_ARRAY_STRUCT, отличается только
+	// копирование (см. array_resolve_var_type/copy_page).
+	case AIN_WRAP:
+		return AIN_STRUCT;
 	default:
 		WARNING("Unknown/invalid array type: %d", type);
 		return type;
@@ -428,6 +445,18 @@ enum ain_data_type array_type(enum ain_data_type type)
  * обычный heap-слот, — шаг равен одному слоту, так что для старых игр
  * (у которых типов 89/100 в массивах нет вовсе) поведение не меняется.
  */
+/*
+ * Элемент generic-контейнера Ixseal объявлен ОБЁРТКОЙ (`wrap<структура>`,
+ * `wrap<интерфейс>`, `ref <интерфейс>`, `option<wrap<интерфейс>>`) — то есть это
+ * ХЭНДЛ, а не значение. Копия такого контейнера обязана ссылаться на ТЕ ЖЕ
+ * объекты; глубокая копия (как у классического `array<структура>`) их клонирует.
+ */
+bool array_handle_elem_type(enum ain_data_type a_type)
+{
+	return a_type == AIN_WRAP || a_type == AIN_OPTION
+		|| a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
+}
+
 bool array_iface_pair_type(enum ain_data_type a_type)
 {
 	return a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
@@ -533,6 +562,31 @@ struct page *copy_page(struct page *src)
 	struct page *dst = alloc_page(src->type, src->index, src->nr_vars);
 	dst->array = src->array;
 
+	/*
+	 * Ixseal: у контейнера с элементами-ХЭНДЛАМИ копируются САМИ ХЭНДЛЫ —
+	 * копия ссылается на те же объекты, ей нужен только свой счётчик.
+	 *
+	 * `variable_type()` отдаёт для владеющего слота такого элемента AIN_STRUCT
+	 * (владение как у struct-элемента), а `vm_copy(AIN_STRUCT)` делает ГЛУБОКУЮ
+	 * копию — верную для классического `array<структура>` со значимой семантикой
+	 * и разрушительную здесь. Наблюдалось на `Footer@0`: возврат
+	 * `ActivityHelper::GetUser<FooterButton>` идёт через `A_REF` (copy_page), и
+	 * `m_uiButtons` получал КЛОНЫ кнопок — подписка на их `OnClickEvent` уходила
+	 * в клонов, а живые кнопки футера (Save/Load/Items/Next) вызывали делегат без
+	 * подписчиков: клик отрабатывал, экран не открывался.
+	 */
+	if (src->type == ARRAY_PAGE && array_handle_elem_type(src->a_type)) {
+		for (int i = 0; i < src->nr_vars; i++) {
+			dst->values[i] = src->values[i];
+			// Владеет только слот объекта (у многослотового элемента —
+			// нулевой); слот 0 кучи — глобальная страница, ею не владеют.
+			if (variable_type(src, i, NULL, NULL) == AIN_STRUCT
+			    && dst->values[i].i > 0)
+				heap_ref(dst->values[i].i);
+		}
+		return dst;
+	}
+
 	for (int i = 0; i < src->nr_vars; i++) {
 		dst->values[i] = vm_copy(src->values[i], variable_type(src, i, NULL, NULL));
 	}
@@ -623,7 +677,9 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 	// Ixseal: маркер массива двухслотовых интерфейсных элементов (89/100).
 	case AIN_IFACE:
 	case AIN_IFACE_WRAP:
-	case AIN_OPTION:              return type;
+	case AIN_OPTION:
+	// ...и массива однослотовых хэндлов wrap<структура>.
+	case AIN_WRAP:                return type;
 	default: VM_ERROR("Attempt to array allocate non-array type");
 	}
 }

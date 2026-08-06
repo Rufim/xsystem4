@@ -134,6 +134,7 @@ void create_struct(int no, union vm_value *var);
 // Тип элемента — ссылка на интерфейс (пара «объект, база интерфейса»)?
 // Это `ref <интерфейс>` (AIN_IFACE) и `wrap<интерфейс>` (AIN_IFACE_WRAP).
 bool array_iface_pair_type(enum ain_data_type a_type);
+bool array_handle_elem_type(enum ain_data_type a_type);
 // Число слотов страницы на ОДИН элемент массива: 1 для всех обычных массивов и
 // 2 для Ixseal-массива с интерфейсным элементом (см. выше).
 // Индексы элементов во всех array_*-функциях — в ЭЛЕМЕНТАХ.
