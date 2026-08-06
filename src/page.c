@@ -871,9 +871,22 @@ struct page *array_insert_n(struct page *page, int i, const union vm_value *v, i
 	int slots = array_elem_slots(page);
 	int n = page->nr_vars / slots;
 
-	// NOTE: you cannot insert at the end of an array due to how i is clamped
-	if (i >= n)
-		i = n - 1;
+	/*
+	 * Вставка В КОНЕЦ (i == n) обязана дописывать элемент, а не класть его
+	 * ПЕРЕД последним. Апстрим зажимал `i` до `n-1` (и сам это отмечал
+	 * комментарием «you cannot insert at the end»), из-за чего первый же
+	 * элемент навсегда оставался последним: `IdArray<string, Weapon>@Add`
+	 * держит массив отсортированным через `pos = Array.LowerBound(...)` +
+	 * `Array.Insert(pos)`, а LowerBound на «больше всех» отдаёт ровно `n`.
+	 * У Dohna это ломало ВЕСЬ порядок: 「クマ1」 (первый ряд таблицы 武器データ)
+	 * оказывался в хвосте из 125 элементов, следом `Array.BinarySearch` его не
+	 * находил, `WeaponCollection@Get` возвращал null и `Weapon@PlayerId::get`
+	 * падал на `PUSHSTRUCTPAGE = -1` при входе в магазин.
+	 * Гейт не нужен: сюда же приходит опкод `A_INSERT` старых игр, и для них
+	 * «вставить за последним» — тот же самый баг движка.
+	 */
+	if (i > n)
+		i = n;
 	if (i < 0)
 		i = 0;
 
