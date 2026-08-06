@@ -88,6 +88,9 @@ static const struct version_check version_checks[] = {
 	// Healing Touch (v14, оба маршрута — проверки идентичны), main @0x49a7a0:
 	// [5:8] + [13:16] + [0:3]; @0x49a5be: [16] == [3].
 	{ "b544iofea", { {5,3}, {13,3}, {0,3} }, 16, 3 },
+	// Haha Ranman (v14.0), main @0x4d3722: [5:7] + [20:22] + [1:4];
+	// @0x4d3506: [6] == [17].
+	{ "83h2mjr", { {5,2}, {20,2}, {1,3} }, 6, 17 },
 };
 
 static const char *game_version_text(void)
