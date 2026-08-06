@@ -155,6 +155,7 @@ void array_sort(struct page *page, int compare_fno);
 void array_sort_mem(struct page *page, int member_no);
 int array_find(struct page *page, int start, int end, union vm_value v, int compare_fno);
 void array_reverse(struct page *page);
+void array_shuffle(struct page *page, int seed);
 
 // delegates
 struct page *delegate_new_from_method(int obj, int fun);

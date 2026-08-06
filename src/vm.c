@@ -670,13 +670,24 @@ static void function_call(int fno, int return_address)
 	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	if (fn_trace_count != 0) {
 		for (int i = 0; i < fn_trace_count; i++) {
-			if (fn_trace_list[i] == fno) {
-				WARNING("FNARGS fn %d nargs=%d a0=%d a1=%d a2=%d", fno, f->nr_args,
-					f->nr_args>0?heap[slot].page->values[0].i:-1,
-					f->nr_args>1?heap[slot].page->values[1].i:-1,
-					f->nr_args>2?heap[slot].page->values[2].i:-1);
-				break;
+			if (fn_trace_list[i] != fno)
+				continue;
+			// Строковые аргументы печатаем ТЕКСТОМ: слот строки — это номер
+			// в куче, и голое число ничего не говорит, а именно строковые
+			// ключи (id предметов, имена CG) обычно и надо увидеть.
+			char buf[512];
+			int off = 0;
+			for (int a = 0; a < f->nr_args && off < (int)sizeof(buf) - 1; a++) {
+				union vm_value v = heap[slot].page->values[a];
+				if (f->vars[a].type.data == AIN_STRING && v.i > 0) {
+					off += snprintf(buf + off, sizeof(buf) - off, " a%d=\"%s\"",
+							a, display_sjis0(heap_get_string(v.i)->text));
+				} else {
+					off += snprintf(buf + off, sizeof(buf) - off, " a%d=%d", a, v.i);
+				}
 			}
+			WARNING("FNARGS fn %d nargs=%d%s", fno, f->nr_args, buf);
+			break;
 		}
 	}
 }
@@ -774,6 +785,20 @@ static void delegate_call(int dg_no, int return_address)
 	int dg_page = stack_peek(1 + return_values).i;
 	int dg_index = stack_peek(0 + return_values).i;
 	int obj, fun;
+	// XSYS4_DG_RUNAWAY=<порог>: одноразовый диагноз «DG_CALL не заканчивается».
+	// Печатает страницу делегата, ТЕКУЩЕЕ число элементов и стек VM — так видно,
+	// растёт ли список во время обхода (обработчик дописывает в тот же делегат).
+	{
+		static bool warned = false;
+		const char *lim = getenv("XSYS4_DG_RUNAWAY");
+		if (lim && !warned && dg_index > atoi(lim)) {
+			warned = true;
+			WARNING("DG RUNAWAY dg_no=%d page=%d idx=%d numof=%d",
+				dg_no, dg_page,	dg_index,
+				delegate_numof(heap_get_delegate_page(dg_page)));
+			vm_stack_trace();
+		}
+	}
 	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun)) {
 		if (fn_trace_count != 0)
 			vm_fn_trace(fun, "DG_CALL");
@@ -1274,6 +1299,40 @@ uint32_t get_strswitch_address(int no, struct string *str)
 static void echo_message(int i)
 {
 	NOTICE("MSG %d: %s", i, display_sjis0(ain->messages[i]->text));
+}
+
+/*
+ * ★У IXSEAL ПОЛЕ `MSGF` В ЗАГОЛОВКЕ .ain НЕ ЗАПОЛНЕНО — обработчик ищется ПО ИМЕНИ.
+ *
+ * `MSG n` передаёт текст реплики игровой «функции сообщения»; её номер движок
+ * брал только из заголовка. У Dohna там 0, а функция 0 в ЛЮБОМ .ain — это
+ * пустышка-заполнитель с именем `NULL` (проверено: fn0 = "NULL" и у Dohna, и у
+ * Tsumamigui 3). Проверка `msgf < 0` ноль пропускала, поэтому первая же реплика
+ * сценария прыгала по адресу заполнителя: `Illegal instruction pointer:
+ * 0x00A2A714` в `ＥＶ／メイン／０１０１` сразу после `○台詞` и `VOICE`.
+ *
+ * Настоящий обработчик у Dohna есть — глобальная функция `message(int nMsgNum,
+ * int nNumofMsg, string szText)` (fno 0x1b3b), рядом с которой лежат `R`
+ * (перевод строки/ожидание) и `A` (ожидание клика), вызываемые сценарием явными
+ * CALLFUNC. Сигнатура ровно та, что кладёт на стек `_MSG`.
+ *
+ * Гейт структурный и не трогает старые игры: поиск по имени включается ТОЛЬКО
+ * при `msgf <= 0`, а у Tsumamigui 3 и Escalayer Reboot заголовок заполнен
+ * (0xe6d и 0xfe5), так что до поиска дело не доходит.
+ */
+static int vm_message_function(void)
+{
+	static int cached = -2;  // -2 = ещё не искали
+	if (cached != -2)
+		return cached;
+	cached = ain->msgf;
+	if (cached <= 0) {
+		cached = ain_get_function(ain, (char *)"message");
+		if (cached > 0)
+			NOTICE("MSG: поле MSGF в заголовке пусто, обработчик найден по имени: "
+			       "функция 'message' (#%d)", cached);
+	}
+	return cached;
 }
 
 static enum opcode execute_instruction(enum opcode opcode)
@@ -1893,12 +1952,13 @@ static enum opcode execute_instruction(enum opcode opcode)
 	case _MSG: {
 		if (config.echo)
 			echo_message(get_argument(0));
-		if (ain->msgf < 0)
+		int msgf = vm_message_function();
+		if (msgf <= 0)
 			break;
 		stack_push(get_argument(0));
 		stack_push(ain->nr_messages);
 		stack_push_string(string_ref(ain->messages[get_argument(0)]));
-		function_call(ain->msgf, instr_ptr + instruction_width(_MSG));
+		function_call(msgf, instr_ptr + instruction_width(_MSG));
 		break;
 	}
 	case JUMP: { // ADDR
@@ -2370,6 +2430,23 @@ static enum opcode execute_instruction(enum opcode opcode)
 	}
 	case S_PLUSA:
 	case S_PLUSA2: {
+		// Тот же рассинхрон формы, что у S_ASSIGN выше: у Ixseal слева лежит
+		// ДВУСЛОТОВАЯ ссылка (страница, индекс), а не разыменованный слот
+		// строки. Гейт проверен по трём .ain: у Dohna НОЛЬ опкодов REF/S_REF
+		// (у Tsumamigui 3 — 6558 S_REF, у Escalayer — 222), то есть новый
+		// компилятор ссылку перед присваиванием не разыменовывает НИКОГДА.
+		// Классический обработчик снимал только два слота и оставлял на стеке
+		// лишний: `ArrayExtensions::Join<string>` копил +1 слот за итерацию
+		// цикла и возвращался с перекошенным стеком (SPCHECK +3 на трёх
+		// элементах), а такой перекос смещает ссылки уже у ВЫЗЫВАЮЩЕГО.
+		if (instructions[CALLMETHOD].args[0] == T_INT) {
+			int rval = stack_pop().i;
+			union vm_value *ref = stack_pop_var();
+			string_append(&heap[ref->i].s, heap_get_string(rval));
+			heap_unref(rval);
+			stack_push_string(string_ref(heap[ref->i].s));
+			break;
+		}
 		int a = stack_peek(1).i;
 		int b = stack_peek(0).i;
 		string_append(&heap[a].s, heap[b].s);
@@ -3355,6 +3432,7 @@ static struct optrace_entry optrace_ring[OPTRACE_SIZE];
 static uint32_t optrace_pos;
 static int optrace_on = -1;
 static bool optrace_underflow_logged = false;
+static unsigned ip_trace_lo, ip_trace_hi;
 
 void vm_optrace_dump(void)
 {
@@ -3375,6 +3453,12 @@ static void vm_execute(void)
 	if (optrace_on < 0) {
 		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
 		sp_check = getenv("XSYS4_SP_CHECK") != NULL;
+		// XSYS4_IP_TRACE=<lo>-<hi> (hex): построчный лог «опкод, sp до -> sp после»
+		// для диапазона адресов. Так ищется функция, которая возвращается с лишними
+		// слотами (SPCHECK показывает ФАКТ расхождения, а этот трейс — сайт).
+		const char *r = getenv("XSYS4_IP_TRACE");
+		if (r && sscanf(r, "%x-%x", &ip_trace_lo, &ip_trace_hi) != 2)
+			ip_trace_lo = ip_trace_hi = 0;
 	}
 	for (;;) {
 		uint16_t opcode;
@@ -3393,8 +3477,8 @@ static void vm_execute(void)
 			optrace_pos++;
 		}
 		opcode = execute_instruction(opcode);
-		if (optrace_on > 0 && rec_ip >= 0x66a5d0 && rec_ip <= 0x66a600)
-			sys_warning("FN6 0x%06x %-14s sp %d->%d\n", rec_ip,
+		if (unlikely(ip_trace_hi) && rec_ip >= ip_trace_lo && rec_ip <= ip_trace_hi)
+			sys_warning("IPTRACE 0x%06x %-14s sp %d->%d\n", rec_ip,
 				    instructions[rec_op].name ? instructions[rec_op].name : "?", rec_sp, stack_ptr);
 		if (optrace_on > 0 && !optrace_underflow_logged && stack_ptr < 0) {
 			optrace_underflow_logged = true;

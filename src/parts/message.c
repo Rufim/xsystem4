@@ -31,6 +31,7 @@ struct parts_message {
 	STAILQ_ENTRY(parts_message) entry;
 	int parts_no;
 	int delegate_index;
+	int unique_id;
 	int type;
 	int variables[PARTS_MSG_MAX_VARS];
 	int nr_variables;
@@ -60,12 +61,77 @@ void PE_set_message_empty_type_minus_one(void)
 	msg_empty_type = -1;
 }
 
-static void msg_push_v(int parts_no, int delegate_index, int type,
+// ★НОМЕРА ТИПОВ СООБЩЕНИЙ У IXSEAL ДРУГИЕ. Внутри движок нумерует по v7
+// (enum parts_message_type), а игра разбирает тип своим SWITCH в
+// `CPartsMessageManager@CallDelegate` — и таблицы разъехались. Обе сняты с самих игр
+// (case → CallFunction*/CallDelegate* по switch-таблице): у Dohna @0x2c6eb6 SWITCH 289
+// (30 ветвей), у Tsumamigui 3 @0x155dae SWITCH 50 (28 ветвей).
+//   имя            v7  v14
+//   MouseEnter      1   0     KeyTrigger     14  15
+//   MouseMove       2   1     KeyDown        15  16
+//   MouseLeave      3   2     KeyPress       16  17
+//   MouseWheel      4   3     KeyUp          17  18
+//   MouseClick      5   4     Focus          18  19
+//   MouseDoubleClick —   5    LostFocus      19  20
+//   MouseOnCursor   6   6     Scroll         20  21
+//   DragBegin       7   7
+//   Draging         8   8
+//   DragEnd         9  10
+//   DropEnter..DropLeave 10..13 → 11..14
+// Сдвиг НЕ равномерный: у v14 нумерация с нуля, между MouseClick и MouseOnCursor
+// ВСТАВЛЕН MouseDoubleClick (у v7 его нет вовсе), а номер 9 у v14 не занят ничем.
+// Из-за этого клик (внутренний 5) приходил игре как MouseDoubleClick — она честно
+// диспатчила двойной клик, на который никто не подписан, и НИ ОДИН пункт меню титула
+// Dohna не работал, хотя сообщение доходило и оба гейта CallDelegate проходило.
+static bool msg_ixseal_types = false;
+
+void PE_set_message_types_ixseal(void)
+{
+	msg_ixseal_types = true;
+}
+
+static int msg_type_out(int type)
+{
+	if (!msg_ixseal_types)
+		return type;
+	switch (type) {
+	case PARTS_MSG_MOUSE_ENTER: return 0;
+	case PARTS_MSG_MOUSE_MOVE:  return 1;
+	case PARTS_MSG_MOUSE_LEAVE: return 2;
+	case PARTS_MSG_MOUSE_WHEEL: return 3;
+	case PARTS_MSG_MOUSE_CLICK: return 4;
+	case PARTS_MSG_MOUSE_ON:    return 6;
+	case PARTS_MSG_DRAG_BEGIN:  return 7;
+	case PARTS_MSG_DRAGGING:    return 8;
+	case PARTS_MSG_DRAG_END:    return 10;
+	case PARTS_MSG_DROP_ENTER:  return 11;
+	case PARTS_MSG_DROP_ON:     return 12;
+	case PARTS_MSG_DROPPED:     return 13;
+	case PARTS_MSG_DROP_LEAVE:  return 14;
+	case PARTS_MSG_KEY_TRIGGER: return 15;
+	case PARTS_MSG_KEY_DOWN:    return 16;
+	case PARTS_MSG_KEY_PRESS:   return 17;
+	case PARTS_MSG_KEY_UP:      return 18;
+	case PARTS_MSG_SCROLL:      return 21;
+	}
+	// Вместо тихого дефолта — проверка допущения: enum выше покрыт целиком, поэтому
+	// сюда попадает только НОВЫЙ тип, для которого номер v14 ещё не установлен.
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		WARNING("parts message type %d has no Ixseal (v14) number — passing through",
+			type);
+	}
+	return type;
+}
+
+static void msg_push_v(int parts_no, int delegate_index, int unique_id, int type,
 		const char *fmt, va_list ap)
 {
 	struct parts_message *msg = xmalloc(sizeof(*msg));
 	msg->parts_no = parts_no;
 	msg->delegate_index = delegate_index;
+	msg->unique_id = unique_id;
 	msg->type = type;
 	msg->nr_variables = 0;
 
@@ -98,7 +164,7 @@ void parts_msg_push(struct parts* parts, int type, const char *fmt, ...)
 
 	va_list ap;
 	va_start(ap, fmt);
-	msg_push_v(parts->no, parts->delegate_index, type, fmt, ap);
+	msg_push_v(parts->no, parts->delegate_index, parts->event_unique_id, type, fmt, ap);
 	va_end(ap);
 }
 
@@ -121,7 +187,7 @@ void parts_msg_push_global(int type, const char *fmt, ...)
 
 	va_list ap;
 	va_start(ap, fmt);
-	msg_push_v(0, -1, type, fmt, ap);
+	msg_push_v(0, -1, -1, type, fmt, ap);
 	va_end(ap);
 }
 
@@ -142,6 +208,19 @@ void PE_PopMessage(void)
 	if (getenv("XSYS4_MSG_TRACE") && msg->type != 6)
 		NOTICE("MSG POP  type=%d parts=%d delegate=%d nvars=%d",
 		       msg->type, msg->parts_no, msg->delegate_index, msg->nr_variables);
+	// XSYS4_MSG_STACK=<тип>: одноразовый стек VM на снятии сообщения этого типа. За
+	// один прогон даёт ВСЮ игровую цепочку обработки — именно так найден диспетчер
+	// Ixseal (SceneTitle@Run → SceneContext@Join → Ｐ＿クリック実行 → WaitForClick →
+	// AFL_View_Update → UpdateMessage → CPartsMessageManager@Update).
+	{
+		static bool traced = false;
+		const char *want = getenv("XSYS4_MSG_STACK");
+		if (want && !traced && msg->type == atoi(want)) {
+			traced = true;
+			NOTICE("MSG STACK for type=%d parts=%d:", msg->type, msg->parts_no);
+			vm_stack_trace();
+		}
+	}
 	STAILQ_REMOVE_HEAD(&msg_queue, entry);
 	free(msg);
 }
@@ -149,7 +228,7 @@ void PE_PopMessage(void)
 int PE_GetMessageType(void)
 {
 	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
-	return msg ? msg->type : msg_empty_type;
+	return msg ? msg_type_out(msg->type) : msg_empty_type;
 }
 
 int PE_GetMessagePartsNumber(void)
@@ -168,9 +247,28 @@ int PE_GetMessageDelegateIndex(void)
 	// the game registers the handler / assigns the delegate index, so the value
 	// captured at push time can be stale (-1).
 	struct parts *p = parts_try_get(msg->parts_no);
-	if (p && p->delegate_index >= 0)
-		return p->delegate_index;
-	return msg->delegate_index;
+	int r = (p && p->delegate_index >= 0) ? p->delegate_index : msg->delegate_index;
+	if (getenv("XSYS4_MSG_TRACE") && msg->type != 6)
+		NOTICE("MSG READ delegate_index -> %d (type=%d parts=%d)", r, msg->type, msg->parts_no);
+	return r;
+}
+
+// Парный к GetMessageDelegateIndex: `uniqueID` набора обработчиков, который поставил
+// SetEventID (см. PE_SetEventID). `CPartsMessageManager@CallDelegate` сверяет его с
+// `GetUniqueID` найденного по индексу набора и при несовпадении сообщение НЕ
+// диспатчит. Актуальное значение части предпочитаем снятому на push по той же
+// причине, что и у индекса делегата: сообщение могло попасть в очередь до того,
+// как игра зарегистрировала обработчик.
+int PE_GetMessageUniqueID(void)
+{
+	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	if (!msg)
+		return -1;
+	struct parts *p = parts_try_get(msg->parts_no);
+	int r = (p && p->event_unique_id >= 0) ? p->event_unique_id : msg->unique_id;
+	if (getenv("XSYS4_MSG_TRACE") && msg->type != 6)
+		NOTICE("MSG READ unique_id -> %d (type=%d parts=%d)", r, msg->type, msg->parts_no);
+	return r;
 }
 
 int PE_GetMessageVariableCount(void)

@@ -680,6 +680,26 @@ bool PE_ClearPartsConstructionProcess(int parts_no, int state)
 	return parts_clear_construction_process(cproc);
 }
 
+/*
+ * Непрозрачная заливка ПРЯМО в состояние `構築パーツ`. Загрузчик раскладок кладёт
+ * её вместо результата непроработанной «процедуры построения»: как картинка она
+ * не годится (её скрывает флаг construction_mask), но как ПРЯМОУГОЛЬНАЯ МАСКА
+ * альфа-клиппера — вполне. Раньше для этого звался PE_SetPartsColorFill, но он
+ * делает CG-состояние, и часть переставала быть 構築パーツ для игры: ассерт
+ * `StandView.jaf:52: (nonnull) m_act.GetConstruction("PlayerC")`.
+ */
+void PE_SetPartsConstructionFill(int parts_no, int w, int h, int state)
+{
+	if (w <= 0 || h <= 0 || !parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_construction_process *cproc = parts_get_construction_process(parts, state);
+	gfx_delete_texture(&cproc->common.texture);
+	gfx_init_texture_rgba(&cproc->common.texture, w, h, (SDL_Color){255, 255, 255, 255});
+	parts_set_dims(parts, &cproc->common, w, h);
+	parts_dirty(parts);
+}
+
 bool PE_SetPartsConstructionSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
 {
 	if (!parts_state_valid(--state))

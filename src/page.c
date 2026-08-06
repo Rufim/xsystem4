@@ -190,6 +190,21 @@ static enum ain_data_type array_type_from_elem(enum ain_data_type et)
 // handling both legacy typed arrays and Ixseal generic arrays.
 // `ref_elem` (можно NULL) сообщает, что элемент объявлен ССЫЛКОЙ: такой элемент
 // по определению пуст до присваивания, и предзаполнять его объектами нельзя.
+// Ведёт ли цепочка обёрток (`wrap`/`option`) к ссылке на ИНТЕРФЕЙС — то есть к
+// «толстому указателю» из двух слотов. Обёртка над обычной структурой сюда не
+// попадает: она остаётся одним heap-слотом.
+static bool type_wraps_iface_pair(struct ain_type *t)
+{
+	while (t) {
+		if (array_iface_pair_type(t->data))
+			return true;
+		if (t->data != AIN_WRAP && t->data != AIN_OPTION)
+			return false;
+		t = t->array_type;
+	}
+	return false;
+}
+
 enum ain_data_type array_resolve_var_type(struct page *container, int varno, int *struct_type,
 					  int *rank, bool *ref_elem)
 {
@@ -228,7 +243,15 @@ enum ain_data_type array_resolve_var_type(struct page *container, int varno, int
 		// такими массивами передавали предикату 1 слот вместо 2, арность не
 		// совпадала и лямбда не вызывалась вовсе (вся Motion-аналитика Dohna
 		// «ничего не находила»).
-		if ((et == AIN_WRAP || et == AIN_OPTION) && vt->array_type->array_type
+		// `option<wrap<интерфейс>>` — ТРИ слота (пара + тег наличия), и байткод
+		// так его и адресует: `RankGauge@EndCurrentMotion` (@0x660c12) считает
+		// `index * 3`, затем `X_REF 3`. Помечаем такой массив маркером
+		// AIN_OPTION (как самостоятельный a_type он больше нигде не рождается).
+		// Интерфейс лежит на уровень ГЛУБЖЕ, чем у голого wrap: цепочка типов
+		// у `array<option<wrap<IParts>>>` — 79 → 86 → 82 → 100.
+		if (et == AIN_OPTION && type_wraps_iface_pair(vt->array_type->array_type))
+			return AIN_OPTION;
+		if (et == AIN_WRAP && vt->array_type->array_type
 				&& array_iface_pair_type(vt->array_type->array_type->data))
 			return vt->array_type->array_type->data;
 		if (array_iface_pair_type(et))
@@ -317,6 +340,24 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 	case AIN_REF_TYPE:
 		if (v.i == -1)
 			break;
+		// Heap-слот 0 — это ГЛОБАЛЬНАЯ СТРАНИЦА (heap_free_ptr начинается с 1,
+		// т.е. слот 0 никогда не выдаётся аллокатором), поэтому им не может
+		// владеть НИ ОДНА переменная. Ноль тут — всегда чужое число, попавшее
+		// в объектный слот: так рассинхрон формы HLL-функции
+		// (FileOperation.GetFileList вернула bool=0 туда, где игра ждала
+		// массив) уничтожал глобалы, а падало это далеко от причины —
+		// «Out of bounds heap index: 0/<любой глобал>». Вместо тихого
+		// разрушения — одноразовый WARNING с типом переменной.
+		if (v.i == 0) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("variable_fini: попытка освободить heap-слот 0 "
+					"(глобальная страница) как значение типа %d — "
+					"в объектный слот попало чужое число", type);
+			}
+			break;
+		}
 		if (call_dtor)
 			heap_unref(v.i);
 		else
@@ -360,6 +401,8 @@ enum ain_data_type array_type(enum ain_data_type type)
 	// каждого слота даёт variable_type() по чётности. Маркер возвращаем как есть.
 	case AIN_IFACE:
 	case AIN_IFACE_WRAP:
+	// Тот же случай, только элемент — `option<wrap<интерфейс>>` (ТРИ слота).
+	case AIN_OPTION:
 		return type;
 	default:
 		WARNING("Unknown/invalid array type: %d", type);
@@ -390,16 +433,22 @@ bool array_iface_pair_type(enum ain_data_type a_type)
 	return a_type == AIN_IFACE || a_type == AIN_IFACE_WRAP;
 }
 
+// Слотов на элемент по маркеру `a_type`: 2 — интерфейсная пара, 3 — она же под
+// `option<>` (пара + тег наличия), иначе 1.
+static int elem_slots_for_type(enum ain_data_type data_type, int rank)
+{
+	if (rank != 1)
+		return 1;
+	if (array_iface_pair_type(data_type))
+		return 2;
+	return data_type == AIN_OPTION ? 3 : 1;
+}
+
 int array_elem_slots(struct page *page)
 {
 	if (!page || page->type != ARRAY_PAGE)
 		return 1;
-	return (page->array.rank == 1 && array_iface_pair_type(page->a_type)) ? 2 : 1;
-}
-
-static int elem_slots_for_type(enum ain_data_type data_type, int rank)
-{
-	return (rank == 1 && array_iface_pair_type(data_type)) ? 2 : 1;
+	return elem_slots_for_type(page->a_type, page->array.rank);
 }
 
 enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank)
@@ -432,8 +481,14 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
 		// объекта (владение и копирование как у struct-элемента), верхний —
 		// целочисленная база интерфейса. Благодаря этому delete_page_vars /
 		// copy_page / variable_set работают с такой страницей без изменений.
-		if (array_elem_slots(page) == 2)
-			return (varno & 1) ? AIN_INT : AIN_STRUCT;
+		{
+			// У многослотового элемента «типа элемента» нет: владеет только
+			// НУЛЕВОЙ слот (heap-слот объекта), остальные — обычные числа
+			// (база интерфейса и, у option, тег наличия).
+			int es = array_elem_slots(page);
+			if (es > 1)
+				return (varno % es) ? AIN_INT : AIN_STRUCT;
+		}
 		return page->array.rank > 1 ? page->a_type : array_type(page->a_type);
 	case DELEGATE_PAGE:
 		// XXX: we return void here because objects in a delegate page aren't
@@ -567,7 +622,8 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 	case AIN_ARRAY_TYPE:          return type;
 	// Ixseal: маркер массива двухслотовых интерфейсных элементов (89/100).
 	case AIN_IFACE:
-	case AIN_IFACE_WRAP:          return type;
+	case AIN_IFACE_WRAP:
+	case AIN_OPTION:              return type;
 	default: VM_ERROR("Attempt to array allocate non-array type");
 	}
 }
@@ -576,10 +632,14 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
 static void init_array_elem(struct page *page, int elem, enum ain_data_type type,
 			    int struct_type, bool init_structs)
 {
-	if (array_elem_slots(page) == 2) {
+	int es = array_elem_slots(page);
+	if (es > 1) {
 		// Пустая ссылка на интерфейс: объекта нет, база интерфейса 0.
-		page->values[elem*2].i = -1;
-		page->values[elem*2 + 1].i = 0;
+		// У `option<>` третий слот — ТЕГ, и 1 значит «пусто» (0 = значение есть).
+		page->values[elem*es].i = -1;
+		page->values[elem*es + 1].i = 0;
+		if (es > 2)
+			page->values[elem*es + 2].i = 1;
 	} else if (type == AIN_STRUCT && init_structs) {
 		create_struct(struct_type, &page->values[elem]);
 	} else {
@@ -853,9 +913,22 @@ struct page *array_insert_n(struct page *page, int i, const union vm_value *v, i
 	int slots = array_elem_slots(page);
 	int n = page->nr_vars / slots;
 
-	// NOTE: you cannot insert at the end of an array due to how i is clamped
-	if (i >= n)
-		i = n - 1;
+	/*
+	 * Вставка В КОНЕЦ (i == n) обязана дописывать элемент, а не класть его
+	 * ПЕРЕД последним. Апстрим зажимал `i` до `n-1` (и сам это отмечал
+	 * комментарием «you cannot insert at the end»), из-за чего первый же
+	 * элемент навсегда оставался последним: `IdArray<string, Weapon>@Add`
+	 * держит массив отсортированным через `pos = Array.LowerBound(...)` +
+	 * `Array.Insert(pos)`, а LowerBound на «больше всех» отдаёт ровно `n`.
+	 * У Dohna это ломало ВЕСЬ порядок: 「クマ1」 (первый ряд таблицы 武器データ)
+	 * оказывался в хвосте из 125 элементов, следом `Array.BinarySearch` его не
+	 * находил, `WeaponCollection@Get` возвращал null и `Weapon@PlayerId::get`
+	 * падал на `PUSHSTRUCTPAGE = -1` при входе в магазин.
+	 * Гейт не нужен: сюда же приходит опкод `A_INSERT` старых игр, и для них
+	 * «вставить за последним» — тот же самый баг движка.
+	 */
+	if (i > n)
+		i = n;
 	if (i < 0)
 		i = 0;
 
@@ -1076,6 +1149,37 @@ void array_reverse(struct page *page)
 			union vm_value tmp = page->values[start*slots + k];
 			page->values[start*slots + k] = page->values[end*slots + k];
 			page->values[end*slots + k] = tmp;
+		}
+	}
+}
+
+// Array.Shuffle(array, seed) — тасовка Фишера-Йетса. Имя второго аргумента взято из
+// .ain (`ainfnsig` по обёртке `ArrayExtensions::GetShuffle<T>`): это именно `seed`,
+// а не количество; 18 из 23 сайтов у Dohna передают литерал -1 = «без фиксированного
+// сида». Состояние генератора ЛОКАЛЬНОЕ: игровой поток rand() (Math.SetSeed → srand)
+// сбивать нельзя, поэтому при seed < 0 берём из него ровно одно значение на затравку.
+// Меняем местами ЭЛЕМЕНТЫ, а не слоты: у двухслотового элемента пара слотов должна
+// остаться в исходном порядке (как в array_reverse).
+void array_shuffle(struct page *page, int seed)
+{
+	if (!page)
+		return;
+	int slots = array_elem_slots(page);
+	int n = page->nr_vars / slots;
+	if (n < 2)
+		return;
+	uint32_t st = seed >= 0 ? (uint32_t)seed : (uint32_t)rand();
+	if (!st)
+		st = 0x9e3779b9u;  // xorshift не выходит из нуля
+	for (int i = n - 1; i > 0; i--) {
+		st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+		int j = (int)(st % (uint32_t)(i + 1));
+		if (j == i)
+			continue;
+		for (int k = 0; k < slots; k++) {
+			union vm_value tmp = page->values[i*slots + k];
+			page->values[i*slots + k] = page->values[j*slots + k];
+			page->values[j*slots + k] = tmp;
 		}
 	}
 }

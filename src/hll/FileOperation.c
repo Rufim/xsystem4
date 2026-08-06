@@ -21,11 +21,13 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include "system4/ain.h"
 #include "system4/file.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
 #include "xsystem4.h"
+#include "vm.h"
 #include "vm/heap.h"
 #include "vm/page.h"
 #include "hll.h"
@@ -144,6 +146,15 @@ static bool FileOperation_DeleteFolder(struct string *folder_name)
 	return result;
 }
 
+static struct page *alloc_name_array(int nr_names, struct string **names)
+{
+	union vm_value dim = { .i = nr_names };
+	struct page *page = alloc_array(1, &dim, AIN_ARRAY_STRING, 0, false);
+	for (int i = 0; i < nr_names; i++)
+		page->values[i].i = heap_alloc_string(names[i]);
+	return page;
+}
+
 static bool get_file_list(struct string *folder_name, struct page **out, bool folders)
 {
 	char *dir_name = unix_path(folder_name->text);
@@ -190,11 +201,7 @@ static bool get_file_list(struct string *folder_name, struct page **out, bool fo
 	closedir_utf8(d);
 	free(dir_name);
 
-	union vm_value dim = { .i = nr_names };
-	struct page *page = alloc_array(1, &dim, AIN_ARRAY_STRING, 0, false);
-	for (int i = 0; i < nr_names; i++) {
-		page->values[i].i = heap_alloc_string(names[i]);
-	}
+	struct page *page = alloc_name_array(nr_names, names);
 	free(names);
 
 	if (*out) {
@@ -215,7 +222,45 @@ static bool FileOperation_GetFolderList(struct string *folder_name, struct page 
 	return get_file_list(folder_name, out, true);
 }
 
+/*
+ * Ixseal (System 4 v14) сменил ФОРМУ обеих списковых функций:
+ *   v6/v7: bool GetFileList(string, ref array<string> out)   — ret 47, args (12,24)
+ *   v14:   array<string> GetFileList(string)                 — ret 79, args (12)
+ * FFI маршалит по сигнатуре .ain, поэтому старая реализация получала один
+ * аргумент, возвращала bool — и игра клала это ЧИСЛО в локал типа
+ * `ref array<string>`. При неудаче (папки ещё нет) число было 0, а heap-слот 0 —
+ * это ГЛОБАЛЬНАЯ СТРАНИЦА: на возврате функции `variable_fini` делала
+ * `heap_unref(0)`, глобальная страница уничтожалась, и следующее же обращение к
+ * глобалу падало «Out of bounds heap index: 0/227» (DohnaDohna::GetContext).
+ *
+ * Возврат — heap-слот страницы массива (как у Array.Where). Пустой результат
+ * обязан быть валидной 0-элементной ТИПИЗИРОВАННОЙ страницей, а не NULL:
+ * иначе следующий PushBack пересоздаст контейнер int-массивом.
+ */
+static int ix_file_list(struct string *folder_name, bool folders)
+{
+	struct page *page = NULL;
+	if (!get_file_list(folder_name, &page, folders) || !page)
+		page = alloc_name_array(0, NULL);
+	int slot = heap_alloc_slot(VM_PAGE);
+	heap_set_page(slot, page);
+	return slot;
+}
+
+static int FileOperation_ix_GetFileList(struct string *folder_name)
+{
+	return ix_file_list(folder_name, false);
+}
+
+static int FileOperation_ix_GetFolderList(struct string *folder_name)
+{
+	return ix_file_list(folder_name, true);
+}
+
+static void FileOperation_PreLink(void);
+
 HLL_LIBRARY(FileOperation,
+	    HLL_EXPORT(_PreLink, FileOperation_PreLink),
 	    HLL_EXPORT(ExistFile, FileOperation_ExistFile),
 	    HLL_TODO_EXPORT(DeleteFile, FileOperation_DeleteFile),
 	    HLL_EXPORT(CopyFile, FileOperation_CopyFile),
@@ -228,3 +273,26 @@ HLL_LIBRARY(FileOperation,
 	    HLL_EXPORT(DeleteFolder, FileOperation_DeleteFolder),
 	    HLL_EXPORT(GetFileList, FileOperation_GetFileList),
 	    HLL_EXPORT(GetFolderList, FileOperation_GetFolderList));
+
+// Гейт СТРУКТУРНЫЙ — по форме, объявленной в .ain (тип возврата), а не по
+// версии движка: у Tsumamigui 3 (v7) и Escalayer (v6) обе функции объявлены
+// `ret=47 (12,24)`, у Dohna — `ret=79 (12)`.
+static void FileOperation_PreLink(void)
+{
+	int libno = ain_get_library(ain, "FileOperation");
+	if (libno < 0)
+		return;
+	static const struct { const char *name; void *ix; } list_getters[] = {
+		{ "GetFileList",   FileOperation_ix_GetFileList },
+		{ "GetFolderList", FileOperation_ix_GetFolderList },
+	};
+	for (unsigned i = 0; i < sizeof(list_getters) / sizeof(*list_getters); i++) {
+		int fno = ain_get_library_function(ain, libno, list_getters[i].name);
+		if (fno < 0)
+			continue;
+		if (ain->libraries[libno].functions[fno].return_type.data != AIN_ARRAY)
+			continue;
+		static_library_replace(&lib_FileOperation, list_getters[i].name,
+				       list_getters[i].ix);
+	}
+}

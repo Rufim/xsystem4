@@ -1441,6 +1441,28 @@ static int act_parts_type(struct ex_tree *t)
 	return v14 - ACT_COMPONENT_TYPE_SHIFT;       // классическое семейство パーツ
 }
 
+/*
+ * Сырой номер типа по нумерации v14 — для виджетов, у которых классического
+ * аналога нет и act_parts_type честно отдаёт -1 (メッセージウィンドウ = 10,
+ * パネル = 14 и т.д.). Отдельная функция, а не новое значение act_parts_type:
+ * её результат сравнивается с классическими id по всему загрузчику.
+ */
+static int act_parts_type_v14(struct ex_tree *t)
+{
+	struct ex_tree *c = act_child(t, "パーツタイプ");
+	if (!c || !c->is_leaf || c->leaf.value.type != EX_STRING || !c->leaf.value.s)
+		return -1;
+	const char *name = c->leaf.value.s->text;
+	for (unsigned i = 0; i < sizeof(act_component_type_names) / sizeof(*act_component_type_names); i++) {
+		char *sjis = utf2sjis(act_component_type_names[i], strlen(act_component_type_names[i]));
+		bool hit = !strcmp(name, sjis);
+		free(sjis);
+		if (hit)
+			return i;
+	}
+	return -1;
+}
+
 // nth element of a list-valued child, as int (floats truncated)
 static int act_list_int(struct ex_tree *t, const char *utf8, int idx, int dflt)
 {
@@ -1571,13 +1593,18 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// rect so it can serve as an alpha-clipper (rectangular clip) for siblings.
 	// The 手順1 create op's 先矩形 gives the size [.,.,.,.,w,h].
 	if (act_parts_type(st) == 18) {
+		// Тип состояния выставляем ВСЕГДА, даже когда `手順リスト` пуст (так у
+		// «PlayerC» в StandView): игра ищет такие части сравнением типа
+		// компонента (`CActivityWrap@GetConstruction`), и без этого падал ассерт
+		// `StandView.jaf:52: (nonnull) m_act.GetConstruction("PlayerC")`.
+		PE_ClearPartsConstructionProcess(no, state);
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
 		if (step1) {
 			int w = act_list_int(step1, "先矩形", 4, 0);
 			int h = act_list_int(step1, "先矩形", 5, 0);
 			if (w > 0 && h > 0) {
-				PE_SetPartsColorFill(no, w, h);
+				PE_SetPartsConstructionFill(no, w, h, state);
 				// Заливка — ТОЛЬКО маска: сама часть не рисуется, иначе
 				// непрозрачный прямоугольник закрывает экран (титул Dohna
 				// объявляет такую часть `表示 = 1, アルファ = 255`, z=29,
@@ -1591,6 +1618,30 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 						"часть используется только как прямоугольная маска "
 						"альфа-клиппера и не рисуется");
 				}
+			}
+		}
+		return;
+	}
+	/*
+	 * `ＣＧ判定パーツ` (классический id 19) — область попадания по форме
+	 * картинки: сама она не рисуется, а её непрозрачные пиксели задают
+	 * hit-область. Игра ищет такие части сравнением типа компонента
+	 * (`CActivityWrap@GetCGDetection` → CompParts(имя, 27, 1)), поэтому без
+	 * своей ветки состояние оставалось обычным CG и падал ассерт
+	 * `FooterButton.jaf:53: (nonnull) m_act.GetCGDetection("Detector")`.
+	 */
+	if (act_parts_type(st) == 19) {
+		struct string *cg = act_str(st, "ＣＧ名");
+		PE_SetPartsCGDetectionSize(no, cg, state);
+		// `サーフェイスエリア` у всех семи таких состояний во всех 195 раскладках
+		// нулевая, а общий сеттер площади пришлось бы звать через parts_get_cg,
+		// который сбросил бы тип состояния обратно в CG. Ненулевую отмечаем.
+		if (act_list_int(st, "サーフェイスエリア", 2, 0) > 0
+		    || act_list_int(st, "サーフェイスエリア", 3, 0) > 0) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("ＣＧ判定パーツ: ненулевая サーフェイスエリア не применяется");
 			}
 		}
 		return;
@@ -1949,6 +2000,151 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				PE_SetParentPartsNumber(tno, parent_no);
 			PE_SetShow(tno, 1);
 		}
+	} else if (ti && act_parts_type_v14(ti) == 14) {
+		/*
+		 * Панель (`パネル`, тип компонента v14 = 14) — прямоугольная заливка
+		 * цветом с альфа-градиентом по краям (src/parts/panel.c). Классического
+		 * аналога нет, поэтому act_parts_type отдаёт -1, и раньше панель уходила
+		 * в общую CG-ветку: `CActivityWrap@GetPanel` (сравнение типа с 14)
+		 * получал null, и `StripDialogBase@SetHeight` падал на пустом
+		 * интерфейсе. Узел кладём теми же сеттерами, что зовёт игра.
+		 */
+		PE_SetPanelSize(no, act_list_int(ti, "サイズ", 0, 0),
+			act_list_int(ti, "サイズ", 1, 0));
+		PE_SetPanelColor(no, act_list_int(ti, "色", 0, 255),
+			act_list_int(ti, "色", 1, 255),
+			act_list_int(ti, "色", 2, 255),
+			act_list_int(ti, "色", 3, 255));
+		// Порядок четвёрки `アルファグラデーション` взят из порядка ОБЪЯВЛЕНИЯ пары
+		// сеттеров/геттеров в библиотеке (fn639-646: Top, Bottom, Left, Right).
+		// Значение движок только хранит и на непустом печатает одноразовый
+		// WARNING (src/parts/panel.c) — там же оговорка, что смысл не установлен.
+		PE_SetPanelAlphaGradationTop(no, act_list_int(ti, "アルファグラデーション", 0, 0));
+		PE_SetPanelAlphaGradationBottom(no, act_list_int(ti, "アルファグラデーション", 1, 0));
+		PE_SetPanelAlphaGradationLeft(no, act_list_int(ti, "アルファグラデーション", 2, 0));
+		PE_SetPanelAlphaGradationRight(no, act_list_int(ti, "アルファグラデーション", 3, 0));
+	} else if (ti && act_parts_type_v14(ti) == 17) {
+		/*
+		 * `ユーザコンポーネント` (тип компонента v14 = 17) — место под ОТДЕЛЬНУЮ
+		 * активность (шапка, футер, полоса фазы). Классического аналога нет,
+		 * поэтому act_parts_type отдаёт -1 и часть уходила в CG-ветку, где у
+		 * неё нет ни одного узла состояния; игра же ищет её сравнением типа
+		 * (`CActivityWrap@CompParts(имя, 17, 1)` @0x1fd54) и, не найдя,
+		 * возвращала null-компонент — на нём и падал `SceneAzito@0`
+		 * (`PhaseBar@Text::set`, PUSHSTRUCTPAGE = -1).
+		 *
+		 * Читаем узел теми же сеттерами, которыми потом пользуется игра.
+		 * `データ` — плоский список «ключ, значение» (по всем 195 раскладках
+		 * 270 таких частей, у 152 из них список есть, других полей нет вовсе).
+		 */
+		struct string *uc_name = act_str(ti, "ユーザコンポーネント名");
+		PE_SetUserComponentName(no, uc_name);
+		struct ex_tree *data = act_child(ti, "データ");
+		if (data && data->is_leaf && data->leaf.value.type == EX_LIST) {
+			struct ex_list *l = data->leaf.value.list;
+			if (l->nr_items % 2) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					WARNING("ユーザコンポーネント: нечётный список データ (%u) — "
+						"пары «ключ, значение» не складываются", l->nr_items);
+				}
+			}
+			for (unsigned i = 0; i + 1 < l->nr_items; i += 2) {
+				struct ex_value *k = &l->items[i].value;
+				struct ex_value *v = &l->items[i + 1].value;
+				if (k->type != EX_STRING || v->type != EX_STRING)
+					continue;
+				PE_SetUserComponentData(no, k->s, v->s);
+			}
+		}
+	} else if (ti && act_parts_type_v14(ti) == 10) {
+		/*
+		 * Окно реплик ADV (`メッセージウィンドウ`, тип компонента v14 = 10) — тип,
+		 * у которого классического аналога нет вовсе, поэтому act_parts_type
+		 * отдаёт -1 и часть уходила в общую CG-ветку, где у неё нет ни одного
+		 * знакомого узла состояния: окно оставалось пустым, а первое же
+		 * обращение игры (SetMessageWindowActive) роняло движок в REPL.
+		 *
+		 * Узел `種類別情報` один-в-один ложится на HLL-функции, поэтому читаем
+		 * его теми же сеттерами, которыми потом пользуется игра — никакой
+		 * второй дороги к тем же полям.
+		 */
+		int mw_text_no = ++pe_act_part_seq;
+		int mw_mark_no = ++pe_act_part_seq;
+		PE_CreateMessageWindow(no, mw_text_no, mw_mark_no);
+		PE_SetMessageWindowInactiveMultipleColor(no,
+			act_list_int(ti, "非アクティブ時の乗算カラー", 0, 255),
+			act_list_int(ti, "非アクティブ時の乗算カラー", 1, 255),
+			act_list_int(ti, "非アクティブ時の乗算カラー", 2, 255));
+		struct string *mw_cg = act_str(ti, "ＣＧ名");
+		if (mw_cg)
+			PE_SetMessageWindowCGName(no, mw_cg);
+		struct string *mw_flat = act_str(ti, "フラット名");
+		if (mw_flat)
+			PE_SetMessageWindowFlatName(no, mw_flat);
+		// `フラット表示待ちフレーム数` в раскладке НЕТ (проверено по всем пяти узлам
+		// メッセージウィンドウ во всех 195 .pactex) — это чисто рантаймовое свойство,
+		// игра задаёт его сама через SetMessageWindowFlatShowWaitFrameNumber.
+		PE_SetMessageWindowTextFont(no,
+			act_int(ti, "フォントタイプ", 0),
+			act_int(ti, "フォントサイズ", 16),
+			act_list_int(ti, "フォント色", 0, 255),
+			act_list_int(ti, "フォント色", 1, 255),
+			act_list_int(ti, "フォント色", 2, 255),
+			act_float(ti, "フォント太さ", 0.0f),
+			act_list_int(ti, "フォント縁取り色", 0, 0),
+			act_list_int(ti, "フォント縁取り色", 1, 0),
+			act_list_int(ti, "フォント縁取り色", 2, 0),
+			act_float(ti, "フォント縁取り", 0.0f));
+		PE_SetMessageWindowTextSpace(no, act_int(ti, "文字間隔", 0),
+			act_int(ti, "行間隔", 0));
+		PE_SetMessageWindowTextArea(no,
+			act_list_int(ti, "テキストエリア", 0, 0),
+			act_list_int(ti, "テキストエリア", 1, 0),
+			act_list_int(ti, "テキストエリア", 2, 0),
+			act_list_int(ti, "テキストエリア", 3, 0));
+		PE_SetMessageWindowTextOriginPosMode(no, act_int(ti, "テキスト位置", 1));
+		PE_SetMessageWindowTextSpeed(no, act_int(ti, "字速度", 0));
+		struct ex_tree *ruby = act_child(ti, "ルビ");
+		if (ruby && !ruby->is_leaf) {
+			PE_SetMessageWindowRubyFont(no,
+				act_int(ruby, "フォントタイプ", 0),
+				act_int(ruby, "フォントサイズ", 10),
+				act_list_int(ruby, "フォント色", 0, 255),
+				act_list_int(ruby, "フォント色", 1, 255),
+				act_list_int(ruby, "フォント色", 2, 255),
+				act_float(ruby, "フォント太さ", 0.0f),
+				act_list_int(ruby, "フォント縁取り色", 0, 0),
+				act_list_int(ruby, "フォント縁取り色", 1, 0),
+				act_list_int(ruby, "フォント縁取り色", 2, 0),
+				act_float(ruby, "フォント縁取り", 0.0f));
+			PE_SetMessageWindowRubyCharSpace(no, act_int(ruby, "文字間隔", 0));
+			PE_SetMessageWindowRubyLineSpace(no, act_int(ruby, "行間隔", 0));
+		}
+		PE_SetEnableMessageWindowTextWrapping(no, act_int(ti, "折り返し", 0));
+		struct ex_tree *mark = act_child(ti, "キー待ちマーク");
+		if (mark && !mark->is_leaf) {
+			PE_SetKeyWaitPos(no, act_list_int(mark, "座標", 0, 0),
+				act_list_int(mark, "座標", 1, 0),
+				act_list_int(mark, "座標", 2, 0));
+			struct string *mcg = act_str(mark, "ＣＧ名");
+			if (mcg)
+				PE_SetKeyWaitCGName(no, mcg,
+					act_int(mark, "ループＣＧ開始番号", 0),
+					act_int(mark, "ループＣＧ枚数", 0),
+					act_int(mark, "ループＣＧ切り替え時間", 0));
+			struct string *mflat = act_str(mark, "フラット名");
+			if (mflat)
+				PE_SetKeyWaitFlatName(no, mflat);
+		}
+		/*
+		 * `テキスト` из раскладки — образец для редактора активностей («проверьте
+		 * прозрачность/яркость»), а не реплика: игра выдаёт текст сама через
+		 * SetMessageWindowText. Не подставляем его, иначе на экране висел бы
+		 * японский рыбный текст до первой реплики.
+		 */
+		PE_SetMessageWindowActive(no, act_int(ti, "アクティブ", 0));
 	} else if (ti) {
 		// CG part: per-state CG names
 		act_set_state_cg(no, ti, "通常状態", 1);
@@ -2009,6 +2205,11 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 	 */
 	if (act_int(node, "オンカーソル透過", 0))
 		PE_SetPassCursor(no, true);
+	// `マウスカーソルピクセル判定`: hit-тест по непрозрачным пикселям, а не по боксу
+	// (см. parts->pixel_hittest — без него перекрывающиеся диагональные полосы меню
+	// титула Dohna воровали клик друг у друга).
+	if (act_int(node, "マウスカーソルピクセル判定", 0))
+		PE_SetPartsPixelHitTest(no, true);
 	if (parent_no >= 0)
 		PE_SetParentPartsNumber(no, parent_no);
 	PE_SetShow(no, act_int(node, "表示", 1));
@@ -2747,13 +2948,6 @@ static void PE_AddChild(int parent, int child) { PE_SetParentPartsNumber(child, 
 static void PE_InsertChild(int parent, int child, int index) { (void)index; PE_SetParentPartsNumber(child, parent); }
 static void PE_RemoveChild(int parent, int child) { (void)parent; PE_SetParentPartsNumber(child, -1); }
 static bool PE_IsExistChild(int parent, int child) { return PE_GetParentPartsNumber(child) == parent; }
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, ClearChild, int a);
-HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, NumofChild, int a);
-HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChild, int a, int b);
-HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetChildIndex, int a, int b);
-// Ixseal (Healing Touch/Dohna): SetEventID(parts, ?, event_id) — привязка id
-// события ввода к части; для достижения экрана безвредный no-op.
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetEventID, int a, int b, int c);
 // Parts_StopSwipe() — отменяет свайп-инерцию. Зовётся первым в
 // CBackLogView@MouseWheelEvent (и swipe-обработчиках). Свайп-инерцию не
 // моделируем, поэтому no-op; без него колесо в бэклоге падало в REPL.
@@ -3259,11 +3453,11 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(InsertChild, PE_InsertChild),
 	    HLL_EXPORT(RemoveChild, PE_RemoveChild),
 	    HLL_EXPORT(IsExistChild, PE_IsExistChild),
-	    HLL_EXPORT(ClearChild, PartsEngine_ClearChild),
-	    HLL_EXPORT(NumofChild, PartsEngine_NumofChild),
-	    HLL_EXPORT(GetChild, PartsEngine_GetChild),
-	    HLL_EXPORT(GetChildIndex, PartsEngine_GetChildIndex),
-	    HLL_EXPORT(SetEventID, PartsEngine_SetEventID),
+	    HLL_EXPORT(ClearChild, PE_ClearChild),
+	    HLL_EXPORT(NumofChild, PE_NumofChild),
+	    HLL_EXPORT(GetChild, PE_GetChild),
+	    HLL_EXPORT(GetChildIndex, PE_GetChildIndex),
+	    HLL_EXPORT(SetEventID, PE_SetEventID),
 	    HLL_EXPORT(Parts_StopSwipe, PartsEngine_Parts_StopSwipe),
 	    HLL_EXPORT(Parts_SetComment, PartsEngine_Parts_SetComment),
 	    HLL_EXPORT(RemoveController, PE_RemoveController),
@@ -3282,6 +3476,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(PopMessage, PE_PopMessage),
 	    HLL_EXPORT(GetMessagePartsNumber, PE_GetMessagePartsNumber),
 	    HLL_EXPORT(GetMessageDelegateIndex, PE_GetMessageDelegateIndex),
+	    HLL_EXPORT(GetMessageUniqueID, PE_GetMessageUniqueID),
 	    HLL_EXPORT(GetDelegateIndex, PE_GetDelegateIndex),
 	    HLL_EXPORT(GetMessageType, PE_GetMessageType),
 	    HLL_EXPORT(GetMessageVariableCount, PE_GetMessageVariableCount),
@@ -3293,6 +3488,14 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetDelegateIndex, PE_SetDelegateIndex),
 	    HLL_EXPORT(SetFocus, PE_SetFocusPartsNumber),
 	    HLL_EXPORT(IsFocus, PE_IsFocus),
+	    HLL_EXPORT(SetComponentReverseLR, PE_SetComponentReverseLR),
+	    HLL_EXPORT(SetComponentReverseTB, PE_SetComponentReverseTB),
+	    HLL_EXPORT(GetComponentReverseLR, PE_GetComponentReverseLR),
+	    HLL_EXPORT(GetComponentReverseTB, PE_GetComponentReverseTB),
+	    HLL_EXPORT(SetUserComponentName, PE_SetUserComponentName),
+	    HLL_EXPORT(GetUserComponentName, PE_GetUserComponentName),
+	    HLL_EXPORT(SetUserComponentData, PE_SetUserComponentData),
+	    HLL_EXPORT(GetUserComponentData, PE_GetUserComponentData),
 	    HLL_EXPORT(SetComponentType, PE_SetComponentType),
 	    HLL_EXPORT(GetComponentType, PE_GetComponentType),
 	    HLL_EXPORT(SetComponentPos, PartsEngine_SetComponentPos),
@@ -3313,6 +3516,53 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(IsComponentShow, PE_IsComponentShow),
 	    HLL_EXPORT(SetComponentMessageWindowShowLink, PE_SetPartsMessageWindowShowLink),
 	    HLL_EXPORT(IsComponentMessageWindowShowLink, PE_GetPartsMessageWindowShowLink),
+	    // Окно реплик ADV (`メッセージウィンドウ`) — src/parts/message_window.c.
+	    HLL_EXPORT(SetMessageWindowActive, PE_SetMessageWindowActive),
+	    HLL_EXPORT(SetMessageWindowInactiveMultipleColor, PE_SetMessageWindowInactiveMultipleColor),
+	    HLL_EXPORT(GetMessageWindowInactiveMultipleColorR, PE_GetMessageWindowInactiveMultipleColorR),
+	    HLL_EXPORT(GetMessageWindowInactiveMultipleColorG, PE_GetMessageWindowInactiveMultipleColorG),
+	    HLL_EXPORT(GetMessageWindowInactiveMultipleColorB, PE_GetMessageWindowInactiveMultipleColorB),
+	    HLL_EXPORT(SetMessageWindowCGName, PE_SetMessageWindowCGName),
+	    HLL_EXPORT(GetMessageWindowCGName, PE_GetMessageWindowCGName),
+	    HLL_EXPORT(SetMessageWindowFlatName, PE_SetMessageWindowFlatName),
+	    HLL_EXPORT(GetMessageWindowFlatName, PE_GetMessageWindowFlatName),
+	    HLL_EXPORT(SetMessageWindowFlatShowWaitFrameNumber, PE_SetMessageWindowFlatShowWaitFrameNumber),
+	    HLL_EXPORT(GetMessageWindowFlatShowWaitFrameNumber, PE_GetMessageWindowFlatShowWaitFrameNumber),
+	    HLL_EXPORT(IsOverMessageWindowFlatShowWaitFrame, PE_IsOverMessageWindowFlatShowWaitFrame),
+	    HLL_EXPORT(BackMessageWindowFlatBeginFrame, PE_BackMessageWindowFlatBeginFrame),
+	    HLL_EXPORT(StepMessageWindowFlatFinalFrame, PE_StepMessageWindowFlatFinalFrame),
+	    HLL_EXPORT(SetMessageWindowText, PE_SetMessageWindowText),
+	    HLL_EXPORT(GetMessageWindowText, PE_GetMessageWindowText),
+	    HLL_EXPORT(FixMessageWindowText, PE_FixMessageWindowText),
+	    HLL_EXPORT(IsFixedMessageWindowText, PE_IsFixedMessageWindowText),
+	    HLL_EXPORT(SetMessageWindowTextArea, PE_SetMessageWindowTextArea),
+	    HLL_EXPORT(GetMessageWindowTextArea, PE_GetMessageWindowTextArea),
+	    HLL_EXPORT(SetMessageWindowTextOriginPosMode, PE_SetMessageWindowTextOriginPosMode),
+	    HLL_EXPORT(GetMessageWindowTextOriginPosMode, PE_GetMessageWindowTextOriginPosMode),
+	    HLL_EXPORT(SetMessageWindowTextFont, PE_SetMessageWindowTextFont),
+	    HLL_EXPORT(GetMessageWindowTextFont, PE_GetMessageWindowTextFont),
+	    HLL_EXPORT(SetMessageWindowTextSpeed, PE_SetMessageWindowTextSpeed),
+	    HLL_EXPORT(GetMessageWindowTextSpeed, PE_GetMessageWindowTextSpeed),
+	    HLL_EXPORT(SetMessageWindowTextSpace, PE_SetMessageWindowTextSpace),
+	    HLL_EXPORT(GetMessageWindowTextSpace, PE_GetMessageWindowTextSpace),
+	    HLL_EXPORT(SetMessageWindowRubyFont, PE_SetMessageWindowRubyFont),
+	    HLL_EXPORT(GetMessageWindowRubyFont, PE_GetMessageWindowRubyFont),
+	    HLL_EXPORT(SetMessageWindowRubyCharSpace, PE_SetMessageWindowRubyCharSpace),
+	    HLL_EXPORT(GetMessageWindowRubyCharSpace, PE_GetMessageWindowRubyCharSpace),
+	    HLL_EXPORT(SetMessageWindowRubyLineSpace, PE_SetMessageWindowRubyLineSpace),
+	    HLL_EXPORT(GetMessageWindowRubyLineSpace, PE_GetMessageWindowRubyLineSpace),
+	    HLL_EXPORT(SetEnableMessageWindowTextWrapping, PE_SetEnableMessageWindowTextWrapping),
+	    HLL_EXPORT(IsEnableMessageWindowTextWrapping, PE_IsEnableMessageWindowTextWrapping),
+	    HLL_EXPORT(SetKeyWaitCGName, PE_SetKeyWaitCGName),
+	    HLL_EXPORT(GetKeyWaitCGName, PE_GetKeyWaitCGName),
+	    HLL_EXPORT(SetKeyWaitFlatName, PE_SetKeyWaitFlatName),
+	    HLL_EXPORT(GetKeyWaitFlatName, PE_GetKeyWaitFlatName),
+	    HLL_EXPORT(SetKeyWaitPos, PE_SetKeyWaitPos),
+	    HLL_EXPORT(GetKeyWaitPosX, PE_GetKeyWaitPosX),
+	    HLL_EXPORT(GetKeyWaitPosY, PE_GetKeyWaitPosY),
+	    HLL_EXPORT(GetKeyWaitPosZ, PE_GetKeyWaitPosZ),
+	    HLL_EXPORT(SetKeyWaitShow, PE_SetKeyWaitShow),
+	    HLL_EXPORT(IsKeyWaitShow, PE_IsKeyWaitShow),
 	    HLL_EXPORT(SetComponentAlpha, PE_SetAlpha),
 	    HLL_EXPORT(GetComponentAlpha, PE_GetPartsAlpha),
 	    HLL_EXPORT(SetComponentAddColor, PE_SetAddColor),
@@ -3526,6 +3776,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetLayoutBoxAlign, PE_GetLayoutBoxAlign),
 	    HLL_EXPORT(Parts_SetPartsCG, PE_SetPartsCG),
 	    HLL_EXPORT(Parts_GetPartsCGName, PE_GetPartsCGName),
+	    HLL_EXPORT(Parts_GetPartsCGDeform, PE_GetPartsCGDeform),
 	    HLL_EXPORT(Parts_SetPartsCGSurfaceArea, PE_SetPartsCGSurfaceArea),
 	    HLL_EXPORT(Parts_SetLoopCG, PE_SetLoopCG),
 	    HLL_EXPORT(Parts_SetLoopCGSurfaceArea, PE_SetLoopCGSurfaceArea),
@@ -3566,6 +3817,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetPartsRectangleDetectionSize, PE_SetPartsRectangleDetectionSize),
 	    HLL_TODO_EXPORT(Parts_SetPartsRectangleDetectionSurfaceArea, PartsEngine_Parts_SetPartsRectangleDetectionSurfaceArea),
 	    HLL_EXPORT(Parts_SetPartsCGDetectionSize, PE_SetPartsCGDetectionSize),
+	    HLL_EXPORT(Parts_GetNumeralNumber, PE_GetNumeralNumber),
+	    HLL_EXPORT(Parts_IsNumeralShowComma, PE_IsNumeralShowComma),
+	    HLL_EXPORT(Parts_GetNumeralSpace, PE_GetNumeralSpace),
+	    HLL_EXPORT(GetNumeralLength, PE_GetNumeralLength),
 	    HLL_TODO_EXPORT(Parts_SetPartsCGDetectionSurfaceArea, PartsEngine_Parts_SetPartsCGDetectionSurfaceArea),
 	    HLL_EXPORT(Parts_SetPartsFlat, PE_SetPartsFlat),
 	    HLL_EXPORT(Parts_IsPartsFlatEnd, PE_IsPartsFlatEnd),
@@ -3665,10 +3920,12 @@ static void PartsEngine_PreLink(void)
 	if (get_fun(libno, "AddController")) {
 		PE_enable_multi_controller();
 	}
-	// В новом message-API «сообщений больше нет» = GetMessageType() == -1, а не 0
-	// (см. src/parts/message.c). SeekMessage объявлена только этим API.
+	// В новом message-API «сообщений больше нет» = GetMessageType() == -1, а не 0,
+	// и САМИ НОМЕРА типов сообщений другие (см. src/parts/message.c). SeekMessage
+	// объявлена только этим API.
 	if (get_fun(libno, "SeekMessage")) {
 		PE_set_message_empty_type_minus_one();
+		PE_set_message_types_ixseal();
 	}
 
 	// Строковые геттеры: Ixseal отдаёт строку ВОЗВРАТОМ, v6/v7 — через

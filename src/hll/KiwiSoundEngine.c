@@ -15,6 +15,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 
 #include "system4.h"
 #include "system4/ain.h"
@@ -25,6 +26,7 @@
 #include "asset_manager.h"
 #include "audio.h"
 #include "mixer.h"
+#include "xsystem4.h"
 
 HLL_WARN_UNIMPLEMENTED( , void, KiwiSoundEngine, SetGlobalFocus, possibly_unused int nNum);
 
@@ -215,11 +217,50 @@ static float KiwiSoundEngine_flat_GetGroupVolume(int id) { (void)id; return 1.0f
 static int KiwiSoundEngine_flat_MillisecondsToSamples(int a, int b) { (void)a; (void)b; return 0; }
 static int KiwiSoundEngine_flat_GetSoundFileName(int id, struct string **out) { (void)id; if (out) { if (*out) free_string(*out); *out = string_ref(&EMPTY_STRING); } return 0; }
 
+// Микшеры (громкость/mute по каналам). У v6/v7 этот API живёт в SystemService, у
+// Ixseal он переехал в KiwiSoundEngine — движковый микшер (src/audio_mixer.c) тот же,
+// меняется только форма out-параметров: v7 объявляет `ref string/int/bool` (типы
+// 20/18/51), Dohna — `wrap<T>` (тип 82), а wrap<скаляр> ffi отдаёт таким же обычным
+// указателем (та же форма, что у уже рабочей Parts_GetPartsSize(no,82,82,int)).
+// Реализуем по-настоящему, а не заглушкой: у каждого сеттера ЕСТЬ геттер, значит
+// no-op отличим — конфиг читает обратно то, что записал.
+static int KiwiSoundEngine_GetMixerName(int n, struct string **name)
+{
+	const char *r = mixer_get_name(n);
+	if (!r)
+		return 0;
+	if (*name)
+		free_string(*name);
+	*name = make_string(r, strlen(r));
+	return 1;
+}
+
+static int KiwiSoundEngine_SetMixerName(int n, struct string *name)
+{
+	return mixer_set_name(n, name ? name->text : "");
+}
+
+static bool KiwiSoundEngine_GetMixerDefaultVolume(int n, int *volume)
+{
+	if (n < 0 || (unsigned)n >= config.mixer_nr_channels)
+		return false;
+	*volume = config.mixer_volumes[n];
+	return true;
+}
+
 static void KiwiSoundEngine_PreLink(void);
 
 HLL_LIBRARY(KiwiSoundEngine,
 	    HLL_EXPORT(_PreLink, KiwiSoundEngine_PreLink),
 	    HLL_EXPORT(SetGlobalFocus, KiwiSoundEngine_SetGlobalFocus),
+	    HLL_EXPORT(GetMixerNumof, mixer_get_numof),
+	    HLL_EXPORT(GetMixerName, KiwiSoundEngine_GetMixerName),
+	    HLL_EXPORT(GetMixerVolume, mixer_get_volume),
+	    HLL_EXPORT(GetMixerDefaultVolume, KiwiSoundEngine_GetMixerDefaultVolume),
+	    HLL_EXPORT(GetMixerMute, mixer_get_mute),
+	    HLL_EXPORT(SetMixerName, KiwiSoundEngine_SetMixerName),
+	    HLL_EXPORT(SetMixerVolume, mixer_set_volume),
+	    HLL_EXPORT(SetMixerMute, mixer_set_mute),
 	    HLL_EXPORT(Music_IsExist, bgm_exists),
 	    HLL_EXPORT(Music_Prepare, bgm_prepare),
 	    HLL_EXPORT(Music_Unprepare, bgm_unprepare),

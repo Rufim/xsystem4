@@ -53,6 +53,8 @@ static Point drag_initial_pos;
 static Point drag_start_cursor;
 static struct parts *drop_target = NULL;
 
+static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos);
+
 static bool parts_hittest(struct parts *parts, int state, Point pos)
 {
 	struct parts_common *c = &parts->states[state].common;
@@ -76,7 +78,43 @@ static bool parts_hittest(struct parts *parts, int state, Point pos)
 			hitbox.y += parts->parent->global.pos.y;
 		}
 	}
-	return SDL_PointInRect(&pos, &hitbox);
+	if (!SDL_PointInRect(&pos, &hitbox))
+		return false;
+	// `ＣＧ判定パーツ` — это и есть «область по форме картинки»: попиксельная
+	// проверка для него не опция раскладки, а сам смысл типа.
+	if (!parts->pixel_hittest
+	    && parts->states[parts->state].type != PARTS_CG_DETECTION)
+		return true;
+	return parts_pixel_hittest(c, hitbox, pos);
+}
+
+// `マウスカーソルピクセル判定`: попадание считается только по НЕПРОЗРАЧНОМУ пикселю
+// текстуры. Альфа читается с GPU ОДИН раз на состояние (glReadPixels синхронизирует
+// конвейер, а hit-тест идёт каждый кадр) и кэшируется в common->hit_mask.
+static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos)
+{
+	if (!c->texture.handle || c->texture.w <= 0 || c->texture.h <= 0)
+		return true;  // нечего проверять — остаётся прямоугольник
+	if (!c->hit_mask) {
+		uint8_t *px = gfx_get_pixels(&c->texture);
+		if (!px)
+			return true;
+		int n = c->texture.w * c->texture.h;
+		c->hit_mask = xmalloc(n);
+		for (int i = 0; i < n; i++)
+			c->hit_mask[i] = px[i * 4 + 3];
+		c->hit_mask_w = c->texture.w;
+		c->hit_mask_h = c->texture.h;
+		free(px);
+	}
+	// Точка → тексель: hitbox растянут на всю текстуру (при масштабе — с ним).
+	if (hitbox.w <= 0 || hitbox.h <= 0)
+		return true;
+	int tx = (int)((int64_t)(pos.x - hitbox.x) * c->hit_mask_w / hitbox.w);
+	int ty = (int)((int64_t)(pos.y - hitbox.y) * c->hit_mask_h / hitbox.h);
+	if (tx < 0 || ty < 0 || tx >= c->hit_mask_w || ty >= c->hit_mask_h)
+		return false;
+	return c->hit_mask[ty * c->hit_mask_w + tx] != 0;
 }
 
 static void drag_state_reset(void)
@@ -121,7 +159,28 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	// Парты погашенного СЛОЯ невидимы по той же причине: пока открыта бэк-сцена,
 	// экран игры спрятан целиком (SetComponentShow с ID контроллера), и его кнопки не
 	// должны перехватывать клики у вьювера.
+	// ПОИМЁННО погашенная часть (`SetShow(0)`) — тоже: раз её не рисует render_parts,
+	// она не может и перехватывать курсор. Без этого условия на титуле Dohna НИ ОДНА
+	// кнопка не получала hover: над экраном висят полноэкранные (1280x720) части
+	// перехода 1000001031/1000001032 с `z = INT_MAX`/`INT_MAX-1` и `表示 = 0`; первая
+	// же из них в обходе front-to-back давала hit и ставила hover_consumed, съедая
+	// курсор у всего экрана (clicked_parts не становился ненулевым никогда).
+	// Непостроенный `構築パーツ` (construction_mask) render_parts тоже пропускает: он
+	// служит только прямоугольной маской альфа-клиппера, а по своей же процедуре
+	// построения его поверхность ПРОЗРАЧНА (см. construction_mask в parts_internal.h).
+	// Прозрачную маску курсор обязан проходить насквозь: на титуле Dohna такая часть
+	// (90000041, `表示 = 1`, 1480x920 при экране 1280x720, z поверх всего меню) была
+	// вторым слоем той же поломки — она перехватывала курсор у кнопок уже ПОСЛЕ того,
+	// как перестали мешать погашенные части перехода.
+	// Полностью прозрачная часть (`アルファ = 0`) невидима — и курсор проходит сквозь неё.
+	// Третий слой той же поломки на титуле Dohna: часть `Overlay` (90000040, CG
+	// `システム／タイトル／ぼかし` — размывка фона под всплывающими экранами) объявлена
+	// `表示 = 1`, но `アルファ = 0`, и полноэкранная (1280x720) поверх всего меню.
+	// Проверяем ТЕКУЩУЮ alpha, а не объявленную: игра проявляет размывку motion-фейдом,
+	// и как только она станет видимой, то и курсор обязана перехватывать.
 	bool is_hovered = parts->global.show
+		&& parts->global.alpha > 0
+		&& !parts->construction_mask
 		&& !parts_hidden_by_layer(parts)
 		&& parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos)
 		&& !*hover_consumed;
@@ -446,6 +505,13 @@ void PE_SendFixedEvent(int parts_no)
 void PE_SetPassCursor(int parts_no, bool pass)
 {
 	parts_get(parts_no)->pass_cursor = !!pass;
+}
+
+// `マウスカーソルピクセル判定` из раскладки (см. parts->pixel_hittest). В библиотеке
+// PartsEngine функции для этого нет — поле читает загрузчик раскладок act_build_part.
+void PE_SetPartsPixelHitTest(int parts_no, bool enable)
+{
+	parts_get(parts_no)->pixel_hittest = !!enable;
 }
 
 bool PE_GetPartsPassCursor(int parts_no)

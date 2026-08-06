@@ -53,6 +53,52 @@ static bool CGManager_GetInfo(struct string *cg_name, int *width, int *height, i
 	return true;
 }
 
+/*
+ * ★ФОРМЫ IXSEAL (v14). Библиотека переименовала и раздробила запросы метрик, а
+ * линковка идёт ПО ИМЕНИ, поэтому это чистое добавление — старые `IsExist`/
+ * `GetInfo` остаются нетронутыми (у Tsumamigui 3 объявлены ровно они две,
+ * у Dohna — ровно четыре новые; тул ainlibbyname):
+ *   v7:  bool IsExist(string)          bool GetInfo(string, ref int ×3, ref bool ×2)
+ *   v14: bool IsExistCG(string)        void GetSize(string, wrap<int>, wrap<int>)
+ *                                      int  GetWidth(string) / GetHeight(string)
+ * Первым же сайтом стал `Ａ＿ＣＧ存在確認` <- PartsHelper::ExistsCg <-
+ * AdvNamePlate@IsExistFaceCg: табличка с именем говорящего проверяет, есть ли
+ * у персонажа портрет-лицо.
+ *
+ * Несуществующий CG: размеры 0 (а не мусор из неинициализированной метрики) —
+ * ровно то, что видит игра, когда спрашивает размер отсутствующего файла.
+ */
+static bool CGManager_IsExistCG(struct string *cg_name)
+{
+	return CGManager_IsExist(cg_name);
+}
+
+static void CGManager_GetSize(struct string *cg_name, int *width, int *height)
+{
+	struct cg_metrics metrics;
+	if (!cg_name || !asset_cg_get_metrics_by_name(cg_name->text, &metrics)) {
+		if (width) *width = 0;
+		if (height) *height = 0;
+		return;
+	}
+	if (width) *width = metrics.w;
+	if (height) *height = metrics.h;
+}
+
+static int CGManager_GetWidth(struct string *cg_name)
+{
+	int w = 0, h;
+	CGManager_GetSize(cg_name, &w, &h);
+	return w;
+}
+
+static int CGManager_GetHeight(struct string *cg_name)
+{
+	int w, h = 0;
+	CGManager_GetSize(cg_name, &w, &h);
+	return h;
+}
+
 //static int CGManager_GetCountOfDataFromArchive(void);
 //static void CGManager_GetTitleByIndexFromArchive(int index, struct string **cg_name);
 //static int CGManager_SearchTitleFromArchive(struct string *cg_name);
@@ -66,6 +112,10 @@ HLL_LIBRARY(CGManager,
 	    HLL_EXPORT(LoadArchive, CGManager_LoadArchive),
 	    HLL_EXPORT(IsExist, CGManager_IsExist),
 	    HLL_EXPORT(GetInfo, CGManager_GetInfo),
+	    HLL_EXPORT(IsExistCG, CGManager_IsExistCG),
+	    HLL_EXPORT(GetSize, CGManager_GetSize),
+	    HLL_EXPORT(GetWidth, CGManager_GetWidth),
+	    HLL_EXPORT(GetHeight, CGManager_GetHeight),
 	    HLL_TODO_EXPORT(GetCountOfDataFromArchive, CGManager_GetCountOfDataFromArchive),
 	    HLL_TODO_EXPORT(GetTitleByIndexFromArchive, CGManager_GetTitleByIndexFromArchive),
 	    HLL_TODO_EXPORT(SearchTitleFromArchive, CGManager_SearchTitleFromArchive),

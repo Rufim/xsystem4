@@ -25,6 +25,7 @@ struct string;
 // parts.c
 void PE_enable_multi_controller(void);
 void PE_set_message_empty_type_minus_one(void);
+void PE_set_message_types_ixseal(void);
 bool PE_Init(void);
 void PE_Reset(void);
 // Текстовые поля ввода (TextBox/MultiTextBox) живут в src/hll/PartsEngine.c,
@@ -37,12 +38,18 @@ void PE_Update(int passed_time, bool message_window_show);
 void PE_UpdateComponent(int passed_time);
 void PE_UpdateParts(int passed_time, bool is_skip, bool message_window_show);
 void PE_SetDelegateIndex(int parts_no, int delegate_index);
+void PE_SetEventID(int parts_no, int delegate_index, int unique_id);
 int PE_GetDelegateIndex(int parts_no);
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state);
 bool PE_SetPartsCG_by_index(int parts_no, int cg_no, int sprite_deform, int state);
 bool PE_SetPartsCG_by_string_index(int parts_no, struct string *cg_no,
 		int sprite_deform, int state);
 void PE_GetPartsCGName(int parts_no, struct string **cg_name, int state);
+int PE_GetPartsCGDeform(int parts_no, int state);
+void PE_SetComponentReverseLR(int parts_no, bool reverse);
+void PE_SetComponentReverseTB(int parts_no, bool reverse);
+bool PE_GetComponentReverseLR(int parts_no);
+bool PE_GetComponentReverseTB(int parts_no);
 bool PE_SetPartsCGSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
 void PE_GetPartsCGSurfaceArea(int parts_no, int *x, int *y, int *w, int *h, int state);
 int PE_GetPartsCGNumber(int parts_no, int state);
@@ -69,6 +76,10 @@ bool PE_SetNumeralLinkedCGNumberWidthWidthList(int parts_no, struct string *cg_n
 		int w0, int w1, int w2, int w3, int w4, int w5, int w6, int w7, int w8,
 		int w9, int w_minus, int w_comma, int state);
 bool PE_SetNumeralNumber(int parts_no, int n, int state);
+int PE_GetNumeralNumber(int parts_no, int state);
+bool PE_IsNumeralShowComma(int parts_no, int state);
+int PE_GetNumeralSpace(int parts_no, int state);
+int PE_GetNumeralLength(int parts_no, int state);
 bool PE_SetNumeralShowComma(int parts_no, bool show_comma, int state);
 bool PE_SetNumeralSpace(int parts_no, int space, int state);
 bool PE_SetNumeralLength(int parts_no, int length, int state);
@@ -102,6 +113,10 @@ void PE_SetPartsOriginPosMode(int parts_no, int origin_pos_mode);
 int PE_GetPartsOriginPosMode(int parts_no);
 void PE_SetParentPartsNumber(int parts_no, int parent_parts_no);
 int PE_GetParentPartsNumber(int parts_no);
+int PE_NumofChild(int parts_no);
+int PE_GetChild(int parts_no, int index);
+int PE_GetChildIndex(int parts_no, int child_no);
+void PE_ClearChild(int parts_no);
 bool PE_SetPartsGroupNumber(int parts_no, int group_no);
 void PE_SetPartsMessageWindowShowLink(int parts_no, bool message_window_show_link);
 bool PE_GetPartsMessageWindowShowLink(int parts_no);
@@ -123,6 +138,10 @@ bool PE_SetThumbnailReductionSize(int reduction_size);
 bool PE_SetThumbnailMode(bool Mode);
 void PE_SetComponentType(int parts_no, int type, int state);
 int PE_GetComponentType(int parts_no, int state);
+void PE_SetUserComponentName(int parts_no, struct string *name);
+struct string *PE_GetUserComponentName(int parts_no);
+void PE_SetUserComponentData(int parts_no, struct string *key, struct string *value);
+struct string *PE_GetUserComponentData(int parts_no, struct string *key);
 void PE_SetInputState(int parts_no, int state);
 void PE_SetComponentEnableClipArea(int parts_no, bool enable);
 bool PE_IsComponentEnableClipArea(int parts_no);
@@ -215,6 +234,7 @@ bool PE_AddDrawTextToPartsConstructionProcess(int parts_no, int x, int y, struct
 		int char_space, int line_space, int state);
 bool PE_BuildPartsConstructionProcess(int parts_no, int state);
 bool PE_ClearPartsConstructionProcess(int parts_no, int state);
+void PE_SetPartsConstructionFill(int parts_no, int w, int h, int state);
 bool PE_SetPartsConstructionSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
 
 // input.c
@@ -223,6 +243,7 @@ void PE_SetPassCursor(int parts_no, bool pass);
 bool PE_GetPartsPassCursor(int parts_no);
 void PE_SetClickable(int parts_no, bool clickable);
 void PE_SetPartsIsButton(int parts_no, bool is_button);
+void PE_SetPartsPixelHitTest(int parts_no, bool enable);
 void PE_SetEnableInputProcess(int parts_no, bool enable);
 bool PE_IsEnableInputProcess(int parts_no);
 void PE_SetPartsWheelable(int parts_no, bool wheelable);
@@ -262,6 +283,7 @@ void PE_PopMessage(void);
 int PE_GetMessageType(void);
 int PE_GetMessagePartsNumber(void);
 int PE_GetMessageDelegateIndex(void);
+int PE_GetMessageUniqueID(void);
 int PE_GetMessageVariableCount(void);
 int PE_GetMessageVariableType(int index);
 int PE_GetMessageVariableInt(int index);
@@ -397,5 +419,63 @@ int PE_get_layoutbox_padding_top(int parts_no);
 int PE_get_layoutbox_padding_bottom(int parts_no);
 int PE_get_layoutbox_padding_left(int parts_no);
 int PE_get_layoutbox_padding_right(int parts_no);
+
+// message_window.c — окно реплик ADV (`メッセージウィンドウ`, тип компонента v14 = 10).
+void PE_CreateMessageWindow(int parts_no, int text_parts_no, int mark_parts_no);
+void PE_SetKeyWaitCGName(int parts_no, struct string *name, int start_no, int nr_cg, int time_per_cg);
+void PE_GetKeyWaitCGName(int parts_no, struct string **name, int *start_no, int *nr_cg, int *time_per_cg);
+void PE_SetKeyWaitFlatName(int parts_no, struct string *name);
+struct string *PE_GetKeyWaitFlatName(int parts_no);
+void PE_SetKeyWaitPos(int parts_no, int x, int y, int z);
+int PE_GetKeyWaitPosX(int parts_no);
+int PE_GetKeyWaitPosY(int parts_no);
+int PE_GetKeyWaitPosZ(int parts_no);
+void PE_SetKeyWaitShow(int parts_no, bool show);
+bool PE_IsKeyWaitShow(int parts_no);
+void PE_SetMessageWindowActive(int parts_no, bool active);
+void PE_SetMessageWindowInactiveMultipleColor(int parts_no, int r, int g, int b);
+int PE_GetMessageWindowInactiveMultipleColorR(int parts_no);
+int PE_GetMessageWindowInactiveMultipleColorG(int parts_no);
+int PE_GetMessageWindowInactiveMultipleColorB(int parts_no);
+void PE_SetMessageWindowCGName(int parts_no, struct string *name);
+struct string *PE_GetMessageWindowCGName(int parts_no);
+void PE_SetMessageWindowFlatName(int parts_no, struct string *name);
+struct string *PE_GetMessageWindowFlatName(int parts_no);
+void PE_SetMessageWindowFlatShowWaitFrameNumber(int parts_no, int frame);
+int PE_GetMessageWindowFlatShowWaitFrameNumber(int parts_no);
+bool PE_IsOverMessageWindowFlatShowWaitFrame(int parts_no);
+bool PE_BackMessageWindowFlatBeginFrame(int parts_no);
+bool PE_StepMessageWindowFlatFinalFrame(int parts_no);
+void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
+                             struct string *func_name, int ver, int step);
+struct string *PE_GetMessageWindowText(int parts_no);
+void PE_FixMessageWindowText(int parts_no);
+bool PE_IsFixedMessageWindowText(int parts_no);
+void PE_SetMessageWindowTextArea(int parts_no, int x, int y, int w, int h);
+void PE_GetMessageWindowTextArea(int parts_no, int *x, int *y, int *w, int *h);
+void PE_SetMessageWindowTextOriginPosMode(int parts_no, int mode);
+int PE_GetMessageWindowTextOriginPosMode(int parts_no);
+void PE_SetMessageWindowTextFont(int parts_no, int type, int size, int r, int g, int b,
+                                 float bold_weight, int edge_r, int edge_g, int edge_b,
+                                 float edge_weight);
+void PE_GetMessageWindowTextFont(int parts_no, int *type, int *size, int *r, int *g, int *b,
+                                 float *bold_weight, int *edge_r, int *edge_g, int *edge_b,
+                                 float *edge_weight);
+void PE_SetMessageWindowTextSpeed(int parts_no, int speed);
+int PE_GetMessageWindowTextSpeed(int parts_no);
+void PE_SetMessageWindowTextSpace(int parts_no, int letter_space, int line_space);
+void PE_GetMessageWindowTextSpace(int parts_no, int *letter_space, int *line_space);
+void PE_SetMessageWindowRubyFont(int parts_no, int type, int size, int r, int g, int b,
+                                 float bold_weight, int edge_r, int edge_g, int edge_b,
+                                 float edge_weight);
+void PE_GetMessageWindowRubyFont(int parts_no, int *type, int *size, int *r, int *g, int *b,
+                                 float *bold_weight, int *edge_r, int *edge_g, int *edge_b,
+                                 float *edge_weight);
+void PE_SetMessageWindowRubyCharSpace(int parts_no, int space);
+int PE_GetMessageWindowRubyCharSpace(int parts_no);
+void PE_SetMessageWindowRubyLineSpace(int parts_no, int space);
+int PE_GetMessageWindowRubyLineSpace(int parts_no);
+void PE_SetEnableMessageWindowTextWrapping(int parts_no, bool enable);
+bool PE_IsEnableMessageWindowTextWrapping(int parts_no);
 
 #endif /* SYSTEM4_PARTS_H */

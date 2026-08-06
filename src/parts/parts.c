@@ -64,6 +64,7 @@ static void parts_init(struct parts *parts)
 	parts->local = PARTS_PARAMS_INITIALIZER;
 	parts->global = PARTS_PARAMS_INITIALIZER;
 	parts->delegate_index = -1;
+	parts->event_unique_id = -1;
 	parts->want_save = true;
 	// Игра зовёт SetWantSaveBackScene только с enable=0 (пять мест в байткоде) ⇒ дефолт «да».
 	parts->want_save_back_scene = true;
@@ -178,12 +179,18 @@ bool parts_exists(int parts_no)
 
 static void parts_state_free(struct parts_state *state)
 {
+	// Маска попиксельного hit-теста привязана к текстуре состояния, которую этот
+	// switch и удаляет — иначе после смены CG остался бы кэш от прежней картинки.
+	free(state->common.hit_mask);
+	state->common.hit_mask = NULL;
+	state->common.hit_mask_w = state->common.hit_mask_h = 0;
 	switch (state->type) {
 	case PARTS_UNINITIALIZED:
 	case PARTS_RECT_DETECTION:
 	case PARTS_LAYOUT_BOX:
 		break;
 	case PARTS_CG:
+	case PARTS_CG_DETECTION:
 		gfx_delete_texture(&state->common.texture);
 		if (state->cg.name)
 			free_string(state->cg.name);
@@ -276,6 +283,7 @@ void parts_state_reset(struct parts_state *state, enum parts_type type)
 		break;
 	case PARTS_UNINITIALIZED:
 	case PARTS_CG:
+	case PARTS_CG_DETECTION:
 	case PARTS_ANIMATION:
 	case PARTS_FLASH:
 	case PARTS_FLAT:
@@ -434,6 +442,12 @@ static void parts_common_recalculate_hitbox(struct parts *parts, struct parts_co
 			.h = common->h,
 		};
 	}
+	// У окна реплик служебная часть текста стоит от УГЛА окна, а не от его точки
+	// привязки, поэтому её позицию надо пересчитывать вместе с origin_offset —
+	// то есть при смене размера, позиции и 原点座標モード. Это единственная воронка,
+	// через которую проходят все три события.
+	if (parts->mw)
+		parts_message_window_relayout(parts);
 }
 
 void parts_recalculate_hitbox(struct parts *parts)
@@ -1025,6 +1039,8 @@ void parts_release(int parts_no)
 	struct parts *parts = slot->value;
 	parts_input_reset_drag(parts);
 	parts_clear_motion(parts);
+	parts_message_window_free(parts->mw);
+	parts->mw = NULL;
 	for (int i = 0; i < PARTS_NR_STATES; i++) {
 		parts_state_free(&parts->states[i]);
 	}
@@ -1053,12 +1069,14 @@ void parts_debug_dump(void)
 	int n = 0;
 	PARTS_LIST_FOREACH(p) {
 		Rectangle *hb = &p->states[0].common.hitbox;
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
-		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y);
+		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
+		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
+		       p->global.alpha);
 		n++;
 	}
 	NOTICE("parts_debug_dump: %d parts total", n);
@@ -1241,6 +1259,27 @@ int PE_GetDelegateIndex(int parts_no)
 	return parts ? parts->delegate_index : -1;
 }
 
+// Ixseal-форма привязки обработчика к части. Имена аргументов взяты из .ain
+// (`ainfnsig` по обёртке `parts::detail::SetEventID` fno 9144):
+// `SetEventID(partsNumber, delegateIndex, uniqueID)` — то есть это и есть
+// «SetDelegateIndex» новых игр, только вместе с идентификатором набора
+// обработчиков. Оба значения обязательны: `CPartsMessageManager@CallDelegate`
+// (@0x2c6eb6) сначала требует, чтобы `GetMessageDelegateIndex` был валидным
+// индексом в его списке наборов, а затем — чтобы `GetMessageUniqueID` совпал с
+// `GetUniqueID` найденного набора; иначе он молча возвращает false, и клик по
+// кнопке не диспатчится (так на титуле Dohna не работал ни один пункт меню).
+void PE_SetEventID(int parts_no, int delegate_index, int unique_id)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT SetEventID(parts=%d, delegate=%d, uid=%d)",
+		       parts_no, delegate_index, unique_id);
+	parts->delegate_index = delegate_index;
+	parts->event_unique_id = unique_id;
+}
+
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state)
 {
 	if (!parts_state_valid(--state))
@@ -1320,6 +1359,58 @@ void PE_GetPartsCGName(int parts_no, struct string **cg_name, int state)
 			free_string(*cg_name);
 		*cg_name = string_dup(cg->name);
 	}
+}
+
+/*
+ * Пара к четвёртому аргументу PE_SetPartsCG (`sprite_deform`): 0 — без
+ * искажения, 1 — отражение по горизонтали, 2 — по вертикали (так его и
+ * трактует render_parts). Сеттер значение хранит по-настоящему и оно даже
+ * попадает в сейв, а геттер отсутствовал — на нём вставала ADV-сцена Dohna:
+ * `CCGParts@ReverseLR::get` — это ровно `Deform::get() == 1`
+ * (@0x2fc18a: CALLMETHOD Deform; PUSH 1; EQUALE), и его читает
+ * `CCGParts@CGName::set`, чтобы восстановить отражение после смены CG.
+ * Функция объявлена и у Tsumamigui 3 (fn411), т.е. это не разница версий, а
+ * пробел движка для обеих.
+ *
+ * Аргумент состояния движок не различает: deform хранится на САМОЙ ЧАСТИ (так
+ * же его пишет сеттер, читает рендер и сохраняет parts/save.c), а не в
+ * состоянии.
+ */
+int PE_GetPartsCGDeform(int parts_no, possibly_unused int state)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->sprite_deform : 0;
+}
+
+/*
+ * `SetComponentReverseLR/TB` (v14, у Tsumamigui 3 не объявлены вовсе) —
+ * НЕЗАВИСИМЫЕ флаги зеркалирования части по каждой оси. Отдельны от
+ * `sprite_deform`: тот одним числом 0/1/2 обе оси сразу выразить не может, а
+ * игра ставит их порознь (`parts::detail::CParts@ReverseLR::set` ←
+ * `CSpriteParts@ReverseLR::set` ← `AdvStandImage@Reverse::set` — зеркалирование
+ * стоячего спрайта персонажа в ADV-сцене). У обоих есть геттер, значит свойство
+ * обязано храниться по-настоящему; рендер складывает их с `sprite_deform`.
+ */
+void PE_SetComponentReverseLR(int parts_no, bool reverse)
+{
+	parts_get(parts_no)->reverse_lr = reverse;
+}
+
+void PE_SetComponentReverseTB(int parts_no, bool reverse)
+{
+	parts_get(parts_no)->reverse_tb = reverse;
+}
+
+bool PE_GetComponentReverseLR(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->reverse_lr : false;
+}
+
+bool PE_GetComponentReverseTB(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->reverse_tb : false;
 }
 
 bool PE_SetPartsCGSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
@@ -1678,6 +1769,52 @@ bool PE_SetNumeralNumber(int parts_no, int n, int state)
 	return parts_numeral_set_number(parts, numeral, n);
 }
 
+/*
+ * Геттеры числовой части. `Parts_GetNumeralNumber` обязателен не «для полноты»:
+ * motion-движок читает ТЕКУЩЕЕ значение как начало интерполяции
+ * (`Motion::Executer@GetValue<int>` ← `CNumeralParts@Number::get`), поэтому без
+ * него первая же анимация счётчика денег на домашнем экране уходила в REPL.
+ */
+int PE_GetNumeralNumber(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return 0;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts || parts->states[state].type != PARTS_NUMERAL)
+		return 0;
+	return parts->states[state].num.num;
+}
+
+bool PE_IsNumeralShowComma(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts || parts->states[state].type != PARTS_NUMERAL)
+		return false;
+	return parts->states[state].num.show_comma;
+}
+
+int PE_GetNumeralSpace(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return 0;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts || parts->states[state].type != PARTS_NUMERAL)
+		return 0;
+	return parts->states[state].num.space;
+}
+
+int PE_GetNumeralLength(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return 0;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts || parts->states[state].type != PARTS_NUMERAL)
+		return 0;
+	return parts->states[state].num.length;
+}
+
 bool PE_SetNumeralShowComma(int parts_no, bool show_comma, int state)
 {
 	if (!parts_state_valid(--state))
@@ -1937,12 +2074,108 @@ void PE_SetParentPartsNumber(int parts_no, int parent_parts_no)
 	parts_component_dirty(parts);
 }
 
+/*
+ * Перечисление ПОТОМКОВ (`NumofChild`/`GetChild`/`GetChildIndex`/`ClearChild`).
+ * Апстрим отдавал 0/-1 заглушками, и на этом стоял ВЕСЬ обход дерева
+ * активности: `activity::detail::CallUserComponentEventWithChild` (@0x29280)
+ * спускается от «ルートパーツ» по `IParts@GetChild`, ищет части с типом
+ * компонента 17 и создаёт для них экземпляры пользовательских компонентов.
+ * Пустой список = ни одного созданного компонента = null у `GetUserComponent`.
+ *
+ * «Действующий» родитель — pending: назначение через PE_SetParentPartsNumber
+ * откладывается до ближайшего UpdateComponent (dirty-очередь), а игра
+ * спрашивает потомков СРАЗУ после загрузки раскладки, до апдейта.
+ *
+ * Порядок — обход общего списка частей (по z), а не TAILQ children: он один и
+ * тот же для Numof/Get/GetChildIndex, чего требует их совместное употребление.
+ */
+static int parts_effective_parent_no(struct parts *p)
+{
+	if (p->pending_parent >= 0)
+		return p->pending_parent;
+	return p->parent ? p->parent->no : -1;
+}
+
+int PE_NumofChild(int parts_no)
+{
+	int n = 0;
+	struct parts *p;
+	PARTS_LIST_FOREACH(p) {
+		if (parts_effective_parent_no(p) == parts_no)
+			n++;
+	}
+	return n;
+}
+
+int PE_GetChild(int parts_no, int index)
+{
+	if (index < 0)
+		return -1;
+	int n = 0;
+	struct parts *p;
+	PARTS_LIST_FOREACH(p) {
+		if (parts_effective_parent_no(p) != parts_no)
+			continue;
+		if (n == index)
+			return p->no;
+		n++;
+	}
+	return -1;
+}
+
+int PE_GetChildIndex(int parts_no, int child_no)
+{
+	int n = 0;
+	struct parts *p;
+	PARTS_LIST_FOREACH(p) {
+		if (parts_effective_parent_no(p) != parts_no)
+			continue;
+		if (p->no == child_no)
+			return n;
+		n++;
+	}
+	return -1;
+}
+
+// Отвязать ВСЕХ потомков. Через PE_SetParentPartsNumber(-1) этого не сделать:
+// -1 в pending_parent означает «изменений нет», а не «нет родителя» (см. цикл
+// dirty-очереди), поэтому связь рвём напрямую.
+void PE_ClearChild(int parts_no)
+{
+	struct parts *parent = parts_try_get(parts_no);
+	struct parts *p;
+	PARTS_LIST_FOREACH(p) {
+		if (parts_effective_parent_no(p) != parts_no)
+			continue;
+		if (p->pending_parent == parts_no)
+			p->pending_parent = -1;
+		if (parent && p->parent == parent) {
+			TAILQ_REMOVE(&parent->children, p, child_list_entry);
+			p->parent = NULL;
+		}
+		parts_component_dirty(p);
+	}
+}
+
 int PE_GetParentPartsNumber(int parts_no)
 {
 	struct parts *parts = parts_get(parts_no);
 	if (parts->parent)
 		return parts->parent->no;
-	return -1;
+	// «Родителя нет» = 0, а НЕ -1. Внутри движка -1 (pending_parent, RemoveChild) —
+	// своя конвенция, но НАРУЖУ games ждут 0, и это доказано байткодом обеих версий:
+	//   Dohna v14 `AFL_Parts_GetLayerIDByParts` (@0x2b316c) идёт вверх по родителям
+	//     циклом `while (no != 0) { p = GetParent(no); if (p == 0) return no; no = p; }`;
+	//   Tsumamigui v7 `パーツ親メッセージウィンドウ設定取得` (@0x15fa34) —
+	//     `if (GetParent(GetParent(x)) == 0) return 0`.
+	// Номер части 0 не бывает валидным ни у одной из игр, поэтому 0 и есть «нет».
+	// С прежним -1 цикл Dohna не завершался НИКОГДА: `-1 != 0`, дальше
+	// `AFL_Parts_Wrap(-1)` (а parts_get(-1) ещё и СОЗДАВАЛ часть с номером -1),
+	// её родитель снова -1 — вечный цикл на 100% CPU с аллокацией обёртки
+	// CSpriteParts на каждом витке (RSS рос ~13 МБ/с, до 3.8 ГБ). Именно так
+	// зависал уход с титула Dohna: клик по «Start Game» → SceneTitle@TitleClose →
+	// EraseLayer → CallErasingLayerEvent → CModeMark@Init-лямбда → GetLayerIDByParts.
+	return 0;
 }
 
 bool PE_SetPartsGroupNumber(possibly_unused int PartsNumber, possibly_unused int GroupNumber)
@@ -2228,6 +2461,13 @@ void PE_SetComponentType(int parts_no, int type, int state)
 			parts_state_reset(&parts->states[state], PARTS_PANEL);
 		return;
 	}
+	// Место под чужую активность (`ユーザコンポーネント`, id 17): своего рендера
+	// нет, поэтому это ФЛАГ на обычной части, как у кнопки, а не вид состояния.
+	// Состояние не сбрасываем — потомков вешает сама игра.
+	if (shifted_component_types() && type == 17) {
+		parts->is_user_component = true;
+		return;
+	}
 	// Кнопка (id 0 в обеих нумерациях): у движка это не отдельный вид рендера, а
 	// ФЛАГ на CG-части (`is_button`), который и отдаёт обратно PE_GetComponentType,
 	// — так же её помечает загрузчик раскладок. Состояние сбрасывать НЕЛЬЗЯ:
@@ -2250,6 +2490,7 @@ void PE_SetComponentType(int parts_no, int type, int state)
 	case 16: pt = PARTS_NUMERAL; break;
 	case 17: pt = PARTS_RECT_DETECTION; break;
 	case 18: pt = PARTS_CONSTRUCTION_PROCESS; break;
+	case 19: pt = PARTS_CG_DETECTION; break;
 	case 20: pt = PARTS_FLAT; break;
 	case 21: pt = PARTS_3DLAYER; break;
 	case 22: pt = PARTS_MOVIE; break;
@@ -2274,6 +2515,12 @@ int PE_GetComponentType(int parts_no, int state)
 	if (parts->is_button)
 		return 0;
 
+	// Место под чужую активность: игра ищет его сравнением
+	// `CActivityWrap@CompParts(имя, 17, 1)` (@0x1fd54), т.е. тип обязан быть
+	// ровно 17 в нумерации v14 (сдвиг её не касается — он начинается с 18).
+	if (parts->is_user_component)
+		return 17;
+
 	// Панель — виджет из v14-части перечисления: её id 14 НЕ сдвигается
 	// (сдвиг касается только классического семейства パーツ, id 18+).
 	if (parts->states[state].type == PARTS_PANEL)
@@ -2293,6 +2540,7 @@ int PE_GetComponentType(int parts_no, int state)
 	case PARTS_NUMERAL: classic = 16; break;
 	case PARTS_RECT_DETECTION: classic = 17; break;
 	case PARTS_CONSTRUCTION_PROCESS: classic = 18; break;
+	case PARTS_CG_DETECTION: classic = 19; break;
 	case PARTS_FLAT: classic = 20; break;
 	case PARTS_3DLAYER: classic = 21; break;
 	case PARTS_MOVIE: classic = 22; break;
@@ -2548,6 +2796,66 @@ void PE_InitPartsCheckBox(int parts_no, struct string *cg_base, bool checked)
 	parts_checkbox_reload_cg(parts);
 }
 
+/*
+ * `ユーザコンポーネント` — см. комментарий у полей в parts_internal.h. Имя и
+ * набор «ключ→значение» просто хранятся: их кладёт загрузчик раскладки из узла
+ * 種類別情報, а читает игра (`parts::detail::CUserComponentParts@ComponentName::get`
+ * @0x3bd0ac и `@GetTextData` @0x3bd1e4), чтобы найти зарегистрированный класс
+ * компонента и создать его экземпляр поверх этой части.
+ */
+void PE_SetUserComponentName(int parts_no, struct string *name)
+{
+	struct parts *parts = parts_get(parts_no);
+	parts->is_user_component = true;
+	if (parts->user_component_name)
+		free_string(parts->user_component_name);
+	parts->user_component_name = name ? string_ref(name) : NULL;
+}
+
+struct string *PE_GetUserComponentName(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return string_ref(parts && parts->user_component_name
+			? parts->user_component_name : &EMPTY_STRING);
+}
+
+void PE_SetUserComponentData(int parts_no, struct string *key, struct string *value)
+{
+	if (!key)
+		return;
+	struct parts *parts = parts_get(parts_no);
+	for (int i = 0; i < parts->nr_user_component_data; i++) {
+		if (strcmp(parts->user_component_data[i].key->text, key->text))
+			continue;
+		free_string(parts->user_component_data[i].value);
+		parts->user_component_data[i].value =
+			string_ref(value ? value : &EMPTY_STRING);
+		return;
+	}
+	parts->user_component_data = xrealloc_array(parts->user_component_data,
+		parts->nr_user_component_data, parts->nr_user_component_data + 1,
+		sizeof(struct parts_uc_data));
+	parts->user_component_data[parts->nr_user_component_data].key = string_ref(key);
+	parts->user_component_data[parts->nr_user_component_data].value =
+		string_ref(value ? value : &EMPTY_STRING);
+	parts->nr_user_component_data++;
+}
+
+struct string *PE_GetUserComponentData(int parts_no, struct string *key)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	struct string *found = &EMPTY_STRING;
+	if (parts && key) {
+		for (int i = 0; i < parts->nr_user_component_data; i++) {
+			if (!strcmp(parts->user_component_data[i].key->text, key->text)) {
+				found = parts->user_component_data[i].value;
+				break;
+			}
+		}
+	}
+	return string_ref(found);
+}
+
 // Toggle on user click; the game reads the new state via IsCheckBoxChecked.
 void parts_checkbox_toggle(struct parts *parts)
 {
@@ -2633,10 +2941,33 @@ bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state)
 	return true;
 }
 
+/*
+ * `ＣＧ判定パーツ`: hit-область по форме картинки. Картинку грузим как обычно,
+ * но состояние помечаем PARTS_CG_DETECTION — рендер такое состояние пропускает,
+ * а hit-тест идёт по непрозрачным пикселям текстуры (тот же путь, что у
+ * `マウスカーソルピクセル判定`). Игра ищет такие части сравнением типа компонента
+ * (`CActivityWrap@GetCGDetection` → CompParts(имя, 27, 1) у v14), поэтому одним
+ * лишь CG-состоянием обойтись нельзя: без своего типа `FooterButton.jaf:53`
+ * ронял игру ассертом «(nonnull) m_act.GetCGDetection("Detector")».
+ */
 bool PE_SetPartsCGDetectionSize(int parts_no, struct string *cg_name, int state)
 {
-	UNIMPLEMENTED("(%d, %s, %d)", parts_no, display_sjis0(cg_name->text), state);
-	return false;
+	if (!parts_state_valid(--state))
+		return false;
+	struct parts *parts = parts_get(parts_no);
+	if (!cg_name || *(cg_name->text) == '\0') {
+		parts_state_reset(&parts->states[state], PARTS_CG_DETECTION);
+		parts_dirty(parts);
+		return true;
+	}
+	// Грузим CG обычным путём (он выставит размеры состояния), затем меняем тип
+	// состояния на «только определение попадания»: parts_state_reset тут звать
+	// нельзя — он же и снёс бы только что загруженную текстуру.
+	struct parts_cg *cg = parts_get_cg(parts, state);
+	bool ok = parts_cg_set(parts, cg, cg_name);
+	parts->states[state].type = PARTS_CG_DETECTION;
+	parts_dirty(parts);
+	return ok;
 }
 
 int PE_GetFreeNumber(void)

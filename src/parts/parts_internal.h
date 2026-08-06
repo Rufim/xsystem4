@@ -110,7 +110,15 @@ enum parts_type {
 	PARTS_3DLAYER,
 	// System 4 v14 (Ixseal): сплошной цветной прямоугольник (`パネル`).
 	PARTS_PANEL,
-#define PARTS_NR_TYPES (PARTS_PANEL+1)
+	/*
+	 * `ＣＧ判定パーツ` (классический id 19) — область попадания, заданная
+	 * НЕПРОЗРАЧНЫМИ ПИКСЕЛЯМИ картинки. Родня `PARTS_RECT_DETECTION`: сама
+	 * часть НЕ рисуется, но её текстура задаёт форму hit-области. Хранится в
+	 * том же `struct parts_cg`, что и обычная картинка (имя + текстура), —
+	 * различие только в типе состояния и в том, что рендер её пропускает.
+	 */
+	PARTS_CG_DETECTION,
+#define PARTS_NR_TYPES (PARTS_CG_DETECTION+1)
 };
 
 struct parts_common {
@@ -119,6 +127,12 @@ struct parts_common {
 	Point origin_offset;
 	Rectangle hitbox;
 	Rectangle surface_area;
+	// Кэш маски попиксельного hit-теста (см. parts->pixel_hittest): 1 байт на
+	// пиксель, !=0 = непрозрачный. Строится ЛЕНИВО из текстуры при первом
+	// попадании в hitbox и живёт до parts_state_free — читать альфу с GPU каждый
+	// кадр нельзя (glReadPixels синхронизирует конвейер).
+	uint8_t *hit_mask;
+	int hit_mask_w, hit_mask_h;
 };
 
 struct parts_cg {
@@ -410,6 +424,8 @@ struct parts_params {
 	SDL_Color multiply_color;
 };
 
+struct parts_message_window;
+
 struct parts {
 	struct sprite sp;
 	enum parts_state_type state;
@@ -424,7 +440,17 @@ struct parts {
 	int dirty;
 	int no;
 	int delegate_index;
+	// `uniqueID` из SetEventID: идентификатор набора обработчиков, который игровой
+	// CPartsMessageManager сверяет с сообщением (см. PE_SetEventID). Дефолт -1.
+	int event_unique_id;
 	int sprite_deform;
+	// `SetComponentReverseLR/TB` (v14): НЕЗАВИСИМЫЕ флаги зеркалирования части по
+	// горизонтали и вертикали. Отдельны от `sprite_deform` (0/1/2), потому что тот
+	// одним числом обе оси выразить не может, а игра ставит их порознь
+	// (`parts::detail::CParts@ReverseLR::set` ← `CSpriteParts` ← `AdvStandImage`),
+	// и у обоих есть геттер. В рендере складываются с `sprite_deform`.
+	bool reverse_lr;
+	bool reverse_tb;
 	bool clickable;
 	// True for activity "button" parts (パーツタイプ=0) created by ReadActivityFile.
 	// Such parts render as CG (hover/click state-switch) but must report component
@@ -438,6 +464,15 @@ struct parts {
 	// видно на экране. Флаг убирает такую часть из отрисовки, оставляя текстуру
 	// доступной клипперу (он читает её напрямую, независимо от show).
 	bool construction_mask;
+	// `マウスカーソルピクセル判定` из раскладки: курсор попадает в часть только там, где
+	// её текстура НЕ прозрачна, а не по всему прямоугольнику. Без этого перекрывающиеся
+	// части воруют клик друг у друга: меню титула Dohna — восемь ДИАГОНАЛЬНЫХ полос,
+	// каждая лежит в текстуре 704x236 при своей видимой высоте ~91, и соседние боксы
+	// перекрываются вчетверо, так что клик по «Start Game» доставался «Load Game»
+	// (та выше по z). Гейт структурный и узкий: у Dohna флаг стоит у 13 частей из 2708
+	// по всем 195 раскладкам (8 кнопок титула, 4 в SceneHome, 1 в DungeonSelector),
+	// у Tsumamigui 3 — у 0 из 629, т.е. старые игры этим путём не идут вовсе.
+	bool pixel_hittest;
 	// Widget state for config-style screens (scrollbars/sliders and checkboxes).
 	// Not yet rendered as interactive widgets, but the game reads these back, so
 	// we store what it sets to keep the config UI logic consistent.
@@ -469,6 +504,23 @@ struct parts {
 	// ("<base>[／チェック]／通常|オン|ダウン"); clicking toggles checkbox_checked.
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
+	/*
+	 * `ユーザコンポーネント` (тип компонента v14 = 17) — часть-место, куда игровой
+	 * фреймворк подставляет ОТДЕЛЬНУЮ активность (шапка, футер, полоса фазы…).
+	 * Своего рендера у неё нет: содержимое создаёт сама игра и вешает потомками.
+	 * Движку нужно хранить ровно то, что у части спрашивают:
+	 *   `ユーザコンポーネント名` → Get/SetUserComponentName (имя класса компонента),
+	 *   `データ` (плоский список «ключ, значение») → Get/SetUserComponentData.
+	 * Обе пары есть в библиотеке ЦЕЛИКОМ (сеттер+геттер), поэтому свойства
+	 * обязаны храниться по-настоящему. У Tsumamigui 3 этих функций нет вовсе.
+	 */
+	bool is_user_component;
+	struct string *user_component_name;
+	struct parts_uc_data {
+		struct string *key;
+		struct string *value;
+	} *user_component_data;
+	int nr_user_component_data;
 	bool pass_cursor;
 	// PartsEngine.SetEnableInputProcess/IsEnableInputProcess: участвует ли часть в
 	// обработке ввода вообще. Отличается от clickable (право на клик) — это ГЛОБАЛЬНЫЙ
@@ -523,6 +575,63 @@ struct parts {
 	int margin_right;
 	struct parts_motion_list motion;
 	int controller_no;
+	// Окно реплик ADV (`パーツタイプ = メッセージウィンドウ`, тип компонента v14 = 10).
+	// Не NULL только у частей, построенных из такого узла раскладки; см.
+	// src/parts/message_window.c.
+	struct parts_message_window *mw;
+};
+
+/*
+ * Окно реплик ADV (`メッセージウィンドウ`) — тип части, которого у v6/v7 нет вовсе
+ * (проверено тулом ainlibbyname: у Tsumamigui 3 из 42 функций `*MessageWindow*`
+ * объявлены ровно две — `SetComponentMessageWindowShowLink`/`Is…`, то есть флаг
+ * привязки чужой части к окну, а самой части нет; у Dohna объявлены все 42).
+ *
+ * СОБРАНО ИЗ ГОТОВЫХ КИРПИЧЕЙ, А НЕ НОВЫМ `enum parts_type`: сама часть держит
+ * фон окна обычным состоянием `PARTS_CG`/`PARTS_FLAT`, а текст и «мигалку»
+ * ожидания клика несут ДВЕ служебные части-потомка. Так подсистема бесплатно
+ * получает всё, что уже работает у частей: якорь 原点座標モード, motion-анимации,
+ * альфу и乗算色 (они наследуются потомками через parts_update_global_*),
+ * альфа-клиппер, сохранение в сейв и метрики текста (те же, по которым выверено
+ * окно сообщений Tsumamigui 3). Отдельный тип части пришлось бы протаскивать
+ * через render/save/debug/hittest и дублировать там уже написанное.
+ *
+ * Раскладка узла (`種類別情報` в .pactex, напр. Scene/10_Adv/Main/
+ * AdvMessageWindow_event.pactex) один-в-один ложится на 42 HLL-функции:
+ * アクティブ→SetMessageWindowActive, ＣＧ名→…CGName, テキストエリア→…TextArea,
+ * 字速度→…TextSpeed, ルビ→…Ruby*, и т.д.
+ */
+struct parts_message_window {
+	bool active;
+	SDL_Color inactive_multiply_color;  // 非アクティブ時の乗算カラー
+	struct string *cg_name;             // ＣＧ名
+	struct string *flat_name;           // フラット名
+	int flat_show_wait_frames;          // フラット表示待ちフレーム数
+	Rectangle text_area;                // テキストエリア
+	int text_origin_pos_mode;           // テキスト位置
+	int text_speed;                     // 字速度
+	bool text_wrapping;                 // 折り返し
+	bool text_fixed;                    // текст проявлен целиком
+	// Идентичность реплики из SetMessageWindowText(…, MsgNum, FuncName, Ver, Step) —
+	// ею игра метит сообщение для 既読判定 (флага «прочитано»).
+	int msg_num;
+	struct string *msg_func_name;
+	int msg_ver, msg_step;
+	// Шрифт руби: своего носителя у него нет (служебная часть текста хранит только
+	// основной), поэтому лежит здесь.
+	struct text_style ruby_ts;
+	int ruby_char_space, ruby_line_space;
+	// キー待ちマーク — значок «жду клика». Хранится здесь, рисуется служебной
+	// частью-потомком; показом управляет игра (SetKeyWaitShow).
+	struct string *mark_cg_name;
+	struct string *mark_flat_name;
+	int mark_start_no, mark_nr_cg, mark_time_per_cg;  // ループＣＧ開始番号/枚数/切り替え時間
+	Point mark_pos;
+	int mark_z;
+	bool mark_show;
+	// Служебные части-потомки: текст и キー待ちマーク. -1 = не создана.
+	int text_parts_no;
+	int mark_parts_no;
 };
 
 #define PARTS_LIST_FOREACH(iter) TAILQ_FOREACH(iter, &parts_list, parts_list_entry)
@@ -750,6 +859,11 @@ void parts_flat_emitter_resolve_layer(
 
 // layoutbox.c
 void parts_do_layout(struct parts *parts);
+
+// message_window.c
+struct parts_message_window *parts_message_window_alloc(void);
+void parts_message_window_free(struct parts_message_window *mw);
+void parts_message_window_relayout(struct parts *parts);
 
 // debug.c
 struct sprite;
