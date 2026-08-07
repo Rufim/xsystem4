@@ -19,6 +19,10 @@
 #include "system4/cg.h"
 #include "system4/string.h"
 
+#include "system4/ain.h"
+#include "vm.h"
+#include "vm/heap.h"
+#include "vm/page.h"
 #include "xsystem4.h"
 #include "asset_manager.h"
 #include "parts.h"
@@ -29,6 +33,93 @@ static struct parts_construction_process *get_cproc(int parts_no, int state)
 	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
 		NOTICE("CP add-op on part=%d state=%d", parts_no, state);
 	return parts_get_construction_process(parts_get(parts_no), state);
+}
+
+/*
+ * `Parts_GetPartsConstructionProcessCount(number, state)` — сколько операций
+ * построения набрано у состояния. Игра спрашивает это, чтобы решить, есть ли что
+ * строить (и не пересобирать пустую процедуру). Считаем длину списка операций.
+ *
+ * Без функции игра валилась в debug-REPL и запускалась лишь костылём
+ * `XSYS4_LENIENT_HLL=1`, где заглушка отдавала 0 — то есть «строить нечего», что
+ * прямо противоречит набранным операциям.
+ */
+int PE_GetPartsConstructionProcessCount(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return 0;
+
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return 0;
+	struct parts_construction_process *cproc = &parts->states[state].cproc;
+	// Считаем по СЫРЬЮ: индексы должны совпадать с тем, что игра добавляла, а
+	// часть команд своей `parts_cp_op` не создаёт (у неизвестных нет обработчика).
+	// Процедуры из раскладок сырья не имеют — там остаётся длина списка операций.
+	if (cproc->nr_raw)
+		return cproc->nr_raw;
+	int n = 0;
+	struct parts_cp_op *op;
+	TAILQ_FOREACH(op, &cproc->ops, entry)
+		n++;
+	return n;
+}
+
+/*
+ * `GetPartsConstructionProcess(number, index, aInt, aFloat, aString, aPos, state)` —
+ * читает ОДНУ операцию построения обратно в четыре массива (игровая структура
+ * `CASConstructionProcess`). Нужна `parts::detail::GetConstructProcess`.
+ *
+ * Отдаём СЫРЬЁ, запомненное при добавлении (см. `PE_SaveConstructionRaw`): так
+ * чтение тождественно записи, и не приходится писать обратное преобразование для
+ * каждой из 25+ команд из уже разобранных `parts_cp_op`. Индексы согласованы с
+ * `GetPartsConstructionProcessCount`, который тоже считает по сырью.
+ *
+ * Процедуры, пришедшие из РАСКЛАДОК, сырья не имеют — для них массивы остаются
+ * пустыми (одноразовое предупреждение, чтобы это было видно, а не молча).
+ */
+void PE_GetPartsConstructionProcess(int parts_no, int index, struct page **a_int,
+		struct page **a_float, struct page **a_string, struct page **a_pos, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	struct parts_construction_process *cproc = &parts->states[state].cproc;
+	if (index < 0 || index >= cproc->nr_raw) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("GetPartsConstructionProcess(part=%d, index=%d): сырья нет "
+				"(набрано %d) — процедура из раскладки либо индекс вне списка",
+				parts_no, index, cproc->nr_raw);
+		}
+		return;
+	}
+	struct parts_cp_raw *r = &cproc->raw[index];
+	if (a_int) {
+		for (int i = 0; i < r->nr_ints; i++)
+			*a_int = array_pushback(*a_int, (union vm_value){ .i = r->ints[i] },
+						AIN_ARRAY_INT, -1);
+	}
+	if (a_float) {
+		for (int i = 0; i < r->nr_floats; i++)
+			*a_float = array_pushback(*a_float, (union vm_value){ .f = r->floats[i] },
+						  AIN_ARRAY_FLOAT, -1);
+	}
+	if (a_string) {
+		for (int i = 0; i < r->nr_strings; i++) {
+			int slot = vm_string_ref(r->strings[i] ? r->strings[i] : &EMPTY_STRING);
+			*a_string = array_pushback(*a_string, (union vm_value){ .i = slot },
+						   AIN_ARRAY_STRING, -1);
+		}
+	}
+	if (a_pos) {
+		for (int i = 0; i < r->nr_pos; i++)
+			*a_pos = array_pushback(*a_pos, (union vm_value){ .i = r->pos[i] },
+						AIN_ARRAY_INT, -1);
+	}
 }
 
 void parts_cp_op_free(struct parts_cp_op *op)
@@ -971,6 +1062,51 @@ bool PE_BuildPartsConstructionProcess(int parts_no, int state)
 	return r;
 }
 
+// Запомнить сырьё операции (см. struct parts_cp_raw): игра читает процедуру
+// обратно через GetPartsConstructionProcess, и отдавать надо ровно поданное.
+void PE_SaveConstructionRaw(int parts_no, int state, union vm_value *ints,
+		int nr_ints, union vm_value *floats, int nr_floats,
+		union vm_value *strings, int nr_strings, union vm_value *pos, int nr_pos)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	struct parts_construction_process *cproc = &parts->states[state].cproc;
+	cproc->raw = xrealloc_array(cproc->raw, cproc->nr_raw, cproc->nr_raw + 1,
+				   sizeof(*cproc->raw));
+	struct parts_cp_raw *r = &cproc->raw[cproc->nr_raw++];
+	r->nr_ints = nr_ints < 40 ? nr_ints : 40;
+	for (int i = 0; i < r->nr_ints; i++)
+		r->ints[i] = ints[i].i;
+	r->nr_floats = nr_floats < 2 ? nr_floats : 2;
+	for (int i = 0; i < r->nr_floats; i++)
+		r->floats[i] = floats[i].f;
+	r->nr_strings = nr_strings < 2 ? nr_strings : 2;
+	for (int i = 0; i < r->nr_strings; i++)
+		r->strings[i] = heap_get_string(strings[i].i)
+			? string_ref(heap_get_string(strings[i].i)) : NULL;
+	r->nr_pos = nr_pos;
+	r->pos = nr_pos ? xcalloc(nr_pos, sizeof(int)) : NULL;
+	for (int i = 0; i < nr_pos; i++)
+		r->pos[i] = pos[i].i;
+}
+
+static void parts_cp_free_raw(struct parts_construction_process *cproc)
+{
+	for (int i = 0; i < cproc->nr_raw; i++) {
+		for (int j = 0; j < cproc->raw[i].nr_strings; j++) {
+			if (cproc->raw[i].strings[j])
+				free_string(cproc->raw[i].strings[j]);
+		}
+		free(cproc->raw[i].pos);
+	}
+	free(cproc->raw);
+	cproc->raw = NULL;
+	cproc->nr_raw = 0;
+}
+
 bool parts_clear_construction_process(struct parts_construction_process *cproc)
 {
 	while (!TAILQ_EMPTY(&cproc->ops)) {
@@ -978,6 +1114,7 @@ bool parts_clear_construction_process(struct parts_construction_process *cproc)
 		TAILQ_REMOVE(&cproc->ops, op, entry);
 		parts_cp_op_free(op);
 	}
+	parts_cp_free_raw(cproc);
 	return true;
 }
 

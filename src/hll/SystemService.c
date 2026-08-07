@@ -65,6 +65,18 @@ static int SystemService_GetGameVersion(void)
 }
 
 /*
+ * Тип платформы, на которой запущена игра. У AliceSoft этим гейтятся платформенные
+ * различия (у DL-версий под Windows — обычный ПК-путь). Возвращаем 0: ровно это
+ * значение подставлял `XSYS4_LENIENT_HLL`, и на нём Haha Ranman отыгрывает титул и
+ * пролог; без функции же она валилась в debug-REPL на первом экране, то есть
+ * запустить её можно было только костылём.
+ */
+static int SystemService_GetPlatformType(void)
+{
+	return 0;
+}
+
+/*
  * Анти-тамппер: `main` сверяет строку версии рантайма System4 по фиксированным
  * позициям — склеивает несколько `String.GetPart(v, index, len)` и сравнивает со
  * своей строковой константой, а рядом требует `ToInt(v[i]) == ToInt(v[j])`. Не
@@ -946,6 +958,7 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(SetMixerVolume, mixer_set_volume),
 	    HLL_EXPORT(SetMixerMute, mixer_set_mute),
 	    HLL_EXPORT(GetGameVersion, SystemService_GetGameVersion),
+	    HLL_EXPORT(GetPlatformType, SystemService_GetPlatformType),
 	    HLL_EXPORT(GetGameVersionByText, SystemService_GetGameVersionByText),
 	    HLL_EXPORT(GetGameName, SystemService_GetGameName),
 	    HLL_EXPORT(AddURLMenu, SystemService_AddURLMenu),

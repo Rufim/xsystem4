@@ -3155,6 +3155,35 @@ void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate)
 	parts_hscrollbar_reposition(parts);
 }
 
+/*
+ * `横スライダーバー` (тип 13) — ВИДЖЕТ, а не `パーツ`: своего вида отрисовки у него
+ * нет, ползунок игра ведёт сама поверх обычной CG-части (см. PE_SetComponentType).
+ * Из всего слайдер-API Haha Ranman зовёт только долю прокрутки, поэтому храним её
+ * в том же поле, что у горизонтальной полосы прокрутки, и отдаём обратно —
+ * остальные функции слайдера не выдумываем, пока их не позовут.
+ *
+ * Без этой пары игра валилась в debug-REPL, и запускалась лишь костылём
+ * `XSYS4_LENIENT_HLL=1`.
+ */
+void PE_SetHSliderBarScrollRate(int parts_no, float rate)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	if (rate < 0.0f) rate = 0.0f;
+	if (rate > 1.0f) rate = 1.0f;
+	parts->hscroll_rate = rate;
+	// Если часть при этом ещё и полоса прокрутки — подвинуть ползунок как обычно.
+	if (parts->is_hscrollbar)
+		PE_SetPartsHScrollbarScrollRate(parts_no, rate);
+}
+
+float PE_GetHSliderBarScrollRate(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->hscroll_rate : 0.0f;
+}
+
 float PE_GetPartsHScrollbarScrollRate(int parts_no)
 {
 	struct parts *parts = parts_try_get(parts_no);

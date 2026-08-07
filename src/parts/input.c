@@ -354,11 +354,41 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	}
 }
 
+/*
+ * `SetEnableInput`/`IsEnableInput` — ГЛОБАЛЬНЫЙ гейт ввода партов (в отличие от
+ * пер-партового `SetEnableInputProcess`). Игра выключает его, пока идёт то, во что
+ * нельзя вмешиваться — переход между экранами, анимация, промотка, — и включает
+ * обратно; сама же читает его назад, поэтому значение надо ХРАНИТЬ, а не только
+ * учитывать.
+ *
+ * Пока функций не было, Haha Ranman валилась в debug-REPL, и запускалась только
+ * костылём `XSYS4_LENIENT_HLL=1` (заглушка отдавала 0 = «ввод выключен», что для
+ * `IsEnableInput` ещё и врёт).
+ */
+static bool parts_input_enabled = true;
+
+void PE_SetEnableInput(bool enable)
+{
+	parts_input_enabled = !!enable;
+	if (getenv("XSYS4_INPUT_TRACE"))
+		NOTICE("INPUT SetEnableInput(%d)", (int)parts_input_enabled);
+}
+
+bool PE_IsEnableInput(void)
+{
+	return parts_input_enabled;
+}
+
 void PE_UpdateInputState(int passed_time)
 {
 	Point cur_pos;
 	bool cur_clicking = key_is_down(VK_LBUTTON);
 	mouse_get_pos(&cur_pos.x, &cur_pos.y);
+
+	// Ввод выключен игрой — не наводим, не кликаем и не рассылаем сообщения.
+	// Позицию курсора при этом всё равно прочли: игра её опрашивает отдельно.
+	if (!parts_input_enabled)
+		return;
 
 	if (getenv("XSYS4_INPUT_TRACE")) {
 		static int ncalls = 0;

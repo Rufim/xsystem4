@@ -148,6 +148,10 @@ struct parts_text {
 	int line_space;
 	struct { float x; int y; } cursor;
 	struct text_style ts;
+	// `Parts_SetTextEnableTag`: разрешена ли РАЗМЕТКА в тексте этой части. Игра
+	// ставит флаг и читает обратно (`Parts_IsTextEnableTag`), поэтому хранить его
+	// обязательно. Сам разбор тегов движком пока не делается — см. PE_SetTextEnableTag.
+	bool enable_tag;
 };
 
 struct parts_animation {
@@ -335,9 +339,31 @@ struct parts_cp_op {
 	};
 };
 
+/*
+ * Сырьё одной операции построения — ровно то, что игра подала в
+ * `AddPartsConstructionProcess` (40 int / 2 float / 2 string / список точек).
+ * Хранится, чтобы `GetPartsConstructionProcess` мог отдать процедуру ОБРАТНО:
+ * восстанавливать эти массивы из уже разобранных `parts_cp_op` пришлось бы
+ * обратным преобразованием на каждую из 25+ команд, а сохранённое сырьё делает
+ * чтение тождественным записи.
+ */
+struct parts_cp_raw {
+	int nr_ints;
+	int ints[40];
+	int nr_floats;
+	float floats[2];
+	int nr_strings;
+	struct string *strings[2];
+	int nr_pos;
+	int *pos;
+};
+
 struct parts_construction_process {
 	struct parts_common common;
 	TAILQ_HEAD(, parts_cp_op) ops;
+	// Сырьё операций в порядке добавления (см. struct parts_cp_raw).
+	struct parts_cp_raw *raw;
+	int nr_raw;
 };
 
 enum parts_flash_blend_mode {

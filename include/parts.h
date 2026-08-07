@@ -272,8 +272,20 @@ void PE_SetPartsIsButton(int parts_no, bool is_button);
 void PE_SetPartsPixelHitTest(int parts_no, bool enable);
 void PE_SetEnableInputProcess(int parts_no, bool enable);
 bool PE_IsEnableInputProcess(int parts_no);
+void PE_SetEnableInput(bool enable);
+bool PE_IsEnableInput(void);
 void PE_SetPartsWheelable(int parts_no, bool wheelable);
 void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate);
+void PE_SetHSliderBarScrollRate(int parts_no, float rate);
+int PE_GetPartsConstructionProcessCount(int parts_no, int state);
+// Запомнить сырьё операции построения (см. struct parts_cp_raw в parts_internal.h):
+// игра читает процедуру обратно через GetPartsConstructionProcess.
+void PE_SaveConstructionRaw(int parts_no, int state, union vm_value *ints,
+		int nr_ints, union vm_value *floats, int nr_floats,
+		union vm_value *strings, int nr_strings, union vm_value *pos, int nr_pos);
+void PE_GetPartsConstructionProcess(int parts_no, int index, struct page **a_int,
+		struct page **a_float, struct page **a_string, struct page **a_pos, int state);
+float PE_GetHSliderBarScrollRate(int parts_no);
 float PE_GetPartsHScrollbarScrollRate(int parts_no);
 void PE_InitPartsHScrollbar(int parts_no, int base_x, int base_y,
 		int length, int width, int total, int view, float rate);
@@ -377,6 +389,8 @@ void PE_PauseMotion(bool pause);
 // text.c
 bool PE_SetText(int parts_no, struct string *text, int state);
 bool PE_AddPartsText(int parts_no, struct string *text, int state);
+void PE_SetTextEnableTag(int parts_no, bool enable, int state);
+bool PE_IsTextEnableTag(int parts_no, int state);
 struct string *PE_GetTextPartsText(int parts_no, int state);
 bool PE_SetPartsTextSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
 bool PE_SetFont(int parts_no, int type, int size, int r, int g, int b, float bold_weight, int edge_r, int edge_g, int edge_b, float edge_weight, int state);

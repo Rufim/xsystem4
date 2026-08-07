@@ -1219,6 +1219,10 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 		NOTICE("AddPartsConstructionProcess part=%d state=%d cmd=%d dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
 		       ints[0].i, ints[1].i, ints[2].i, ints[8].i, ints[9].i,
 		       ints[12].i, ints[13].i, ints[14].i, ints[15].i, ints[16].i, ints[17].i);
+	// Сырьё — для чтения процедуры обратно (см. parts_cp_save_raw). У классической
+	// формы номер части и состояние лежат в ints[0..1], точек нет.
+	PE_SaveConstructionRaw(ints[0].i, ints[1].i, ints, nr_ints, floats, nr_floats,
+			       strings, nr_strings, NULL, 0);
 	PartsEngine_add_construction_process(ints, floats, strings, nr_ints);
 }
 
@@ -1249,7 +1253,6 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, struct page **af,
 		struct page **as, struct page **ap, int state)
 {
-	(void)ap;  // point list: only the v14-only vector-shape commands use it
 	bool trace = !!getenv("XSYS4_CP_TRACE");
 	int nr_ints    = (ai && *ai) ? (*ai)->nr_vars : 0;
 	int nr_floats  = (af && *af) ? (*af)->nr_vars : 0;
@@ -1262,6 +1265,13 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	}
 	union vm_value *src = (*ai)->values;
 	int command = src[0].i;
+	// Сырьё запоминаем СРАЗУ и для любой команды — включая те, что мы ещё не умеем
+	// строить: игра читает процедуру обратно (GetPartsConstructionProcess) и ждёт
+	// ровно то, что подавала, а не только поддержанное нами.
+	PE_SaveConstructionRaw(parts_no, state, src, nr_ints, (*af)->values, nr_floats,
+			       (*as)->values, nr_strings,
+			       (ap && *ap) ? (*ap)->values : NULL,
+			       (ap && *ap) ? (*ap)->nr_vars : 0);
 	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
 	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
@@ -3818,6 +3828,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentClipAreaPosHeight, PE_GetComponentClipAreaPosHeight),
 	    HLL_EXPORT(SetEnableInputProcess, PE_SetEnableInputProcess),
 	    HLL_EXPORT(IsEnableInputProcess, PE_IsEnableInputProcess),
+	    HLL_EXPORT(SetEnableInput, PE_SetEnableInput),
+	    HLL_EXPORT(IsEnableInput, PE_IsEnableInput),
 	    HLL_EXPORT(SetClickable, PE_SetClickable),
 	    HLL_EXPORT(SetSpeedupRateByMessageSkip, PE_SetSpeedupRateByMessageSkip),
 	    HLL_TODO_EXPORT(SetResetTimerByChangeInputStatus, PartsEngine_SetResetTimerByChangeInputStatus),
@@ -3896,6 +3908,8 @@ HLL_LIBRARY(PartsEngine,
 	    // Rance 9
 	    HLL_EXPORT(PartsFunc, PartsEngine_PartsFunc),
 	    HLL_EXPORT(AddPartsConstructionProcess, PE_AddPartsConstructionProcess),
+	    HLL_EXPORT(Parts_GetPartsConstructionProcessCount, PE_GetPartsConstructionProcessCount),
+	    HLL_EXPORT(GetPartsConstructionProcess, PE_GetPartsConstructionProcess),
 	    HLL_EXPORT(Release, PE_ReleaseParts),
 	    HLL_TODO_EXPORT(ReleaseAll, PartsEngine_ReleaseAll),
 	    HLL_EXPORT(ReleaseAllWithoutSystem, PE_ReleaseAllWithoutSystem),
@@ -4238,6 +4252,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetHScrollbarViewSize, PartsEngine_SetHScrollbarViewSize),
 	    HLL_EXPORT(SetHScrollbarScrollPos, PartsEngine_SetHScrollbarScrollPos),
 	    HLL_EXPORT(SetHScrollbarScrollRate, PE_SetPartsHScrollbarScrollRate),
+	    HLL_EXPORT(SetHSliderBarScrollRate, PE_SetHSliderBarScrollRate),
+	    HLL_EXPORT(GetHSliderBarScrollRate, PE_GetHSliderBarScrollRate),
 	    HLL_EXPORT(GetHScrollbarTotalSize, PartsEngine_GetHScrollbarTotalSize),
 	    HLL_EXPORT(GetHScrollbarViewSize, PartsEngine_GetHScrollbarViewSize),
 	    HLL_EXPORT(GetHScrollbarScrollPos, PartsEngine_GetHScrollbarScrollPos),
@@ -4347,6 +4363,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Parts_SetLoopCGSurfaceArea, PE_SetLoopCGSurfaceArea),
 	    HLL_EXPORT(Parts_SetText, PE_SetText),
 	    HLL_EXPORT(Parts_AddPartsText, PE_AddPartsText),
+	    HLL_EXPORT(Parts_SetTextEnableTag, PE_SetTextEnableTag),
+	    HLL_EXPORT(Parts_IsTextEnableTag, PE_IsTextEnableTag),
 	    HLL_TODO_EXPORT(Parts_DeletePartsTopTextLine, PartsEngine_Parts_DeletePartsTopTextLine),
 	    HLL_EXPORT(Parts_SetPartsTextSurfaceArea, PE_SetPartsTextSurfaceArea),
 	    HLL_TODO_EXPORT(Parts_SetPartsTextHighlight, PartsEngine_Parts_SetPartsTextHighlight),

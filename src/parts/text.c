@@ -196,6 +196,49 @@ bool PE_AddPartsText(int parts_no, struct string *text, int state)
 	return true;
 }
 
+/*
+ * `Parts_SetTextEnableTag(number, enable, state)` — разрешить РАЗМЕТКУ в тексте
+ * части. Игра ставит флаг и читает его обратно (`Parts_IsTextEnableTag`), то есть
+ * гейтится по нему, поэтому хранить значение обязательно.
+ *
+ * Без этих двух функций Haha Ranman валилась в debug-REPL на первом же экране
+ * («Unimplemented HLL function: PartsEngine.Parts_SetTextEnableTag»), и запустить
+ * её можно было только костылём `XSYS4_LENIENT_HLL=1`.
+ *
+ * ★Сам разбор тегов НЕ реализован: движок кладёт строку как есть. Если игра
+ * включит теги и подаст разметку, она отрисуется буквально — тогда и надо будет
+ * реализовать разбор, но сперва увидеть такой текст живьём (одноразовый WARNING
+ * ниже это покажет).
+ */
+void PE_SetTextEnableTag(int parts_no, bool enable, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+
+	struct parts *parts = parts_get(parts_no);
+	struct parts_text *text = parts_get_text(parts, state);
+	text->enable_tag = enable;
+	if (enable) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("Parts_SetTextEnableTag: разбор тегов в тексте части не "
+				"реализован — разметка отрисуется как обычный текст");
+		}
+	}
+}
+
+bool PE_IsTextEnableTag(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return false;
+	return parts->states[state].text.enable_tag;
+}
+
 bool PE_SetPartsTextSurfaceArea(int parts_no, int x, int y, int w, int h, int state)
 {
 	if (!parts_state_valid(--state))
