@@ -140,8 +140,21 @@ static void vm_fn_trace_ns(int fno)
 	if (fno < 0 || fno >= ain->nr_functions)
 		return;
 	const char *n = ain->functions[fno].name;
-	if (n && fn_trace_ns_match(n))
-		WARNING("NSTRACE fn %d this=%d %s", fno, struct_page_slot(), n);
+	if (n && fn_trace_ns_match(n)) {
+		// this вызываемого метода в момент трейса ещё в стеке VM ПОД аргументами
+		// (method_call снимает его ПОСЛЕ function_call, который снимет nr_args) —
+		// печатаем его, а не только struct_page_slot() вызывающего.
+		int na = ain->functions[fno].nr_args;
+		// a0 — первый аргумент вызываемого (для сеттеров это значение): он ещё
+		// на стеке НАД this.
+		WARNING("NSTRACE fn %d this=%d callee_this=%d a0=%d %s", fno, struct_page_slot(),
+			stack_ptr > na ? stack[stack_ptr - 1 - na].i : -1,
+			na >= 1 && stack_ptr >= 1 ? stack[stack_ptr - na].i : 0, n);
+		// XSYS4_FN_TRACE_NS_STACK=1 — к каждому совпадению печатать стек
+		// вызовов игры: отвечает «кто зовёт», а не только «что зовётся».
+		if (getenv("XSYS4_FN_TRACE_NS_STACK"))
+			vm_stack_trace();
+	}
 }
 // Delegate watch: XSYS4_DG_WATCH=<dg_no>[,<dg_no>...] logs every DG_PLUSA
 // (subscription) and every DG_CALLBEGIN of the listed delegate types together
@@ -2141,6 +2154,39 @@ static enum opcode execute_instruction(enum opcode opcode)
 					display_sjis0(heap_get_string(file)->text),
 					line,
 					display_sjis1(heap_get_string(expr)->text));
+			// Ассерты игры фатальны и редки: без стека и локалов виновника
+			// приходится восстанавливать по байткоду. Локалы дают одолженные
+			// аргументы упавшей функции (напр. heap-слот parts-пары в
+			// `Motion::Executer@0` при `assert(parts.IsValid)`).
+			vm_stack_trace();
+			if (call_stack_ptr > 0) {
+				struct page *lp = heap_get_page(local_page_slot());
+				for (int i = 0; lp && i < lp->nr_vars && i < 8; i++) {
+					int v = lp->values[i].i;
+					// Для heap-слотов сразу печатаем, ЧТО там лежит: тип
+					// страницы, имя структуры и первые поля — иначе
+					// испорченную пару (слот чужого объекта) не отличить от
+					// валидной, а объект-композицию (CSpriteParts.m_parts)
+					// не связать с трейсами по слоту вложенного объекта.
+					if (v > 0 && heap_slot_is_page(v)) {
+						struct page *p = heap_get_page(v);
+						const char *sname = (p && p->type == STRUCT_PAGE
+							&& p->index >= 0 && p->index < ain->nr_structures)
+							? ain->structures[p->index].name : NULL;
+						char fields[128] = "";
+						int off = 0;
+						for (int f = 0; p && f < p->nr_vars && f < 4
+							&& off < (int)sizeof(fields) - 16; f++)
+							off += snprintf(fields + off, sizeof(fields) - off,
+								" f%d=%d", f, p->values[f].i);
+						sys_warning("\tlocal[%d]=%d (page type=%d %s%s)\n", i, v,
+							p ? (int)p->type : -1,
+							sname ? display_sjis0(sname) : "", fields);
+					} else {
+						sys_warning("\tlocal[%d]=%d\n", i, v);
+					}
+				}
+			}
 			vm_exit(1);
 		}
 		heap_unref(file);

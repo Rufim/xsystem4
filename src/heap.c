@@ -79,14 +79,25 @@ void heap_init(void)
 
 // Точечная диагностика владения: XSYS4_HEAP_WATCH=<slot> печатает каждое
 // событие жизненного цикла слота вместе с адресом инструкции VM.
-static int heap_watch_slot = -2;
+// Вотчей МНОГО (по кругу): XSYS4_STRUCT_WATCH ставит вотч на КАЖДЫЙ созданный
+// объект типа, и одноместный вотч молча съезжал на последний созданный —
+// у предыдущих объектов «терялись» все дальнейшие REF/UNREF.
+#define HEAP_WATCH_MAX 512
+static int heap_watch_slots[HEAP_WATCH_MAX];
+static int heap_watch_nr = -1;
 static bool heap_watched(int32_t slot)
 {
-	if (heap_watch_slot == -2) {
+	if (heap_watch_nr == -1) {
+		heap_watch_nr = 0;
 		const char *s = getenv("XSYS4_HEAP_WATCH");
-		heap_watch_slot = s ? atoi(s) : -1;
+		if (s && *s)
+			heap_watch_slots[heap_watch_nr++] = atoi(s);
 	}
-	return slot == heap_watch_slot;
+	for (int i = 0; i < heap_watch_nr; i++) {
+		if (heap_watch_slots[i] == slot)
+			return true;
+	}
+	return false;
 }
 
 bool heap_slot_is_page(int index)
@@ -105,7 +116,11 @@ bool heap_slot_is_string(int index)
 
 void heap_watch_slot_set(int32_t slot)
 {
-	heap_watch_slot = slot;
+	heap_watched(-1); // инициализировать список из env, если ещё не
+	if (heap_watch_nr < HEAP_WATCH_MAX)
+		heap_watch_slots[heap_watch_nr++] = slot;
+	else
+		heap_watch_slots[heap_watch_nr - 1] = slot; // последняя ячейка — по кругу
 }
 
 int32_t heap_alloc_slot(enum vm_pointer_type type)
