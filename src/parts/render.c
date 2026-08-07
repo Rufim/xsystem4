@@ -754,6 +754,9 @@ void parts_render(struct parts *parts)
 			}
 		}
 	}
+	// Часть-маска не рисуется: её текстура нужна только как альфа-клип.
+	if (parts->is_alpha_clipper)
+		return;
 	switch (state->type) {
 	case PARTS_UNINITIALIZED:
 	case PARTS_RECT_DETECTION:
