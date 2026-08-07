@@ -1672,6 +1672,36 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 	return done;
 }
 
+/*
+ * РЕДАКТОРСКАЯ ЗАГЛУШКА в поле `テキスト` раскладки. Обычный текст оттуда нужен —
+ * подписи кнопок выбора фазы («Hustling Phase») лежат именно там, и игра их не
+ * переустанавливает (проверено XSYS4_SETTEXT_TRACE: `SetText` для них не приходит).
+ * Но у части заготовок текст — буквальный placeholder редактора: `パーツテキスト`
+ * («текст части») у строки-подсказки футера, `ボタン` («кнопка») у подписи
+ * FooterButton. Игра переписывает их, ТОЛЬКО если ей есть что показать: у футера
+ * обучения подсказки нет (в EX-таблице `FooterText` нет записи для этой сцены), и
+ * заглушка оставалась на экране вместе с белой подложкой, которой у оригинала нет.
+ */
+static bool act_is_placeholder_text(struct string *txt)
+{
+	static const char *const placeholders[] = {
+		"パーツテキスト",  // «текст части» — подпись-заготовка в Footer.pactex
+		"ボタン",          // «кнопка» — подпись-заготовка в FooterButton.pactex
+	};
+	for (size_t i = 0; i < sizeof(placeholders) / sizeof(placeholders[0]); i++) {
+		char *sjis = utf2sjis(placeholders[i], strlen(placeholders[i]));
+		size_t n = strlen(sjis);
+		// ★Сравнение по ДЛИНЕ, а не strcmp: строки из EX-дерева не обязаны быть
+		// NUL-терминированными, и strcmp читал за границей буфера (движок падал
+		// молча на загрузке раскладок, ещё до титула).
+		bool hit = txt->size >= 0 && (size_t)txt->size == n && !memcmp(txt->text, sjis, n);
+		free(sjis);
+		if (hit)
+			return true;
+	}
+	return false;
+}
+
 static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8, int state)
 {
 	struct ex_tree *st = act_child(ti, state_utf8);
@@ -1701,6 +1731,10 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// message ("サンプル") whose 通常状態 is a パーツタイプ=13 text sub-node.
 	if (act_parts_type(st) == 13) {
 		struct string *txt = act_str(st, "テキスト");
+		// ★Шрифт настраиваем ДАЖЕ для заглушки: без него часть остаётся без
+		// метрик, и когда игра позже кладёт в неё свой текст, рендер падает
+		// молча (движок умирал на загрузке ADV-сцены, 0 *ERROR* в логе).
+		bool placeholder = txt && act_is_placeholder_text(txt);
 		if (txt && txt->size) {
 			struct ex_tree *fd = act_child(st, "テキスト装飾");
 			if (fd) {
@@ -1745,7 +1779,8 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 					PE_SetTextCharSpace(no, act_int(fd, "字間隔", 0), state);
 				PE_SetTextLineSpace(no, act_int(fd, "行間隔", 0), state);
 			}
-			PE_SetText(no, txt, state);
+			if (!placeholder)
+				PE_SetText(no, txt, state);
 		}
 		return;
 	}
