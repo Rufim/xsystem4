@@ -921,6 +921,18 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		PE_AddBlurFilterToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
 				full_size, blur, command == 28, state);
 		break;
+	case 88:  // CASConstructionProcess::SetFillRect (v14) — заливка ЦВЕТОМ
+		PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh, r, g, b, state);
+		break;
+	case 90:  // CASConstructionProcess::SetFillRectAMap (v14) — заливка АЛЬФЫ
+		PE_AddFillAMapToPartsConstructionProcess(parts_no, dx, dy, dw, dh, a, state);
+		break;
+	case 102:  // CASConstructionProcess::SetFillCircleAMap (v14)
+		// Круг = сектор на 360°: центр в `先矩形`, радиусы в `半径`, альфа из `色１`.
+		// Так собраны точки-индикаторы страниц и круглые подложки иконок.
+		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
+				radius_x, radius_y, 0, 360, a, state);
+		break;
 	case 122:  // CASConstructionProcess::SetFillPieAMap (v14)
 		// Сектор в альфа-карту: из четырёх таких углов и двух прямоугольников
 		// собрана каждая скруглённая подложка интерфейса Dohna.
@@ -1250,8 +1262,14 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	}
 	union vm_value *src = (*ai)->values;
 	int command = src[0].i;
-	// 122 (SetFillPieAMap) реализована, хотя и лежит за классическим набором.
-	if (command < 0 || (command >= NR_CLASSIC_CONSTRUCTION_COMMANDS && command != 122)) {
+	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
+	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
+	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
+	static const int v14_ok[] = { 27, 28, 88, 90, 102, 122 };
+	bool known_v14 = false;
+	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
+		known_v14 |= (command == v14_ok[i]);
+	if (command < 0 || (command >= NR_CLASSIC_CONSTRUCTION_COMMANDS && !known_v14)) {
 		if (trace)
 			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d)",
 			       command, parts_no);
@@ -1613,7 +1631,8 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			continue;
 		// Команды за пределами реализованного набора пропускаем ЯВНО: пусть их
 		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
-		if (command > 24 && command != 27 && command != 28 && command != 122) {
+		if (command > 24 && command != 27 && command != 28 && command != 88
+				&& command != 90 && command != 102 && command != 122) {
 			static bool warned = false;
 			if (!warned) {
 				warned = true;
