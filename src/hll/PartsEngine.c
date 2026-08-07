@@ -2046,6 +2046,21 @@ struct pe_vscrollbar {
 };
 static struct pe_vscrollbar *pe_vscrollbar_get(int parts_no, bool create);
 static void pe_vscrollbar_apply_enabled(struct pe_vscrollbar *sb);
+struct pe_button_state {
+	int parts_no;
+	struct string *cg_base;
+	int enabled;  // -1 ещё не спрашивали, 0 выключена, 1 включена
+	/*
+	 * Подпись НА кнопке — отдельная текстовая часть-ребёнок, созданная при
+	 * разборе раскладки (шрифт и цвет оттуда же). Игра меняет только СТРОКУ,
+	 * через `SetButtonText`, поэтому храним номер части и геометрию кнопки,
+	 * чтобы каждый раз перецентрировать надпись.
+	 */
+	int text_no;
+	int text_x, text_y, box_w, box_h, font_size;
+};
+
+static struct pe_button_state *pe_button_get(int parts_no, bool create);
 // Запоминает базовое имя CG кнопки — по нему SetButtonEnable подставляет `／無効`.
 static void pe_button_remember_cg(int parts_no, struct string *cg_base);
 
@@ -2141,6 +2156,54 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		}
 		PE_SetClickable(no, true);
 		PE_SetPartsIsButton(no, true);  // report component type 0 (button) to the game
+		/*
+		 * Подпись НА кнопке. У типа `ボタン` она лежит в самой кнопке
+		 * (`テキスト` + свой шрифт + `テキスト位置`), а не в отдельной текстовой
+		 * части, и раньше не рисовалась вовсе: в CONFIG плашки «Reset» выходили
+		 * пустыми белыми прямоугольниками. Рисуем так же, как подпись чекбокса —
+		 * отдельной текстовой частью-ребёнком, но ПО ЦЕНТРУ кнопки
+		 * (`テキスト位置 = 5` у всех кнопок Dohna — то же значение, что
+		 * `原点座標モード` для центра).
+		 */
+		struct string *btxt = act_str(ti, "テキスト");
+		if (btxt && btxt->size && !act_is_placeholder_text(btxt)) {
+			int base_x = act_list_int(node, "座標", 0, 0);
+			int base_y = act_list_int(node, "座標", 1, 0);
+			int cw = PE_GetPartsWidth(no, 1);
+			int ch = PE_GetPartsHeight(no, 1);
+			if (cw <= 0) cw = bw;
+			if (ch <= 0) ch = bh;
+			int fsize = act_int(ti, "フォントサイズ", 16);
+			int tno = ++pe_act_part_seq;
+			PE_SetText(tno, btxt, 1);
+			PE_SetFont(tno, act_int(ti, "フォントタイプ", 0), fsize,
+				act_list_int(ti, "フォント色", 0, 0),
+				act_list_int(ti, "フォント色", 1, 0),
+				act_list_int(ti, "フォント色", 2, 0),
+				act_float(ti, "フォント太さ", 0.0f),
+				act_list_int(ti, "フォント縁取り色", 0, 0),
+				act_list_int(ti, "フォント縁取り色", 1, 0),
+				act_list_int(ti, "フォント縁取り色", 2, 0),
+				act_float(ti, "フォント縁取り", 0.0f), 1);
+			int tw = PE_GetPartsWidth(tno, 1);
+			int tx = base_x + (cw > tw ? (cw - tw) / 2 : 0);
+			int ty = base_y + (ch > fsize ? (ch - fsize) / 2 : 0);
+			PE_SetPos(tno, tx, ty);
+			if (parent_no >= 0)
+				PE_SetParentPartsNumber(tno, parent_no);
+			// ★Подпись лежит ПОВЕРХ плашки кнопки: с равным z она уходила под
+			// картинку кнопки и не была видна (плашки «Reset» в CONFIG выходили
+			// пустыми, хотя текст в часть ставился — видно в XSYS4_SETTEXT_TRACE).
+			PE_SetZ(tno, act_list_int(node, "座標", 2, 0) + 1);
+			PE_SetShow(tno, 1);
+			struct pe_button_state *b = pe_button_get(no, true);
+			b->text_no = tno;
+			b->text_x = base_x;
+			b->text_y = base_y;
+			b->box_w = cw;
+			b->box_h = ch;
+			b->font_size = fsize;
+		}
 	} else if (ptype == 3 && ti) {
 		// horizontal scrollbar / slider (パーツタイプ=3). ＣＧ名 is a *base* name;
 		// the draggable knob ("bar") is stored per-state as "<base>／バー／通常",
@@ -2888,11 +2951,6 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonSize, int a, int b, int c)
  * его взять уже негде — часть хранит только имя загруженного файла с суффиксом.
  * Приём тот же, что у скроллбара (`pe_vscrollbar.cg_base`).
  */
-struct pe_button_state {
-	int parts_no;
-	struct string *cg_base;
-	int enabled;  // -1 ещё не спрашивали, 0 выключена, 1 включена
-};
 static struct pe_button_state *pe_buttons;
 static int nr_pe_buttons;
 
@@ -3167,7 +3225,28 @@ static bool PE_ReleasePartsMovie(int parts_no, int state) {
 	(void)parts_no; (void)state;
 	return true;
 }
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonText, int a, struct string *b);
+/*
+ * Игра меняет подпись кнопки этой функцией — например в CONFIG кнопки «Reset»
+ * (`SYS_マスターボタン` и соседние) приходят из раскладки с текстом, а игра
+ * переустанавливает его при построении страницы. Пока функция была заглушкой,
+ * плашки «Reset» оставались пустыми белыми прямоугольниками.
+ *
+ * Рисуем в ту же текстовую часть, которую загрузчик создал для подписи (шрифт и
+ * цвет — из раскладки), и заново центрируем: ширина строки меняется вместе с
+ * текстом. Если подписи у кнопки не было (текст в раскладке пуст), рисовать
+ * нечем — тогда молча выходим, как раньше.
+ */
+static void PartsEngine_SetButtonText(int parts_no, struct string *text)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, false);
+	if (!b || !b->text_no || !text)
+		return;
+	PE_SetText(b->text_no, text, 1);
+	int tw = PE_GetPartsWidth(b->text_no, 1);
+	int tx = b->text_x + (b->box_w > tw ? (b->box_w - tw) / 2 : 0);
+	int ty = b->text_y + (b->box_h > b->font_size ? (b->box_h - b->font_size) / 2 : 0);
+	PE_SetPos(b->text_no, tx, ty);
+}
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonTextOriginPosMode, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetButtonTextOriginPosMode, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonCharSpace, int a, int b);
