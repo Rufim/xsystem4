@@ -492,17 +492,49 @@ void parts_recalculate_hitbox(struct parts *parts)
 	}
 }
 
-static void parts_update_global_pos(struct parts *parts, Point parent_pos)
+/*
+ * Позиция ребёнка складывается с УЧЁТОМ масштаба родителя: в иерархии
+ * трансформаций масштаб сжимает не только сам рисунок, но и смещения детей.
+ *
+ * ★Без этого уменьшенная сцена «разъезжалась»: обучение Dohna кладёт сцену под
+ * родителя со `拡大縮小 = 0.85` (`Tutorial::MoveSceneParent` / SceneParentStack) —
+ * каждая часть рисовалась мельче, но на СВОЁМ прежнем месте, поэтому кадр не
+ * собирался в уменьшенную картинку (правый край уезжал за экран), а голубые
+ * рамки-подсветки, которые обводят элемент, к которому относится подсказка,
+ * не совпадали с этим элементом.
+ */
+static void parts_update_global_pos(struct parts *parts, Point parent_pos,
+		float parent_scale_x, float parent_scale_y)
 {
 	parts->global.pos = (Point) {
-		parent_pos.x + parts->local.pos.x,
-		parent_pos.y + parts->local.pos.y
+		parent_pos.x + (int)roundf(parts->local.pos.x * parent_scale_x),
+		parent_pos.y + (int)roundf(parts->local.pos.y * parent_scale_y)
 	};
 
 	struct parts *child;
 	PARTS_FOREACH_CHILD(child, parts) {
-		parts_update_global_pos(child, parts->global.pos);
+		parts_update_global_pos(child, parts->global.pos,
+				parts->global.scale.x, parts->global.scale.y);
 	}
+}
+
+// Масштаб родителя для позиционирования САМОЙ части (её собственный масштаб
+// влияет только на детей, см. parts_update_global_pos).
+static float parts_parent_scale_x(struct parts *parts)
+{
+	return parts->parent ? parts->parent->global.scale.x : 1.0f;
+}
+
+static float parts_parent_scale_y(struct parts *parts)
+{
+	return parts->parent ? parts->parent->global.scale.y : 1.0f;
+}
+
+static void parts_reposition_family(struct parts *parts)
+{
+	parts_update_global_pos(parts,
+			parts->parent ? parts->parent->global.pos : root_pos,
+			parts_parent_scale_x(parts), parts_parent_scale_y(parts));
 }
 
 void parts_set_pos(struct parts *parts, Point pos)
@@ -510,7 +542,7 @@ void parts_set_pos(struct parts *parts, Point pos)
 	parts->local.pos.x = pos.x;
 	parts->local.pos.y = pos.y;
 	parts_recalculate_hitbox(parts);
-	parts_update_global_pos(parts, parts->parent ? parts->parent->global.pos : root_pos);
+	parts_reposition_family(parts);
 	parts_dirty(parts);
 }
 
@@ -519,7 +551,7 @@ void parts_set_global_pos(Point pos)
 	root_pos = pos;
 	struct parts *parts;
 	PARTS_LIST_FOREACH(parts) {
-		parts_update_global_pos(parts, root_pos);
+		parts_update_global_pos(parts, root_pos, 1.0f, 1.0f);
 	}
 	parts_engine_dirty();
 }
@@ -656,7 +688,8 @@ void parts_set_scale_x(struct parts *parts, float mag)
 {
 	parts->local.scale.x = mag;
 	parts_recalculate_hitbox(parts);
-	parts_update_global_scale_x(parts, parts->parent ? parts->parent->global.scale.x : 1.0f);
+	parts_update_global_scale_x(parts, parts_parent_scale_x(parts));
+	parts_reposition_family(parts);  // смещения детей зависят от масштаба
 	parts_dirty(parts);
 }
 
@@ -674,7 +707,8 @@ void parts_set_scale_y(struct parts *parts, float mag)
 {
 	parts->local.scale.y = mag;
 	parts_recalculate_hitbox(parts);
-	parts_update_global_scale_y(parts, parts->parent ? parts->parent->global.scale.y : 1.0f);
+	parts_update_global_scale_y(parts, parts_parent_scale_y(parts));
+	parts_reposition_family(parts);
 	parts_dirty(parts);
 }
 
