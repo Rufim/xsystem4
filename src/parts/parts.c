@@ -3024,6 +3024,12 @@ int PE_GetComponentType(int parts_no, int state)
 		struct pending_ctype *pc = pending_ctype_get(parts_no);
 		if (pc && pc->state - 1 == state)
 			return pc->type;
+		/*
+		 * ★ОТВЕРГНУТО ЗАМЕРОМ: «отдавать тип CG вместо -1, чтобы `parts::detail::Wrap`
+		 * (он начинается с `GetComponentType`) не делал НЕВАЛИДНУЮ обёртку». Ассерт
+		 * `Executer.jaf:55` у Dohna не уходит — значит валидность обёртки Wrap берёт
+		 * не только отсюда. Не возвращать без нового замера.
+		 */
 		return -1;
 	}
 
@@ -3741,11 +3747,27 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	 * ПОРЯДОК РАБОТ: сперва смерть сцен (AIN_IFACE), потом эта трактовка —
 	 * поодиночке каждая делает хуже.
 	 */
-	bool was_active = true;
-	(void)index;
-	int pos = ctrl_stack_pos(ctrl_stack.active);
-	int ctrl_no = (pos >= 0 && pos < ctrl_stack.nr_controllers)
-			? ctrl_stack.stack[pos] : -1;
+	// ★XSYS4_RC_ID=1 — ЗАМЕР: читать аргумент как ID СЛОЯ (при -1 — активный).
+	// Игровой код на это указывает: подписки на покадровое событие помечаются слоем
+	// из `GetActiveController`, а `EraseLayer(id)` тем же id их и снимает
+	// (`ResetPartsUpdateEventLayerID`). Прежние шесть замеров давали чёрный экран,
+	// но тогда СЦЕНЫ БЫЛИ БЕССМЕРТНЫ (владеющие хэндлы не освобождались) и их парты
+	// оставались на экране; теперь сцены умирают, поэтому трактовку надо проверить
+	// заново — от неё зависит ассерт `Executer.jaf:55` у Dohna.
+	bool rc_id = !!getenv("XSYS4_RC_ID");
+	bool was_active = !rc_id || index < 0 || index == ctrl_stack.active;
+	int ctrl_no;
+	int pos;
+	if (rc_id) {
+		ctrl_no = index >= 0 ? index : ctrl_stack.active;
+		pos = ctrl_stack_pos(ctrl_no);
+		if (pos < 0)
+			ctrl_no = -1;
+	} else {
+		pos = ctrl_stack_pos(ctrl_stack.active);
+		ctrl_no = (pos >= 0 && pos < ctrl_stack.nr_controllers)
+				? ctrl_stack.stack[pos] : -1;
+	}
 	if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
 		NOTICE("PE_RemoveController: index=%d -> сношу ctrl %d (позиция %d, nr=%d) [%s]",
 		       index, ctrl_no, pos, ctrl_stack.nr_controllers,

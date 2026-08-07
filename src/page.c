@@ -422,6 +422,28 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 			}
 			break;
 		}
+		/*
+		 * ★`XSYS4_NO_HANDLE_FINI=1` — не освобождать владеющие хэндлы
+		 * (AIN_IFACE/AIN_WRAP), то есть вернуть прежнее поведение «сцены
+		 * бессмертны». Нужна как обход ИЗВЕСТНОГО РЕГРЕССА: у Dohna Dohna
+		 * освобождение сцены обнажает то, что `Motion::Executer` её переживает
+		 * (он лежит в ГЛОБАЛЬНОЙ `Motion::ExecuterCollection`, чистится по
+		 * `IsAlive` = `m_parts != -1 && !m_isFinish`, а при сносе сцены игра не
+		 * зовёт ни `EndAll`, ни `EndParts` — замер: 217 `Motion::Create` против
+		 * 3+2 вызовов End*). На следующем кадре он читает уже обнулённую обёртку
+		 * (`CParts@Release` ставит `Number = 0`) и игра сама ассертит
+		 * `Executer.jaf:55: assert( parts . IsValid )`, экран остаётся чёрным.
+		 *
+		 * Пока настоящая причина не найдена, ручка позволяет работать с Dohna на
+		 * этой же сборке, не откатывая фикс, которым у Haha Ranman закрыт пролог.
+		 */
+		if ((type == AIN_IFACE || type == AIN_WRAP) && getenv("XSYS4_NO_HANDLE_FINI"))
+			break;
+		// Раздельные ручки замера: какой именно тип хэндла ломает Dohna.
+		if (type == AIN_WRAP && getenv("XSYS4_NO_WRAP_FINI"))
+			break;
+		if (type == AIN_IFACE && getenv("XSYS4_NO_IFACE_FINI"))
+			break;
 		if (getenv("XSYS4_UNREF_TRACE"))
 			WARNING("UNREFTRACE type=%d v=%d dtor=%d in %s", type, v.i,
 				(int)call_dtor, vm_current_function_name());
@@ -625,6 +647,10 @@ void delete_page_vars(struct page *page)
 	int nr_args = 0;
 	if (page->type == LOCAL_PAGE && page->index >= 0 && page->index < ain->nr_functions)
 		nr_args = ain->functions[page->index].nr_args;
+	// ★ОТВЕРГНУТО ЗАМЕРОМ: «освобождать поля структуры в ПРЯМОМ порядке объявления»
+	// (гипотеза: у Dohna `Motion::Executer` держит парт полем `IParts m_parts`, и от
+	// порядка зависит, что умрёт раньше — задача анимации или парт). Прямой порядок
+	// ассерт `Executer.jaf:55` НЕ убирает, кадр остаётся чёрным. Порядок обратный.
 	for (int i = page->nr_vars - 1; i >= 0; i--) {
 		enum ain_data_type t = variable_type(page, i, NULL, NULL);
 		if ((t == AIN_IFACE || t == AIN_WRAP) && i < nr_args)
