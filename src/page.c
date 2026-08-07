@@ -349,6 +349,15 @@ union vm_value variable_initval_var(struct page *container, int varno, enum ain_
 
 void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 {
+	// XSYS4_FINI_TRACE=<подстрока имени функции> — какие ТИПЫ и значения реально
+	// освобождаются при удалении её страницы. Нужно, чтобы понять, каким типом
+	// приходит интерфейсная переменная (`s : IScene` в `Scenes::RunIScene`).
+	{
+		const char *w = getenv("XSYS4_FINI_TRACE");
+		if (w && *w && strstr(vm_current_function_name(), w))
+			WARNING("FINI type=%d v=%d in %s", type, v.i,
+				vm_current_function_name());
+	}
 	switch (type) {
 	case AIN_STRING:
 	case AIN_STRUCT:
@@ -377,11 +386,20 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 	 * присваивается парой `X_ASSIGN 2` БЕЗ `SP_INC`, то есть компилятор передаёт
 	 * владение (move) — владельцев оказывается два, а ссылка одна.
 	 *
-	 * Вывод: у типа 89 (`ref <интерфейс>`) владение НЕ универсально. Следующая
-	 * версия для проверки: владеет `wrap<интерфейс>` (AIN_IFACE_WRAP, 100), а 89 —
-	 * одолженная ссылка; тогда правку надо вести по 100 и симметрично в
-	 * `vm_copy`/`slot_owns_heap_ref`. Диагностика на месте: `heap_double_free`
-	 * печатает стек вызовов игры.
+	 * ИЗОЛЯЦИЯ (проведена, части включались по одной): `double free` даёт УЖЕ ОДИН
+	 * `case AIN_IFACE` здесь, без правок `vm_copy` и ветки делегата. Место всегда
+	 * одно — `activity::detail::CUserComponentManager@SetComponentImp`, на RETURN:
+	 * там объект уходит наружу двумя путями (`Array PushBack` в
+	 * `userComponentList` и `CALLMETHOD 7` у `CUserComponentSet`), и НИ ОДИН из
+	 * них ссылку не берёт, а локальные `component`/dummy при выходе её снимают.
+	 *
+	 * Вывод: у типа 89 (`ref <интерфейс>`) владение НЕ универсально, и чинить надо
+	 * НЕ здесь, а на путях передачи владения. Следующий шаг: HLL `Array.PushBack`
+	 * и копирование интерфейсного ЭЛЕМЕНТА массива (в `variable_type` нулевой слот
+	 * такого элемента уже трактуется как AIN_STRUCT — значит владение там
+	 * предполагается, но кто его берёт, не проверено).
+	 * Диагностика: `heap_double_free` печатает стек вызовов игры,
+	 * `XSYS4_FINI_TRACE=<функция>` — какие типы освобождаются при её выходе.
 	 */
 		if (v.i == -1)
 			break;
