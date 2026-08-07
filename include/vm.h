@@ -140,6 +140,14 @@ enum string_format_type {
 struct string *string_format(struct string *fmt, union vm_value arg, enum string_format_type type);
 
 void vm_stack_trace(void);
+
+// Системные окна сообщений (у оригинала на Windows это MessageBox). Один путь и для
+// syscall'ов SYS_MSGBOX*, и для HLL-обёрток System.MsgBox*: игры зовут то одно, то
+// другое — Dohna, например, подтверждает возврат на титул через HLL.
+// Текст — UTF-8. `vm_msgbox_ok_cancel` возвращает 1 (OK) либо 0 (Cancel).
+void vm_msgbox(const char *utf8);
+int vm_msgbox_ok_cancel(const char *utf8);
+
 _Noreturn void _vm_error(const char *fmt, ...);
 _Noreturn void vm_exit(int code);
 _Noreturn void vm_reset(void);
