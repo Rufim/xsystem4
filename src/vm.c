@@ -934,6 +934,10 @@ static void delegate_call(int dg_no, int return_address)
 			enum ain_data_type type = ain->delegates[dg_no].variables[i].type.data;
 			switch (type) {
 			case AIN_REF_TYPE:
+			// Аргумент-интерфейс/хэндл ОДОЛЖЕН — та же причина, что в
+			// delete_page_vars: сайт кладёт его чтением, без копии.
+			case AIN_IFACE:
+			case AIN_WRAP:
 				break;
 			default:
 				variable_fini(v, type, true);
