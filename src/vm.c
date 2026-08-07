@@ -907,6 +907,10 @@ static void delegate_call(int dg_no, int return_address)
 		struct ain_function_type *dg = &ain->delegates[dg_no];
 		for (int i = 0; i < dg->nr_arguments; i++) {
 			union vm_value arg = stack_peek((dg->nr_arguments + 1) - i);
+			if (getenv("XSYS4_DG_ARG_TRACE"))
+				WARNING("DGARG dg=%d nr_args=%d nr_vars=%d i=%d type=%d val=%d",
+					dg_no, dg->nr_arguments, dg->nr_variables, i,
+					dg->variables[i].type.data, arg.i);
 			heap[slot].page->values[i] = vm_copy(arg, dg->variables[i].type.data);
 		}
 
