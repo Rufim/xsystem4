@@ -1594,11 +1594,14 @@ static float act_float(struct ex_tree *t, const char *utf8, float dflt);
  * `AddPartsConstructionProcess`, поле в поле, поэтому обе дороги сходятся в
  * `construction_op`. Возвращает число ВЫПОЛНЕННЫХ операций (неизвестные команды
  * не в счёт) — вызывающему это нужно, чтобы понять, осталась ли часть пустой.
+ * `blurred` — сколько шагов размытия встретилось: по нему вызывающий узнаёт, что
+ * процедура строит РАЗМЫТЫЙ ЗАДНИК экрана, а не элемент интерфейса.
  */
-static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped)
+static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped, int *blurred)
 {
 	int done = 0;
 	*skipped = 0;
+	*blurred = 0;
 	for (int i = 1; ; i++) {
 		char key[32];
 		snprintf(key, sizeof(key), "手順%d", i);
@@ -1620,6 +1623,8 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			(*skipped)++;
 			continue;
 		}
+		if (command == 27 || command == 28)
+			(*blurred)++;
 		struct string *text = act_str(op, "テキスト");
 		struct string *cg = act_str(op, "ＣＧ名");
 		construction_op(no, state, command, act_int(op, "補間タイプ", 0),
@@ -1844,13 +1849,18 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		 *    подложки счётчиков, НО часть процедур создаёт полноэкранные
 		 *    поверхности (`CP BUILD` показывает 1380×820 и 1480×920), они
 		 *    перекрывают верхние слои, и логотип пропадает.
-		 * Поэтому сборка из загрузчика — под ручкой XSYS4_CP_ACT_BUILD=1, пока
-		 * не разобрана видимость/z таких полноэкранных частей (у Tsumamigui 3
-		 * подобные клипперы объявлены `表示 = 0`, у Dohna — `表示 = 1`).
+		 * ★Причина того перекрытия — НЕ z, а незаконченная процедура: те
+		 * полноэкранные поверхности строят размытый задник экрана
+		 * (`SetCreateCG` → `Set{H,V}BlurFilter` → `SetFillAlphaColor`), а команды
+		 * размытия не были реализованы — шаг пропускался, и вместо задника
+		 * оставался чёрный непрозрачный прямоугольник. С реализованными 27/28
+		 * (см. `PARTS_CP_BLUR_FILTER`) процедура доходит до конца, поэтому сборка
+		 * из загрузчика включена ПО УМОЛЧАНИЮ; отключить для A/B —
+		 * XSYS4_CP_NO_ACT_BUILD=1.
 		 */
 		if (step1) {
-			int skipped = 0;
-			int nr = act_construction_run(no, state, proc, &skipped);
+			int skipped = 0, blurred = 0;
+			int nr = act_construction_run(no, state, proc, &skipped, &blurred);
 			// Операции только НАКАПЛИВАЮТСЯ; поверхность появляется лишь после
 			// сборки. В рантайме её запускает сама игра
 			// (`Parts_BuildPartsConstructionProcess`), а для процедуры из
@@ -1867,7 +1877,16 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 			 * маской альфа-клиппера.
 			 * XSYS4_CP_NO_ACT_BUILD=1 — A/B-ручка, отключает сборку целиком.
 			 */
-			if (nr > 0 && skipped == 0 && getenv("XSYS4_CP_ACT_BUILD"))
+			// ★По умолчанию собираем ТОЛЬКО задники — процедуры с размытием
+			// (`Set{H,V}BlurFilter`): без них экран остаётся без фона, а сквозь
+			// панель просвечивает предыдущая сцена. Прочие процедуры (подложки
+			// счётчиков и т.п.) по-прежнему под ручкой XSYS4_CP_ACT_BUILD=1:
+			// с ними на экране подбора талантов ПРОПАДАЕТ логотип магазина
+			// (часть 90000941 остаётся `lshow=1 gshow=1 alpha=255`, то есть её
+			// перекрывают, а чем — пока не выяснено; в слое титула висит
+			// собранная поверхность 1480×920 `90000041` с alpha=255).
+			bool build = blurred > 0 || getenv("XSYS4_CP_ACT_BUILD");
+			if (nr > 0 && skipped == 0 && build && !getenv("XSYS4_CP_NO_ACT_BUILD"))
 				PE_BuildPartsConstructionProcess(no, state);
 			// Процедуры без единой ВЫПОЛНЕННОЙ операции (все команды
 			// неизвестны) оставляем прежним поведением — прямоугольной
