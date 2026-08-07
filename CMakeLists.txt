@@ -109,6 +109,7 @@ target_sources(xsystem4 PRIVATE
   src/parts/input.c
   src/parts/layoutbox.c
   src/parts/message.c
+  src/parts/message_window.c
   src/parts/motion.c
   src/parts/panel.c
   src/parts/parts.c
@@ -144,6 +145,7 @@ target_sources(xsystem4 PRIVATE
   src/hll/Data.c
   src/hll/DataFile.c
   src/hll/Delegate.c
+  src/hll/Int.c
   src/hll/Discord.c
   src/hll/DrawDungeon.c
   src/hll/DrawEffect.c
