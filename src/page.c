@@ -679,6 +679,44 @@ void variable_set(struct page *page, int varno, enum ain_data_type type, union v
 	page->values[varno] = val;
 }
 
+// Полное ОБЪЯВЛЕНИЕ переменной страницы (для option-подтипа enum'а мало).
+// Для ARRAY/DELEGATE-страниц объявления нет — NULL.
+static struct ain_type *page_var_decl_type(struct page *page, int varno)
+{
+	switch (page->type) {
+	case GLOBAL_PAGE:
+		return &ain->globals[varno].type;
+	case LOCAL_PAGE:
+		return &ain->functions[page->index].vars[varno].type;
+	case STRUCT_PAGE:
+		return &ain->structures[page->index].members[varno].type;
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Владеет ли ЗНАЧЕНИЕ `option<T>`-переменной heap-слотом (первый слот значения —
+ * объект или строка). option<int>/option<enum> хранят голое число — их трогать
+ * нельзя. Подтип берём из объявления: 86 → array_type.
+ */
+static bool option_var_value_owns(struct page *page, int varno)
+{
+	struct ain_type *t = page_var_decl_type(page, varno);
+	if (!t || t->data != AIN_OPTION || !t->array_type)
+		return false;
+	switch (t->array_type->data) {
+	case AIN_STRING:
+	case AIN_STRUCT:
+	case AIN_WRAP:       // option<wrap<структура>> и option<wrap<iwrap<T>>>
+	case AIN_IFACE:      // option<ref интерфейс> — первый слот пары владеет
+	case AIN_IFACE_WRAP:
+		return true;
+	default:
+		return false;
+	}
+}
+
 void delete_page_vars(struct page *page)
 {
 	/*
@@ -705,6 +743,32 @@ void delete_page_vars(struct page *page)
 		enum ain_data_type t = variable_type(page, i, NULL, NULL);
 		if ((t == AIN_IFACE || t == AIN_WRAP) && i < nr_args)
 			continue;
+		/*
+		 * ★`option<T>`-переменная страницы ВЛАДЕЕТ своим значением, но
+		 * variable_fini(AIN_OPTION) освободить его не может: без объявления
+		 * не отличить option<int> (не трогать!) от option<wrap<T>> (первый
+		 * слот — heap-объект). Пока слот не освобождался вовсе, владеющие
+		 * ссылки текли на КАЖДОМ прокиде значения через option-локаль/dummy.
+		 *
+		 * Так жил зомби-Footer у Dohna (ассерт Executer.jaf:55): SceneHome@0
+		 * читал компонент через `GetComponent`/`GetUserComponent` — обе
+		 * возвращают `option<wrap<CUserComponentSet>>` и оставляли сету +1
+		 * (замер мультивотчем: +1 @26394 CALLHLL — возврат HLL First в
+		 * option-dummy, +1 @29258 SP_INC — возврат option наружу). После
+		 * штатного RemoveComponent сет оставался жив (ref=2), держал Footer,
+		 * его Observer-ротация тикала по снесённому EraseLayer'ом парту и
+		 * Motion::Create ассертил. «Худые» сеты (никогда не читанные Get'ами)
+		 * умирали в Erase правильно — только этим и отличались.
+		 *
+		 * Аргументы-option не трогаем: как и IFACE/WRAP, сайт кладёт их
+		 * чтением (X_REF n) без передачи владения.
+		 */
+		if (t == AIN_OPTION) {
+			if (i >= nr_args && option_var_value_owns(page, i)
+			    && page->values[i].i > 0)
+				variable_fini(page->values[i], AIN_STRUCT, true);
+			continue;
+		}
 		variable_fini(page->values[i], t, true);
 	}
 }
@@ -769,7 +833,18 @@ struct page *copy_page(struct page *src)
 	}
 
 	for (int i = 0; i < src->nr_vars; i++) {
-		dst->values[i] = vm_copy(src->values[i], variable_type(src, i, NULL, NULL));
+		enum ain_data_type t = variable_type(src, i, NULL, NULL);
+		// `option<хэндл>`-слот: копия страницы ссылается на ТОТ ЖЕ объект и
+		// обязана взять свой счётчик — delete_page_vars теперь его снимает.
+		// vm_copy(AIN_OPTION) этого не умеет (без объявления не отличить
+		// option<int>), поэтому реф здесь, где объявление доступно.
+		if (t == AIN_OPTION) {
+			dst->values[i] = src->values[i];
+			if (option_var_value_owns(src, i) && src->values[i].i > 0)
+				heap_ref(src->values[i].i);
+			continue;
+		}
+		dst->values[i] = vm_copy(src->values[i], t);
 	}
 	return dst;
 }
@@ -808,8 +883,14 @@ int alloc_struct(int no)
 	 * а `UpdateEvent` тикает до конца прогона и воскрешает парт плёночного шума.
 	 */
 	{
+		// Префикс '=' — ТОЧНОЕ имя (иначе "Footer" матчит и FooterButton,
+		// и кольцо вотчей забивается неинтересными объектами).
 		const char *w = getenv("XSYS4_STRUCT_WATCH");
-		if (w && *w && s->name && strstr(s->name, w)) {
+		bool hit = false;
+		if (w && *w && s->name)
+			hit = (w[0] == '=') ? !strcmp(s->name, w + 1)
+					    : !!strstr(s->name, w);
+		if (hit) {
 			NOTICE("STRUCTWATCH создана структура '%s' в слоте %d — следим",
 			       s->name, slot);
 			heap_watch_slot_set(slot);
