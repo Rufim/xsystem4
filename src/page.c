@@ -358,6 +358,30 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 	// mirroring variable_initval/vm_copy which also special-case AIN_ARRAY.
 	case AIN_ARRAY:
 	case AIN_REF_TYPE:
+	/*
+	 * ★★НАЙДЕННЫЙ КОРЕНЬ, но фикс НЕ здесь одной строкой (проверено: `double
+	 * free` на первых же кадрах, до титула дело не доходит).
+	 *
+	 * Асимметрия: `slot_owns_heap_ref()` в vm.c СЧИТАЕТ `ref <интерфейс>`
+	 * (AIN_IFACE, 89) владельцем heap-слота и берёт на него `heap_ref` при
+	 * присваивании (и прямо утверждает, что «набор ровно тот, который освобождает
+	 * variable_fini»), — а здесь AIN_IFACE нет, то есть ссылка берётся и никогда
+	 * не отдаётся. Всё, что игра держит через интерфейс, бессмертно.
+	 *
+	 * Последствие, из-за которого это и нашли: у Haha Ranman НЕ УМИРАЕТ НИ ОДНА
+	 * СЦЕНА. `Scenes::RunIScene` держит её в локальной `s` типа `IScene` и удаляет
+	 * через `.LOCALDELETE s`. Замер `XSYS4_STRUCT_WATCH=<тип>`: у `TitleScene`,
+	 * `title::CActivity` и `title::CScreen` refcount не опускался ниже 1 за весь
+	 * прогон, а деструкторы `@1` не вызывались НИ РАЗУ. Мёртвый титул продолжал
+	 * тикать (`title::CScreen@UpdateEvent` — 22194 вызова) и каждый кадр
+	 * воскрешал свой освобождённый парт — плёночный шум в углу пролога.
+	 *
+	 * Почему одного `case AIN_IFACE` мало: `heap_ref` для интерфейса берётся
+	 * ТОЛЬКО в одном месте (vm.c, присваивание в слот страницы), а копий
+	 * интерфейсного значения делается больше (vm_copy, X_MOV/X_DUP, аргументы и
+	 * возвраты функций) — и они ссылку не берут. Чинить надо симметрично с обеих
+	 * сторон, под замер, а не добавлением сюда одного case.
+	 */
 		if (v.i == -1)
 			break;
 		// Heap-слот 0 — это ГЛОБАЛЬНАЯ СТРАНИЦА (heap_free_ptr начинается с 1,
@@ -652,6 +676,23 @@ int alloc_struct(int no)
 {
 	struct ain_struct *s = &ain->structures[no];
 	int slot = heap_alloc_slot(VM_PAGE);
+	/*
+	 * `XSYS4_STRUCT_WATCH=<подстрока имени структуры>` — поиск ЛИШНЕЙ ССЫЛКИ на
+	 * объект: с этого места за его heap-слотом следит heap-watch (ref/unref/free
+	 * с адресом инструкции). По номеру слота объект опознать нельзя — слот
+	 * переиспользуется тысячи раз за прогон, поэтому watch ставится по ТИПУ.
+	 * Живой случай: `title::CScreen` (титульный экран Haha Ranman) не умирает
+	 * после разрушения титульной сцены — его деструктор `@1` не зовётся ни разу,
+	 * а `UpdateEvent` тикает до конца прогона и воскрешает парт плёночного шума.
+	 */
+	{
+		const char *w = getenv("XSYS4_STRUCT_WATCH");
+		if (w && *w && s->name && strstr(s->name, w)) {
+			NOTICE("STRUCTWATCH создана структура '%s' в слоте %d — следим",
+			       s->name, slot);
+			heap_watch_slot_set(slot);
+		}
+	}
 	heap_set_page(slot, alloc_page(STRUCT_PAGE, no, s->nr_members));
 	bool ix = ix_members_self_ctor();
 	for (int i = 0; i < s->nr_members; i++) {

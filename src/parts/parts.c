@@ -25,6 +25,7 @@
 
 #include "asset_manager.h"
 #include "audio.h"
+#include "vm.h"
 #include "vm/page.h"
 #include "xsystem4.h"
 #include "sact.h"
@@ -37,6 +38,74 @@ struct parts_list parts_list = TAILQ_HEAD_INITIALIZER(parts_list);
 static struct parts_list dirty_list = TAILQ_HEAD_INITIALIZER(dirty_list);
 static struct hash_table *parts_table = NULL;
 static Point root_pos = { 0, 0 };
+
+/*
+ * Тип компонента, назначенный номеру ДО создания парта. Игровые обёртки
+ * (parts::detail::C*Parts@0) зовут SetComponentType сразу в конструкторе, когда
+ * парта ещё нет, — а материализовать его в этот момент НЕЛЬЗЯ: оригинальный
+ * GetFreeNumber сканирует от базы, и пока по номеру не создан парт, соседние
+ * вызовы возвращают тот же номер (игры опираются на этот алиасинг — см.
+ * PE_GetFreeNumberScan). Тип запоминаем здесь и применяем при первом реальном
+ * создании парта, чтобы не потерять флаги вроде is_button (Ixseal конструирует
+ * кнопки в рантайме тем же путём).
+ */
+static struct hash_table *pending_ctype_table = NULL;
+
+struct pending_ctype { int type; int state; };
+
+static void pending_ctype_set(int parts_no, int type, int state)
+{
+	if (!pending_ctype_table)
+		pending_ctype_table = ht_create(64);
+	struct ht_slot *slot = ht_put_int(pending_ctype_table, parts_no, NULL);
+	struct pending_ctype *p = slot->value;
+	if (!p) {
+		p = xmalloc(sizeof(*p));
+		slot->value = p;
+	}
+	p->type = type;
+	p->state = state;
+}
+
+static struct pending_ctype *pending_ctype_get(int parts_no)
+{
+	if (!pending_ctype_table)
+		return NULL;
+	return ht_get_int(pending_ctype_table, parts_no, NULL);
+}
+
+static void pending_ctype_clear(int parts_no)
+{
+	if (!pending_ctype_table)
+		return;
+	struct ht_slot *slot = ht_put_int(pending_ctype_table, parts_no, NULL);
+	if (slot->value) {
+		free(slot->value);
+		slot->value = NULL;
+	}
+}
+
+static bool shifted_component_types(void);
+bool parts_exists(int parts_no);
+
+/*
+ * ★ОТВЕРГНУТО ЗАМЕРОМ, не возвращать: «НАДГРОБИЯ» — запоминать при освобождении
+ * последнюю видимость парта и возвращать её, если номер воскрешает обращение без
+ * заявки SetComponentType (то есть мёртвая тикающая обёртка).
+ * Не работает ПРИНЦИПИАЛЬНО: номер переиспользуется РАЗНЫМИ владельцами, и
+ * надгробие фиксирует состояние ПОСЛЕДНЕГО из них, а не того, кто тикает. В
+ * замере плёночный шум титула воскрешал номер 1000001050, надгробие которого
+ * оставил юнит партии `actionselect::CPartyUnit` с show=1 — прямоугольник
+ * остался видимым. По номеру отличить «чей» зомби движок не может.
+ */
+
+/*
+ * ★ОТВЕРГНУТО ЗАМЕРОМ, не возвращать: «у v14 парт создаётся только по заявке
+ * SetComponentType из конструктора обёртки, поэтому SetPartsCG на
+ * несуществующем парте — тик мёртвой обёртки, создавать нельзя».
+ * Результат: ЧЁРНЫЙ ЭКРАН с первого кадра (не отрисовалось даже лого Alice) —
+ * SetPartsCG у v14 тоже штатный путь создания части.
+ */
 
 struct parts_controller_stack ctrl_stack;
 bool parts_multi_controller;
@@ -63,6 +132,10 @@ static void parts_init(struct parts *parts)
 	parts->sp.to_json = parts_sprite_to_json;
 	parts->local = PARTS_PARAMS_INITIALIZER;
 	parts->global = PARTS_PARAMS_INITIALIZER;
+	// ★ОТВЕРГНУТО ЗАМЕРОМ (дважды), не возвращать: «создавать парт скрытым» —
+	// ни для всех партов v14, ни только для тех, кого создают без заявки
+	// SetComponentType. В обоих случаях зомби-плёнка гаснет, но ВМЕСТЕ С НЕЙ
+	// пропадает фон ADV-сцены с дождём: явного SetShow(1) он не получает.
 	parts->delegate_index = -1;
 	parts->event_unique_id = -1;
 	parts->want_save = true;
@@ -212,11 +285,21 @@ struct parts *parts_get(int parts_no)
 	struct parts *parts = parts_alloc();
 	parts->no = parts_no;
 	parts->controller_no = ctrl_stack.active;
-	if (parts_watched(parts_no))
-		NOTICE("PARTWATCH создан парт %d на слое %d (стек-глубина %d)",
+	if (parts_watched(parts_no)) {
+		NOTICE("PARTWATCH создан парт %d на слое %d (стек-глубина %d) — стек вызовов игры:",
 		       parts_no, parts->controller_no, ctrl_stack.nr_controllers);
+		vm_stack_trace();
+	}
 	slot->value = parts;
 	parts_list_insert(parts);
+	// Тип компонента, назначенный номеру до создания, применяется при
+	// материализации (см. pending_ctype_table).
+	struct pending_ctype *pc = pending_ctype_get(parts_no);
+	if (pc) {
+		int t = pc->type, s = pc->state;
+		pending_ctype_clear(parts_no);
+		PE_SetComponentType(parts_no, t, s);
+	}
 	return parts;
 }
 
@@ -1142,8 +1225,12 @@ void parts_release(int parts_no)
 	struct ht_slot *slot = ht_put_int(parts_table, parts_no, NULL);
 	if (!slot->value)
 		return;
-	if (getenv("XSYS4_CTRL_TRACE") || parts_watched(parts_no))
+	if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_PARTS_TRACE") || parts_watched(parts_no))
 		NOTICE("parts_release(%d)", parts_no);
+	if (parts_watched(parts_no)) {
+		NOTICE("PARTWATCH освобождение парта %d — стек вызовов игры:", parts_no);
+		vm_stack_trace();
+	}
 
 	struct parts *parts = slot->value;
 	parts_input_reset_drag(parts);
@@ -1155,6 +1242,10 @@ void parts_release(int parts_no)
 	}
 
 	// break parent/child relationships
+	// ★Пробовали «Release забирает всё ПОДДЕРЕВО» (рекурсивно освобождать детей) —
+	// плёночный шум титула в углу пролога это НЕ убрало (он воскресает покадровым
+	// тиком мёртвой сцены, см. §5c), а семантику меняет заметно: у игры остаются
+	// живые обёртки на детей. Не возвращать без замера, который это подтвердит.
 	while (!TAILQ_EMPTY(&parts->children)) {
 		struct parts *child = TAILQ_FIRST(&parts->children);
 		TAILQ_REMOVE(&parts->children, child, child_list_entry);
@@ -1254,6 +1345,11 @@ bool PE_Init(void)
 
 void PE_Reset(void)
 {
+	if (pending_ctype_table) {
+		ht_foreach_value(pending_ctype_table, free);
+		ht_free_int(pending_ctype_table);
+		pending_ctype_table = NULL;
+	}
 	PE_ReleaseAllParts();
 	PE_ReleaseMessage();
 	parts_input_reset();
@@ -1338,6 +1434,12 @@ void PE_UpdateComponent(possibly_unused int passed_time)
 		parts->dirty = false;
 
 		// update parent
+		// Сам на себя: при оригинальной семантике GetFreeNumber (скан с алиасингом
+		// «пустых» выдач) игра штатно делает SetParentPartsNumber(X, X) — узлы её
+		// собственного дерева алиасятся в один парт. Подвесить парт к самому себе
+		// нельзя (цикл в children ⇒ бесконечная рекурсия обхода) — игнорируем.
+		if (parts->pending_parent == parts->no)
+			parts->pending_parent = -1;
 		struct parts *parent;
 		if (parts->pending_parent >= 0 && (parent = parts_try_get(parts->pending_parent))) {
 			if (parts->parent) {
@@ -2365,6 +2467,10 @@ int PE_GetPartsOriginPosMode(int parts_no)
 void PE_SetParentPartsNumber(int parts_no, int parent_parts_no)
 {
 	struct parts *parts = parts_get(parts_no);
+	if (getenv("XSYS4_PARTS_TRACE") || parts_watched(parts_no) || parts_watched(parent_parts_no))
+		NOTICE("PARTS SetParentPartsNumber(%d, %d) parent_exists=%d",
+		       parts_no, parent_parts_no,
+		       parent_parts_no >= 0 ? parts_exists(parent_parts_no) : -1);
 	parts->pending_parent = parent_parts_no;
 	parts_component_dirty(parts);
 }
@@ -2765,6 +2871,14 @@ void PE_SetComponentType(int parts_no, int type, int state)
 {
 	if (getenv("XSYS4_BL_TRACE"))
 		NOTICE("SetComponentType part=%d type=%d state=%d", parts_no, type, state);
+	// Парта ещё нет — НЕ материализовать: игровые обёртки зовут это прямо из
+	// конструктора, до создания, а создание здесь ломало бы алиасинг номеров
+	// оригинального GetFreeNumber (см. pending_ctype_table и PE_GetFreeNumberScan:
+	// виджет юнит-анимации Haha Ranman из-за этого оставался на экране навсегда).
+	if (!parts_try_get(parts_no)) {
+		pending_ctype_set(parts_no, type, state);
+		return;
+	}
 	if (!parts_state_valid(--state))
 		return;
 	struct parts *parts = parts_get(parts_no);
@@ -2871,8 +2985,13 @@ int PE_GetComponentType(int parts_no, int state)
 	if (!parts_state_valid(--state))
 		return -1;
 	struct parts *parts = parts_try_get(parts_no);
-	if (!parts)
+	if (!parts) {
+		// Тип мог быть назначен до материализации парта (см. pending_ctype_table).
+		struct pending_ctype *pc = pending_ctype_get(parts_no);
+		if (pc && pc->state - 1 == state)
+			return pc->type;
 		return -1;
+	}
 
 	// Чекбокс (パーツタイプ=1) тоже рисуется CG-частью, но обязан отвечать своим
 	// типом: `CActivityWrap@GetCheckBox` (@0x200c8) отдаёт часть только если
@@ -3368,6 +3487,32 @@ int PE_GetFreeNumber(void)
 	return first_free++;
 }
 
+/*
+ * Вариант PartsEngine (новые игры): чистый скан от базы БЕЗ памяти между
+ * вызовами. Пока по номеру не создан парт, соседние вызовы возвращают ОДИН И
+ * ТОТ ЖЕ номер — и игры на это опираются. Обёртки Haha Ranman
+ * (parts::detail::CParts) берут номер в конструкторе ВПРОК: контейнер, фон и
+ * рамка виджета юнит-анимации получают один номер и живут в одном парте,
+ * который игра потом прячет и освобождает по любому из хранимых номеров.
+ * Монотонный счётчик (вариант GUIEngine выше) раскладывал их в РАЗНЫЕ парты:
+ * SetShow/ReleaseParts игры попадали лишь в один из них, а рамка с фоном
+ * оставались на экране навсегда (два «лишних прямоугольника» на прологе).
+ * Сверено симуляцией этой семантики по трейсу движка: финальное состояние
+ * совпадает с эталоном оригинала (виджет не существует, кнопки ADV видимы).
+ */
+int PE_GetFreeNumberScan(void)
+{
+	int n = 1000001000;
+	while (PE_IsExist(n))
+		n++;
+	// Номер уходит новому владельцу: тип, назначенный прежним владельцем до
+	// материализации, не должен протечь (новая обёртка выставит свой).
+	pending_ctype_clear(n);
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS GetFreeNumber -> %d", n);
+	return n;
+}
+
 bool PE_IsExist(int parts_no)
 {
 	return !!ht_get_int(parts_table, parts_no, NULL);
@@ -3445,7 +3590,14 @@ int PE_AddController(int index)
 	ctrl_stack.hidden[pos] = false;
 	ctrl_stack.active = no;
 	ctrl_stack_resort_all();   // позиции слоёв — ключ порядка, см. parts_get_sprite_z
-	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController(index=%d) -> ctrl %d (nr=%d)", index, no, ctrl_stack.nr_controllers);
+	// XSYS4_CTRL_TRACE_AR=1 — только Add/Remove слоёв, без пер-партового спама
+	// (полный XSYS4_CTRL_TRACE упирается в лимит лога задолго до конца прогона).
+	if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
+		NOTICE("PE_AddController(index=%d) -> ctrl %d (nr=%d) [%s]", index, no,
+		       ctrl_stack.nr_controllers, display_sjis0(vm_current_function_name()));
+		if (getenv("XSYS4_CTRL_TRACE_AR"))
+			vm_stack_trace();
+	}
 	return no;
 }
 
@@ -3492,13 +3644,52 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	 * Мерить так: `XSYS4_CTRL_TRACE=1` печатает и запрошенный index, и сколько партов
 	 * реально освобождено, и пример их CG.
 	 */
+	/*
+	 * ★Трактовка «аргумент = ID слоя» проверена ПЯТЫЙ раз — снова ЧЁРНЫЙ ЭКРАН,
+	 * теперь уже с починенным списком delegate-индексов (см. ниже), то есть
+	 * прежние четыре замера отвергли её не из-за сломанного списка. Хотя игровой
+	 * код на неё указывает (`AddPartsUpdateEvent` помечает подписку слоем из
+	 * `GetActiveLayer` = HLL `GetActiveController` = наш `ctrl_stack.active`,
+	 * а `EraseLayer(id)` тем же id снимает подписки), расходится ПРИВЯЗКА ПАРТОВ
+	 * К СЛОЯМ, а не чтение аргумента. Не возвращать без нового замера.
+	 */
+	/*
+	 * ★Чтение аргумента как ID СЛОЯ — верное (замер `XSYS4_CTRL_TRACE_AR=1`
+	 * подтвердил: игра адресует слои, которые сама и создавала), но ВКЛЮЧАТЬ ЕГО
+	 * СЕЙЧАС НЕЛЬЗЯ — экран пролога становится ЧЁРНЫМ, и это уже не загадка:
+	 *
+	 *   • снос слоя 12 освобождает 0 партов, а титульные `タイトル／背景` и
+	 *     `タイトル／ロゴ` (оба 1280x720, непрозрачные) лежат на слое 13, который
+	 *     игра в этот момент НЕ сносит — она сносит его позже, при реальном
+	 *     разрушении стека сцен;
+	 *   • освободить их должны деструкторы игровых обёрток (`CParts@1` при
+	 *     autoRelease) вместе со смертью `TitleScene`, а она у нас НЕ УМИРАЕТ
+	 *     (см. `variable_fini`/AIN_IFACE в page.c);
+	 *   • `title::CActivity@Close` титул не прячет, а ЗАТЕМНЯЕТ через
+	 *     `SetMulColorAll`, поэтому уцелевший фон и даёт ровно чёрный кадр.
+	 *
+	 * Пока сносим АКТИВНЫЙ слой: он совпадает с тем, где реально лежат парты
+	 * уходящей сцены (игра сама делает активным последний созданный слой сцены —
+	 * замер `XSYS4_CTRL_TRACE_ACTIVE=1`: переключения только между 0 и слоем
+	 * сцены, 0↔3, 0↔7), поэтому экран разбирается. Цена известна: номера партов
+	 * освобождаются раньше, чем игра считает, и покадровый тик мёртвого титула
+	 * воскрешает плёночный шум в углу пролога.
+	 *
+	 * ПОРЯДОК РАБОТ: сперва смерть сцен (AIN_IFACE), потом эта трактовка —
+	 * поодиночке каждая делает хуже.
+	 */
+	bool was_active = true;
 	(void)index;
 	int pos = ctrl_stack_pos(ctrl_stack.active);
 	int ctrl_no = (pos >= 0 && pos < ctrl_stack.nr_controllers)
 			? ctrl_stack.stack[pos] : -1;
-	if (getenv("XSYS4_CTRL_TRACE"))
-		NOTICE("PE_RemoveController: index=%d -> сношу ctrl %d (позиция %d, nr=%d)",
-		       index, ctrl_no, pos, ctrl_stack.nr_controllers);
+	if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
+		NOTICE("PE_RemoveController: index=%d -> сношу ctrl %d (позиция %d, nr=%d) [%s]",
+		       index, ctrl_no, pos, ctrl_stack.nr_controllers,
+		       display_sjis0(vm_current_function_name()));
+		if (getenv("XSYS4_CTRL_TRACE_AR"))
+			vm_stack_trace();
+	}
 	if (ctrl_no < 0) {
 		// Вместо тихого «снесу что-нибудь» — проверка допущения.
 		static bool warned = false;
@@ -3517,20 +3708,37 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	while (p) {
 		struct parts *next = TAILQ_NEXT(p, parts_list_entry);
 		if (p->controller_no == ctrl_no) {
-			if (getenv("XSYS4_CTRL_TRACE")) {
+			if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
 				released++;
 				if (!*sample && p->states[0].type == PARTS_CG
 						&& p->states[0].cg.name)
 					sample = display_sjis0(p->states[0].cg.name->text);
 			}
-			*erase_number_list = array_pushback(*erase_number_list,
-					(union vm_value){.i = p->no}, AIN_ARRAY_INT, -1);
+			/*
+			 * ★В массив идут DELEGATE-ИНДЕКСЫ, а не номера партов. Так его читает
+			 * сама игра: `parts::detail::EraseLayer` называет локальную
+			 * переменную `delegateIndexList` и сразу передаёт её в
+			 * `CPartsMessageManager@ReleaseFunctionSetList`, который в цикле
+			 * зовёт `ReleaseFunctionSet(delegateIndex)`. Имя аргумента в
+			 * HLL-декларации (`EraseNumberList`) сбивает с толку.
+			 *
+			 * Пока сюда клали `p->no`, игра снимала наборы обработчиков по
+			 * мусорным индексам, а настоящие оставались жить — вместе с
+			 * объектами, которые их держат. Отсюда «покадровое событие мёртвого
+			 * экрана»: `title::CScreen@UpdateEvent` тикал ещё долго после сноса
+			 * титула и каждый кадр воскрешал свой парт через SetPartsCG (белый
+			 * прямоугольник плёночного шума 320x180 в углу пролога).
+			 */
+			if (p->delegate_index >= 0)
+				*erase_number_list = array_pushback(*erase_number_list,
+						(union vm_value){.i = p->delegate_index},
+						AIN_ARRAY_INT, -1);
 			parts_release(p->no);
 		}
 		p = next;
 	}
 
-	if (getenv("XSYS4_CTRL_TRACE")) {
+	if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
 		NOTICE("   ctrl %d: освобождено партов %d, напр. cg=\"%s\"", ctrl_no, released, sample);
 		// Снос пустого слоя — признак того, что парты легли не туда: печатаем, где
 		// они на самом деле, и каков стек. Ровно этот вывод показал, что расходится
@@ -3568,7 +3776,10 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	ctrl_stack_resort_all();
 	if (ctrl_stack.nr_controllers == 0) {
 		PE_AddController(-1);
-	} else {
+	} else if (was_active) {
+		// Активный слой умер — активным становится верх стека. Если снесли
+		// НЕ-активный, active НЕ трогаем: игра ничего не переключала, и
+		// принудительный перескок отправлял бы новые парты на чужой слой.
 		ctrl_stack.active = ctrl_stack.stack[ctrl_stack.nr_controllers - 1];
 	}
 }
@@ -3578,8 +3789,11 @@ void PE_set_active_controller(int controller_no)
 	// ★ОТДЕЛЬНАЯ ручка, а не XSYS4_CTRL_TRACE: игра дёргает это КАЖДЫЙ КАДР (у Haha
 	// Ranman — 3↔0 по три раза за кадр), и под общим трейсом 200 000 строк выносили
 	// из лога всё остальное, включая сами Add/RemoveController.
-	if (getenv("XSYS4_CTRL_TRACE_ACTIVE"))
-		NOTICE("PE_set_active_controller(%d) (был %d)", controller_no, ctrl_stack.active);
+	// Печатаем только РЕАЛЬНЫЕ смены: игра дёргает это каждый кадр одним и тем же
+	// значением, и «печатать всё» выносит из лога остальное.
+	if (getenv("XSYS4_CTRL_TRACE_ACTIVE") && controller_no != ctrl_stack.active)
+		NOTICE("ACTIVE %d -> %d [%s]", ctrl_stack.active, controller_no,
+		       display_sjis0(vm_current_function_name()));
 	if (controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY ||
 			ctrl_stack_pos(controller_no) >= 0)
 		ctrl_stack.active = controller_no;
@@ -3589,6 +3803,25 @@ void PE_set_active_controller(int controller_no)
 
 int PE_get_active_controller(void)
 {
+	/*
+	 * `XSYS4_LAYER_SUB_TRACE=1` — чем помечается ПОДПИСКА на покадровое событие.
+	 * Игра держит подписки в своём массиве `g_dgPartsBeginUpdateEvent`
+	 * (`SPartsUpdateData { int Layer; DG_PARTS_UpdateHandler Event; }`),
+	 * пишет в `Layer` результат ЭТОЙ функции (`parts::detail::AddPartsUpdateEvent`
+	 * → `GetActiveLayer`) и потом снимает подписки по слою
+	 * (`ResetPartsUpdateEventLayerID` из `EraseLayer(id)`). Если помеченный слой не
+	 * совпадёт с id стираемого, подписка не снимется никогда — именно так у нас
+	 * тикает `title::CScreen@UpdateEvent` после сноса титула и каждый кадр
+	 * воскрешает свой парт (плёночный шум в углу пролога).
+	 *
+	 * Саму функцию игра дёргает КАЖДЫЙ КАДР, поэтому печатаем только вызовы
+	 * из подписки — иначе лог заваливает всё остальное.
+	 */
+	if (getenv("XSYS4_LAYER_SUB_TRACE") && vm_called_from("AddPartsUpdateEvent")) {
+		NOTICE("LAYERSUB подписка помечается слоем %d — стек вызовов игры:",
+		       ctrl_stack.active);
+		vm_stack_trace();
+	}
 	return ctrl_stack.active;
 }
 

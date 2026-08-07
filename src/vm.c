@@ -3781,6 +3781,27 @@ int vm_execute_ain(struct ain *program)
 	return stack_pop().i;
 }
 
+const char *vm_current_instruction_name(void)
+{
+	return current_instruction_name();
+}
+
+const char *vm_current_function_name(void)
+{
+	if (call_stack_ptr <= 0)
+		return "(no game code)";
+	return ain->functions[call_stack[call_stack_ptr-1].fno].name;
+}
+
+bool vm_called_from(const char *substr)
+{
+	for (int i = call_stack_ptr - 1; i >= 0; i--) {
+		if (strstr(ain->functions[call_stack[i].fno].name, substr))
+			return true;
+	}
+	return false;
+}
+
 void vm_stack_trace(void)
 {
 	for (int i = call_stack_ptr - 1; i >= 0; i--) {

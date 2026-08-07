@@ -89,6 +89,11 @@ static bool heap_watched(int32_t slot)
 	return slot == heap_watch_slot;
 }
 
+void heap_watch_slot_set(int32_t slot)
+{
+	heap_watch_slot = slot;
+}
+
 int32_t heap_alloc_slot(enum vm_pointer_type type)
 {
 	if (heap_free_ptr >= heap_size) {
@@ -142,7 +147,7 @@ void heap_ref(int32_t slot)
 		return;
 	heap[slot].ref++;
 	if (unlikely(heap_watched(slot)))
-		WARNING("HEAPWATCH %d REF -> %d @%X", slot, heap[slot].ref, instr_ptr);
+		WARNING("HEAPWATCH %d REF -> %d @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
 #ifdef DEBUG_HEAP
 	heap[slot].ref_addr[heap[slot].ref_nr++ % 16] = instr_ptr;
 #endif
@@ -151,7 +156,7 @@ void heap_ref(int32_t slot)
 void heap_unref(int slot)
 {
 	if (unlikely(heap_watched(slot)))
-		WARNING("HEAPWATCH %d UNREF (ref=%d) @%X", slot, heap[slot].ref, instr_ptr);
+		WARNING("HEAPWATCH %d UNREF (ref=%d) @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
 	if (unlikely(heap[slot].ref <= 0)) {
 		heap_double_free(slot);
 		VM_ERROR("double free");

@@ -1315,10 +1315,21 @@ static bool PE_ReleaseActivity(struct string *name, struct page **out)
 			NOTICE("BS   act part=%d '%s'", a->parts[i].number,
 			       display_sjis1(a->parts[i].name->text));
 	}
-	union vm_value dim = { .i = n };
+	// Массив — DELEGATE-ИНДЕКСЫ, не номера партов: игра передаёт его прямо в
+	// `CPartsMessageManager@ReleaseFunctionSetList` (см. разбор в
+	// PE_RemoveController). Парты без набора обработчиков в список не попадают.
+	int nr = 0;
+	int *indices = n ? xcalloc(n, sizeof(int)) : NULL;
+	for (int i = 0; i < n; i++) {
+		int di = PE_GetDelegateIndex(a->parts[i].number);
+		if (di >= 0)
+			indices[nr++] = di;
+	}
+	union vm_value dim = { .i = nr };
 	struct page *page = alloc_array(1, &dim, AIN_ARRAY_INT, 0, false);
-	for (int i = 0; i < n; i++)
-		page->values[i].i = a->parts[i].number;
+	for (int i = 0; i < nr; i++)
+		page->values[i].i = indices[i];
+	free(indices);
 	if (*out) {
 		delete_page_vars(*out);
 		free_page(*out);
@@ -3311,9 +3322,9 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetMulColorForBackScene, PE_SetMulColorForBackScene),
 	    HLL_EXPORT(SetFontColorForBackScene, PE_SetFontColorForBackScene),
 	    HLL_EXPORT(SaveThumbnail, PE_SaveThumbnail),
-	    HLL_EXPORT(GetFreeSystemPartsNumber, PE_GetFreeNumber),
+	    HLL_EXPORT(GetFreeSystemPartsNumber, PE_GetFreeNumberScan),
 	    // FIXME: what is the difference?
-	    HLL_EXPORT(GetFreeSystemPartsNumberNotSaved, PE_GetFreeNumber),
+	    HLL_EXPORT(GetFreeSystemPartsNumberNotSaved, PE_GetFreeNumberScan),
 	    HLL_EXPORT(IsExistParts, PE_IsExist),
 	    HLL_EXPORT(SetPartsCG, PE_SetPartsCG),
 	    HLL_EXPORT(CreatePartsMovie, PE_CreatePartsMovie),
@@ -3502,7 +3513,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(Release, PE_ReleaseParts),
 	    HLL_TODO_EXPORT(ReleaseAll, PartsEngine_ReleaseAll),
 	    HLL_EXPORT(ReleaseAllWithoutSystem, PE_ReleaseAllWithoutSystem),
-	    HLL_EXPORT(GetFreeNumber, PE_GetFreeNumber),
+	    HLL_EXPORT(GetFreeNumber, PE_GetFreeNumberScan),
 	    HLL_EXPORT(IsExist, PE_IsExist),
 	    HLL_EXPORT(AddController, PE_AddController),
 	    HLL_EXPORT(SetActiveController, PE_set_active_controller),

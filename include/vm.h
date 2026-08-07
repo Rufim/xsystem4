@@ -140,6 +140,16 @@ enum string_format_type {
 struct string *string_format(struct string *fmt, union vm_value arg, enum string_format_type type);
 
 void vm_stack_trace(void);
+// Есть ли на стеке вызовов игровая функция, чьё имя содержит `substr` (сырые
+// байты имени, то есть Shift-JIS). Только для диагностики: позволяет печатать
+// трейс лишь для интересных путей вызова, когда сам HLL-обработчик дёргается
+// каждый кадр.
+bool vm_called_from(const char *substr);
+// Имя игровой функции на верху стека вызовов (для диагностики: HEAPWATCH
+// группирует ref/unref по функциям, по одному адресу инструкции путь не понять).
+const char *vm_current_function_name(void);
+// Имя текущей инструкции VM (диагностика: КАКАЯ инструкция взяла/отдала ссылку).
+const char *vm_current_instruction_name(void);
 _Noreturn void _vm_error(const char *fmt, ...);
 _Noreturn void vm_exit(int code);
 _Noreturn void vm_reset(void);

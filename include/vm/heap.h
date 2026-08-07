@@ -59,6 +59,10 @@ void heap_grow(size_t new_size);
 int32_t heap_alloc_slot(enum vm_pointer_type type);
 void heap_ref(int slot);
 void heap_unref(int slot);
+// Диагностика владения: следить за этим слотом (как XSYS4_HEAP_WATCH, но слот
+// задаётся из кода — номер слота переиспользуется, поэтому по нему объект не
+// опознать; ставится при создании структуры, чьё имя совпало с XSYS4_STRUCT_WATCH).
+void heap_watch_slot_set(int32_t slot);
 void exit_unref(int slot);
 
 uint32_t heap_get_seq(int slot);
