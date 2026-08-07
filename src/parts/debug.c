@@ -119,6 +119,7 @@ static void parts_construction_process_to_json(struct parts_construction_process
 		[PARTS_CP_GRAY_FILTER] = "gray_filter",
 		[PARTS_CP_FILL_GRADATION_HORIZON] = "fill_gradation_horizon",
 		[PARTS_CP_MUL_FILTER] = "mul_filter",
+		[PARTS_CP_BLUR_FILTER] = "blur_filter",
 	};
 
 	cJSON *ops, *tmp;

@@ -68,14 +68,24 @@ static struct string *System_OutputLine(struct string *text)
 
 static struct string *System_MsgBox(struct string *text)
 {
-	NOTICE("system.MsgBox: %s", display_sjis0(text->text));
+	char *utf = sjis2utf(text->text, text->size);
+	vm_msgbox(utf);
+	free(utf);
 	return sys_ref(text);
 }
 
+// ★Показываем НАСТОЯЩЕЕ окно, а не авто-подтверждаем: новые игры спрашивают
+// подтверждение именно через HLL-обёртку, а не через syscall. У Dohna так сделаны
+// «Return to the title screen?» и «Exit the game?» из CONFIG
+// (`Ａ＿タイトルに戻る` / `Ａ＿ゲーム終了` → `CALLHLL system MsgBoxOkCancel`), и с
+// авто-ответом окно не появлялось вовсе — игра молча уходила на титул, тогда как
+// оригинал спрашивает. Автопрогоны подтверждают через XSYS4_AUTO_MSGBOX (см. vm_msgbox_*).
 static int System_MsgBoxOkCancel(struct string *text)
 {
-	NOTICE("system.MsgBoxOkCancel: %s -> OK", display_sjis0(text->text));
-	return 1; // auto-confirm
+	char *utf = sjis2utf(text->text, text->size);
+	int result = vm_msgbox_ok_cancel(utf);
+	free(utf);
+	return result;
 }
 
 static struct string *System_Error(struct string *text)

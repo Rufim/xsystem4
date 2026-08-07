@@ -398,6 +398,35 @@ enum window_settings_id {
 	WINDOW_SETTINGS_CLOSE_GAME_CONFIRM = 6,
 };
 
+/*
+ * У новых релизов (ain 14, Ixseal) таблица настроек окна КОРОЧЕ: из неё выпали
+ * «ожидать vsync» и «запоминать позицию/размер», и номера сдвинулись —
+ * 2 = минимизировать в фоне, 3 = спрашивать при возврате на титул,
+ * 4 = спрашивать при выходе. Замер по всем обращениям Dohna к
+ * Get/SetWindowSetting (пары `config::detail::Get*`/`Set*` сходятся):
+ *
+ *   0 AspectRatio · 1 ScalingType · 2 MinimizeByFullScreenInactive
+ *   3 BackToTitleConfirm · 4 CloseGameConfirm
+ *
+ * Из-за расхождения `config::detail::GetCloseGameConfirm` читал у нас
+ * «минимизировать в фоне», а `GetBackToTitleConfirm` — «запоминать позицию»:
+ * подтверждение оказывалось выключенным, и CONFIG → «Return to Title» уходил на
+ * титул БЕЗ системного окна `タイトル画面に戻りますか？`, которое показывает оригинал.
+ */
+static int window_setting_id(int type)
+{
+	if (ain->version < 14)
+		return type;
+	switch (type) {
+	case 0: return WINDOW_SETTINGS_ASPECT_RATIO;
+	case 1: return WINDOW_SETTINGS_SCALING_TYPE;
+	case 2: return WINDOW_SETTINGS_MINIMIZE_BY_FULL_SCREEN_INACTIVE;
+	case 3: return WINDOW_SETTINGS_BACK_TO_TITLE_CONFIRM;
+	case 4: return WINDOW_SETTINGS_CLOSE_GAME_CONFIRM;
+	default: return -1;
+	}
+}
+
 static void save_window_settings(void)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -421,7 +450,7 @@ static void load_window_settings(void)
 
 static bool SystemService_SetWindowSetting(int type, int value)
 {
-	switch (type) {
+	switch (window_setting_id(type)) {
 	case WINDOW_SETTINGS_ASPECT_RATIO:
 		window_settings.aspect_ratio = value;
 		break;
@@ -454,7 +483,7 @@ static bool SystemService_SetWindowSetting(int type, int value)
 
 static bool SystemService_GetWindowSetting(int type, int *value)
 {
-	switch (type) {
+	switch (window_setting_id(type)) {
 	case WINDOW_SETTINGS_ASPECT_RATIO:
 		*value = window_settings.aspect_ratio;
 		break;

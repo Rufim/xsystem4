@@ -234,7 +234,16 @@ enum parts_cp_op_type {
 	// все последующие операции в уже записанных сейвах.
 	PARTS_CP_FILL_GRADATION_HORIZON,
 	PARTS_CP_MUL_FILTER,
-#define PARTS_NR_CP_TYPES (PARTS_CP_MUL_FILTER+1)
+	// v14 (Ixseal): векторные фигуры В АЛЬФА-КАРТУ. Из них собраны скруглённые
+	// подложки интерфейса Dohna: прямоугольник + четыре сектора по углам
+	// (см. «Round128x40» в PlayerShopView.pactex).
+	PARTS_CP_FILL_PIE_AMAP,
+	// v14 (Ixseal): размытие поверхности по одной оси (команды 27/28 раскладки,
+	// `CASConstructionProcess@Set{H,V}BlurFilter`). Игра ставит их парой сразу за
+	// `SetCreateCG` — так собран размытый задник экранов (CONFIG, галерея, выбор
+	// фазы): CG фона → HBlur → VBlur, сила в поле `ブラー`.
+	PARTS_CP_BLUR_FILTER,
+#define PARTS_NR_CP_TYPES (PARTS_CP_BLUR_FILTER+1)
 };
 
 struct parts_cp_create {
@@ -249,6 +258,21 @@ struct parts_cp_cg {
 struct parts_cp_fill {
 	int x, y, w, h;
 	int r, g, b, a;
+};
+
+/*
+ * Сектор эллипса, заливаемый в АЛЬФА-КАРТУ (`SetFillPieAMap`, команда 122 — самая
+ * частая в раскладках Dohna: 258 вхождений). Углы в градусах, 0° — вправо (+X),
+ * растут ПО ЧАСОВОЙ стрелке (экранный Y вниз): проверено по четырём угловым
+ * секторам «Round128x40», где 180°+90° даёт левый верхний угол, 270°+90° —
+ * правый верхний, 0°+90° — правый нижний, 90°+90° — левый нижний.
+ */
+struct parts_cp_pie {
+	int x, y;              // центр
+	int rx, ry;            // радиусы
+	int start_angle;       // начало дуги, град.
+	int sweep_angle;       // длина дуги, град.
+	int a;                 // заливаемая альфа
 };
 
 struct parts_cp_cut_cg {
@@ -268,6 +292,15 @@ struct parts_cp_text {
 struct parts_cp_filter {
 	int x, y, w, h;
 	bool full_size;
+};
+
+// Размытие по одной оси: `radius` — поле `ブラー` раскладки (у Dohna всегда 10),
+// `vertical` различает команды 27 (по X) и 28 (по Y).
+struct parts_cp_blur {
+	int x, y, w, h;
+	bool full_size;
+	int radius;
+	bool vertical;
 };
 
 // `Ｐ＿構築手順＿グラデーション横` — заливка прямоугольника градиентом СВЕРХУ ВНИЗ
@@ -292,9 +325,11 @@ struct parts_cp_op {
 		struct parts_cp_create create;
 		struct parts_cp_cg cg;
 		struct parts_cp_fill fill;
+		struct parts_cp_pie pie;
 		struct parts_cp_cut_cg cut_cg;
 		struct parts_cp_text text;
 		struct parts_cp_filter filter;
+		struct parts_cp_blur blur;
 		struct parts_cp_fill_gradation gradation;
 		struct parts_cp_color_filter color_filter;
 	};

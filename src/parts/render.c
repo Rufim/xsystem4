@@ -133,19 +133,30 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 	};
 	float blend_rate = parts->global.alpha / 255.0;
 
-	int x = parts->global.pos.x + t->common.origin_offset.x;
-	int y = parts->global.pos.y + t->common.origin_offset.y;
+	/*
+	 * ★Масштаб части (`拡大縮小`) применяется и к тексту — как в parts_render_cg.
+	 * Раньше текст рисовался в натуральном кегле, и подписи выходили ВДВОЕ
+	 * крупнее: у кнопки футера Dohna (`FooterButton.pactex`, части `Text`
+	 * и `TextSelected`) кегль 62 при `拡大縮小 = (0.5, 0.5)`, то есть на экране
+	 * должно быть 31. Масштабируем и размер глифа, и шаг между символами, и
+	 * межстрочный интервал — иначе буквы разъезжались бы по своим местам.
+	 */
+	float sx = parts->global.scale.x;
+	float sy = parts->global.scale.y;
+	float ox = parts->global.pos.x + t->common.origin_offset.x * sx;
+	float oy = parts->global.pos.y + t->common.origin_offset.y * sy;
+	float x = ox, y = oy;
 	for (int i = 0; i < t->nr_lines; i++) {
 		struct parts_text_line *line = &t->lines[i];
 		for (int j = 0; j < line->nr_chars; j++) {
 			struct parts_text_char *ch = &line->chars[j];
-			mat4 mw_transform = WORLD_TRANSFORM(ch->t.w, ch->t.h, x, y);
+			mat4 mw_transform = WORLD_TRANSFORM(ch->t.w * sx, ch->t.h * sy, x, y);
 			Rectangle r = { 0, 0, ch->t.w, ch->t.h };
 			parts_render_texture(&ch->t, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts->alpha_clipper_parts_no);
-			x += ch->advance;
+			x += ch->advance * sx;
 		}
-		x = parts->global.pos.x + t->common.origin_offset.x;
-		y += line->height + t->line_space;
+		x = ox;
+		y += (line->height + t->line_space) * sy;
 	}
 }
 

@@ -1069,6 +1069,44 @@ static const SDL_MessageBoxButtonData ok_cancel_buttons[] = {
 	{ SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel" },
 };
 
+void vm_msgbox(const char *utf)
+{
+	// Тестовый режим: нативная модалка блокирует игровой цикл и рисуется на
+	// ДЕФОЛТНОМ дисплее, минуя виртуальный X-сервер, — в автопрогонах просто
+	// пишем текст в лог.
+	if (getenv("XSYS4_AUTO_MSGBOX")) {
+		NOTICE("AUTO_MSGBOX: '%s'", utf);
+		return;
+	}
+	SDL_ShowSimpleMessageBox(0, "xsystem4", utf, NULL);
+}
+
+int vm_msgbox_ok_cancel(const char *utf)
+{
+	if (getenv("XSYS4_AUTO_MSGBOX")) {
+		NOTICE("AUTO_MSGBOX_OK_CANCEL: '%s' -> OK", utf);
+		return 1;
+	}
+	int result = 0;
+	const SDL_MessageBoxData mbox = {
+		SDL_MESSAGEBOX_INFORMATION,
+		NULL,
+		"xsystem4",
+		utf,
+		SDL_arraysize(ok_cancel_buttons),
+		ok_cancel_buttons,
+		NULL
+	};
+	if (SDL_ShowMessageBox(&mbox, &result)) {
+		// Спросить не удалось (нет дисплея/собран без нужного бэкенда) — отвечаем
+		// «OK»: с «Cancel» игра осталась бы в том же меню, и пользователь не смог
+		// бы ни выйти, ни вернуться на титул.
+		WARNING("Error displaying message box: %s", SDL_GetError());
+		return 1;
+	}
+	return result;
+}
+
 static const SDL_MessageBoxButtonData stop_continue_buttons[] = {
 	{ SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Stop" },
 	{ 0, 0, "Continue" },
@@ -1126,36 +1164,15 @@ static void system_call(enum syscall_code code)
 	case SYS_MSGBOX: {
 		struct string *str = stack_peek_string(0);
 		char *utf = sjis2utf(str->text, str->size);
-		// Test mode: skip the native modal (it blocks the loop and renders on the
-		// default display, bypassing a virtual X server) — just log the text.
-		if (getenv("XSYS4_AUTO_MSGBOX"))
-			NOTICE("AUTO_MSGBOX: '%s'", utf);
-		else
-			SDL_ShowSimpleMessageBox(0, "xsystem4", utf, NULL);
+		vm_msgbox(utf);
 		free(utf);
 		// XXX: caller S_POPs
 		break;
 	}
 	case SYS_MSGBOX_OK_CANCEL: {
-		int result = 0;
 		struct string *str = stack_peek_string(0);
 		char *utf = sjis2utf(str->text, str->size);
-
-		const SDL_MessageBoxData mbox = {
-			SDL_MESSAGEBOX_INFORMATION,
-			NULL,
-			"xsystem4",
-			utf,
-			SDL_arraysize(ok_cancel_buttons),
-			ok_cancel_buttons,
-			NULL
-		};
-		if (getenv("XSYS4_AUTO_MSGBOX")) {
-			NOTICE("AUTO_MSGBOX_OK_CANCEL: '%s' -> OK", utf);
-			result = 1;  // auto-confirm (OK) for automated testing
-		} else if (SDL_ShowMessageBox(&mbox, &result)) {
-			WARNING("Error displaying message box");
-		}
+		int result = vm_msgbox_ok_cancel(utf);
 		free(utf);
 		heap_unref(stack_pop().i);
 		stack_push(result);

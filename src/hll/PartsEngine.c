@@ -779,50 +779,24 @@ static void PartsEngine_AddComponentMotionPos(int parts_no, float begin_x, float
 			begin_t, end_t, curve_name);
 }
 
-static void PartsEngine_add_construction_process(union vm_value *ints,
-		union vm_value *floats, union vm_value *strings)
+/*
+ * Одна операция процедуры построения (構築パーツ). Раньше это был инлайн-switch
+ * внутри HLL-обёртки; вынесен отдельно, потому что ТЕ ЖЕ операции приходят из
+ * ДВУХ мест: игра добавляет их в рантайме через AddPartsConstructionProcess, а
+ * раскладка активности описывает их узлом `手順リスト` (см. act_construction_run).
+ * Поля раскладки ложатся на параметры один в один: `コマンド`, `元矩形`,
+ * `先矩形`, `色１`, `文字間隔`/`行間隔`, `フォント*`, `テキスト`, `ＣＧ名`.
+ */
+static void construction_op(int parts_no, int state, int command, int interp_type,
+		int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh,
+		int r, int g, int b, int a, int r2, int g2, int b2,
+		int char_space, int line_space, int font_type, int font_size,
+		int font_r, int font_g, int font_b, int edge_r, int edge_g, int edge_b,
+		int full_size, float bold_weight, float edge_weight,
+		struct string *text, struct string *cg_name,
+		int radius_x, int radius_y, int start_angle, int sweep_angle, int blur)
 {
-	int parts_no    = ints[0].i;
-	int state       = ints[1].i;
-	int command     = ints[2].i;
-	int interp_type = ints[3].i;
-	int sx          = ints[4].i;
-	int sy          = ints[5].i;
-	int sw          = ints[6].i;
-	int sh          = ints[7].i;
-	int dx          = ints[8].i;
-	int dy          = ints[9].i;
-	int dw          = ints[12].i;
-	int dh          = ints[13].i;
-	int r           = ints[14].i;
-	int g           = ints[15].i;
-	int b           = ints[16].i;
-	int a           = ints[17].i;
-	// int r2       = ints[18].i;
-	// int g2       = ints[19].i;
-	// int b2       = ints[20].i;
-	int char_space  = ints[21].i;
-	int line_space  = ints[22].i;
-	int font_type   = ints[23].i;
-	int font_size   = ints[24].i;
-	int font_r      = ints[25].i;
-	int font_g      = ints[26].i;
-	int font_b      = ints[27].i;
-	int edge_r      = ints[28].i;
-	int edge_g      = ints[29].i;
-	int edge_b      = ints[30].i;
-	int full_size   = ints[31].i;
-	float bold_weight = floats[0].f;
-	float edge_weight = floats[1].f;
-	struct string *text    = heap_get_string(strings[0].i);
-	struct string *cg_name = heap_get_string(strings[1].i);
-
-	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
-		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
-		       command, parts_no, dx, dy, font_type, font_size, font_r, font_g, font_b,
-		       edge_r, edge_g, edge_b, edge_weight, bold_weight,
-		       strings[0].i, text ? (int)text->size : -1, text ? display_sjis0(text->text) : "(null)");
-
+	(void)interp_type; (void)sw; (void)sh;
 	switch (command) {
 	case 0:  // CASConstructionProcess::SetCreate
 		PE_AddCreateToPartsConstructionProcess(parts_no, dw, dh, state);
@@ -941,10 +915,93 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 				edge_r, edge_g, edge_b, edge_weight,
 				char_space, line_space, state);
 		break;
+	case 27:  // CASConstructionProcess::SetHBlurFilter (v14)
+	case 28:  // CASConstructionProcess::SetVBlurFilter (v14)
+		// Размытый задник экранов Dohna: CreateCG → HBlur → VBlur, сила в `ブラー`.
+		PE_AddBlurFilterToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				full_size, blur, command == 28, state);
+		break;
+	case 88:  // CASConstructionProcess::SetFillRect (v14) — заливка ЦВЕТОМ
+		PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh, r, g, b, state);
+		break;
+	case 90:  // CASConstructionProcess::SetFillRectAMap (v14) — заливка АЛЬФЫ
+		PE_AddFillAMapToPartsConstructionProcess(parts_no, dx, dy, dw, dh, a, state);
+		break;
+	case 102:  // CASConstructionProcess::SetFillCircleAMap (v14)
+		// Круг = сектор на 360°: центр в `先矩形`, радиусы в `半径`, альфа из `色１`.
+		// Так собраны точки-индикаторы страниц и круглые подложки иконок.
+		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
+				radius_x, radius_y, 0, 360, a, state);
+		break;
+	case 122:  // CASConstructionProcess::SetFillPieAMap (v14)
+		// Сектор в альфа-карту: из четырёх таких углов и двух прямоугольников
+		// собрана каждая скруглённая подложка интерфейса Dohna.
+		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
+				radius_x, radius_y, start_angle, sweep_angle, a, state);
+		break;
 	default:
 		WARNING("AddConstructProcess: unknown command %d", command);
 		break;
 	}
+}
+
+
+static void PartsEngine_add_construction_process(union vm_value *ints,
+		union vm_value *floats, union vm_value *strings, int nr_ints)
+{
+	int parts_no    = ints[0].i;
+	int state       = ints[1].i;
+	int command     = ints[2].i;
+	int interp_type = ints[3].i;
+	int sx          = ints[4].i;
+	int sy          = ints[5].i;
+	int sw          = ints[6].i;
+	int sh          = ints[7].i;
+	int dx          = ints[8].i;
+	int dy          = ints[9].i;
+	int dw          = ints[12].i;
+	int dh          = ints[13].i;
+	int r           = ints[14].i;
+	int g           = ints[15].i;
+	int b           = ints[16].i;
+	int a           = ints[17].i;
+	int r2          = ints[18].i;
+	int g2          = ints[19].i;
+	int b2          = ints[20].i;
+	int char_space  = ints[21].i;
+	int line_space  = ints[22].i;
+	int font_type   = ints[23].i;
+	int font_size   = ints[24].i;
+	int font_r      = ints[25].i;
+	int font_g      = ints[26].i;
+	int font_b      = ints[27].i;
+	int edge_r      = ints[28].i;
+	int edge_g      = ints[29].i;
+	int edge_b      = ints[30].i;
+	int full_size   = ints[31].i;
+	float bold_weight = floats[0].f;
+	float edge_weight = floats[1].f;
+	struct string *text    = heap_get_string(strings[0].i);
+	struct string *cg_name = heap_get_string(strings[1].i);
+	// Поля векторных фигур v14 живут за 32-м слотом классической раскладки —
+	// сюда они приходят только из ix-варианта (см. PE_AddPartsConstructionProcess_ix).
+	int radius_x = nr_ints > 34 ? ints[34].i : 0;
+	int radius_y = nr_ints > 35 ? ints[35].i : 0;
+	int start_angle = nr_ints > 36 ? ints[36].i : 0;
+	int sweep_angle = nr_ints > 37 ? ints[37].i : 0;
+	int blur = nr_ints > 38 ? ints[38].i : 0;  // поле `ブラー` (команды 27/28)
+
+	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
+		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
+		       command, parts_no, dx, dy, font_type, font_size, font_r, font_g, font_b,
+		       edge_r, edge_g, edge_b, edge_weight, bold_weight,
+		       strings[0].i, text ? (int)text->size : -1, text ? display_sjis0(text->text) : "(null)");
+
+	construction_op(parts_no, state, command, interp_type, sx, sy, sw, sh,
+			dx, dy, dw, dh, r, g, b, a, r2, g2, b2, char_space, line_space,
+			font_type, font_size, font_r, font_g, font_b,
+			edge_r, edge_g, edge_b, full_size, bold_weight, edge_weight,
+			text, cg_name, radius_x, radius_y, start_angle, sweep_angle, blur);
 }
 
 // Generic dispatch function for PartsEngine operations.
@@ -1048,7 +1105,7 @@ static int PartsEngine_PartsFunc(int func_id, struct page **array_int,
 		REQUIRE_INTS(32);
 		REQUIRE_FLOATS(2);
 		REQUIRE_STRINGS(2);
-		PartsEngine_add_construction_process(ints, floats, strings);
+		PartsEngine_add_construction_process(ints, floats, strings, 32);
 		return 1;
 	case 162:  // bool InitPartsMovie(int parts_no, int width, int height, int bg_r, int bg_g, int bg_b, int state)
 		REQUIRE_INTS(8);
@@ -1162,7 +1219,7 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 		NOTICE("AddPartsConstructionProcess part=%d state=%d cmd=%d dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
 		       ints[0].i, ints[1].i, ints[2].i, ints[8].i, ints[9].i,
 		       ints[12].i, ints[13].i, ints[14].i, ints[15].i, ints[16].i, ints[17].i);
-	PartsEngine_add_construction_process(ints, floats, strings);
+	PartsEngine_add_construction_process(ints, floats, strings, nr_ints);
 }
 
 // Ixseal (System 4 v14) form of the batch construction interface. The classic
@@ -1205,14 +1262,21 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	}
 	union vm_value *src = (*ai)->values;
 	int command = src[0].i;
-	if (command < 0 || command >= NR_CLASSIC_CONSTRUCTION_COMMANDS) {
+	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
+	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
+	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
+	static const int v14_ok[] = { 27, 28, 88, 90, 102, 122 };
+	bool known_v14 = false;
+	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
+		known_v14 |= (command == v14_ok[i]);
+	if (command < 0 || (command >= NR_CLASSIC_CONSTRUCTION_COMMANDS && !known_v14)) {
 		if (trace)
 			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d)",
 			       command, parts_no);
 		return;
 	}
 
-	union vm_value ints[32] = {0};
+	union vm_value ints[38] = {0};
 	ints[0].i = parts_no;
 	ints[1].i = state;
 	ints[2].i = command;
@@ -1227,7 +1291,13 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 		       ints[4].i, ints[5].i, ints[6].i, ints[7].i,
 		       ints[8].i, ints[9].i, ints[12].i, ints[13].i,
 		       ints[14].i, ints[15].i, ints[16].i, ints[17].i);
-	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values);
+	// Слоты 34..37 — наши, для полей фигур v14 (радиусы и углы дуги): классическая
+	// раскладка их не знает, а команде 122 они необходимы.
+	ints[34] = src[32];  // RadiusX
+	ints[35] = src[33];  // RadiusY
+	ints[36] = src[38];  // StartAngle
+	ints[37] = src[39];  // SweepAngle
+	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values, 38);
 }
 
 // --- Подсистема Activity (именованные наборы parts) ---
@@ -1541,6 +1611,108 @@ static float act_list_float(struct ex_tree *t, const char *utf8, int idx, float 
 
 static float act_float(struct ex_tree *t, const char *utf8, float dflt);
 
+/*
+ * Выполнить процедуру построения, ОПИСАННУЮ В РАСКЛАДКЕ (`手順リスト` у состояния
+ * `構築パーツ`). Раньше не выполнялась ни одна: часть превращалась в
+ * прямоугольную маску, и всё, что игра рисует этим механизмом, с экрана
+ * пропадало. У Dohna таких состояний 178 в 109 раскладках — это подложки
+ * счётчиков («Round128x40» под «TALENT 3/3»), рамки, стрелки навигации,
+ * размытия фона.
+ *
+ * Узел `手順N` описывает ровно ту же операцию, что игра шлёт в рантайме через
+ * `AddPartsConstructionProcess`, поле в поле, поэтому обе дороги сходятся в
+ * `construction_op`. Возвращает число ВЫПОЛНЕННЫХ операций (неизвестные команды
+ * не в счёт) — вызывающему это нужно, чтобы понять, осталась ли часть пустой.
+ * `blurred` — сколько шагов размытия встретилось: по нему вызывающий узнаёт, что
+ * процедура строит РАЗМЫТЫЙ ЗАДНИК экрана, а не элемент интерфейса.
+ */
+static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped, int *blurred)
+{
+	int done = 0;
+	*skipped = 0;
+	*blurred = 0;
+	for (int i = 1; ; i++) {
+		char key[32];
+		snprintf(key, sizeof(key), "手順%d", i);
+		struct ex_tree *op = act_child(proc, key);
+		if (!op)
+			break;
+		int command = act_int(op, "コマンド", -1);
+		if (command < 0)
+			continue;
+		// Команды за пределами реализованного набора пропускаем ЯВНО: пусть их
+		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
+		if (command > 24 && command != 27 && command != 28 && command != 88
+				&& command != 90 && command != 102 && command != 122) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("構築パーツ: команда %d раскладки не реализована "
+					"(часть %d) — этот шаг пропущен", command, no);
+			}
+			(*skipped)++;
+			continue;
+		}
+		if (command == 27 || command == 28)
+			(*blurred)++;
+		struct string *text = act_str(op, "テキスト");
+		struct string *cg = act_str(op, "ＣＧ名");
+		construction_op(no, state, command, act_int(op, "補間タイプ", 0),
+			act_list_int(op, "元矩形", 0, 0), act_list_int(op, "元矩形", 1, 0),
+			act_list_int(op, "元矩形", 2, 0), act_list_int(op, "元矩形", 3, 0),
+			act_list_int(op, "先矩形", 0, 0), act_list_int(op, "先矩形", 1, 0),
+			act_list_int(op, "先矩形", 4, 0), act_list_int(op, "先矩形", 5, 0),
+			act_list_int(op, "色１", 0, 0), act_list_int(op, "色１", 1, 0),
+			act_list_int(op, "色１", 2, 0), act_list_int(op, "色１", 3, 255),
+			act_list_int(op, "色２", 0, 0), act_list_int(op, "色２", 1, 0),
+			act_list_int(op, "色２", 2, 0),
+			act_int(op, "文字間隔", 0), act_int(op, "行間隔", 0),
+			act_int(op, "フォントタイプ", 0), act_int(op, "フォントサイズ", 16),
+			act_list_int(op, "フォント色", 0, 255), act_list_int(op, "フォント色", 1, 255),
+			act_list_int(op, "フォント色", 2, 255),
+			act_list_int(op, "フォント縁取り色", 0, 0),
+			act_list_int(op, "フォント縁取り色", 1, 0),
+			act_list_int(op, "フォント縁取り色", 2, 0),
+			act_int(op, "全体", 0), act_float(op, "フォント太さ", 0.0f),
+			act_float(op, "フォント縁取り", 0.0f), text, cg,
+			act_list_int(op, "半径", 0, 0), act_list_int(op, "半径", 1, 0),
+			act_list_int(op, "円弧角度", 0, 0), act_list_int(op, "円弧角度", 1, 0),
+			act_int(op, "ブラー", 0));
+		done++;
+	}
+	return done;
+}
+
+/*
+ * РЕДАКТОРСКАЯ ЗАГЛУШКА в поле `テキスト` раскладки. Обычный текст оттуда нужен —
+ * подписи кнопок выбора фазы («Hustling Phase») лежат именно там, и игра их не
+ * переустанавливает (проверено XSYS4_SETTEXT_TRACE: `SetText` для них не приходит).
+ * Но у части заготовок текст — буквальный placeholder редактора: `パーツテキスト`
+ * («текст части») у строки-подсказки футера, `ボタン` («кнопка») у подписи
+ * FooterButton. Игра переписывает их, ТОЛЬКО если ей есть что показать: у футера
+ * обучения подсказки нет (в EX-таблице `FooterText` нет записи для этой сцены), и
+ * заглушка оставалась на экране вместе с белой подложкой, которой у оригинала нет.
+ */
+static bool act_is_placeholder_text(struct string *txt)
+{
+	static const char *const placeholders[] = {
+		"パーツテキスト",  // «текст части» — подпись-заготовка в Footer.pactex
+		"ボタン",          // «кнопка» — подпись-заготовка в FooterButton.pactex
+	};
+	for (size_t i = 0; i < sizeof(placeholders) / sizeof(placeholders[0]); i++) {
+		char *sjis = utf2sjis(placeholders[i], strlen(placeholders[i]));
+		size_t n = strlen(sjis);
+		// ★Сравнение по ДЛИНЕ, а не strcmp: строки из EX-дерева не обязаны быть
+		// NUL-терминированными, и strcmp читал за границей буфера (движок падал
+		// молча на загрузке раскладок, ещё до титула).
+		bool hit = txt->size >= 0 && (size_t)txt->size == n && !memcmp(txt->text, sjis, n);
+		free(sjis);
+		if (hit)
+			return true;
+	}
+	return false;
+}
+
 static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8, int state)
 {
 	struct ex_tree *st = act_child(ti, state_utf8);
@@ -1570,6 +1742,10 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// message ("サンプル") whose 通常状態 is a パーツタイプ=13 text sub-node.
 	if (act_parts_type(st) == 13) {
 		struct string *txt = act_str(st, "テキスト");
+		// ★Шрифт настраиваем ДАЖЕ для заглушки: без него часть остаётся без
+		// метрик, и когда игра позже кладёт в неё свой текст, рендер падает
+		// молча (движок умирал на загрузке ADV-сцены, 0 *ERROR* в логе).
+		bool placeholder = txt && act_is_placeholder_text(txt);
 		if (txt && txt->size) {
 			struct ex_tree *fd = act_child(st, "テキスト装飾");
 			if (fd) {
@@ -1614,7 +1790,8 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 					PE_SetTextCharSpace(no, act_int(fd, "字間隔", 0), state);
 				PE_SetTextLineSpace(no, act_int(fd, "行間隔", 0), state);
 			}
-			PE_SetText(no, txt, state);
+			if (!placeholder)
+				PE_SetText(no, txt, state);
 		}
 		return;
 	}
@@ -1727,23 +1904,65 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		PE_ClearPartsConstructionProcess(no, state);
 		struct ex_tree *proc = act_child(st, "手順リスト");
 		struct ex_tree *step1 = proc ? act_child(proc, "手順1") : NULL;
+		/*
+		 * Операции процедуры ЗАПИСЫВАЕМ всегда, а СОБИРАЕМ поверхность — нет.
+		 * Разделение не косметическое, оно доказано A/B-прогонами:
+		 *  • только запись (сборку делает сама игра, когда ей нужно) — на экране
+		 *    появляются логотип магазина, эмблемы над карточками, подпись
+		 *    «TIME LEFT» и стрелки навигации, всё как у оригинала;
+		 *  • плюс наша сборка прямо из загрузчика — добавляются скруглённые
+		 *    подложки счётчиков, НО часть процедур создаёт полноэкранные
+		 *    поверхности (`CP BUILD` показывает 1380×820 и 1480×920), они
+		 *    перекрывают верхние слои, и логотип пропадает.
+		 * ★Причина того перекрытия — НЕ z, а незаконченная процедура: те
+		 * полноэкранные поверхности строят размытый задник экрана
+		 * (`SetCreateCG` → `Set{H,V}BlurFilter` → `SetFillAlphaColor`), а команды
+		 * размытия не были реализованы — шаг пропускался, и вместо задника
+		 * оставался чёрный непрозрачный прямоугольник. С реализованными 27/28
+		 * (см. `PARTS_CP_BLUR_FILTER`) процедура доходит до конца, поэтому сборка
+		 * из загрузчика включена ПО УМОЛЧАНИЮ; отключить для A/B —
+		 * XSYS4_CP_NO_ACT_BUILD=1.
+		 */
 		if (step1) {
-			int w = act_list_int(step1, "先矩形", 4, 0);
-			int h = act_list_int(step1, "先矩形", 5, 0);
-			if (w > 0 && h > 0) {
-				PE_SetPartsConstructionFill(no, w, h, state);
-				// Заливка — ТОЛЬКО маска: сама часть не рисуется, иначе
-				// непрозрачный прямоугольник закрывает экран (титул Dohna
-				// объявляет такую часть `表示 = 1, アルファ = 255`, z=29,
-				// 1480x920 поверх всего, а по её процедуре поверхность
-				// прозрачная). Клипперы Tsumamigui 3 и так `表示 = 0`.
-				PE_SetPartsConstructionMask(no);
-				static bool warned = false;
-				if (!warned) {
-					warned = true;
-					WARNING("構築パーツ: процедура построения не выполняется, "
-						"часть используется только как прямоугольная маска "
-						"альфа-клиппера и не рисуется");
+			int skipped = 0, blurred = 0;
+			int nr = act_construction_run(no, state, proc, &skipped, &blurred);
+			// Операции только НАКАПЛИВАЮТСЯ; поверхность появляется лишь после
+			// сборки. В рантайме её запускает сама игра
+			// (`Parts_BuildPartsConstructionProcess`), а для процедуры из
+			// раскладки звать некому — иначе часть остаётся пустой, и вся работа
+			// выше не видна на экране.
+			/*
+			 * Собираем и ПОКАЗЫВАЕМ часть только если выполнены ВСЕ шаги её
+			 * процедуры. Недостроенная поверхность — это не «частично верная
+			 * картинка», а чёрный непрозрачный прямоугольник: у титула Dohna
+			 * есть такая часть 1480×920 с `表示 = 1, アルファ = 255, z = 29`,
+			 * и, построенная наполовину, она накрывала весь экран (логотип
+			 * магазина и эмблемы на экране подбора талантов исчезали).
+			 * Пропущен хоть один шаг — ведём себя как раньше, прямоугольной
+			 * маской альфа-клиппера.
+			 * XSYS4_CP_NO_ACT_BUILD=1 — A/B-ручка, отключает сборку целиком.
+			 */
+			// ★По умолчанию собираем ТОЛЬКО задники — процедуры с размытием
+			// (`Set{H,V}BlurFilter`): без них экран остаётся без фона, а сквозь
+			// панель просвечивает предыдущая сцена. Прочие процедуры (подложки
+			// счётчиков и т.п.) по-прежнему под ручкой XSYS4_CP_ACT_BUILD=1:
+			// с ними на экране подбора талантов ПРОПАДАЕТ логотип магазина
+			// (часть 90000941 остаётся `lshow=1 gshow=1 alpha=255`, то есть её
+			// перекрывают, а чем — пока не выяснено; в слое титула висит
+			// собранная поверхность 1480×920 `90000041` с alpha=255).
+			bool build = blurred > 0 || getenv("XSYS4_CP_ACT_BUILD");
+			if (nr > 0 && skipped == 0 && build && !getenv("XSYS4_CP_NO_ACT_BUILD"))
+				PE_BuildPartsConstructionProcess(no, state);
+			// Процедуры без единой ВЫПОЛНЕННОЙ операции (все команды
+			// неизвестны) оставляем прежним поведением — прямоугольной
+			// маской альфа-клиппера: лучше клип по габаритам, чем пустая
+			// часть. Заодно так ведут себя `表示 = 0`-клипперы Tsumamigui 3.
+			if (nr == 0 || skipped > 0) {
+				int w = act_list_int(step1, "先矩形", 4, 0);
+				int h = act_list_int(step1, "先矩形", 5, 0);
+				if (w > 0 && h > 0) {
+					PE_SetPartsConstructionFill(no, w, h, state);
+					PE_SetPartsConstructionMask(no);
 				}
 			}
 		}
@@ -1838,6 +2057,23 @@ struct pe_vscrollbar {
 };
 static struct pe_vscrollbar *pe_vscrollbar_get(int parts_no, bool create);
 static void pe_vscrollbar_apply_enabled(struct pe_vscrollbar *sb);
+struct pe_button_state {
+	int parts_no;
+	struct string *cg_base;
+	int enabled;  // -1 ещё не спрашивали, 0 выключена, 1 включена
+	/*
+	 * Подпись НА кнопке — отдельная текстовая часть-ребёнок, созданная при
+	 * разборе раскладки (шрифт и цвет оттуда же). Игра меняет только СТРОКУ,
+	 * через `SetButtonText`, поэтому храним номер части и геометрию кнопки,
+	 * чтобы каждый раз перецентрировать надпись.
+	 */
+	int text_no;
+	int text_x, text_y, box_w, box_h, font_size;
+};
+
+static struct pe_button_state *pe_button_get(int parts_no, bool create);
+// Запоминает базовое имя CG кнопки — по нему SetButtonEnable подставляет `／無効`.
+static void pe_button_remember_cg(int parts_no, struct string *cg_base);
 
 // base CG name + UTF-8 suffix -> new SJIS string (caller frees). For composite
 // widgets whose sub-CGs are stored as "<base><suffix>" in the CG archive
@@ -1905,6 +2141,9 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		static const char *const btn_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
 		struct string *cg = act_str(ti, "ＣＧ名");
 		struct string *flat = act_str(ti, "フラット名");
+		// Запоминаем БАЗУ имени: по ней SetButtonEnable подставит `／無効`
+		// (серый вид недоступной кнопки), которого среди трёх состояний нет.
+		pe_button_remember_cg(no, cg);
 		int bw = act_list_int(ti, "サイズ", 0, 0);
 		int bh = act_list_int(ti, "サイズ", 1, 0);
 		for (int s = 1; s <= 3; s++) {
@@ -1928,6 +2167,54 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		}
 		PE_SetClickable(no, true);
 		PE_SetPartsIsButton(no, true);  // report component type 0 (button) to the game
+		/*
+		 * Подпись НА кнопке. У типа `ボタン` она лежит в самой кнопке
+		 * (`テキスト` + свой шрифт + `テキスト位置`), а не в отдельной текстовой
+		 * части, и раньше не рисовалась вовсе: в CONFIG плашки «Reset» выходили
+		 * пустыми белыми прямоугольниками. Рисуем так же, как подпись чекбокса —
+		 * отдельной текстовой частью-ребёнком, но ПО ЦЕНТРУ кнопки
+		 * (`テキスト位置 = 5` у всех кнопок Dohna — то же значение, что
+		 * `原点座標モード` для центра).
+		 */
+		struct string *btxt = act_str(ti, "テキスト");
+		if (btxt && btxt->size && !act_is_placeholder_text(btxt)) {
+			int base_x = act_list_int(node, "座標", 0, 0);
+			int base_y = act_list_int(node, "座標", 1, 0);
+			int cw = PE_GetPartsWidth(no, 1);
+			int ch = PE_GetPartsHeight(no, 1);
+			if (cw <= 0) cw = bw;
+			if (ch <= 0) ch = bh;
+			int fsize = act_int(ti, "フォントサイズ", 16);
+			int tno = ++pe_act_part_seq;
+			PE_SetText(tno, btxt, 1);
+			PE_SetFont(tno, act_int(ti, "フォントタイプ", 0), fsize,
+				act_list_int(ti, "フォント色", 0, 0),
+				act_list_int(ti, "フォント色", 1, 0),
+				act_list_int(ti, "フォント色", 2, 0),
+				act_float(ti, "フォント太さ", 0.0f),
+				act_list_int(ti, "フォント縁取り色", 0, 0),
+				act_list_int(ti, "フォント縁取り色", 1, 0),
+				act_list_int(ti, "フォント縁取り色", 2, 0),
+				act_float(ti, "フォント縁取り", 0.0f), 1);
+			int tw = PE_GetPartsWidth(tno, 1);
+			int tx = base_x + (cw > tw ? (cw - tw) / 2 : 0);
+			int ty = base_y + (ch > fsize ? (ch - fsize) / 2 : 0);
+			PE_SetPos(tno, tx, ty);
+			if (parent_no >= 0)
+				PE_SetParentPartsNumber(tno, parent_no);
+			// ★Подпись лежит ПОВЕРХ плашки кнопки: с равным z она уходила под
+			// картинку кнопки и не была видна (плашки «Reset» в CONFIG выходили
+			// пустыми, хотя текст в часть ставился — видно в XSYS4_SETTEXT_TRACE).
+			PE_SetZ(tno, act_list_int(node, "座標", 2, 0) + 1);
+			PE_SetShow(tno, 1);
+			struct pe_button_state *b = pe_button_get(no, true);
+			b->text_no = tno;
+			b->text_x = base_x;
+			b->text_y = base_y;
+			b->box_w = cw;
+			b->box_h = ch;
+			b->font_size = fsize;
+		}
 	} else if (ptype == 3 && ti) {
 		// horizontal scrollbar / slider (パーツタイプ=3). ＣＧ名 is a *base* name;
 		// the draggable knob ("bar") is stored per-state as "<base>／バー／通常",
@@ -2663,8 +2950,70 @@ HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, LoadActivityEXText, struct str
 // сеттеры — no-op, геттеры — разумные дефолты. Кнопки считаем включёнными,
 // чтобы логика меню могла по ним кликать. ---
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonSize, int a, int b, int c);
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonEnable, int a, bool b);
-HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsButtonEnable, int a);
+/*
+ * Доступность кнопки. В архиве у кнопочного CG ЧЕТЫРЕ варианта:
+ * `<base>／通常`, `／オン`, `／ダウン` и `／無効` — последний как раз серый. При
+ * создании из раскладки грузятся только первые три, поэтому недоступные кнопки
+ * оставались цветными: у Dohna на выборе фазы дня «Hunting Phase» должна быть
+ * СЕРОЙ (в первый день недоступна), на домашнем экране — «Squad» и «Shop».
+ * Заодно снимаем кликабельность, иначе по серой кнопке можно нажать.
+ *
+ * Базовое имя CG запоминаем при разборе раскладки (act_build_part): в рантайме
+ * его взять уже негде — часть хранит только имя загруженного файла с суффиксом.
+ * Приём тот же, что у скроллбара (`pe_vscrollbar.cg_base`).
+ */
+static struct pe_button_state *pe_buttons;
+static int nr_pe_buttons;
+
+static struct pe_button_state *pe_button_get(int parts_no, bool create)
+{
+	for (int i = 0; i < nr_pe_buttons; i++)
+		if (pe_buttons[i].parts_no == parts_no)
+			return &pe_buttons[i];
+	if (!create)
+		return NULL;
+	pe_buttons = xrealloc_array(pe_buttons, nr_pe_buttons, nr_pe_buttons + 1,
+			sizeof(*pe_buttons));
+	struct pe_button_state *b = &pe_buttons[nr_pe_buttons++];
+	*b = (struct pe_button_state){ .parts_no = parts_no, .enabled = -1 };
+	return b;
+}
+
+static void pe_button_remember_cg(int parts_no, struct string *cg_base)
+{
+	if (!cg_base || !cg_base->size)
+		return;
+	struct pe_button_state *b = pe_button_get(parts_no, true);
+	if (b->cg_base)
+		free_string(b->cg_base);
+	b->cg_base = string_ref(cg_base);
+}
+
+static void PartsEngine_SetButtonEnable(int parts_no, bool enable)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, true);
+	int en = enable ? 1 : 0;
+	if (b->enabled == en)
+		return;
+	b->enabled = en;
+	PE_SetClickable(parts_no, enable);
+	if (!b->cg_base)
+		return;
+	// Серый вид — отдельный файл `／無効`; включённой кнопке возвращаем `／通常`.
+	struct string *f = act_cg_suffix(b->cg_base, enable ? "／通常" : "／無効");
+	PE_SetPartsCG(parts_no, f, 0, 1);
+	free_string(f);
+}
+
+static bool PartsEngine_IsButtonEnable(int parts_no)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, false);
+	return !b || b->enabled != 0;
+}
+// Чекбоксы — так же: «доступность» не рисуем, но считаем включёнными. Без этих
+// двух System Menu в ADV (SceneAdvButtonMenu@UpdateCheckable) валит движок.
+HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetCheckBoxEnable, int a, bool b);
+HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsCheckBoxEnable, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonColor, int a, int b, int c, int d);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonR, int a);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonG, int a);
@@ -2887,7 +3236,28 @@ static bool PE_ReleasePartsMovie(int parts_no, int state) {
 	(void)parts_no; (void)state;
 	return true;
 }
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonText, int a, struct string *b);
+/*
+ * Игра меняет подпись кнопки этой функцией — например в CONFIG кнопки «Reset»
+ * (`SYS_マスターボタン` и соседние) приходят из раскладки с текстом, а игра
+ * переустанавливает его при построении страницы. Пока функция была заглушкой,
+ * плашки «Reset» оставались пустыми белыми прямоугольниками.
+ *
+ * Рисуем в ту же текстовую часть, которую загрузчик создал для подписи (шрифт и
+ * цвет — из раскладки), и заново центрируем: ширина строки меняется вместе с
+ * текстом. Если подписи у кнопки не было (текст в раскладке пуст), рисовать
+ * нечем — тогда молча выходим, как раньше.
+ */
+static void PartsEngine_SetButtonText(int parts_no, struct string *text)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, false);
+	if (!b || !b->text_no || !text)
+		return;
+	PE_SetText(b->text_no, text, 1);
+	int tw = PE_GetPartsWidth(b->text_no, 1);
+	int tx = b->text_x + (b->box_w > tw ? (b->box_w - tw) / 2 : 0);
+	int ty = b->text_y + (b->box_h > b->font_size ? (b->box_h - b->font_size) / 2 : 0);
+	PE_SetPos(b->text_no, tx, ty);
+}
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonTextOriginPosMode, int a, int b);
 HLL_QUIET_UNIMPLEMENTED(0, int, PartsEngine, GetButtonTextOriginPosMode, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonCharSpace, int a, int b);
@@ -3300,6 +3670,22 @@ static void PE_GetTextPartsText_v7(struct string **out, int parts_no, int state)
 }
 
 static void PartsEngine_PreLink(void);
+
+// --- «Асинхронная» загрузка ресурса в часть (Ixseal-игры).
+// Делегат завершения игра вызывает САМА: в .ain у parts::detail::SetPartsCGThread
+// после CALLHLL идёт проверка Delegate.Empty и вызов лямбд. Движку остаётся
+// загрузить ресурс — делаем это синхронно, и на «готово?» отвечаем сразу да.
+static bool PartsEngine_Parts_SetPartsCGThread(int parts_no, struct string *cg_name, int state)
+{
+	return PE_SetPartsCG(parts_no, cg_name, 0, state);
+}
+
+static bool PartsEngine_Parts_SetPartsFlatThread(int parts_no, struct string *filename, int state)
+{
+	return PE_SetPartsFlat(parts_no, filename, state);
+}
+
+HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, Parts_IsThreadLoading, int a, int b);
 
 HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(_PreLink, PartsEngine_PreLink),
@@ -3800,6 +4186,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetCheckBoxSize, PartsEngine_SetCheckBoxSize),
 	    HLL_TODO_EXPORT(SetCheckBoxDrag, PartsEngine_SetCheckBoxDrag),
 	    HLL_TODO_EXPORT(IsCheckBoxDrag, PartsEngine_IsCheckBoxDrag),
+	    HLL_EXPORT(SetCheckBoxEnable, PartsEngine_SetCheckBoxEnable),
+	    HLL_EXPORT(IsCheckBoxEnable, PartsEngine_IsCheckBoxEnable),
 	    HLL_EXPORT(CheckBoxChecked, PE_SetPartsCheckBoxChecked),
 	    HLL_EXPORT(IsCheckBoxChecked, PE_GetPartsCheckBoxChecked),
 	    HLL_EXPORT(SetCheckBoxColor, PE_SetPartsCheckBoxColor),
@@ -3950,6 +4338,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetPanelAlphaGradationRight, PE_GetPanelAlphaGradationRight),
 	    HLL_EXPORT(GetLayoutBoxAlign, PE_GetLayoutBoxAlign),
 	    HLL_EXPORT(Parts_SetPartsCG, PE_SetPartsCG),
+	    HLL_EXPORT(Parts_SetPartsCGThread, PartsEngine_Parts_SetPartsCGThread),
+	    HLL_EXPORT(Parts_IsThreadLoading, PartsEngine_Parts_IsThreadLoading),
 	    HLL_EXPORT(Parts_GetPartsCGName, PE_GetPartsCGName),
 	    HLL_EXPORT(Parts_GetPartsCGDeform, PE_GetPartsCGDeform),
 	    HLL_EXPORT(Parts_SetPartsCGSurfaceArea, PE_SetPartsCGSurfaceArea),
@@ -4002,6 +4392,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetNumeralLength, PE_GetNumeralLength),
 	    HLL_TODO_EXPORT(Parts_SetPartsCGDetectionSurfaceArea, PartsEngine_Parts_SetPartsCGDetectionSurfaceArea),
 	    HLL_EXPORT(Parts_SetPartsFlat, PE_SetPartsFlat),
+	    HLL_EXPORT(Parts_SetPartsFlatThread, PartsEngine_Parts_SetPartsFlatThread),
 	    HLL_EXPORT(Parts_IsPartsFlatEnd, PE_IsPartsFlatEnd),
 	    HLL_EXPORT(Parts_GetPartsFlatCurrentFrameNumber, PE_GetPartsFlatCurrentFrameNumber),
 	    HLL_EXPORT(Parts_BackPartsFlatBeginFrame, PE_BackPartsFlatBeginFrame),

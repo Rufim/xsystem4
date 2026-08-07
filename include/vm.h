@@ -155,6 +155,14 @@ const char *vm_current_instruction_name(void);
 // номер слота — слоты переиспользуются, по номеру виновника не опознать.
 void vm_note_last_fini(int type, int value, const char *fn);
 const char *vm_last_fini_str(void);
+
+// Системные окна сообщений (у оригинала на Windows это MessageBox). Один путь и для
+// syscall'ов SYS_MSGBOX*, и для HLL-обёрток System.MsgBox*: игры зовут то одно, то
+// другое — Dohna, например, подтверждает возврат на титул через HLL.
+// Текст — UTF-8. `vm_msgbox_ok_cancel` возвращает 1 (OK) либо 0 (Cancel).
+void vm_msgbox(const char *utf8);
+int vm_msgbox_ok_cancel(const char *utf8);
+
 _Noreturn void _vm_error(const char *fmt, ...);
 _Noreturn void vm_exit(int code);
 _Noreturn void vm_reset(void);

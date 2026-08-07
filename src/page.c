@@ -811,13 +811,24 @@ static void init_array_elem(struct page *page, int elem, enum ain_data_type type
 			    int struct_type, bool init_structs)
 {
 	int es = array_elem_slots(page);
-	if (es > 1) {
+	if (es > 1 && page->a_type == AIN_OPTION) {
+		// `option<>`: ПОСЛЕДНИЙ слот — тег наличия, 1 = пусто; остальные — само
+		// значение, пустое = -1 (та же раскладка, что у переменных, см.
+		// init_option_vars). Ширина зависит от обёрнутого типа: над структурой
+		// это ДВА слота (объект + тег), над интерфейсом — три (пара + тег).
+		// ★Прежде второй слот безусловно писался нулём — как «база интерфейса»,
+		// — и у двухслотового option это давало тег 0, то есть «значение есть»
+		// при объекте -1. `ItemViewCollection@SetPosition` тег проверяет, а на -1
+		// не смотрит (в отличие от OptionalExtensions::HasValue), поэтому звал
+		// метод на пустой ссылке: экран ITEMS падал «Out of bounds heap index:
+		// -1/0» в `ItemView@SetPos`.
+		for (int k = 0; k < es - 1; k++)
+			page->values[elem*es + k].i = -1;
+		page->values[elem*es + es - 1].i = 1;
+	} else if (es > 1) {
 		// Пустая ссылка на интерфейс: объекта нет, база интерфейса 0.
-		// У `option<>` третий слот — ТЕГ, и 1 значит «пусто» (0 = значение есть).
 		page->values[elem*es].i = -1;
 		page->values[elem*es + 1].i = 0;
-		if (es > 2)
-			page->values[elem*es + 2].i = 1;
 	} else if (type == AIN_STRUCT && init_structs) {
 		create_struct(struct_type, &page->values[elem]);
 	} else {

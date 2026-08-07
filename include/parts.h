@@ -234,6 +234,8 @@ bool PE_AddFillToPartsConstructionProcess(int parts_no, int x, int y, int w, int
 bool PE_AddFillAlphaColorToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, int a, int state);
 bool PE_AddFillAMapToPartsConstructionProcess(int parts_no, int x, int y, int w, int h, int a, int state);
+bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int rx, int ry,
+		int start_angle, int sweep_angle, int a, int state);
 bool PE_AddFillWithAlphaToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, int a, int state);
 bool PE_AddDrawRectToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
@@ -244,6 +246,10 @@ bool PE_AddCopyCutCGToPartsConstructionProcess(int parts_no, struct string *cg_n
 		int dx, int dy, int dw, int dh, int sx, int sy, int sw, int sh, int interp_type, int state);
 bool PE_AddGrayFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		bool full_size, int state);
+// Размытие по одной оси (команды 27/28 раскладки): `vertical` различает V- и H-вариант,
+// `radius` — поле `ブラー`.
+bool PE_AddBlurFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		bool full_size, int radius, bool vertical, int state);
 bool PE_AddCopyTextToPartsConstructionProcess(int parts_no, int x, int y, struct string *text,
 		int type, int size, int r, int g, int b, float bold_weight,
 		int edge_r, int edge_g, int edge_b, float edge_weight,
