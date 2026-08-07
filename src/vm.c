@@ -1990,7 +1990,20 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case SP_INC: {
-		heap_ref(stack_pop().i);
+		int slot = stack_pop().i;
+		/*
+		 * `XSYS4_SPINC_TRACE=1` — ЗАМЕР: берётся ли ссылка на настоящий объект.
+		 * Компилятор балансирует владение парой `POP; SP_INC` над многослотовым
+		 * значением (у интерфейса это `[слот объекта, база]`), и если наш порядок
+		 * слотов расходится, `SP_INC` реф'ит «базу» — то есть произвольное число, а
+		 * объект остаётся без удержания и умирает раньше времени. Печатаем ТОЛЬКО
+		 * подозрительные случаи, иначе лог тонет.
+		 */
+		if (getenv("XSYS4_SPINC_TRACE") && slot != -1 && !heap_slot_is_page(slot)
+				&& !heap_slot_is_string(slot))
+			WARNING("SPINC подозрительный слот %d в %s", slot,
+				display_sjis0(vm_current_function_name()));
+		heap_ref(slot);
 		break;
 	}
 	case OBJSWAP: {

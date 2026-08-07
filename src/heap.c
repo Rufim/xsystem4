@@ -89,6 +89,20 @@ static bool heap_watched(int32_t slot)
 	return slot == heap_watch_slot;
 }
 
+bool heap_slot_is_page(int index)
+{
+	if (index <= 0 || !heap_index_valid(index))
+		return false;
+	return heap[index].type == VM_PAGE && heap[index].ref > 0 && heap[index].page;
+}
+
+bool heap_slot_is_string(int index)
+{
+	if (index <= 0 || !heap_index_valid(index))
+		return false;
+	return heap[index].type == VM_STRING && heap[index].ref > 0;
+}
+
 void heap_watch_slot_set(int32_t slot)
 {
 	heap_watch_slot = slot;

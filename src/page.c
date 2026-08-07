@@ -347,6 +347,45 @@ union vm_value variable_initval_var(struct page *container, int varno, enum ain_
 	return (union vm_value) { .i = slot };
 }
 
+/*
+ * Лежит ли в heap-слоте обёртка ПАРТА, то есть структура, реализующая интерфейс
+ * `IParts` (`parts::detail::CParts` и её производные — CSpriteParts, CTextParts,
+ * CButtonParts и прочие). Номер интерфейса ищем по имени один раз.
+ */
+possibly_unused static bool page_is_parts_wrapper(int slot)
+{
+	// Слот мог быть уже освобождён или содержать не страницу — `heap_get_page` в
+	// таком случае валит VM фатальной ошибкой, поэтому сначала безопасная проверка.
+	if (!heap_slot_is_page(slot))
+		return false;
+	struct page *page = heap_get_page(slot);
+	if (!page || page->type != STRUCT_PAGE)
+		return false;
+	if (page->index < 0 || page->index >= ain->nr_structures)
+		return false;
+
+	static int iparts = -2;
+	if (iparts == -2) {
+		iparts = -1;
+		for (int i = 0; i < ain->nr_structures; i++) {
+			if (ain->structures[i].name
+			    && !strcmp(ain->structures[i].name, "IParts")) {
+				iparts = i;
+				break;
+			}
+		}
+	}
+	if (iparts < 0)
+		return false;
+
+	struct ain_struct *s = &ain->structures[page->index];
+	for (int i = 0; i < s->nr_interfaces; i++) {
+		if (s->interfaces[i].struct_type == iparts)
+			return true;
+	}
+	return false;
+}
+
 void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 {
 	// XSYS4_FINI_TRACE=<подстрока имени функции> — какие ТИПЫ и значения реально
@@ -444,6 +483,17 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 			break;
 		if (type == AIN_IFACE && getenv("XSYS4_NO_IFACE_FINI"))
 			break;
+		/*
+		 * ★ОТВЕРГНУТО ЗАМЕРОМ: «не освобождать из `wrap<>`-полей ОБЁРТКИ ПАРТОВ
+		 * (структуры, реализующие `IParts`), раз их жизненным циклом распоряжается
+		 * игра через `AutoRelease`». Ассерт `Executer.jaf:55` у Dohna остаётся.
+		 * ★Осторожно с ложным успехом: в первом прогоне ассертов было 0 только
+		 * потому, что игра падала РАНЬШЕ на фатальной `Invalid page index` из самой
+		 * проверки (`heap_get_page` на освобождённом слоте). После добавления
+		 * `heap_slot_is_page()` фатальная ушла — и ассерт вернулся.
+		 * Предикат `page_is_parts_wrapper()` оставлен: он же понадобится следующей
+		 * версии, а стоит один вызов только для AIN_WRAP.
+		 */
 		if (getenv("XSYS4_UNREF_TRACE"))
 			WARNING("UNREFTRACE type=%d v=%d dtor=%d in %s", type, v.i,
 				(int)call_dtor, vm_current_function_name());

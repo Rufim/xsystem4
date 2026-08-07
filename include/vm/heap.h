@@ -72,6 +72,12 @@ bool page_index_valid(int index);
 bool string_index_valid(int index);
 
 struct page *heap_get_page(int index);
+// Безопасная проверка: лежит ли в слоте СТРАНИЦА (а не строка/пусто). Нужна там,
+// где слот мог быть уже освобождён: `heap_get_page` на чужом типе — фатальная
+// ошибка VM, а не NULL.
+bool heap_slot_is_page(int index);
+// Лежит ли в слоте СТРОКА (парный предикат к heap_slot_is_page).
+bool heap_slot_is_string(int index);
 struct page *heap_get_delegate_page(int index);
 struct string *heap_get_string(int index);
 void heap_set_page(int slot, struct page *page);
