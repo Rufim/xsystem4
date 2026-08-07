@@ -130,12 +130,28 @@ static void dirty_list_remove(struct parts *parts)
 		TAILQ_REMOVE(&dirty_list, parts, dirty_list_entry);
 }
 
+static int ctrl_stack_pos(int id);
+
 static int parts_get_sprite_z(struct parts *parts)
 {
 	if (!parts_multi_controller)
 		return parts->global.z;
+	// ★Порядок слоёв задаёт ПОЗИЦИЯ В СТЕКЕ, а не id: id — просто выданный номер,
+	// и после сноса слоя из середины он уже не совпадает с глубиной (наш id —
+	// наименьший свободный, так что заново созданный слой может получить МАЛЫЙ
+	// номер и оказаться на вершине стека). Пока ключом был id, свежий экран мог
+	// уехать ПОД старый — у Haha Ranman так титул (id 3, позиция 2) сортировался
+	// выше сцены, добавленной после него (id 2, позиция 3).
 	// The system overlay controller sorts above any in-stack controller.
-	return parts->controller_no;
+	if (parts->controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY)
+		return PARTS_CONTROLLER_STACK_MAX;
+	int pos = ctrl_stack_pos(parts->controller_no);
+	// Слоя уже нет в стеке, а парт его пережил — кладём под всё. ★ИМЕННО 0, а не
+	// −1: отрицательный ключ спрайт-сцена не принимает, и парт пропадает с экрана
+	// совсем. Ловилось так: при опыте с честным сносом слоя пролог становился
+	// ЧЁРНЫМ, хотя дамп показывал у частей show=1, alpha=255 и живую текстуру —
+	// невидимыми оказывались ровно те слои, которых уже не было в стеке.
+	return pos >= 0 ? pos : 0;
 }
 
 static int parts_get_sprite_z2(struct parts *parts)
@@ -1194,6 +1210,14 @@ void parts_debug_dump(void)
 {
 	struct parts *p;
 	int n = 0;
+	{
+		char buf[256]; int m = 0;
+		for (int i = 0; i < ctrl_stack.nr_controllers && m < 200; i++)
+			m += snprintf(buf + m, sizeof(buf) - m, "%d%s ", ctrl_stack.stack[i],
+				      ctrl_stack.hidden[i] ? "(скрыт)" : "");
+		buf[m] = 0;
+		NOTICE("  СТЕК СЛОЁВ (низ→верх): %s| активный %d", buf, ctrl_stack.active);
+	}
 	PARTS_LIST_FOREACH(p) {
 		Rectangle *hb = &p->states[0].common.hitbox;
 		// Имя CG у состояния 0 — без него в дампе не отличить «наш прямоугольник не
@@ -2582,9 +2606,15 @@ void PE_SetPartsPixelDecide(int parts_no, bool pixel_decide)
 	//UNIMPLEMENTED("(%d, %s)", parts_no, pixel_decide ? "true" : "false");
 }
 
+// ★Коэффициент уменьшения превью. Хранить его обязательно: он ЕДИНСТВЕННЫЙ признак,
+// по которому различаются две несовместимые трактовки второго аргумента SaveThumbnail
+// (см. PE_save_thumbnail). Tsumamigui 3 не зовёт эту функцию ВООБЩЕ (0 вхождений в
+// байткоде), Escalayer Reboot зовёт перед каждым сохранением со значением 5.
+static int thumbnail_reduction_size = 0;
+
 bool PE_SetThumbnailReductionSize(int reduction_size)
 {
-	UNIMPLEMENTED("(%d)", reduction_size);
+	thumbnail_reduction_size = reduction_size;
 	return true;
 }
 
@@ -2594,15 +2624,30 @@ bool PE_SetThumbnailMode(bool mode)
 	return true;
 }
 
-// thumbnail_width — ШИРИНА превью в пикселях, не делитель. В .ain Tsumamigui 3 параметр
-// обёртки так и называется (`gamesave::SaveThumbnail(int SaveNumber, int ThumbnailWidth)`),
-// а игра передаёт 200 (`AFL_GameSave_SaveThumbnail`: PUSH 81 / PUSH 200). Прежняя трактовка
-// «reduction factor» (догадка upstream, судя по всему непроверенная) давала 1024/200 = 5 ⇒
-// превью 5×3 px, и превью в слотах сохранения выглядели пустыми. Высота — по пропорции кадра.
+// ★ВТОРОЙ АРГУМЕНТ ЗНАЧИТ РАЗНОЕ У РАЗНЫХ ИГР, и это не догадка, а замер по двум играм:
+//
+//   Tsumamigui 3  — `SetThumbnailReductionSize` НЕ зовёт вовсе (0 вхождений в байткоде),
+//                   параметр обёртки называется `ThumbnailWidth`, игра передаёт 200.
+//                   Это ШИРИНА: превью выходят ~40 КБ и выглядят как надо.
+//   Escalayer Reboot — зовёт `SetThumbnailReductionSize(5)` перед КАЖДЫМ сохранением
+//                   (`AFL_GameSave_SaveThumbnail`: SetReductionSize → SetThumbnailMode(1)
+//                   → Update → SaveThumbnail) и передаёт ту же пятёрку. Это ДЕЛИТЕЛЬ:
+//                   трактовка «ширина» давала 5×3 px и файлы по 140 байт — в слотах
+//                   сохранения картинок просто не было видно (нашёл пользователь).
+//
+// Различитель — сам факт вызова `SetThumbnailReductionSize`: у кого он задан, у того
+// второй аргумент делитель. Подгонка по величине («меньше 32 — значит делитель») тут не
+// нужна и была бы догадкой. Высота — по пропорции кадра.
 bool PE_save_thumbnail(struct string *filename, int thumbnail_width)
 {
 	Texture *src = gfx_main_surface();
-	int w = thumbnail_width > 0 ? thumbnail_width : src->w;
+	int w;
+	if (thumbnail_reduction_size > 1)
+		w = src->w / thumbnail_reduction_size;
+	else
+		w = thumbnail_width > 0 ? thumbnail_width : src->w;
+	if (w < 1)
+		w = 1;
 	if (w > src->w)
 		w = src->w;
 	int h = src->h * w / src->w;
@@ -3352,6 +3397,8 @@ int PE_GetFreeNumber(void)
 		first_free++;
 	}
 	// XXX: the ID is incremented even if the parts is not created
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS GetFreeNumber -> %d", first_free);
 	return first_free++;
 }
 
@@ -3364,6 +3411,23 @@ void PE_SetSpeedupRateByMessageSkip(int parts_no, int rate)
 {
 	if (rate != 1)
 		UNIMPLEMENTED("(%d, %d)");
+}
+
+// Порядок слоёв изменился (добавили/сняли слой) — ключ сортировки у ВСЕХ партов
+// зависит от позиции, поэтому список надо пересобрать целиком.
+static void ctrl_stack_resort_all(void)
+{
+	struct parts *p;
+	struct parts_list saved;
+	TAILQ_INIT(&saved);
+	while ((p = TAILQ_FIRST(&parts_list))) {
+		parts_list_remove(p);   // снимает и с TAILQ, и со сцены спрайтов
+		TAILQ_INSERT_TAIL(&saved, p, parts_list_entry);
+	}
+	while ((p = TAILQ_FIRST(&saved))) {
+		TAILQ_REMOVE(&saved, p, parts_list_entry);
+		parts_list_insert(p);
+	}
 }
 
 // Позиция слоя `id` в стеке (низ = 0) или -1, если такого слоя нет.
@@ -3382,8 +3446,11 @@ void parts_controller_stack_restore(int nr, int active)
 	if (nr < 0) nr = 0;
 	if (nr > PARTS_CONTROLLER_STACK_MAX) nr = PARTS_CONTROLLER_STACK_MAX;
 	ctrl_stack.nr_controllers = nr;
-	for (int i = 0; i < nr; i++)
+	for (int i = 0; i < nr; i++) {
 		ctrl_stack.stack[i] = i;
+		ctrl_stack.hidden[i] = false;
+	}
+	ctrl_stack.next_id = nr;
 	ctrl_stack.active = active;
 }
 
@@ -3405,15 +3472,13 @@ int PE_AddController(int index)
 	if (ctrl_stack.nr_controllers >= PARTS_CONTROLLER_STACK_MAX)
 		VM_ERROR("controller stack overflow");
 
-	// ID — НАИМЕНЬШИЙ СВОБОДНЫЙ (см. struct parts_controller_stack): при чисто
-	// стековом использовании это ровно прежняя нумерация 0,1,2,…, но id не съезжает
-	// при удалении слоя из середины.
-	int no = 0;
-	while (ctrl_stack_pos(no) >= 0)
-		no++;
-	ctrl_stack.stack[ctrl_stack.nr_controllers++] = no;
+	// ID монотонный (см. struct parts_controller_stack): номера НЕ переиспользуются.
+	int no = ctrl_stack.next_id++;
+	int pos = ctrl_stack.nr_controllers++;
+	ctrl_stack.stack[pos] = no;
+	ctrl_stack.hidden[pos] = false;
 	ctrl_stack.active = no;
-	ctrl_stack.hidden[no] = false;  // номер мог остаться погашенным от прошлого слоя
+	ctrl_stack_resort_all();   // позиции слоёв — ключ порядка, см. parts_get_sprite_z
 	if (getenv("XSYS4_CTRL_TRACE")) NOTICE("PE_AddController(index=%d) -> ctrl %d (nr=%d)", index, no, ctrl_stack.nr_controllers);
 	return no;
 }
@@ -3444,12 +3509,20 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	 *   • как ID     — сносятся ПУСТЫЕ слои: в трейсе `освобождено партов 0` почти на
 	 *                  каждом вызове, а экран титула не разбирается вовсе;
 	 *   • как позиция — то же самое.
+	 * Проверено ЧЕТЫРЕ раза, все дают ЧЁРНЫЙ экран вместо пролога: аргумент как ID
+	 * слоя; как позиция в стеке; то же самое уже ПОСЛЕ перевода порядка отрисовки с
+	 * id на позицию (см. parts_get_sprite_z); и ещё раз после того, как осиротевшим
+	 * партам починили ключ (ключ −1 спрайт-сцена не принимала, и они пропадали
+	 * совсем — это была ОТДЕЛЬНАЯ ошибка, найденная в этом же опыте и исправленная).
+	 * То есть дело ни в порядке, ни в чтении аргумента.
 	 * Вывод замера: расходится не чтение аргумента, а НАША ПРИВЯЗКА ПАРТОВ К СЛОЯМ
 	 * (`parts_init`: `controller_no = ctrl_stack.active`). Игра адресует слои, в
 	 * которых по-нашему нет ни одного парта, — значит парты попадают не туда. Пока
 	 * это не разобрано, «снести активный» остаётся единственным вариантом, при котором
 	 * экраны разбираются; цена известна и записана: у Haha Ranman на ADV-сцене остаются
-	 * чужие парты (плёночный шум титула, рамка юнит-анимации `行動選択`).
+	 * чужие парты (плёночный шум титула, рамка юнит-анимации `行動選択`) — их
+	 * пересоздаёт покадровое событие мёртвого экрана, которое игра снимает по СВОЕМУ
+	 * номеру слоя (`ResetPartsUpdateEventLayerID`), а он у неё другой.
 	 * Мерить так: `XSYS4_CTRL_TRACE=1` печатает и запрошенный index, и сколько партов
 	 * реально освобождено, и пример их CG.
 	 */
@@ -3519,11 +3592,14 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 			       buf, st, ctrl_stack.active);
 		}
 	}
-	// Вынимаем из стека, НЕ перенумеровывая остальные (id устойчив).
-	for (int i = pos; i + 1 < ctrl_stack.nr_controllers; i++)
+	// Вынимаем из стека, НЕ перенумеровывая остальные (id устойчив). Признак
+	// «погашен» живёт по позиции, поэтому сдвигается вместе со стеком.
+	for (int i = pos; i + 1 < ctrl_stack.nr_controllers; i++) {
 		ctrl_stack.stack[i] = ctrl_stack.stack[i + 1];
+		ctrl_stack.hidden[i] = ctrl_stack.hidden[i + 1];
+	}
 	ctrl_stack.nr_controllers--;
-	ctrl_stack.hidden[ctrl_no] = false;
+	ctrl_stack_resort_all();
 	if (ctrl_stack.nr_controllers == 0) {
 		PE_AddController(-1);
 	} else {
@@ -3533,7 +3609,10 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 
 void PE_set_active_controller(int controller_no)
 {
-	if (getenv("XSYS4_CTRL_TRACE"))
+	// ★ОТДЕЛЬНАЯ ручка, а не XSYS4_CTRL_TRACE: игра дёргает это КАЖДЫЙ КАДР (у Haha
+	// Ranman — 3↔0 по три раза за кадр), и под общим трейсом 200 000 строк выносили
+	// из лога всё остальное, включая сами Add/RemoveController.
+	if (getenv("XSYS4_CTRL_TRACE_ACTIVE"))
 		NOTICE("PE_set_active_controller(%d) (был %d)", controller_no, ctrl_stack.active);
 	if (controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY ||
 			ctrl_stack_pos(controller_no) >= 0)
@@ -3549,6 +3628,8 @@ int PE_get_active_controller(void)
 
 int PE_get_controller_length(void)
 {
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("GetControllerLength -> %d", ctrl_stack.nr_controllers);
 	return ctrl_stack.nr_controllers;
 }
 
@@ -3556,6 +3637,8 @@ int PE_get_controller_id(int index)
 {
 	if (index < 0 || index >= ctrl_stack.nr_controllers)
 		return -1;
+	if (getenv("XSYS4_CTRL_TRACE"))
+		NOTICE("GetControllerID(%d) -> %d", index, ctrl_stack.stack[index]);
 	return ctrl_stack.stack[index];
 }
 
@@ -3589,9 +3672,10 @@ bool parts_controller_is_layer(int id)
 
 void parts_controller_set_show(int id, bool show)
 {
-	if (id < 0 || id > PARTS_CONTROLLER_STACK_MAX)
-		return;
-	ctrl_stack.hidden[id] = !show;
+	int pos = ctrl_stack_pos(id);
+	if (pos < 0)
+		return;   // слоя уже нет — гасить нечего
+	ctrl_stack.hidden[pos] = !show;
 	if (getenv("XSYS4_CTRL_TRACE"))
 		NOTICE("CTRL слой %d -> show=%d", id, show);
 	struct parts *parts;
@@ -3603,17 +3687,16 @@ void parts_controller_set_show(int id, bool show)
 
 bool parts_controller_get_show(int id)
 {
-	if (id < 0 || id > PARTS_CONTROLLER_STACK_MAX)
-		return false;
-	return !ctrl_stack.hidden[id];
+	int pos = ctrl_stack_pos(id);
+	return pos < 0 ? false : !ctrl_stack.hidden[pos];
 }
 
 bool parts_hidden_by_layer(struct parts *parts)
 {
-	int no = parts->controller_no;
-	if (no < 0 || no > PARTS_CONTROLLER_STACK_MAX)
-		return false;
-	return ctrl_stack.hidden[no];
+	int pos = ctrl_stack_pos(parts->controller_no);
+	// Слоя уже нет: парт его пережил. Погашенным он не считается (иначе исчез бы
+	// совсем) — он и так уходит под всё, см. parts_get_sprite_z.
+	return pos < 0 ? false : ctrl_stack.hidden[pos];
 }
 
 void PE_parts_set_want_save(int parts_no, bool want_save)

@@ -58,6 +58,7 @@ void scene_set_sprite_z(struct sprite *sp, int z);
 void scene_set_sprite_z2(struct sprite *sp, int z, int z2);
 
 void scene_print(void);
+void scene_trace_once(void);
 cJSON *scene_to_json(bool verbose);
 struct sprite *scene_get(int id);
 
