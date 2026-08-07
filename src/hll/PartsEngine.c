@@ -1992,6 +1992,8 @@ struct pe_vscrollbar {
 };
 static struct pe_vscrollbar *pe_vscrollbar_get(int parts_no, bool create);
 static void pe_vscrollbar_apply_enabled(struct pe_vscrollbar *sb);
+// Запоминает базовое имя CG кнопки — по нему SetButtonEnable подставляет `／無効`.
+static void pe_button_remember_cg(int parts_no, struct string *cg_base);
 
 // base CG name + UTF-8 suffix -> new SJIS string (caller frees). For composite
 // widgets whose sub-CGs are stored as "<base><suffix>" in the CG archive
@@ -2059,6 +2061,9 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		static const char *const btn_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
 		struct string *cg = act_str(ti, "ＣＧ名");
 		struct string *flat = act_str(ti, "フラット名");
+		// Запоминаем БАЗУ имени: по ней SetButtonEnable подставит `／無効`
+		// (серый вид недоступной кнопки), которого среди трёх состояний нет.
+		pe_button_remember_cg(no, cg);
 		int bw = act_list_int(ti, "サイズ", 0, 0);
 		int bh = act_list_int(ti, "サイズ", 1, 0);
 		for (int s = 1; s <= 3; s++) {
@@ -2817,8 +2822,71 @@ HLL_QUIET_UNIMPLEMENTED(false, bool, PartsEngine, LoadActivityEXText, struct str
 // сеттеры — no-op, геттеры — разумные дефолты. Кнопки считаем включёнными,
 // чтобы логика меню могла по ним кликать. ---
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonSize, int a, int b, int c);
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonEnable, int a, bool b);
-HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsButtonEnable, int a);
+/*
+ * Доступность кнопки. В архиве у кнопочного CG ЧЕТЫРЕ варианта:
+ * `<base>／通常`, `／オン`, `／ダウン` и `／無効` — последний как раз серый. При
+ * создании из раскладки грузятся только первые три, поэтому недоступные кнопки
+ * оставались цветными: у Dohna на выборе фазы дня «Hunting Phase» должна быть
+ * СЕРОЙ (в первый день недоступна), на домашнем экране — «Squad» и «Shop».
+ * Заодно снимаем кликабельность, иначе по серой кнопке можно нажать.
+ *
+ * Базовое имя CG запоминаем при разборе раскладки (act_build_part): в рантайме
+ * его взять уже негде — часть хранит только имя загруженного файла с суффиксом.
+ * Приём тот же, что у скроллбара (`pe_vscrollbar.cg_base`).
+ */
+struct pe_button_state {
+	int parts_no;
+	struct string *cg_base;
+	int enabled;  // -1 ещё не спрашивали, 0 выключена, 1 включена
+};
+static struct pe_button_state *pe_buttons;
+static int nr_pe_buttons;
+
+static struct pe_button_state *pe_button_get(int parts_no, bool create)
+{
+	for (int i = 0; i < nr_pe_buttons; i++)
+		if (pe_buttons[i].parts_no == parts_no)
+			return &pe_buttons[i];
+	if (!create)
+		return NULL;
+	pe_buttons = xrealloc_array(pe_buttons, nr_pe_buttons, nr_pe_buttons + 1,
+			sizeof(*pe_buttons));
+	struct pe_button_state *b = &pe_buttons[nr_pe_buttons++];
+	*b = (struct pe_button_state){ .parts_no = parts_no, .enabled = -1 };
+	return b;
+}
+
+static void pe_button_remember_cg(int parts_no, struct string *cg_base)
+{
+	if (!cg_base || !cg_base->size)
+		return;
+	struct pe_button_state *b = pe_button_get(parts_no, true);
+	if (b->cg_base)
+		free_string(b->cg_base);
+	b->cg_base = string_ref(cg_base);
+}
+
+static void PartsEngine_SetButtonEnable(int parts_no, bool enable)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, true);
+	int en = enable ? 1 : 0;
+	if (b->enabled == en)
+		return;
+	b->enabled = en;
+	PE_SetClickable(parts_no, enable);
+	if (!b->cg_base)
+		return;
+	// Серый вид — отдельный файл `／無効`; включённой кнопке возвращаем `／通常`.
+	struct string *f = act_cg_suffix(b->cg_base, enable ? "／通常" : "／無効");
+	PE_SetPartsCG(parts_no, f, 0, 1);
+	free_string(f);
+}
+
+static bool PartsEngine_IsButtonEnable(int parts_no)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, false);
+	return !b || b->enabled != 0;
+}
 // Чекбоксы — так же: «доступность» не рисуем, но считаем включёнными. Без этих
 // двух System Menu в ADV (SceneAdvButtonMenu@UpdateCheckable) валит движок.
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetCheckBoxEnable, int a, bool b);
