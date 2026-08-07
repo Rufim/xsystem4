@@ -2704,6 +2704,16 @@ void PE_SetPartsAlphaClipperPartsNumber(int parts_no, int alpha_clipper_parts_no
 {
 	struct parts *parts = parts_get(parts_no);
 	parts->alpha_clipper_parts_no = alpha_clipper_parts_no;
+	// Помечаем маску, чтобы её саму не рисовать (см. parts_render). Прежнюю метку
+	// не снимаем: на одну маску обычно ссылается несколько частей, а счётчик
+	// ссылок тут держать негде — лишняя метка безобиднее пропавшего клипа.
+	if (alpha_clipper_parts_no) {
+		struct parts *clip = parts_try_get(alpha_clipper_parts_no);
+		if (clip) {
+			clip->is_alpha_clipper = true;
+			parts_dirty(clip);
+		}
+	}
 	parts_dirty(parts);
 }
 

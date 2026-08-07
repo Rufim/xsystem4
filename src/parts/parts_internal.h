@@ -678,6 +678,14 @@ struct parts {
 	int draw_filter;
 	bool message_window;
 	int alpha_clipper_parts_no;
+	/*
+	 * Часть служит АЛЬФА-МАСКОЙ для кого-то (кто-то указал её в
+	 * `alpha_clipper_parts_no`). Такую часть саму рисовать НЕЛЬЗЯ: её роль —
+	 * задавать форму, а не картинку. У Dohna клиппер обучения
+	 * (`Tutorial::CreateClipper`) — construction 1280×720, залитая ЧЁРНЫМ, и,
+	 * будучи нарисованной, она накрывала экран.
+	 */
+	bool is_alpha_clipper;
 	int margin_top;
 	int margin_bottom;
 	int margin_left;

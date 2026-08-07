@@ -3028,7 +3028,29 @@ HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonColor, int a, int b, int c
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonR, int a);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonG, int a);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonB, int a);
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonFontProperty, int a, int b, int c, int d, int e, int f, float g, int h, int i, int j, float k);
+/*
+ * Шрифт подписи кнопки. Игра задаёт его сама (`Ｐ＿ボタン＿フォント設定`), и пока
+ * функция была заглушкой, подпись рисовалась шрифтом ИЗ РАСКЛАДКИ: в CONFIG
+ * «Reset» выходил заметно крупнее и жирнее, чем у оригинала. Порядок аргументов —
+ * как у остальных `*FontProperty`: тип, размер, RGB, жирность, RGB окантовки,
+ * ширина окантовки.
+ */
+static void PartsEngine_SetButtonFontProperty(int parts_no, int type, int size,
+		int r, int g, int b, float bold_weight,
+		int edge_r, int edge_g, int edge_b, float edge_weight)
+{
+	struct pe_button_state *btn = pe_button_get(parts_no, false);
+	if (!btn || !btn->text_no)
+		return;
+	PE_SetFont(btn->text_no, type, size, r, g, b, bold_weight,
+			edge_r, edge_g, edge_b, edge_weight, 1);
+	btn->font_size = size;
+	// Кегль изменился — надпись надо перецентрировать по кнопке.
+	int tw = PE_GetPartsWidth(btn->text_no, 1);
+	int tx = btn->text_x + (btn->box_w > tw ? (btn->box_w - tw) / 2 : 0);
+	int ty = btn->text_y + (btn->box_h > size ? (btn->box_h - size) / 2 : 0);
+	PE_SetPos(btn->text_no, tx, ty);
+}
 // ВАЖНО: ref-output геттеры ОБЯЗАНЫ заполнять выходы — иначе игра читает
 // неинициализированный локал (мусор INT_MIN) и, напр., сохраняет как размер
 // шрифта → текст не рисуется. Пишем разумные дефолты (размер шрифта 16).
