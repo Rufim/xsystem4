@@ -3785,6 +3785,24 @@ int vm_execute_ain(struct ain *program)
 	return stack_pop().i;
 }
 
+static int last_fini_type = -1, last_fini_value = -1;
+static char last_fini_fn[128] = "(none)";
+
+void vm_note_last_fini(int type, int value, const char *fn)
+{
+	last_fini_type = type;
+	last_fini_value = value;
+	snprintf(last_fini_fn, sizeof(last_fini_fn), "%s", fn ? fn : "(null)");
+}
+
+const char *vm_last_fini_str(void)
+{
+	static char buf[192];
+	snprintf(buf, sizeof(buf), "type=%d v=%d in %s", last_fini_type,
+		 last_fini_value, last_fini_fn);
+	return buf;
+}
+
 const char *vm_current_instruction_name(void)
 {
 	return current_instruction_name();

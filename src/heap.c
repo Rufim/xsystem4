@@ -127,8 +127,8 @@ static void heap_double_free(int32_t slot)
 {
 	// Стек вызовов игры — иначе виновника приходится угадывать по номеру слота, а
 	// слоты переиспользуются и от прогона к прогону разные.
-	WARNING("double free of slot %d (%s) — стек вызовов игры:", slot,
-		vm_ptrtype_string(heap[slot].type));
+	WARNING("double free of slot %d (%s); последнее variable_fini: %s — стек вызовов игры:",
+		slot, vm_ptrtype_string(heap[slot].type), vm_last_fini_str());
 	vm_stack_trace();
 #ifdef DEBUG_HEAP
 		WARNING("double free of slot %d (%s) ref=%d seq=%u\nOriginally allocated at %X\nOriginally freed at %X",

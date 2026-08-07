@@ -150,6 +150,11 @@ bool vm_called_from(const char *substr);
 const char *vm_current_function_name(void);
 // Имя текущей инструкции VM (диагностика: КАКАЯ инструкция взяла/отдала ссылку).
 const char *vm_current_instruction_name(void);
+// Последнее освобождение переменной (variable_fini): тип, значение, функция.
+// Диагностика: сообщение о double free должно называть ТИП и место, а не только
+// номер слота — слоты переиспользуются, по номеру виновника не опознать.
+void vm_note_last_fini(int type, int value, const char *fn);
+const char *vm_last_fini_str(void);
 _Noreturn void _vm_error(const char *fmt, ...);
 _Noreturn void vm_exit(int code);
 _Noreturn void vm_reset(void);
