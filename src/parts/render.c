@@ -119,6 +119,23 @@ static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rec
 	gfx_run_job(&job);
 }
 
+/*
+ * Эффективная альфа-маска: если у части своей нет, берём родительскую. Игра
+ * ставит клиппер на КОНТЕЙНЕР (`CASPartsLayer@Active`, `CParts@AlphaClipper::set`),
+ * а рисуются его дети — без наследования клип не применялся ни к чему. У Dohna
+ * из-за этого сцена под обучением не обрезалась по клипперу
+ * (`Tutorial::CreateClipper`, 1280×720): подложка меню убежища вылезала левее
+ * уменьшенного кадра, и серого обрамления не было видно.
+ */
+static int parts_effective_clipper(struct parts *parts)
+{
+	for (struct parts *p = parts; p; p = p->parent) {
+		if (p->alpha_clipper_parts_no)
+			return p->alpha_clipper_parts_no;
+	}
+	return 0;
+}
+
 static void parts_render_text(struct parts *parts, struct parts_text *t)
 {
 	vec3 add_color = {
@@ -152,7 +169,7 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 			struct parts_text_char *ch = &line->chars[j];
 			mat4 mw_transform = WORLD_TRANSFORM(ch->t.w * sx, ch->t.h * sy, x, y);
 			Rectangle r = { 0, 0, ch->t.w, ch->t.h };
-			parts_render_texture(&ch->t, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts->alpha_clipper_parts_no);
+			parts_render_texture(&ch->t, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts_effective_clipper(parts));
 			x += ch->advance * sx;
 		}
 		x = ox;
@@ -213,7 +230,7 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 		parts->global.multiply_color.g / 255.0f,
 		parts->global.multiply_color.b / 255.0f,
 	};
-	parts_render_texture(&common->texture, mw_transform, &r, parts->global.alpha / 255.0, add_color, multiply_color, parts->draw_filter, parts->alpha_clipper_parts_no);
+	parts_render_texture(&common->texture, mw_transform, &r, parts->global.alpha / 255.0, add_color, multiply_color, parts->draw_filter, parts_effective_clipper(parts));
 
 	glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
 }
@@ -316,7 +333,7 @@ static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 		struct emitter_render_ud ud = {
 			.f = f,
 			.parent_alpha = eff.alpha,
-			.alpha_clipper = parts->alpha_clipper_parts_no,
+			.alpha_clipper = parts_effective_clipper(parts),
 			.draw_filter = eff.draw_filter,
 		};
 		glm_vec2_copy(align, ud.align);
@@ -387,7 +404,7 @@ static void render_flat_cg(struct parts *parts, Texture *tex,
 	}
 
 	parts_render_texture(tex, render_m, &rect, ctx->alpha, ctx->add_color, ctx->mul_color,
-			ctx->draw_filter, parts->alpha_clipper_parts_no);
+			ctx->draw_filter, parts_effective_clipper(parts));
 
 	if (ctx->draw_filter != PARTS_DRAW_FILTER_NORMAL)
 		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
@@ -556,7 +573,7 @@ static void parts_render_flash_shape(struct parts *parts, struct parts_flash *f,
 		(parts->global.multiply_color.g / 255.0f) * fixed16_to_float(obj->color_transform.mult_terms[1]),
 		(parts->global.multiply_color.b / 255.0f) * fixed16_to_float(obj->color_transform.mult_terms[2])
 	};
-	parts_render_texture(src, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts->alpha_clipper_parts_no);
+	parts_render_texture(src, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts_effective_clipper(parts));
 }
 
 static void parts_render_flash_sprite(struct parts *parts, struct parts_flash *f, struct parts_flash_object *obj, struct swf_tag_define_sprite *tag)
@@ -638,8 +655,8 @@ void parts_render(struct parts *parts)
 		       parts->global.multiply_color.r, parts->global.multiply_color.g, parts->global.multiply_color.b,
 		       parts->global.add_color.r, parts->global.add_color.g, parts->global.add_color.b,
 		       parts->draw_filter);
-		if (parts->alpha_clipper_parts_no) {
-			struct parts *clp = parts_try_get(parts->alpha_clipper_parts_no);
+		if (parts_effective_clipper(parts)) {
+			struct parts *clp = parts_try_get(parts_effective_clipper(parts));
 			NOTICE("   part %d alpha_clipper=%d clipper_tex=%u linked_to=%d parent=%d",
 			       parts->no, parts->alpha_clipper_parts_no,
 			       clp ? clp->states[clp->state].common.texture.handle : 9999,
