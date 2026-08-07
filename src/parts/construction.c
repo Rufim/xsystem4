@@ -46,6 +46,7 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_DRAW_CUT_CG:
 	case PARTS_CP_COPY_CUT_CG:
 	case PARTS_CP_GRAY_FILTER:
+	case PARTS_CP_BLUR_FILTER:
 	case PARTS_CP_FILL_GRADATION_HORIZON:
 	case PARTS_CP_MUL_FILTER:
 		break;
@@ -297,6 +298,26 @@ bool PE_AddGrayFilterToPartsConstructionProcess(int parts_no, int x, int y, int 
 	return true;
 }
 
+bool PE_AddBlurFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		bool full_size, int radius, bool vertical, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_BLUR_FILTER;
+	op->blur = (struct parts_cp_blur) {
+		.x = x, .y = y, .w = w, .h = h,
+		.full_size = full_size,
+		.radius = radius,
+		.vertical = vertical
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
 bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, bool full_size, int state);
 bool PE_AddDrawLineToPartsConstructionProcess(int parts_no, int x1, int y1, int x2, int y2,
@@ -453,22 +474,6 @@ static bool build_cg(struct parts *parts, struct parts_construction_process *cpr
 	return true;
 }
 
-static bool build_fill(struct parts_construction_process *cproc, struct parts_cp_fill *op)
-{
-	if (!cproc->common.texture.handle)
-		return false;
-	gfx_fill(&cproc->common.texture, op->x, op->y, op->w, op->h, op->r, op->g, op->b);
-	return true;
-}
-
-static bool build_fill_alpha_color(struct parts_construction_process *cproc, struct parts_cp_fill *op)
-{
-	if (!cproc->common.texture.handle)
-		return false;
-	gfx_fill_alpha_color(&cproc->common.texture, op->x, op->y, op->w, op->h, op->r, op->g, op->b, op->a);
-	return true;
-}
-
 /*
  * `全体 = 1` («на весь размер»): раскладка при этом флаге кладёт в `先矩形` нули,
  * а в рантайме флаг приходит отдельным полем FullSize — но размеры там точно так
@@ -487,6 +492,30 @@ static void cp_fill_rect(struct parts_construction_process *cproc, int *x, int *
 	*y = 0;
 	*w = cproc->common.texture.w;
 	*h = cproc->common.texture.h;
+}
+
+static bool build_fill(struct parts_construction_process *cproc, struct parts_cp_fill *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	cp_fill_rect(cproc, &x, &y, &w, &h);
+	gfx_fill(&cproc->common.texture, x, y, w, h, op->r, op->g, op->b);
+	return true;
+}
+
+static bool build_fill_alpha_color(struct parts_construction_process *cproc, struct parts_cp_fill *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	// ★`全体 = 1` даёт нулевой прямоугольник — без подстановки полного размера
+	// заливка была no-op. На этом терялась ЧЁРНАЯ ВУАЛЬ (0,0,0,180) поверх
+	// размытого задника: экраны Dohna (CONFIG и прочие) выходили заметно светлее
+	// оригинала. Остальные заливки подставляют размер давно (см. cp_fill_rect).
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	cp_fill_rect(cproc, &x, &y, &w, &h);
+	gfx_fill_alpha_color(&cproc->common.texture, x, y, w, h, op->r, op->g, op->b, op->a);
+	return true;
 }
 
 static bool build_fill_amap(struct parts_construction_process *cproc, struct parts_cp_fill *op)
@@ -725,6 +754,89 @@ static bool build_gray_filter(struct parts_construction_process *cproc, struct p
 	return true;
 }
 
+/*
+ * Размытие поверхности по одной оси (команды 27/28 раскладки).
+ *
+ * Считаем на CPU: в gfx нет ни свёртки, ни шейдера под неё, а construction-процесс
+ * строится ОДИН раз в текстуру — это не горячий путь отрисовки. `gfx_get_pixels`
+ * отдаёт RGBA всей текстуры, `gfx_update_texture_with_pixels` кладёт обратно в том же
+ * порядке строк (glReadPixels/glTexImage2D снимают и грузят одинаково), поэтому
+ * переворачивать буфер не нужно — но прямоугольник от игры задан в ЭКРАННЫХ
+ * координатах (Y вниз), а строки буфера идут снизу вверх, и его надо отразить.
+ *
+ * Скользящее среднее по (2r+1) отсчётам: у Dohna блюр всегда парный (H, затем V),
+ * так что двумерный результат получается как раз произведением двух проходов, а два
+ * box-прохода по осям — стандартное приближение гаусса.
+ * ★Альфу усредняем вместе с цветом: у задников она сплошная (255), а на прозрачных
+ * краях иначе проступала бы рамка непрозрачных пикселей.
+ */
+static bool build_blur_filter(struct parts_construction_process *cproc, struct parts_cp_blur *op)
+{
+	Texture *t = &cproc->common.texture;
+	if (!t->handle)
+		return false;
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	if (op->full_size) {
+		x = 0; y = 0;
+		w = t->w; h = t->h;
+	}
+	// Отсечение по границам текстуры — операция приходит из раскладки, доверять нельзя.
+	if (x < 0) { w += x; x = 0; }
+	if (y < 0) { h += y; y = 0; }
+	if (x + w > t->w) w = t->w - x;
+	if (y + h > t->h) h = t->h - y;
+	int r = op->radius;
+	if (w <= 0 || h <= 0 || r <= 0)
+		return true;
+
+	uint8_t *px = gfx_get_pixels(t);
+	// Экранный Y → строка буфера (буфер идёт снизу вверх).
+	int y0 = t->h - (y + h);
+	int len = op->vertical ? h : w;
+	int lines = op->vertical ? w : h;
+	uint8_t *line = xmalloc((size_t)len * 4);
+
+	for (int i = 0; i < lines; i++) {
+		// Собираем полосу (строку или столбец) в непрерывный буфер.
+		for (int j = 0; j < len; j++) {
+			int sx = op->vertical ? x + i : x + j;
+			int sy = op->vertical ? y0 + j : y0 + i;
+			memcpy(line + (size_t)j * 4, px + ((size_t)sy * t->w + sx) * 4, 4);
+		}
+		// Скользящая сумма: окно [j-r, j+r], обрезанное краями полосы.
+		int sum[4] = {0, 0, 0, 0};
+		int win = 0;
+		for (int j = 0; j <= r && j < len; j++) {
+			for (int c = 0; c < 4; c++)
+				sum[c] += line[(size_t)j * 4 + c];
+			win++;
+		}
+		for (int j = 0; j < len; j++) {
+			int dx = op->vertical ? x + i : x + j;
+			int dy = op->vertical ? y0 + j : y0 + i;
+			uint8_t *dst = px + ((size_t)dy * t->w + dx) * 4;
+			for (int c = 0; c < 4; c++)
+				dst[c] = sum[c] / win;
+			int add = j + r + 1, sub = j - r;
+			if (add < len) {
+				for (int c = 0; c < 4; c++)
+					sum[c] += line[(size_t)add * 4 + c];
+				win++;
+			}
+			if (sub >= 0) {
+				for (int c = 0; c < 4; c++)
+					sum[c] -= line[(size_t)sub * 4 + c];
+				win--;
+			}
+		}
+	}
+
+	gfx_update_texture_with_pixels(t, px);
+	free(line);
+	free(px);
+	return true;
+}
+
 // Цветового градиента в gfx нет (`gfx_fill_amap_gradation_ud` красит АЛЬФУ и требует
 // своего шейдера), поэтому кладём построчно обычным `gfx_fill`. Это не горячий путь:
 // construction-процесс строится ОДИН раз в текстуру, а не каждый кадр, поэтому h вызовов
@@ -825,6 +937,10 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_GRAY_FILTER:
 			if (!build_gray_filter(cproc, &op->filter))
+				return false;
+			break;
+		case PARTS_CP_BLUR_FILTER:
+			if (!build_blur_filter(cproc, &op->blur))
 				return false;
 			break;
 		case PARTS_CP_FILL_GRADATION_HORIZON:

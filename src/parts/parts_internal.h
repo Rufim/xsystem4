@@ -238,7 +238,12 @@ enum parts_cp_op_type {
 	// подложки интерфейса Dohna: прямоугольник + четыре сектора по углам
 	// (см. «Round128x40» в PlayerShopView.pactex).
 	PARTS_CP_FILL_PIE_AMAP,
-#define PARTS_NR_CP_TYPES (PARTS_CP_FILL_PIE_AMAP+1)
+	// v14 (Ixseal): размытие поверхности по одной оси (команды 27/28 раскладки,
+	// `CASConstructionProcess@Set{H,V}BlurFilter`). Игра ставит их парой сразу за
+	// `SetCreateCG` — так собран размытый задник экранов (CONFIG, галерея, выбор
+	// фазы): CG фона → HBlur → VBlur, сила в поле `ブラー`.
+	PARTS_CP_BLUR_FILTER,
+#define PARTS_NR_CP_TYPES (PARTS_CP_BLUR_FILTER+1)
 };
 
 struct parts_cp_create {
@@ -289,6 +294,15 @@ struct parts_cp_filter {
 	bool full_size;
 };
 
+// Размытие по одной оси: `radius` — поле `ブラー` раскладки (у Dohna всегда 10),
+// `vertical` различает команды 27 (по X) и 28 (по Y).
+struct parts_cp_blur {
+	int x, y, w, h;
+	bool full_size;
+	int radius;
+	bool vertical;
+};
+
 // `Ｐ＿構築手順＿グラデーション横` — заливка прямоугольника градиентом СВЕРХУ ВНИЗ
 // (полосы горизонтальные, цвет меняется по вертикали от верхнего к нижнему).
 struct parts_cp_fill_gradation {
@@ -315,6 +329,7 @@ struct parts_cp_op {
 		struct parts_cp_cut_cg cut_cg;
 		struct parts_cp_text text;
 		struct parts_cp_filter filter;
+		struct parts_cp_blur blur;
 		struct parts_cp_fill_gradation gradation;
 		struct parts_cp_color_filter color_filter;
 	};

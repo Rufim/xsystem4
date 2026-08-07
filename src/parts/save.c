@@ -237,6 +237,15 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->filter.h);
 		iarray_write(w, op->filter.full_size);
 		break;
+	case PARTS_CP_BLUR_FILTER:
+		iarray_write(w, op->blur.x);
+		iarray_write(w, op->blur.y);
+		iarray_write(w, op->blur.w);
+		iarray_write(w, op->blur.h);
+		iarray_write(w, op->blur.full_size);
+		iarray_write(w, op->blur.radius);
+		iarray_write(w, op->blur.vertical);
+		break;
 	case PARTS_CP_FILL_GRADATION_HORIZON:
 		iarray_write(w, op->gradation.x);
 		iarray_write(w, op->gradation.y);
@@ -316,6 +325,15 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->filter.w = iarray_read(r);
 		op->filter.h = iarray_read(r);
 		op->filter.full_size = !!iarray_read(r);
+		break;
+	case PARTS_CP_BLUR_FILTER:
+		op->blur.x = iarray_read(r);
+		op->blur.y = iarray_read(r);
+		op->blur.w = iarray_read(r);
+		op->blur.h = iarray_read(r);
+		op->blur.full_size = !!iarray_read(r);
+		op->blur.radius = iarray_read(r);
+		op->blur.vertical = !!iarray_read(r);
 		break;
 	case PARTS_CP_FILL_GRADATION_HORIZON:
 		op->gradation.x = iarray_read(r);

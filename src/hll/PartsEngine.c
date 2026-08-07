@@ -794,7 +794,7 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		int font_r, int font_g, int font_b, int edge_r, int edge_g, int edge_b,
 		int full_size, float bold_weight, float edge_weight,
 		struct string *text, struct string *cg_name,
-		int radius_x, int radius_y, int start_angle, int sweep_angle)
+		int radius_x, int radius_y, int start_angle, int sweep_angle, int blur)
 {
 	(void)interp_type; (void)sw; (void)sh;
 	switch (command) {
@@ -915,6 +915,12 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 				edge_r, edge_g, edge_b, edge_weight,
 				char_space, line_space, state);
 		break;
+	case 27:  // CASConstructionProcess::SetHBlurFilter (v14)
+	case 28:  // CASConstructionProcess::SetVBlurFilter (v14)
+		// Размытый задник экранов Dohna: CreateCG → HBlur → VBlur, сила в `ブラー`.
+		PE_AddBlurFilterToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				full_size, blur, command == 28, state);
+		break;
 	case 122:  // CASConstructionProcess::SetFillPieAMap (v14)
 		// Сектор в альфа-карту: из четырёх таких углов и двух прямоугольников
 		// собрана каждая скруглённая подложка интерфейса Dohna.
@@ -971,6 +977,7 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 	int radius_y = nr_ints > 35 ? ints[35].i : 0;
 	int start_angle = nr_ints > 36 ? ints[36].i : 0;
 	int sweep_angle = nr_ints > 37 ? ints[37].i : 0;
+	int blur = nr_ints > 38 ? ints[38].i : 0;  // поле `ブラー` (команды 27/28)
 
 	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
 		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
@@ -982,7 +989,7 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 			dx, dy, dw, dh, r, g, b, a, r2, g2, b2, char_space, line_space,
 			font_type, font_size, font_r, font_g, font_b,
 			edge_r, edge_g, edge_b, full_size, bold_weight, edge_weight,
-			text, cg_name, radius_x, radius_y, start_angle, sweep_angle);
+			text, cg_name, radius_x, radius_y, start_angle, sweep_angle, blur);
 }
 
 // Generic dispatch function for PartsEngine operations.
@@ -1601,10 +1608,9 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 		int command = act_int(op, "コマンド", -1);
 		if (command < 0)
 			continue;
-		// Команды за пределами реализованного набора (у Dohna в раскладках
-		// встречаются 28 и 122 — расширения v14) пропускаем ЯВНО: пусть их
+		// Команды за пределами реализованного набора пропускаем ЯВНО: пусть их
 		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
-		if (command > 24 && command != 122) {
+		if (command > 24 && command != 27 && command != 28 && command != 122) {
 			static bool warned = false;
 			if (!warned) {
 				warned = true;
@@ -1635,7 +1641,8 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			act_int(op, "全体", 0), act_float(op, "フォント太さ", 0.0f),
 			act_float(op, "フォント縁取り", 0.0f), text, cg,
 			act_list_int(op, "半径", 0, 0), act_list_int(op, "半径", 1, 0),
-			act_list_int(op, "円弧角度", 0, 0), act_list_int(op, "円弧角度", 1, 0));
+			act_list_int(op, "円弧角度", 0, 0), act_list_int(op, "円弧角度", 1, 0),
+			act_int(op, "ブラー", 0));
 		done++;
 	}
 	return done;
