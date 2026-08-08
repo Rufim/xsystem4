@@ -2322,15 +2322,31 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		static const char *const bar_sfx[4] = { NULL, "／バー／通常", "／バー／オン", "／バー／ダウン" };
 		struct string *cg = act_str(ti, "ＣＧ名");
 		struct string *flat = act_str(ti, "フラット名");
-		if (cg && cg->size) {
+		/*
+		 * `上書きバーＣＧ名` — ГОТОВОЕ имя картинки бегунка, взамен производного
+		 * `<база>／バー／…`. Поле не читалось, и у Dohna слайдеры конфига оставались
+		 * без белого кружка: их база называется `システム／スクロールバーダミー`
+		 * («заглушка») и в архиве у неё есть только `／背景` — жёлоб, — а сам
+		 * бегунок лежит отдельно, `システム／スクロールボタン／通常|オン|ダウン`.
+		 * Суффиксы состояний у переопределения БЕЗ `／バー`.
+		 * Счёт по раскладкам: 13 горизонтальных полос (10× `スクロールボタン`,
+		 * 3× `スクロールボタン小`) и 6 вертикальных (BACK LOG, BACK SCENE, вьювер
+		 * поз, три `ScrollBarUnit*`). `上書き前/次/背景ＣＧ名` пусты во всех —
+		 * рельс и стрелки по-прежнему берутся от базы.
+		 */
+		static const char *const knob_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+		struct string *bar_cg = act_str(ti, "上書きバーＣＧ名");
+		struct string *knob_cg = cg;
+		const char *const *sfx = bar_sfx;
+		if (bar_cg && bar_cg->size) {
+			knob_cg = bar_cg;
+			sfx = knob_sfx;
+		}
+		if (knob_cg && knob_cg->size) {
 			for (int s = 1; s <= 3; s++) {
-				char *sjis = utf2sjis(bar_sfx[s], strlen(bar_sfx[s]));
-				struct string *suf = make_string(sjis, strlen(sjis));
-				struct string *full = string_concatenate(cg, suf);
+				struct string *full = act_cg_suffix(knob_cg, sfx[s]);
 				PE_SetPartsCG(no, full, 0, s);
 				free_string(full);
-				free_string(suf);
-				free(sjis);
 			}
 		} else if (flat && flat->size) {
 			PE_SetPartsFlat(no, flat, 1);
@@ -2406,10 +2422,24 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		int width  = act_int(ti, "幅", 0);
 		int up_sz  = act_int(ti, "前サイズ", 0);
 		int down_sz = act_int(ti, "次サイズ", 0);
-		// The knob is the part's own CG (per-state ／バー).
-		if (cg && cg->size) {
+		// The knob is the part's own CG (per-state ／バー) — либо ГОТОВОЕ имя из
+		// `上書きバーＣＧ名` с суффиксами состояний без `／バー` (см. подробный
+		// разбор у горизонтальной полосы: у Dohna база — «заглушка» с одним
+		// только `／背景`, а бегунок лежит отдельной картинкой).
+		// ★Переопределение касается ТОЛЬКО бегунка: рельс, стрелки и переключение
+		// 通常/無効 ниже по-прежнему считаются от базового `cg` (иначе рельс уехал бы
+		// в `システム／スクロールボタン縦／背景`, которого в архиве нет).
+		static const char *const vknob_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+		struct string *vbar_cg = act_str(ti, "上書きバーＣＧ名");
+		struct string *vknob_cg = cg;
+		const char *const *vsfx = vbar_sfx;
+		if (vbar_cg && vbar_cg->size) {
+			vknob_cg = vbar_cg;
+			vsfx = vknob_sfx;
+		}
+		if (vknob_cg && vknob_cg->size) {
 			for (int s = 1; s <= 3; s++) {
-				struct string *full = act_cg_suffix(cg, vbar_sfx[s]);
+				struct string *full = act_cg_suffix(vknob_cg, vsfx[s]);
 				PE_SetPartsCG(no, full, 0, s);
 				free_string(full);
 			}
