@@ -2119,6 +2119,54 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Ixseal added a third operand describing the element type of a generic
 		// container (see hll_call). Older games emit only two.
 		int elem_class = instructions[CALLHLL].nr_args >= 3 ? get_argument(2) : 0;
+		/*
+		 * XSYS4_HLL_IN_FUNC=<подстрока> — печатать HLL-вызовы, сделанные ИЗ игровой
+		 * функции с таким именем (по всему стеку вызовов). Нужна, когда игра ходит
+		 * в движок через интерфейсные методы: в байткоде видно только смещение в
+		 * vtable (`PUSH 226; ADD; X_REF 1; CALLMETHOD`), а во что оно превращается —
+		 * нет. Так разбирается `Tutorial::MoveSceneParent`, где `<226>`/`<50>` не
+		 * дают ни одного наблюдаемого эффекта.
+		 */
+		{
+			const char *w = getenv("XSYS4_HLL_IN_FUNC");
+			if (w && *w && vm_called_from(w)) {
+				int lib = get_argument(0), fun = get_argument(1);
+				NOTICE("HLLIN %s.%s <- %s",
+				       ain->libraries[lib].name,
+				       ain->libraries[lib].functions[fun].name,
+				       display_sjis0(vm_current_function_name()));
+			}
+		}
+		/*
+		 * XSYS4_SLOW_MS=<порог> — печатать HLL-вызовы, которые заняли дольше
+		 * порога, с именем библиотеки, функции и игровой функции-источника.
+		 * Ручка для поиска фризов: у Dohna смена сцены встаёт на несколько
+		 * секунд, и без замера непонятно, кто именно столько думает.
+		 * Порог читаем один раз: getenv на каждом вызове байткода — уже сам
+		 * по себе заметная нагрузка.
+		 */
+		{
+			static int slow_ms = -1;
+			if (slow_ms < 0) {
+				const char *e = getenv("XSYS4_SLOW_MS");
+				slow_ms = e && *e ? atoi(e) : 0;
+			}
+			if (slow_ms > 0) {
+				int lib = get_argument(0), fun = get_argument(1);
+				struct timespec t0, t1;
+				clock_gettime(CLOCK_MONOTONIC, &t0);
+				hll_call(lib, fun, elem_class);
+				clock_gettime(CLOCK_MONOTONIC, &t1);
+				double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+					+ (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+				if (ms >= slow_ms)
+					NOTICE("SLOW %.0f ms %s.%s <- %s", ms,
+					       ain->libraries[lib].name,
+					       ain->libraries[lib].functions[fun].name,
+					       display_sjis0(vm_current_function_name()));
+				break;
+			}
+		}
 		hll_call(get_argument(0), get_argument(1), elem_class);
 		break;
 	}

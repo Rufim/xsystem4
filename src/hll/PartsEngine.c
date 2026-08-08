@@ -2238,7 +2238,22 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 			// (часть 90000941 остаётся `lshow=1 gshow=1 alpha=255`, то есть её
 			// перекрывают, а чем — пока не выяснено; в слое титула висит
 			// собранная поверхность 1480×920 `90000041` с alpha=255).
-			bool build = blurred > 0 || getenv("XSYS4_CP_ACT_BUILD");
+			/*
+			 * ★Плюс процедуры, которые строят поверхность НЕ БОЛЬШЕ экрана:
+			 * поломка выше — про полноэкранные задники (1380×820 и 1480×920
+			 * при экране 1280×720), они перекрывают верхние слои. Элемент
+			 * интерфейса такого размера не бывает, и без сборки он остаётся
+			 * пустым: превью страницы `Text Area UI` — часть 640×180, чья
+			 * процедура берёт полосу `背景／ナユタ` (元矩形 0,360,1280,360) и
+			 * ужимает её в размер превью (команда 13). Без сборки на месте
+			 * картинки города был чёрный прямоугольник, а у оригинала там
+			 * сцена с рамкой окна реплик.
+			 */
+			int cw = act_list_int(step1, "先矩形", 4, 0);
+			int ch = act_list_int(step1, "先矩形", 5, 0);
+			bool fits_screen = cw > 0 && ch > 0
+				&& cw <= config.view_width && ch <= config.view_height;
+			bool build = blurred > 0 || fits_screen || getenv("XSYS4_CP_ACT_BUILD");
 			if (nr > 0 && skipped == 0 && build && !getenv("XSYS4_CP_NO_ACT_BUILD"))
 				PE_BuildPartsConstructionProcess(no, state);
 			// Процедуры без единой ВЫПОЛНЕННОЙ операции (все команды
@@ -2376,12 +2391,83 @@ static struct string *act_cg_suffix(struct string *base, const char *utf8_suffix
 	return full;
 }
 
+/*
+ * `オンカーソル表示連動` — ИМЯ соседней части, при наведении на которую эта часть
+ * показывается. Загрузчик поле не читал вовсе, и подсказки, которым положено
+ * появляться по очереди, висели на экране все сразу: на странице `Window` конфига
+ * Dohna три пояснения (`Scaling`, `Display Mode`, `Fullscreen Mode Aspect Ratio`)
+ * печатались одно поверх другого в блоке `Hint`. Непустое поле есть ровно у четырёх
+ * частей во всей игре, и все четыре — в `コンフィグ／０６／ウィンドウページ.x`.
+ *
+ * Разрешаем ОТЛОЖЕННО: цель — сосед по дереву и может быть построена позже нас.
+ * Ищем по именам ЭТОЙ постройки, а не по регистру активности (`a->parts`): у одной
+ * раскладки живёт несколько экземпляров, и второй получил бы ссылку на часть первого.
+ * Списки сохраняются/восстанавливаются вокруг вложенного `ReadActivityFile`
+ * (раскладка тянет за собой активности своих user-компонентов) — иначе пара уехала бы
+ * в чужое дерево, где имена самые ходовые.
+ */
+struct act_hover_pending { int parts_no; struct string *target_name; };
+static struct act_hover_pending *act_hover_pending;
+static int act_hover_nr;
+struct act_built_name { struct string *name; int no; };
+static struct act_built_name *act_built;
+static int act_built_nr;
+
+// Строки из EX-дерева не обязаны быть NUL-терминированными (§5be: strcmp на них
+// молча ронял загрузку раскладок) — сравниваем по длине и memcmp.
+static bool act_name_eq(struct string *a, struct string *b)
+{
+	return a && b && a->size == b->size && !memcmp(a->text, b->text, a->size);
+}
+
+static void act_apply_pending_hover_links(void)
+{
+	for (int i = 0; i < act_hover_nr; i++) {
+		int target_no = -1;
+		for (int j = 0; j < act_built_nr; j++) {
+			if (act_name_eq(act_built[j].name, act_hover_pending[i].target_name)) {
+				target_no = act_built[j].no;
+				break;
+			}
+		}
+		if (target_no < 0) {
+			WARNING("act_build_part: hover-link target '%s' not found in this activity",
+			        display_sjis0(act_hover_pending[i].target_name->text));
+			continue;
+		}
+		PE_set_on_cursor_show_link(act_hover_pending[i].parts_no, target_no);
+		if (getenv("XSYS4_PARTS_TRACE") || getenv("XSYS4_ACT_TRACE"))
+			NOTICE("ACT hover-link: part %d shown while cursor over '%s' (part %d)",
+			       act_hover_pending[i].parts_no,
+			       display_sjis0(act_hover_pending[i].target_name->text), target_no);
+	}
+	free(act_hover_pending);
+	act_hover_pending = NULL;
+	act_hover_nr = 0;
+	free(act_built);
+	act_built = NULL;
+	act_built_nr = 0;
+}
+
 // Returns the (top-level) parts number built for `node`, or -1 for a leaf/null.
 static int act_build_part(struct pe_activity *a, struct ex_tree *node, int parent_no)
 {
 	if (!node || node->is_leaf)
 		return -1;
 	int no = ++pe_act_part_seq;
+
+	act_built = xrealloc_array(act_built, act_built_nr, act_built_nr + 1, sizeof(*act_built));
+	act_built[act_built_nr].name = node->name;
+	act_built[act_built_nr].no = no;
+	act_built_nr++;
+	struct string *hover_target = act_str(node, "オンカーソル表示連動");
+	if (hover_target && hover_target->size > 0) {
+		act_hover_pending = xrealloc_array(act_hover_pending, act_hover_nr,
+		                                   act_hover_nr + 1, sizeof(*act_hover_pending));
+		act_hover_pending[act_hover_nr].parts_no = no;
+		act_hover_pending[act_hover_nr].target_name = hover_target;
+		act_hover_nr++;
+	}
 
 	// register name -> number so the game can resolve it (GetActivityPartsNumber)
 	a->parts = xrealloc_array(a->parts, a->nr_parts, a->nr_parts + 1, sizeof(*a->parts));
@@ -2512,15 +2598,31 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		static const char *const bar_sfx[4] = { NULL, "／バー／通常", "／バー／オン", "／バー／ダウン" };
 		struct string *cg = act_str(ti, "ＣＧ名");
 		struct string *flat = act_str(ti, "フラット名");
-		if (cg && cg->size) {
+		/*
+		 * `上書きバーＣＧ名` — ГОТОВОЕ имя картинки бегунка, взамен производного
+		 * `<база>／バー／…`. Поле не читалось, и у Dohna слайдеры конфига оставались
+		 * без белого кружка: их база называется `システム／スクロールバーダミー`
+		 * («заглушка») и в архиве у неё есть только `／背景` — жёлоб, — а сам
+		 * бегунок лежит отдельно, `システム／スクロールボタン／通常|オン|ダウン`.
+		 * Суффиксы состояний у переопределения БЕЗ `／バー`.
+		 * Счёт по раскладкам: 13 горизонтальных полос (10× `スクロールボタン`,
+		 * 3× `スクロールボタン小`) и 6 вертикальных (BACK LOG, BACK SCENE, вьювер
+		 * поз, три `ScrollBarUnit*`). `上書き前/次/背景ＣＧ名` пусты во всех —
+		 * рельс и стрелки по-прежнему берутся от базы.
+		 */
+		static const char *const knob_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+		struct string *bar_cg = act_str(ti, "上書きバーＣＧ名");
+		struct string *knob_cg = cg;
+		const char *const *sfx = bar_sfx;
+		if (bar_cg && bar_cg->size) {
+			knob_cg = bar_cg;
+			sfx = knob_sfx;
+		}
+		if (knob_cg && knob_cg->size) {
 			for (int s = 1; s <= 3; s++) {
-				char *sjis = utf2sjis(bar_sfx[s], strlen(bar_sfx[s]));
-				struct string *suf = make_string(sjis, strlen(sjis));
-				struct string *full = string_concatenate(cg, suf);
+				struct string *full = act_cg_suffix(knob_cg, sfx[s]);
 				PE_SetPartsCG(no, full, 0, s);
 				free_string(full);
-				free_string(suf);
-				free(sjis);
 			}
 		} else if (flat && flat->size) {
 			PE_SetPartsFlat(no, flat, 1);
@@ -2596,10 +2698,24 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		int width  = act_int(ti, "幅", 0);
 		int up_sz  = act_int(ti, "前サイズ", 0);
 		int down_sz = act_int(ti, "次サイズ", 0);
-		// The knob is the part's own CG (per-state ／バー).
-		if (cg && cg->size) {
+		// The knob is the part's own CG (per-state ／バー) — либо ГОТОВОЕ имя из
+		// `上書きバーＣＧ名` с суффиксами состояний без `／バー` (см. подробный
+		// разбор у горизонтальной полосы: у Dohna база — «заглушка» с одним
+		// только `／背景`, а бегунок лежит отдельной картинкой).
+		// ★Переопределение касается ТОЛЬКО бегунка: рельс, стрелки и переключение
+		// 通常/無効 ниже по-прежнему считаются от базового `cg` (иначе рельс уехал бы
+		// в `システム／スクロールボタン縦／背景`, которого в архиве нет).
+		static const char *const vknob_sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+		struct string *vbar_cg = act_str(ti, "上書きバーＣＧ名");
+		struct string *vknob_cg = cg;
+		const char *const *vsfx = vbar_sfx;
+		if (vbar_cg && vbar_cg->size) {
+			vknob_cg = vbar_cg;
+			vsfx = vknob_sfx;
+		}
+		if (vknob_cg && vknob_cg->size) {
 			for (int s = 1; s <= 3; s++) {
-				struct string *full = act_cg_suffix(cg, vbar_sfx[s]);
+				struct string *full = act_cg_suffix(vknob_cg, vsfx[s]);
 				PE_SetPartsCG(no, full, 0, s);
 				free_string(full);
 			}
@@ -2660,6 +2776,38 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			NOTICE("PT vscrollbar no=%d base=(%d,%d) len=%d w=%d up=%d down=%d total=%d view=%d rate=%.3f",
 			       no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
 		PE_SetClickable(no, true);
+	} else if (ptype == 8 && ti) {
+		/*
+		 * `レイアウトボックス` (パーツタイプ=8) — контейнер, сам раскладывающий детей.
+		 * Загрузчик его не настраивал вовсе: тип раскладки, выравнивание, перенос и
+		 * поля оставались нулевыми, и `parts_do_layout` укладывал кнопки слева
+		 * направо от точки привязки независимо от того, что написано в раскладке.
+		 *
+		 * Симптом — системные кнопки ADV (`AdvSystemButton.x`): у `LayoutRight`
+		 * (`座標` 1263,653, `原点座標モード` 3 — привязка к правому краю) кнопки
+		 * должны расти ВЛЕВО от 1263, а уезжали вправо за экран: `ButtonAuto` в
+		 * x=1315, `ButtonBackLog` в x=1523 при ширине экрана 1280 — то есть AUTO и
+		 * History просто не попадали в кадр. У `LayoutLeft` иконки, наоборот, стояли
+		 * на 104 px правее оригинальных: места ушедших в `LayoutHide` соседей
+		 * (`BackScene`, `Config`) оставались зарезервированными.
+		 *
+		 * Поля ложатся на HLL-сеттеры один в один, ими же потом пользуется игра.
+		 * `折り返しサイズ` — вещественное, но `SetLayoutBoxReturn` принимает int:
+		 * во всех раскладках Dohna значения целые (200.0 и т.п.).
+		 */
+		PE_SetLayoutBoxLayoutType(no, act_int(ti, "レイアウトタイプ", 0));
+		PE_SetLayoutBoxAlign(no, act_int(ti, "配置", 0));
+		PE_SetLayoutBoxReturn(no, act_int(ti, "折り返し許可", 0) != 0,
+			(int)act_float(ti, "折り返しサイズ", 0.0f));
+		PE_set_layoutbox_padding(no,
+			act_list_int(ti, "パディング", 0, 0),
+			act_list_int(ti, "パディング", 1, 0),
+			act_list_int(ti, "パディング", 2, 0),
+			act_list_int(ti, "パディング", 3, 0));
+		if (getenv("XSYS4_PT_TRACE"))
+			NOTICE("PT layoutbox no=%d type=%d align=%d wrap=%d/%d", no,
+			       act_int(ti, "レイアウトタイプ", 0), act_int(ti, "配置", 0),
+			       act_int(ti, "折り返し許可", 0), (int)act_float(ti, "折り返しサイズ", 0.0f));
 	} else if (ptype == 1 && ti) {
 		// checkbox (パーツタイプ=1): ＣＧ名 is a base; the box has checked/unchecked
 		// variants. テキスト is the label drawn to the right of the box.
@@ -2739,6 +2887,41 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		 * `データ` — плоский список «ключ, значение» (по всем 195 раскладках
 		 * 270 таких частей, у 152 из них список есть, других полей нет вовсе).
 		 */
+		/*
+		 * `エディタ上表示 = 0` у части-компонента — ОФОРМИТЕЛЬСКАЯ ЗАГОТОВКА МАКЕТА,
+		 * и компонент по ней создавать не надо. В пяти раскладках-вьюхах
+		 * (`SceneTutorial`, `StatusHomeView`, `EventHintView`, `ItemOperation`,
+		 * `SendOperation`) в макет вставлены шапка и подвал, чтобы дизайнер видел
+		 * экран целиком, хотя настоящие приходят из главной сцены. Таких девять:
+		 * компоненты `Fotter` (опечатка авторов в `Footer::GetComponentName`) и
+		 * `Header` при частях с редакторскими именами и без списка `データ`.
+		 *
+		 * Симптом: на экране обучения поверх полосатой подложки лежал ВТОРОЙ,
+		 * полноразмерный футер — белая полоса подсказки во всю ширину и розовые
+		 * плашки-пустышки (замер: часть `90000429` в слое сцены обучения, масштаб
+		 * 1.0, поверх уменьшенного до 0.85 футера `90000372` домашней сцены). У
+		 * оригинала там штриховка и точки страниц: 288 кадров записи оригинала, ни
+		 * одного с этой подложкой.
+		 *
+		 * ★Скрыть часть-ХОЗЯИНА мало: активность компонента всё равно создаётся, и
+		 * её детали (тени и подложки кнопок) остаются на экране серой рамкой вокруг
+		 * `Prev`/`Next` — проверено кадром. Поэтому компонент не заводим вовсе.
+		 *
+		 * ★Флаг стоит и у 125 других частей, но там он значит иное, и прятать их
+		 * нельзя — проверено кадрами: `構築パーツ_000` (фон страниц CONFIG) уносит фон
+		 * конфига, `ＣＧパーツ_000` в `AdvMessageWindow_main`/`_mainB` (CG
+		 * `メッセージウィンドウ／Ａ案`) — подложку окна реплик вместе с текстом; в прологе
+		 * текст при этом оставался, потому что там другое окно (`_plot`), где такой
+		 * части нет. Поэтому правило ограничено типом «пользовательский компонент».
+		 */
+		if (!act_int(node, "エディタ上表示", 1)) {
+			if (getenv("XSYS4_ACT_TRACE") || getenv("XSYS4_PARTS_TRACE"))
+				NOTICE("ACT: заготовка макета '%s' (%s) не создаётся",
+				       display_sjis0(node->name ? node->name->text : ""),
+				       display_sjis0(act_str(ti, "ユーザコンポーネント名") ?
+				                     act_str(ti, "ユーザコンポーネント名")->text : ""));
+			return no;
+		}
 		struct string *uc_name = act_str(ti, "ユーザコンポーネント名");
 		PE_SetUserComponentName(no, uc_name);
 		struct ex_tree *data = act_child(ti, "データ");
@@ -2841,11 +3024,24 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				PE_SetKeyWaitFlatName(no, mflat);
 		}
 		/*
-		 * `テキスト` из раскладки — образец для редактора активностей («проверьте
-		 * прозрачность/яркость»), а не реплика: игра выдаёт текст сама через
-		 * SetMessageWindowText. Не подставляем его, иначе на экране висел бы
-		 * японский рыбный текст до первой реплики.
+		 * `テキスト` из раскладки — ОБРАЗЕЦ реплики. Его не подставляли, считая
+		 * заготовкой редактора, и в превью страницы `Text Area UI` рамка окна
+		 * оставалась пустой, тогда как у оригинала внутри стоят три строки
+		 * («Hey there, sexy! I'm some example text…»).
+		 *
+		 * Что это именно экранный текст, видно по данным: части типа
+		 * `メッセージウィンドウ` во всей игре пять, у всех пяти поле непустое, и
+		 * ровно у конфиговой оно ПЕРЕВЕДЕНО на английский — у четырёх ADV-окон там
+		 * осталась японская рыба (`これはサンプルメッセージです`,
+		 * `あいうえお…`, `透過率／明るさを確認してください`). Заготовку редактора
+		 * локализовывать бы не стали.
+		 *
+		 * ADV-окна рыбу не показывают: до первой реплики окно не выведено, а с
+		 * первой же игра перезаписывает текст своим (`SetMessageWindowText`).
 		 */
+		struct string *mw_text = act_str(ti, "テキスト");
+		if (mw_text && mw_text->size > 0)
+			PE_SetMessageWindowText(no, mw_text, 0, NULL, 0, 0);
 		PE_SetMessageWindowActive(no, act_int(ti, "アクティブ", 0));
 	} else if (ti) {
 		// CG part: per-state CG names
@@ -2885,6 +3081,19 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			        act_list_int(node, "原点座標", 1, 0));
 		}
 	}
+	/*
+	 * `マージン` — отступы части, которые учитывает раскладка контейнера
+	 * (`parts_do_layout` прибавляет их к размеру ребёнка). Поле не читалось, и
+	 * кнопки в layout box стояли вплотную: у системных кнопок ADV каждая объявляет
+	 * `マージン = (0, 0, 0, 8)`, то есть 8 px справа, — без них шаг выходил 44
+	 * вместо 52. Порядок значений — как у `パディング` бокса (верх, низ, лево, право).
+	 * По всей игре поле ненулевое у 120 с небольшим частей, у остальных нули.
+	 */
+	PE_SetComponentMargin(no,
+		act_list_int(node, "マージン", 0, 0),
+		act_list_int(node, "マージン", 1, 0),
+		act_list_int(node, "マージン", 2, 0),
+		act_list_int(node, "マージン", 3, 0));
 	PE_SetAlpha(no, act_int(node, "アルファ", 255));
 	// 拡大縮小 (scale x,y): e.g. the config sample-window system icons are 0.5.
 	float sx = act_list_float(node, "拡大縮小", 0, 1.0f);
@@ -2914,7 +3123,40 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetPartsPixelHitTest(no, true);
 	if (parent_no >= 0)
 		PE_SetParentPartsNumber(no, parent_no);
-	PE_SetShow(no, act_int(node, "表示", 1));
+	/*
+	 * `エディタ上表示 = 0` — часть-ОБРАЗЕЦ: живёт в макете ради редактора, а в игре не
+	 * рисуется. Поле читалось как «показ в редакторе» и игнорировалось, отчего на
+	 * экран лезло всё, что дизайнер оставил себе для наглядности. По раскладкам
+	 * Dohna таких частей 134 из 2708, и список сам себя объясняет: девять заготовок
+	 * шапки и подвала (`ユーザコンポーネント_000/001/002` → компоненты `Fotter`/`Header`)
+	 * в пяти вьюхах, семь образцов подписи `CaptionConfig2` у заголовка CONFIG,
+	 * четыре части `背景音声` на вкладке Sound, направляющие `Guide`/`ガイド`,
+	 * 21 разметочная `BaseLine` в фонах битв.
+	 *
+	 * Симптом, с которого начали: на экране обучения поверх полосатой подложки лежал
+	 * ВТОРОЙ, полноразмерный футер — белая полоса подсказки во всю ширину и розовые
+	 * плашки-пустышки (замер: часть `90000429` в слое сцены обучения, масштаб 1.0,
+	 * поверх уменьшенного до 0.85 футера `90000372` домашней сцены). У оригинала там
+	 * штриховка и точки страниц: 288 кадров записи, ни одного с этой подложкой.
+	 */
+	/*
+	 * `エディタ上表示 = 0` — часть-ОБРАЗЕЦ: живёт в макете ради редактора, а в игре не
+	 * рисуется. Таких 134 из 2708 по раскладкам Dohna, и список сам себя объясняет:
+	 * семь образцов подписи `CaptionConfig2` у заголовка CONFIG, четыре части
+	 * `背景音声` на вкладке Sound, направляющие `Guide`/`ガイド`, 21 разметочная
+	 * `BaseLine` в фонах битв, безымянные `ＣＧパーツ_000/001`.
+	 *
+	 * ★У части-КОМПОНЕНТА тот же флаг значит больше: там мало не показать хозяина —
+	 * активность всё равно создаётся, и её детали остаются на экране (серая рамка
+	 * вокруг `Prev`/`Next` в обучении). Такие компоненты не заводятся вовсе — см.
+	 * ветку `ユーザコンポーネント` выше.
+	 *
+	 * ★ПОД НАБЛЮДЕНИЕМ: тот же флаг стоит у подложки окна реплик
+	 * (`ＣＧパーツ_000` в `AdvMessageWindow_main`/`_mainB`, CG `メッセージウィンドウ／Ａ案`)
+	 * и у фона страниц CONFIG (`構築パーツ_000`). Если окно реплик или фон пропадут —
+	 * правило придётся сузить обратно по типу части.
+	 */
+	PE_SetShow(no, act_int(node, "表示", 1) && act_int(node, "エディタ上表示", 1));
 
 	// recurse into child parts. A パーツタイプ=18 "display range" child acts as a
 	// clip viewport: subsequent siblings (the preview scene/message-window/icons)
@@ -2929,7 +3171,23 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				continue;
 			struct ex_tree *cti = act_child(&kids->children[i], "種類別情報");
 			struct ex_tree *cnorm = cti ? act_child(cti, "通常状態") : NULL;
-			bool is_viewport = cnorm && act_parts_type(cnorm) == 18;
+			/*
+			 * «Область отображения» (классический тип 18) работает как
+			 * clip viewport: следующие соседи обрезаются по ней.
+			 *
+			 * ★Только для СТАРЫХ раскладок, где тип записан ЧИСЛОМ. У v14 тип
+			 * записан именем, и 18 в классической нумерации — это `構築パーツ`
+			 * (см. таблицу act_component_type_names, 26→18), то есть обычная
+			 * собираемая поверхность. Из-за этого фон страниц CONFIG у Dohna
+			 * назначался маской 29 соседним частям и переставал рисоваться сам:
+			 * в дампе у него `clip=0 isclip=1`, поверхность построена
+			 * (`XSYS4_CP_DUMP`: размытый `背景／ナユタ` с чёрной заливкой по
+			 * альфе 180), а на экране вместо затемнённого задника просвечивал
+			 * титул в полную яркость.
+			 */
+			struct ex_tree *cpt = cnorm ? act_child(cnorm, "パーツタイプ") : NULL;
+			bool numeric_type = cpt && cpt->is_leaf && cpt->leaf.value.type == EX_INT;
+			bool is_viewport = numeric_type && act_parts_type(cnorm) == 18;
 			if (is_viewport)
 				clip_viewport_no = cno;
 			else if (clip_viewport_no >= 0)
@@ -2991,7 +3249,20 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 				NOTICE("   pre-reg[%d] name='%s' number=%d",
 				       i, display_sjis0(a->parts[i].name->text), a->parts[i].number);
 		}
+		// Списки hover-связей — на ЭТУ постройку; вложенные вызовы (активности
+		// user-компонентов) не должны видеть чужие пары.
+		struct act_hover_pending *saved_pending = act_hover_pending;
+		int saved_pending_nr = act_hover_nr;
+		struct act_built_name *saved_built = act_built;
+		int saved_built_nr = act_built_nr;
+		act_hover_pending = NULL; act_hover_nr = 0;
+		act_built = NULL; act_built_nr = 0;
+
 		act_build_part(a, &act->tree->children[0], -1);  // ルートパーツ
+		act_apply_pending_hover_links();
+
+		act_hover_pending = saved_pending; act_hover_nr = saved_pending_nr;
+		act_built = saved_built; act_built_nr = saved_built_nr;
 		if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_DUMP_PARTS")) {
 			NOTICE("=== parts right after ReadActivityFile build ===");
 			parts_debug_dump();
