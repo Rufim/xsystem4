@@ -1415,7 +1415,23 @@ static void parts_combine_params(struct parts_params *parent, struct parts_param
 		struct parts_params *out)
 {
 	out->z = parent->z + child->z;
-	out->pos = (Point) { parent->pos.x + child->pos.x, parent->pos.y + child->pos.y };
+	/*
+	 * ★Смещение ребёнка МАСШТАБИРУЕТСЯ родителем — ровно как в
+	 * parts_update_global_pos, куда это правило внесли раньше. Здесь его не было,
+	 * и два пути расчёта расходились: позиция, посчитанная при установке
+	 * координат, затиралась несмасштабированной при ближайшем UpdateComponent.
+	 *
+	 * Замер, на котором поймано: образец реплики в превью страницы `Text Area UI`
+	 * у Dohna. Окно `メッセージウィンドウサンプル` — 862×206 с масштабом 0.66 и
+	 * центральным origin, его текстовая часть стоит локально в (-301,-41).
+	 * Правильно 832 + (-301 × 0.66) = 633, у оригинала текст и начинается с 633;
+	 * без масштаба выходило 832 - 301 = 531, и текст вылезал за левый край рамки
+	 * окна на картинку сцены.
+	 */
+	out->pos = (Point) {
+		parent->pos.x + (int)roundf(child->pos.x * parent->scale.x),
+		parent->pos.y + (int)roundf(child->pos.y * parent->scale.y)
+	};
 	out->show = parent->show && child->show;
 	out->alpha = parent->alpha * (child->alpha / 255.0f);
 	out->scale.x = parent->scale.x * child->scale.x;
