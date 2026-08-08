@@ -80,15 +80,28 @@ static bool vsf_write_type(enum vsf_valuetype type)
 	return vsf_write(&b, 1);
 }
 
+/*
+ * Файлы VSFile живут в СЕЙВ-ПАПКЕ: игра пишет сюда сайдкар сейва
+ * (`gamesave::detail::追加セーブ` → «Haharanman_08.vsf» с датой/комментом,
+ * по нему список слотов показывает записи). Раньше открывали из каталога
+ * игры — сайдкар писался мимо сейвов (а каталог игры может быть и вовсе
+ * read-only). На чтении, не найдя файла в сейв-папке, пробуем каталог
+ * игры — на случай .vsf-данных, поставляемых с игрой.
+ */
 static bool vsfile_open(struct string *filename, bool read)
 {
-	char *u = gamedir_path(filename->text);
 	if (vs_file) {
 		WARNING("VSFile is already opened");
 		fclose(vs_file);
 	}
 	vs_read = read;
+	char *u = savedir_path(filename->text);
 	vs_file = file_open_utf8(u, read ? "rb" : "wb");
+	if (!vs_file && read) {
+		free(u);
+		u = gamedir_path(filename->text);
+		vs_file = file_open_utf8(u, "rb");
+	}
 	if (!vs_file) {
 		WARNING("Failed to open '%s': %s", display_utf0(u), strerror(errno));
 	}

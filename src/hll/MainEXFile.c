@@ -26,6 +26,7 @@
 #include "vm/heap.h"
 #include "vm/page.h"
 #include "hll.h"
+#include "iarray.h"
 
 #include "system4/utfsjis.h"
 
@@ -911,6 +912,35 @@ bool mainex_list_int_get(const char *key_utf8, int index, int *out)
 	return true;
 }
 
+/*
+ * Save/Load(wrap<array<int>> image) — снапшот ИЗМЕНЕНИЙ главного .ex в
+ * сейв-образ (зовётся из gamesave::detail::セーブ実行/ロード復帰; без Save
+ * сохранение падало фатальной «Unimplemented HLL function»). Наш движок EX не
+ * модифицирует вовсе (EXWriter не реализован), поэтому честный снапшот —
+ * «изменений нет»: Save пишет пустой образ с магией, Load принимает любой.
+ * Формат наш собственный, с образом оригинального DLL совпадать не обязан
+ * (сейвы читаются нашим же загрузчиком).
+ */
+static bool MainEXFile_Save(struct page **image)
+{
+	struct iarray_writer w;
+	iarray_init_writer(&w, "MEX");
+	iarray_write(&w, 0); // версия формата: «изменений нет»
+	if (*image) {
+		delete_page_vars(*image);
+		free_page(*image);
+	}
+	*image = iarray_to_page(&w);
+	iarray_free_writer(&w);
+	return true;
+}
+
+static bool MainEXFile_Load(possibly_unused struct page **image)
+{
+	// Восстанавливать нечего: движок не накапливает изменений EX.
+	return true;
+}
+
 static void MainEXFile_PreLink(void);
 
 HLL_LIBRARY(MainEXFile,
@@ -918,6 +948,8 @@ HLL_LIBRARY(MainEXFile,
 	    HLL_EXPORT(_ModuleFini, MainEXFile_ModuleFini),
 	    HLL_EXPORT(_PreLink, MainEXFile_PreLink),
 	    HLL_EXPORT(ReloadDebugEXFile, MainEXFile_ReloadDebugEXFile),
+	    HLL_EXPORT(Save, MainEXFile_Save),
+	    HLL_EXPORT(Load, MainEXFile_Load),
 	    HLL_EXPORT(Handle, MainEXFile_Handle),
 	    HLL_EXPORT(AHandle, MainEXFile_AHandle),
 	    HLL_EXPORT(A2Handle, MainEXFile_A2Handle),
