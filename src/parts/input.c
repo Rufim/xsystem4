@@ -451,6 +451,21 @@ void PE_UpdateInputState(int passed_time)
 				&hover_consumed, &click_consumed);
 	}
 
+	/*
+	 * `オンカーソル表示連動`: часть видна ровно пока курсор над ТОЙ, к которой её
+	 * привязала раскладка (имя цели разрешает загрузчик — см. on_cursor_show_link).
+	 * Отдельным проходом, ПОСЛЕ основного: hover цели считается в том же цикле, и
+	 * порядок front-to-back не даёт узнать её состояние заранее. Так на странице
+	 * `Window` конфига Dohna появляется одна подсказка — та, на пункт которой навели,
+	 * а не все четыре разом.
+	 */
+	PARTS_LIST_FOREACH(parts) {
+		if (parts->on_cursor_show_link < 0)
+			continue;
+		struct parts *target = parts_try_get(parts->on_cursor_show_link);
+		parts_set_show(parts, target && target->is_hovered);
+	}
+
 	// Mouse wheel: deliver a MOUSE_WHEEL message (Forward/Back counts) to hovered
 	// parts. The engine never generated these, so wheel-scrollable UIs (Tsumamigui 3
 	// BACK LOG: a full-screen part catches the notch -> opens the log; inside the

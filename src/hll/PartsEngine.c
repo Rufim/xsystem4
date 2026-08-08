@@ -2115,12 +2115,83 @@ static struct string *act_cg_suffix(struct string *base, const char *utf8_suffix
 	return full;
 }
 
+/*
+ * `オンカーソル表示連動` — ИМЯ соседней части, при наведении на которую эта часть
+ * показывается. Загрузчик поле не читал вовсе, и подсказки, которым положено
+ * появляться по очереди, висели на экране все сразу: на странице `Window` конфига
+ * Dohna три пояснения (`Scaling`, `Display Mode`, `Fullscreen Mode Aspect Ratio`)
+ * печатались одно поверх другого в блоке `Hint`. Непустое поле есть ровно у четырёх
+ * частей во всей игре, и все четыре — в `コンフィグ／０６／ウィンドウページ.x`.
+ *
+ * Разрешаем ОТЛОЖЕННО: цель — сосед по дереву и может быть построена позже нас.
+ * Ищем по именам ЭТОЙ постройки, а не по регистру активности (`a->parts`): у одной
+ * раскладки живёт несколько экземпляров, и второй получил бы ссылку на часть первого.
+ * Списки сохраняются/восстанавливаются вокруг вложенного `ReadActivityFile`
+ * (раскладка тянет за собой активности своих user-компонентов) — иначе пара уехала бы
+ * в чужое дерево, где имена самые ходовые.
+ */
+struct act_hover_pending { int parts_no; struct string *target_name; };
+static struct act_hover_pending *act_hover_pending;
+static int act_hover_nr;
+struct act_built_name { struct string *name; int no; };
+static struct act_built_name *act_built;
+static int act_built_nr;
+
+// Строки из EX-дерева не обязаны быть NUL-терминированными (§5be: strcmp на них
+// молча ронял загрузку раскладок) — сравниваем по длине и memcmp.
+static bool act_name_eq(struct string *a, struct string *b)
+{
+	return a && b && a->size == b->size && !memcmp(a->text, b->text, a->size);
+}
+
+static void act_apply_pending_hover_links(void)
+{
+	for (int i = 0; i < act_hover_nr; i++) {
+		int target_no = -1;
+		for (int j = 0; j < act_built_nr; j++) {
+			if (act_name_eq(act_built[j].name, act_hover_pending[i].target_name)) {
+				target_no = act_built[j].no;
+				break;
+			}
+		}
+		if (target_no < 0) {
+			WARNING("act_build_part: hover-link target '%s' not found in this activity",
+			        display_sjis0(act_hover_pending[i].target_name->text));
+			continue;
+		}
+		PE_set_on_cursor_show_link(act_hover_pending[i].parts_no, target_no);
+		if (getenv("XSYS4_PARTS_TRACE") || getenv("XSYS4_ACT_TRACE"))
+			NOTICE("ACT hover-link: part %d shown while cursor over '%s' (part %d)",
+			       act_hover_pending[i].parts_no,
+			       display_sjis0(act_hover_pending[i].target_name->text), target_no);
+	}
+	free(act_hover_pending);
+	act_hover_pending = NULL;
+	act_hover_nr = 0;
+	free(act_built);
+	act_built = NULL;
+	act_built_nr = 0;
+}
+
 // Returns the (top-level) parts number built for `node`, or -1 for a leaf/null.
 static int act_build_part(struct pe_activity *a, struct ex_tree *node, int parent_no)
 {
 	if (!node || node->is_leaf)
 		return -1;
 	int no = ++pe_act_part_seq;
+
+	act_built = xrealloc_array(act_built, act_built_nr, act_built_nr + 1, sizeof(*act_built));
+	act_built[act_built_nr].name = node->name;
+	act_built[act_built_nr].no = no;
+	act_built_nr++;
+	struct string *hover_target = act_str(node, "オンカーソル表示連動");
+	if (hover_target && hover_target->size > 0) {
+		act_hover_pending = xrealloc_array(act_hover_pending, act_hover_nr,
+		                                   act_hover_nr + 1, sizeof(*act_hover_pending));
+		act_hover_pending[act_hover_nr].parts_no = no;
+		act_hover_pending[act_hover_nr].target_name = hover_target;
+		act_hover_nr++;
+	}
 
 	// register name -> number so the game can resolve it (GetActivityPartsNumber)
 	a->parts = xrealloc_array(a->parts, a->nr_parts, a->nr_parts + 1, sizeof(*a->parts));
@@ -2814,7 +2885,20 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 				NOTICE("   pre-reg[%d] name='%s' number=%d",
 				       i, display_sjis0(a->parts[i].name->text), a->parts[i].number);
 		}
+		// Списки hover-связей — на ЭТУ постройку; вложенные вызовы (активности
+		// user-компонентов) не должны видеть чужие пары.
+		struct act_hover_pending *saved_pending = act_hover_pending;
+		int saved_pending_nr = act_hover_nr;
+		struct act_built_name *saved_built = act_built;
+		int saved_built_nr = act_built_nr;
+		act_hover_pending = NULL; act_hover_nr = 0;
+		act_built = NULL; act_built_nr = 0;
+
 		act_build_part(a, &act->tree->children[0], -1);  // ルートパーツ
+		act_apply_pending_hover_links();
+
+		act_hover_pending = saved_pending; act_hover_nr = saved_pending_nr;
+		act_built = saved_built; act_built_nr = saved_built_nr;
 		if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_DUMP_PARTS")) {
 			NOTICE("=== parts right after ReadActivityFile build ===");
 			parts_debug_dump();

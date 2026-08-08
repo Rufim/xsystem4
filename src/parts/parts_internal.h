@@ -673,6 +673,14 @@ struct parts {
 	// неверной прокруткой. Хранить всё равно нужно: без экспорта движок уходил в REPL.
 	int scroll_pos_x_link;
 	int scroll_pos_y_link;
+	/*
+	 * `オンカーソル表示連動` — «показ, связанный с наведением курсора»: номер части,
+	 * при наведении на которую показывается ЭТА. В раскладке поле хранит ИМЯ соседней
+	 * части, загрузчик разрешает его в номер отложенно (act_apply_pending_hover_links).
+	 * Пока поле не читалось, все четыре подсказки страницы Window у Dohna были
+	 * показаны разом и печатались одна поверх другой.
+	 */
+	int on_cursor_show_link;
 	bool is_hovered;
 	int hover_time;
 	int draw_filter;
@@ -831,6 +839,7 @@ void parts_set_scale_x(struct parts *parts, float mag);
 void parts_set_scale_y(struct parts *parts, float mag);
 void parts_set_rotation_z(struct parts *parts, float rot);
 void parts_set_alpha(struct parts *parts, int alpha);
+void parts_set_show(struct parts *parts, bool show);
 void parts_set_state(struct parts *parts, enum parts_state_type state);
 void parts_release(int parts_no);
 void parts_release_all(void);

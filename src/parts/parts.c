@@ -148,6 +148,7 @@ static void parts_init(struct parts *parts)
 	parts->pending_parent = -1;
 	parts->linked_to = -1;
 	parts->linked_from = -1;
+	parts->on_cursor_show_link = -1;
 	TAILQ_INIT(&parts->children);
 	TAILQ_INIT(&parts->motion);
 }
@@ -4090,6 +4091,17 @@ void PE_set_component_scroll_pos_link(int parts_no, int link_parts_no, bool vert
 				"само следование не реализовано", parts_no, link_parts_no);
 		}
 	}
+}
+
+void PE_set_on_cursor_show_link(int parts_no, int target_parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	parts->on_cursor_show_link = target_parts_no;
+	// До первого наведения подсказки быть не должно: `表示 = 1` в раскладке значит
+	// «показать, когда позовут», а зовёт её именно курсор.
+	parts_set_show(parts, false);
 }
 
 int PE_get_component_scroll_pos_link(int parts_no, bool vertical)
