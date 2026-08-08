@@ -1817,7 +1817,24 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 	// Dohna не создавались бы вовсе.
 	if (act_parts_type(st) == 16) {
 		struct string *cg = act_str(st, "ＣＧ名");
-		if (cg && cg->size)
+		/*
+		 * `表示タイプ = 1` — ЕДИНАЯ ЛЕНТА цифр: `ＣＧ名` указывает на один CG
+		 * со всеми глифами подряд, а `幅リスト` даёт 12 ширин (0-9, минус,
+		 * запятая). Раскладке нужен PE_SetNumeralLinkedCGNumberWidthWidthList,
+		 * а не PE_SetNumeralCG: у имени нет %d-плейсхолдера, и separate-
+		 * загрузчик находил ПО ЭТОМУ ИМЕНИ САМУ ЛЕНТУ для всех 12 глифов —
+		 * каждая цифра рисовалась целой лентой «0123456789…» (кнопки страниц
+		 * экрана сейвов Haha Ranman, «шум из цифр» вместо номеров), причём
+		 * без единого предупреждения — CG-то существует.
+		 */
+		if (cg && cg->size && act_int(st, "表示タイプ", 0) == 1) {
+			int w[12];
+			for (int i = 0; i < 12; i++)
+				w[i] = act_list_int(st, "幅リスト", i, 0);
+			PE_SetNumeralLinkedCGNumberWidthWidthList(no, cg,
+				w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+				w[8], w[9], w[10], w[11], state);
+		} else if (cg && cg->size)
 			PE_SetNumeralCG(no, cg, state);
 		/*
 		 * `表示タイプ = 2` — цифры рисуются ШРИФТОМ, а не набором CG (`ＣＧ名`
