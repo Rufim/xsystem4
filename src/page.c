@@ -717,6 +717,30 @@ static bool option_var_value_owns(struct page *page, int varno)
 	}
 }
 
+/*
+ * `option<string>`-АРГУМЕНТ владеет своей строкой: ВСЕ формы сайтов передают
+ * владение — литерал `S_PUSH` (новая строка на куче), копия из локали
+ * `X_REF 2; X_MOV; A_REF` (A_REF создаёт строке СВОЙ слот; так comment уходит в
+ * `parts::detail::CParts@0` со всех 19 сайтов), пустой option `PUSH -1; PUSH 1`
+ * (освобождать нечего, -1 variable_fini пропускает). Пока такие аргументы не
+ * освобождались, копия текла на каждый вызов — а конструкторы обёрток зовутся
+ * на каждую часть.
+ *
+ * ОБЪЕКТНЫЕ подтипы (wrap/struct/iface) в аргументах НЕ трогаем: передача
+ * владения для них не доказана (все такие сигнатуры — редактор сцен, в игре не
+ * выполняются), а ошибка в эту сторону — double free.
+ *
+ * Делегатов с `option<string>`-аргументами в .ain нет вовсе (проверено), так что
+ * крайний случай «кадры N подписчиков делят один слот сырьём» не существует.
+ */
+static bool option_arg_value_owns(struct page *page, int varno)
+{
+	struct ain_type *t = page_var_decl_type(page, varno);
+	if (!t || t->data != AIN_OPTION || !t->array_type)
+		return false;
+	return t->array_type->data == AIN_STRING;
+}
+
 void delete_page_vars(struct page *page)
 {
 	/*
@@ -767,6 +791,11 @@ void delete_page_vars(struct page *page)
 			if (i >= nr_args && option_var_value_owns(page, i)
 			    && page->values[i].i > 0)
 				variable_fini(page->values[i], AIN_STRUCT, true);
+			// Аргумент со СТРОКОВЫМ подтипом — владеющий (см.
+			// option_arg_value_owns): сайт всегда передаёт копию/литерал.
+			else if (i < nr_args && option_arg_value_owns(page, i)
+			    && page->values[i].i > 0)
+				variable_fini(page->values[i], AIN_STRING, true);
 			continue;
 		}
 		variable_fini(page->values[i], t, true);
