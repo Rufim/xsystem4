@@ -480,6 +480,30 @@ static union vm_value *stack_peek_ptr(int n)
 	return &stack[stack_ptr - (1 + n)];
 }
 
+// Что лежит в heap-слоте — для сообщений об ошибках ссылок: «page index N/M»
+// без типа страницы не отличает подменённый объект (слот переиспользован после
+// чужого освобождения) от неверного смещения. Плюс последнее variable_fini —
+// виноват обычно тот, кто освободил слот раньше.
+static const char *describe_heap_slot(int32_t slot)
+{
+	static char buf[256];
+	if (!heap_index_valid(slot))
+		return "невалидный слот";
+	if (heap[slot].type == VM_STRING)
+		return "VM_STRING";
+	struct page *p = heap[slot].page;
+	if (!p)
+		return "VM_PAGE (NULL)";
+	const char *sname = (p->type == STRUCT_PAGE
+			     && p->index >= 0 && p->index < ain->nr_structures)
+		? ain->structures[p->index].name : NULL;
+	snprintf(buf, sizeof(buf), "%s idx=%d nr_vars=%d%s%s a_type=%d",
+		 pagetype_string(p->type), p->index, p->nr_vars,
+		 sname ? " " : "", sname ? display_sjis0(sname) : "",
+		 p->type == ARRAY_PAGE ? (int)p->a_type : -1);
+	return buf;
+}
+
 // Pop a reference off the stack, returning the address of the referenced object.
 static union vm_value *stack_pop_var(void)
 {
@@ -488,7 +512,9 @@ static union vm_value *stack_pop_var(void)
 	if (unlikely(!heap_index_valid(heap_index)))
 		VM_ERROR("Out of bounds heap index: %d/%d", heap_index, page_index);
 	if (unlikely(!heap[heap_index].page || page_index >= heap[heap_index].page->nr_vars))
-		VM_ERROR("Out of bounds page index: %d/%d", heap_index, page_index);
+		VM_ERROR("Out of bounds page index: %d/%d (в слоте: %s; последнее fini: %s)",
+			 heap_index, page_index, describe_heap_slot(heap_index),
+			 vm_last_fini_str());
 	return &heap[heap_index].page->values[page_index];
 }
 
@@ -544,6 +570,26 @@ union vm_value vm_copy(union vm_value v, enum ain_data_type type)
 	case AIN_ARRAY:
 		return (union vm_value) { .i = vm_copy_page(heap_get_page(v.i)) };
 	case AIN_REF_TYPE:
+		heap_ref(v.i);
+		return v;
+	/*
+	 * ★`wrap<структура>` (AIN_WRAP) — ВЛАДЕЮЩИЙ хэндл, и копия обязана взять свою
+	 * ссылку: `variable_fini` его освобождает (линия фиксов владения), значит
+	 * копирование без ref даёт висячий слот, как только умирает источник.
+	 *
+	 * Живой случай (Haha Ranman, конфиг → «To Title»): `confirm::CFrame@Open`
+	 * пересоздаёт задачу идиомой `NEW CASTaskParts; SR_ASSIGN; DELETE` —
+	 * `heap_struct_assign` копирует ВРЕМЕННУЮ структуру через `copy_page`
+	 * (поля идут через vm_copy), после чего DELETE честно освобождает временную
+	 * вместе с её полем `m_task` (wrap<CASTask>). Копия оставалась с мёртвым
+	 * слотом, и первый же `CASTaskParts@Next` → `CASTask@JoinImp` падал
+	 * «Out of bounds page index: N/10» — визуально игра «зависала» на
+	 * подтверждении возврата на титул. Смерть поймана `XSYS4_DTOR_TRACE=CASTask`:
+	 * стек указывал ровно в CFrame@Open.
+	 *
+	 * NULL-маркер у wrap — -1 (см. variable_initval_var), heap_ref(-1) — no-op.
+	 */
+	case AIN_WRAP:
 		heap_ref(v.i);
 		return v;
 	default:

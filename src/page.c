@@ -930,6 +930,19 @@ void init_struct(int no, int slot)
 void delete_struct(int no, int slot)
 {
 	struct ain_struct *s = &ain->structures[no];
+	// XSYS4_DTOR_TRACE=<подстрока имени структуры> — СТЕК ИГРЫ в момент смерти
+	// объекта. Легче heap-watch (не следит за ref/unref покадрово), поэтому не
+	// прячет тайминго-зависимые гонки владения: use-after-free CASTask на
+	// «конфиг → To Title» под тяжёлым watch просто не воспроизводился.
+	{
+		static const char *w = (const char *)1;
+		if (w == (const char *)1)
+			w = getenv("XSYS4_DTOR_TRACE");
+		if (w && *w && s->name && strstr(s->name, w)) {
+			WARNING("DTOR %s слот %d — стек вызовов игры:", s->name, slot);
+			vm_stack_trace();
+		}
+	}
 	if (s->destructor > 0) {
 		vm_call(s->destructor, slot);
 	}

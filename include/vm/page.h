@@ -101,6 +101,9 @@ static inline void _page_set_var(struct page *page, int i, union vm_value v)
 
 #define page_set_var(page, i, v) _page_set_var(page, i, vm_value_cast(v))
 
+// Имя типа страницы (для диагностик).
+const char *pagetype_string(enum page_type type);
+
 // variables
 union vm_value variable_initval(enum ain_data_type type);
 // Тот же initval, но со знанием слота в контейнере: generic-контейнер Ixseal

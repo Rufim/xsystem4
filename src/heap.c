@@ -148,6 +148,12 @@ int32_t heap_alloc_slot(enum vm_pointer_type type)
 
 static void heap_free_slot(int32_t slot)
 {
+	// Наблюдаемый слот умер — печатаем СТЕК ИГРЫ: момент смерти важнее момента
+	// падения (падение при чтении случается позже и в другом месте).
+	if (unlikely(heap_watched(slot))) {
+		WARNING("HEAPWATCH %d FREE — стек вызовов игры:", slot);
+		vm_stack_trace();
+	}
 	heap[slot].seq = 0;
 	heap_free_stack[--heap_free_ptr] = slot;
 }
@@ -179,6 +185,13 @@ void heap_ref(int32_t slot)
 {
 	if (slot == -1)
 		return;
+	// XSYS4_REF_DEAD_TRACE=1 — детектор use-after-free ПО ВЛАДЕНИЮ: взятие ссылки
+	// на уже освобождённый слот означает, что чей-то хэндл пережил объект. Ловит
+	// момент ДО падения (падение случается позже и в другом месте — при чтении).
+	if (unlikely(heap[slot].ref <= 0) && getenv("XSYS4_REF_DEAD_TRACE")) {
+		WARNING("REF-DEAD слот %d (ref=%d) — стек вызовов игры:", slot, heap[slot].ref);
+		vm_stack_trace();
+	}
 	heap[slot].ref++;
 	if (unlikely(heap_watched(slot)))
 		WARNING("HEAPWATCH %d REF -> %d @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));

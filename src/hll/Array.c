@@ -388,6 +388,15 @@ static bool ix_elem_is_object(enum ain_data_type array_dt)
 	// wrap<интерфейс>: нижний слот пары — heap-слот объекта, владение как у
 	// struct-элемента (верхний слот — просто индекс, ничем не владеет).
 	case AIN_IFACE_WRAP:
+	// ★wrap<структура> (AIN_WRAP) — владеющий хэндл и в КОНТЕЙНЕРЕ: пока его тут
+	// не было, `Array.PushBack` не брал ссылку на элемент `array<wrap<CASTask>>`,
+	// и после смерти владельца задачи элемент повисал. Живой случай (Haha Ranman,
+	// конфиг → «To Title»): подтверждение `タイトルに戻る確認` → `CASTask@JoinImp`
+	// перебирает parentList и читает поле у уже освобождённой страницы — движок
+	// падал «Out of bounds page index» в X_REF, игра «останавливалась».
+	// Симметрия с variable_fini: wrap-слоты страниц освобождаются (фикс option<>
+	// той же линии), значит и контейнер обязан владеть.
+	case AIN_WRAP:
 	case AIN_ARRAY_TYPE:
 		return true;
 	default:

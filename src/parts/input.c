@@ -197,6 +197,16 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	// SetEnableInputProcess(false) выключает часть из обработки ввода целиком: ни
 	// hit-теста, ни сообщений, и курсор она НЕ перехватывает у частей за собой.
 	// Сбрасываем is_hovered, иначе «залипший» hover выстрелит MOUSE_LEAVE позже.
+	// XSYS4_PART_WATCH=<номер>: весь путь решения по вводу для этой части — раз в
+	// кадр, вместе с вычисленным hit-тестом. Общий XSYS4_CURSOR_TRACE упирается в
+	// лимит лога задолго до интересного места (200k строк — до открытия конфига).
+	if (parts_watched(parts->no)) {
+		NOTICE("INWATCH part=%d eip=%d can=%d show=%d alpha=%d lhid=%d hit=%d pos=%d,%d",
+		       parts->no, parts->enable_input_process, parts_can_take_cursor(parts),
+		       parts->global.show, parts->global.alpha, parts_hidden_by_layer(parts),
+		       parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos),
+		       cur_pos.x, cur_pos.y);
+	}
 	if (!parts->enable_input_process) {
 		parts->is_hovered = false;
 		return;
@@ -249,6 +259,16 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 
 	bool was_hovered = parts->is_hovered;
 	parts->is_hovered = is_hovered;
+
+	// Вторая половина INWATCH: итог и был ли курсор уже съеден кем-то выше.
+	if (parts_watched(parts->no))
+		NOTICE("INWATCH2 part=%d hovered=%d consumed_before=%d",
+		       parts->no, (int)is_hovered, (int)*hover_consumed);
+	// Кто съел курсор над наблюдаемой точкой: печатаем ЛЮБОЙ парт, который стал
+	// hovered и потребил курсор в кадре, где включён XSYS4_HOVER_TRACE.
+	if (getenv("XSYS4_HOVER_TRACE") && is_hovered && !parts->pass_cursor)
+		NOTICE("HOVER consumed by part=%d z=%d ctrl=%d", parts->no,
+		       parts->global.z, parts->controller_no);
 
 	// !pass_cursor parts consume the cursor for parts behind them
 	if (is_hovered && !parts->pass_cursor)
