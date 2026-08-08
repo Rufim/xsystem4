@@ -42,10 +42,9 @@ static Point root_pos = { 0, 0 };
 /*
  * Тип компонента, назначенный номеру ДО создания парта. Игровые обёртки
  * (parts::detail::C*Parts@0) зовут SetComponentType сразу в конструкторе, когда
- * парта ещё нет, — а материализовать его в этот момент НЕЛЬЗЯ: оригинальный
- * GetFreeNumber сканирует от базы, и пока по номеру не создан парт, соседние
- * вызовы возвращают тот же номер (игры опираются на этот алиасинг — см.
- * PE_GetFreeNumberScan). Тип запоминаем здесь и применяем при первом реальном
+ * парта ещё нет, — материализовать парт в этот момент нельзя (это создание из
+ * ЗАЯВКИ, реального парта у игры ещё нет; кто и когда создаёт по-настоящему —
+ * SetPartsCG/SetText/…). Тип запоминаем здесь и применяем при первом реальном
  * создании парта, чтобы не потерять флаги вроде is_button (Ixseal конструирует
  * кнопки в рантайме тем же путём).
  */
@@ -1607,6 +1606,10 @@ bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int 
 		}
 	}
 	if (!cg_name || *(cg_name->text) == '\0') {
+		// Сброс CG раньше не логировался вовсе — «тихое» обнуление затёртого
+		// парта не находилось трейсом (чёрный фон пролога Dohna).
+		if (getenv("XSYS4_PARTS_TRACE"))
+			NOTICE("PARTS SetPartsCG(%d, '') -> reset", parts_no);
 		parts_state_reset(&parts->states[state], PARTS_CG);
 		parts_dirty(parts);
 		return true;
@@ -2916,9 +2919,7 @@ void PE_SetComponentType(int parts_no, int type, int state)
 	if (getenv("XSYS4_BL_TRACE"))
 		NOTICE("SetComponentType part=%d type=%d state=%d", parts_no, type, state);
 	// Парта ещё нет — НЕ материализовать: игровые обёртки зовут это прямо из
-	// конструктора, до создания, а создание здесь ломало бы алиасинг номеров
-	// оригинального GetFreeNumber (см. pending_ctype_table и PE_GetFreeNumberScan:
-	// виджет юнит-анимации Haha Ranman из-за этого оставался на экране навсегда).
+	// конструктора, до реального создания (см. pending_ctype_table).
 	if (!parts_try_get(parts_no)) {
 		pending_ctype_set(parts_no, type, state);
 		return;
@@ -3553,9 +3554,31 @@ bool PE_SetPartsCGDetectionSize(int parts_no, struct string *cg_name, int state)
 	return ok;
 }
 
+/*
+ * NOTE: per GUIEngine.dll (Rance 01) — МОНОТОННЫЙ счётчик, номера не
+ * переиспользуются. Эта же семантика верна и для PartsEngine новых игр.
+ *
+ * ★ОТВЕРГНУТО ЗАМЕРОМ, не возвращать: «чистый скан от базы БЕЗ памяти между
+ * вызовами» (бывший PE_GetFreeNumberScan из c987c19). Пока парт не
+ * материализован, скан выдаёт ОДИН номер ВСЕМ подряд идущим вызовам — а игровые
+ * Create-пути между взятиями номера движку не сообщают НИЧЕГО (вся
+ * «занятость» живёт в игровых структурах: `AFL_Parts_CreateSprite(0)` →
+ * `GetFreeSystemPartsNumber` → `NEW CSpriteParts` → CParts@0 → Number::set +
+ * Deleted-подписка в CPartsMessageManager — ни одного HLL-вызова). У Dohna
+ * `AdvEventCg@0` зовёт `NsfwCGParts::Create` ДВАЖДЫ (фон и оверлей) — оба
+ * получали 1000001022, и оверлей штатным `SetPartsCG(n,"")` стирал только что
+ * установленный фон пролога (замер FREENUM-стеками: оба владельца — соседние
+ * адреса 0x66833a/0x66839e в AdvEventCg@0; кадр: текст ADV на чёрном).
+ * Кейс, ради которого скан вводился (виджет юнит-анимации Haha Ranman,
+ * «контейнер+фон+рамка должны слиться в один парт»), оказался ЛОЖНОЙ моделью:
+ * `CUnitAnimation@0#2` у HR тоже зовёт `AFL_Parts_CreateSprite` дважды — как у
+ * Dohna, то есть у оригинала это РАЗНЫЕ парты; серый прямоугольник чинила
+ * вторая половина c987c19 (delegate-индексы у RemoveController/ReleaseActivity)
+ * вместе с заявками SetComponentType. Проверено на счётчике: пролог HR чист
+ * (плёнка 0, юнит-аниме 0, кнопок 11), фон пролога Dohna на месте.
+ */
 int PE_GetFreeNumber(void)
 {
-	// NOTE: per GUIEngine.dll (Rance 01)
 	static int first_free = 1000001000;
 	while (PE_IsExist(first_free)) {
 		first_free++;
@@ -3563,33 +3586,16 @@ int PE_GetFreeNumber(void)
 	// XXX: the ID is incremented even if the parts is not created
 	if (getenv("XSYS4_PARTS_TRACE"))
 		NOTICE("PARTS GetFreeNumber -> %d", first_free);
+	// XSYS4_FREENUM_STACK=<номер>: стек игры на выдаче этого номера —
+	// отвечает «кто взял номер» (им и найден дубль-владелец при скане).
+	{
+		const char *w = getenv("XSYS4_FREENUM_STACK");
+		if (w && atoi(w) == first_free) {
+			NOTICE("FREENUM %d выдан:", first_free);
+			vm_stack_trace();
+		}
+	}
 	return first_free++;
-}
-
-/*
- * Вариант PartsEngine (новые игры): чистый скан от базы БЕЗ памяти между
- * вызовами. Пока по номеру не создан парт, соседние вызовы возвращают ОДИН И
- * ТОТ ЖЕ номер — и игры на это опираются. Обёртки Haha Ranman
- * (parts::detail::CParts) берут номер в конструкторе ВПРОК: контейнер, фон и
- * рамка виджета юнит-анимации получают один номер и живут в одном парте,
- * который игра потом прячет и освобождает по любому из хранимых номеров.
- * Монотонный счётчик (вариант GUIEngine выше) раскладывал их в РАЗНЫЕ парты:
- * SetShow/ReleaseParts игры попадали лишь в один из них, а рамка с фоном
- * оставались на экране навсегда (два «лишних прямоугольника» на прологе).
- * Сверено симуляцией этой семантики по трейсу движка: финальное состояние
- * совпадает с эталоном оригинала (виджет не существует, кнопки ADV видимы).
- */
-int PE_GetFreeNumberScan(void)
-{
-	int n = 1000001000;
-	while (PE_IsExist(n))
-		n++;
-	// Номер уходит новому владельцу: тип, назначенный прежним владельцем до
-	// материализации, не должен протечь (новая обёртка выставит свой).
-	pending_ctype_clear(n);
-	if (getenv("XSYS4_PARTS_TRACE"))
-		NOTICE("PARTS GetFreeNumber -> %d", n);
-	return n;
 }
 
 bool PE_IsExist(int parts_no)
