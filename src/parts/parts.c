@@ -1266,6 +1266,16 @@ void parts_release(int parts_no)
 	}
 
 	struct parts *parts = slot->value;
+	// Уходя, снимаем свою ссылку с маски: иначе счётчик никогда не дойдёт до нуля
+	// и часть, побывавшая маской, останется невидимой навсегда (фон CONFIG).
+	if (parts->alpha_clipper_parts_no) {
+		struct parts *clip = parts_try_get(parts->alpha_clipper_parts_no);
+		if (clip && --clip->alpha_clipper_refs <= 0) {
+			clip->alpha_clipper_refs = 0;
+			clip->is_alpha_clipper = false;
+			parts_dirty(clip);
+		}
+	}
 	parts_input_reset_drag(parts);
 	parts_clear_motion(parts);
 	parts_message_window_free(parts->mw);
@@ -1318,7 +1328,7 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d tex=%u cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
@@ -1326,7 +1336,8 @@ void parts_debug_dump(void)
 		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
 		       p->global.alpha, parts_hidden_by_layer(p), p->message_window,
-		       p->linked_to, p->states[p->state].common.texture.handle, cgname);
+		       p->linked_to, p->alpha_clipper_parts_no, p->is_alpha_clipper,
+		       p->states[p->state].common.texture.handle, cgname);
 		n++;
 	}
 	NOTICE("parts_debug_dump: %d parts total", n);
@@ -2711,13 +2722,33 @@ int PE_GetPartsAlphaClipperPartsNumber(int parts_no)
 void PE_SetPartsAlphaClipperPartsNumber(int parts_no, int alpha_clipper_parts_no)
 {
 	struct parts *parts = parts_get(parts_no);
+	int old_no = parts->alpha_clipper_parts_no;
+	if (old_no == alpha_clipper_parts_no)
+		return;
 	parts->alpha_clipper_parts_no = alpha_clipper_parts_no;
-	// Помечаем маску, чтобы её саму не рисовать (см. parts_render). Прежнюю метку
-	// не снимаем: на одну маску обычно ссылается несколько частей, а счётчик
-	// ссылок тут держать негде — лишняя метка безобиднее пропавшего клипа.
+
+	/*
+	 * Маску саму рисовать нельзя (см. parts_render), но и метка «я маска» не
+	 * вечная: на одну маску ссылается несколько частей, поэтому считаем ссылки и
+	 * снимаем метку, когда ушла последняя. Пока метка не снималась, часть,
+	 * ПОБЫВАВШАЯ маской, не рисовалась уже никогда — так пропадал фон страниц
+	 * CONFIG у Dohna: поверхность построена (`XSYS4_CP_DUMP` показывает размытый
+	 * `背景／ナユタ`, затемнённый заливкой по альфе 180), часть показана
+	 * (`gshow=1 alpha=255 tex=123`), а в дампе у неё `clip=0 isclip=1` — ссылок
+	 * нет, метка осталась, и рендер её пропускал.
+	 */
+	if (old_no) {
+		struct parts *old_clip = parts_try_get(old_no);
+		if (old_clip && --old_clip->alpha_clipper_refs <= 0) {
+			old_clip->alpha_clipper_refs = 0;
+			old_clip->is_alpha_clipper = false;
+			parts_dirty(old_clip);
+		}
+	}
 	if (alpha_clipper_parts_no) {
 		struct parts *clip = parts_try_get(alpha_clipper_parts_no);
 		if (clip) {
+			clip->alpha_clipper_refs++;
 			clip->is_alpha_clipper = true;
 			parts_dirty(clip);
 		}

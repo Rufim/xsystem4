@@ -968,9 +968,18 @@ static bool build_mul_filter(struct parts_construction_process *cproc,
 	return true;
 }
 
+int gfx_save_texture(Texture *t, const char *path, enum cg_type);
+
 bool parts_build_construction_process(struct parts *parts,
 		struct parts_construction_process *cproc)
 {
+	// XSYS4_CP_DUMP=<номер части> — сохранять поверхность ПОСЛЕ КАЖДОГО шага в
+	// /tmp/cp-<часть>-<шаг>-<тип>.png. Нужна, когда процедура собирается «успешно»,
+	// а на экране пусто: по шагам видно, где теряется содержимое.
+	const char *dump = getenv("XSYS4_CP_DUMP");
+	int dump_no = dump ? atoi(dump) : 0;
+	int dump_step = 0;
+
 	struct parts_cp_op *op;
 	TAILQ_FOREACH(op, &cproc->ops, entry) {
 		switch (op->type) {
@@ -1043,6 +1052,14 @@ bool parts_build_construction_process(struct parts *parts,
 				return false;
 			break;
 		}
+		if (dump_no && (dump_no < 0 || parts->no == dump_no)) {
+			char path[256];
+			snprintf(path, sizeof(path), "/tmp/cp-%d-%02d-after-type%d.png",
+			         parts->no, dump_step, op->type);
+			if (cproc->common.texture.handle)
+				gfx_save_texture(&cproc->common.texture, path, ALCG_PNG);
+		}
+		dump_step++;
 	}
 	parts_dirty(parts);
 	return true;

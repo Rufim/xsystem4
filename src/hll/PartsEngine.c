@@ -2736,7 +2736,23 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				continue;
 			struct ex_tree *cti = act_child(&kids->children[i], "種類別情報");
 			struct ex_tree *cnorm = cti ? act_child(cti, "通常状態") : NULL;
-			bool is_viewport = cnorm && act_parts_type(cnorm) == 18;
+			/*
+			 * «Область отображения» (классический тип 18) работает как
+			 * clip viewport: следующие соседи обрезаются по ней.
+			 *
+			 * ★Только для СТАРЫХ раскладок, где тип записан ЧИСЛОМ. У v14 тип
+			 * записан именем, и 18 в классической нумерации — это `構築パーツ`
+			 * (см. таблицу act_component_type_names, 26→18), то есть обычная
+			 * собираемая поверхность. Из-за этого фон страниц CONFIG у Dohna
+			 * назначался маской 29 соседним частям и переставал рисоваться сам:
+			 * в дампе у него `clip=0 isclip=1`, поверхность построена
+			 * (`XSYS4_CP_DUMP`: размытый `背景／ナユタ` с чёрной заливкой по
+			 * альфе 180), а на экране вместо затемнённого задника просвечивал
+			 * титул в полную яркость.
+			 */
+			struct ex_tree *cpt = cnorm ? act_child(cnorm, "パーツタイプ") : NULL;
+			bool numeric_type = cpt && cpt->is_leaf && cpt->leaf.value.type == EX_INT;
+			bool is_viewport = numeric_type && act_parts_type(cnorm) == 18;
 			if (is_viewport)
 				clip_viewport_no = cno;
 			else if (clip_viewport_no >= 0)
