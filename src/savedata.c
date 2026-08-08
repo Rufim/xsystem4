@@ -152,6 +152,11 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 			}
 			return gsave_add_record(save, &rec);
 		}
+	// Generic-массив (array<?>, Ixseal): контейнер сериализуется так же, как
+	// типизированный — ранг, размеры и тип элементов берутся из самой страницы,
+	// объявленный тип здесь не нужен. Расходятся они только при ЗАГРУЗКЕ
+	// (см. gsave_to_vm_value).
+	case AIN_ARRAY:
 	case AIN_ARRAY_TYPE:
 		{
 			struct page *page = heap_get_page(val.i);
@@ -523,6 +528,68 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			struct page *page = alloc_array(array_rank, dims, type, struct_type, false);
 			heap[slot].page = page;
 			free(dims);
+			gsave_load_array(save, page, array->flat_arrays);
+			return vm_int(slot);
+		}
+	// Generic-массив (array<?>): у объявления нет ни ранга, ни типа элемента —
+	// и то и другое берём из СЕЙВА (тип элемента — из flat-массива; индекс
+	// структуры — по имени из записи первого элемента). Страница
+	// материализуется типизированной, как это делает Array.PushBack.
+	case AIN_ARRAY:
+		{
+			int slot = heap_alloc_slot(VM_PAGE);
+			// -1 — сейв старой сборки, где тип 79 не сериализовался.
+			if (value < 0) {
+				heap[slot].page = NULL;
+				return vm_int(slot);
+			}
+			struct gsave_array *array = &save->arrays[value];
+			if (array->rank == -1) {
+				heap[slot].page = NULL;
+				return vm_int(slot);
+			}
+			if (array->rank != 1) {
+				WARNING("array<?> ранга %d в сейве не поддержан", array->rank);
+				heap[slot].page = NULL;
+				return vm_int(slot);
+			}
+			struct gsave_flat_array *fa = array->flat_arrays;
+			enum ain_data_type elem = fa->nr_values ? fa->values[0].type : fa->type;
+			enum ain_data_type container;
+			int elem_struct = -1;
+			switch (elem) {
+			case AIN_VOID:
+			case AIN_INT:       container = AIN_ARRAY_INT; break;
+			case AIN_BOOL:      container = AIN_ARRAY_BOOL; break;
+			case AIN_LONG_INT:  container = AIN_ARRAY_LONG_INT; break;
+			case AIN_FLOAT:     container = AIN_ARRAY_FLOAT; break;
+			case AIN_STRING:    container = AIN_ARRAY_STRING; break;
+			case AIN_FUNC_TYPE: container = AIN_ARRAY_FUNC_TYPE; break;
+			case AIN_DELEGATE:  container = AIN_ARRAY_DELEGATE; break;
+			case AIN_STRUCT:
+				container = AIN_ARRAY_STRUCT;
+				if (fa->nr_values) {
+					struct gsave_record *rec = &save->records[fa->values[0].value];
+					char *name = save->version >= 7
+						? save->struct_defs[rec->struct_index].name
+						: rec->struct_name;
+					elem_struct = ain_get_struct(ain, name);
+					if (elem_struct < 0) {
+						WARNING("array<?>: неизвестная структура %s", display_sjis0(name));
+						heap[slot].page = NULL;
+						return vm_int(slot);
+					}
+				}
+				break;
+			default:
+				WARNING("array<?> с элементом %s в сейве не поддержан",
+				        ain_strtype(ain, elem, -1));
+				heap[slot].page = NULL;
+				return vm_int(slot);
+			}
+			union vm_value dim = { .i = array->dimensions[0] };
+			struct page *page = alloc_array(1, &dim, container, elem_struct, false);
+			heap[slot].page = page;
 			gsave_load_array(save, page, array->flat_arrays);
 			return vm_int(slot);
 		}

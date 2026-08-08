@@ -206,10 +206,24 @@ static bool System_BackupSaveFile(struct string *dst, struct string *src)
 	return System_CopySaveFile(dst, src);
 }
 
-static bool System_ResumeSave(struct string *key, struct string *filename, struct page **comment)
+static bool System_ResumeSave(struct string *key, struct string *filename, void *out)
 {
-	(void)comment;
-	return vm_save_image(key->text, filename->text);
+	int r = vm_save_image(key->text, filename->text);
+	/*
+	 * У новых игр (Ixseal v14) третий аргумент — `wrap<int> result`,
+	 * out-параметр (ffi отдаёт указатель на значение): gamesave::detail::
+	 * セーブ実行 пишет добавочный сейв-сайдкар (.vsf с датой/комментом для
+	 * списка слотов) ТОЛЬКО при result != 0 — без обратной записи слоты
+	 * экрана сейвов оставались пустыми при живом .asd. Старая форма
+	 * (ref array<int> comment) приходит страницей — её не трогаем.
+	 */
+	if (out && hll_current_fn && hll_current_fn->nr_arguments >= 3) {
+		struct ain_type *t = &hll_current_fn->arguments[2].type;
+		if (t->data == AIN_WRAP && t->array_type
+		    && t->array_type[0].data == AIN_INT)
+			((union vm_value*)out)->i = r;
+	}
+	return r;
 }
 
 static void System_ResumeLoad(struct string *key, struct string *filename)

@@ -663,14 +663,19 @@ static bool ix_less(union vm_value *fn, struct page *a, int i, int j)
 	return vm_call_hll_func(fn, argv, argc).i != 0;
 }
 
-// Индекс первого/последнего элемента, удовлетворяющего предикату (-1 если нет).
-static int ix_find_pred(struct page **self, union vm_value *fn, bool last)
+// Индекс первого/последнего элемента [begin, end), удовлетворяющего предикату
+// (-1 если нет).
+static int ix_find_pred_range(struct page **self, union vm_value *fn, int begin, int end, bool last)
 {
 	if (!self || !*self || !fn)
 		return -1;
 	int n = array_numof(*self, 1);
+	if (begin < 0)
+		begin = 0;
+	if (end > n)
+		end = n;
 	int found = -1;
-	for (int i = 0; i < n; i++) {
+	for (int i = begin; i < end; i++) {
 		// Массив может быть перевыделен лямбдой — берём страницу каждый раз.
 		if (!*self || i >= array_numof(*self, 1))
 			break;
@@ -681,6 +686,11 @@ static int ix_find_pred(struct page **self, union vm_value *fn, bool last)
 		}
 	}
 	return found;
+}
+
+static int ix_find_pred(struct page **self, union vm_value *fn, bool last)
+{
+	return ix_find_pred_range(self, fn, 0, INT_MAX, last);
 }
 
 static int Array_ix_Find(struct page **self, union vm_value *search)
@@ -702,6 +712,41 @@ static int Array_ix_FindLast(struct page **self, union vm_value *search)
 	int n = array_numof(*self, 1);
 	int found = -1;
 	for (int i = 0; i < n; i++) {
+		if (array_find(*self, i, i + 1, *search, 0) >= 0)
+			found = i;
+	}
+	return found;
+}
+
+/*
+ * Четырёхаргументные Find/FindLast(self, begin, end, search|предикат).
+ * Линковка идёт по имени, поэтому раньше они попадали в двухаргументный
+ * Array_ix_Find, а cif собирается по .ain — вторым C-параметром приходил
+ * begin (обычно 0 → NULL) вместо search, и поиск ВСЕГДА отвечал «не найдено»,
+ * молча. Чем это ломало Haha Ranman: CMessageWindowStatusManager@
+ * HideMessageWindow ищет имя окна через Find(list, 0, Numof, имя) и, не найдя,
+ * не удалял его из showing-списка — CreateByShowingList каждым обновлением
+ * показывал окно сообщений обратно, и оно не пряталось на слайдах пролога
+ * (■枠消し). Haha Ranman: Find#1 — 22 сайта; форма с предикатом (Find#3) в
+ * байткоде не встречается, но различается штатно — через ix_arg_is_func.
+ */
+static int Array_ix_Find4(struct page **self, int begin, int end, union vm_value *search)
+{
+	if (!self || !*self || !search)
+		return -1;
+	if (ix_arg_is_func(3))
+		return ix_find_pred_range(self, search, begin, end, false);
+	return array_find(*self, begin, end, *search, 0);
+}
+
+static int Array_ix_FindLast4(struct page **self, int begin, int end, union vm_value *search)
+{
+	if (!self || !*self || !search)
+		return -1;
+	if (ix_arg_is_func(3))
+		return ix_find_pred_range(self, search, begin, end, true);
+	int found = -1;
+	for (int i = begin < 0 ? 0 : begin; i < end; i++) {
 		if (array_find(*self, i, i + 1, *search, 0) >= 0)
 			found = i;
 	}
@@ -1271,7 +1316,9 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Reverse, Array_Reverse),
 	    HLL_EXPORT(Shuffle, Array_Shuffle),
 	    HLL_EXPORT(Fill, Array_ix_Fill),
+	    HLL_EXPORT_N(Find, 4, Array_ix_Find4),
 	    HLL_EXPORT(Find, Array_ix_Find),
+	    HLL_EXPORT_N(FindLast, 4, Array_ix_FindLast4),
 	    HLL_EXPORT(FindLast, Array_ix_FindLast),
 	    HLL_EXPORT(IsExist, Array_ix_IsExist),
 	    HLL_EXPORT(ShallowCopy, Array_ix_ShallowCopy),

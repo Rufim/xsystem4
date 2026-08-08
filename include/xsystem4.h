@@ -92,6 +92,11 @@ void screenshot_save(void);
 
 #define MMAP_IF_64BIT (sizeof(void*) >= 8 ? ARCHIVE_MMAP : 0)
 
+// hll/MsgSkip.c: флаг «сообщение прочитано» для 既読-перекраски окна сообщений.
+bool msgskip_message_is_read(int msgnum);
+// hll/MainEXFile.c: int-элемент list-значения главного .ex (ключ в UTF-8).
+bool mainex_list_int_get(const char *key_utf8, int index, int *out);
+
 extern bool game_daibanchou_en;
 extern bool game_rance02_mg;
 extern bool game_rance6_mg;

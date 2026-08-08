@@ -26,6 +26,7 @@
 #include "vm/heap.h"
 #include "vm/page.h"
 #include "hll.h"
+#include "iarray.h"
 
 #include "system4/utfsjis.h"
 
@@ -889,6 +890,57 @@ static int MEX_d_A2Int(struct string *name, int row, int col, int def, int id) {
 static float MEX_d_A2Float(struct string *name, int row, int col, float def, int id) { (void)id; float v; return hv_float(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : def; }
 static struct string *MEX_d_A2String(struct string *name, int row, int col, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : string_ref(def); }
 
+/*
+ * Прямое чтение int-элемента list-значения главного .ex движковыми модулями
+ * (既読-цвет окна сообщений: список «Ｅ＿既読メッセージ色»). Ключ — UTF-8,
+ * внутри конвертируется в SJIS ключей .ex. false — .ex не загружен, ключа/
+ * элемента нет или тип не int; *out при этом не трогается.
+ */
+bool mainex_list_int_get(const char *key_utf8, int index, int *out)
+{
+	if (!ex)
+		return false;
+	char *sjis = utf2sjis(key_utf8, strlen(key_utf8));
+	struct ex_value *v = ex_get(ex, sjis);
+	free(sjis);
+	if (!v || v->type != EX_LIST)
+		return false;
+	struct ex_value *item = ex_list_get(v->list, index);
+	if (!item || item->type != EX_INT)
+		return false;
+	*out = item->i;
+	return true;
+}
+
+/*
+ * Save/Load(wrap<array<int>> image) — снапшот ИЗМЕНЕНИЙ главного .ex в
+ * сейв-образ (зовётся из gamesave::detail::セーブ実行/ロード復帰; без Save
+ * сохранение падало фатальной «Unimplemented HLL function»). Наш движок EX не
+ * модифицирует вовсе (EXWriter не реализован), поэтому честный снапшот —
+ * «изменений нет»: Save пишет пустой образ с магией, Load принимает любой.
+ * Формат наш собственный, с образом оригинального DLL совпадать не обязан
+ * (сейвы читаются нашим же загрузчиком).
+ */
+static bool MainEXFile_Save(struct page **image)
+{
+	struct iarray_writer w;
+	iarray_init_writer(&w, "MEX");
+	iarray_write(&w, 0); // версия формата: «изменений нет»
+	if (*image) {
+		delete_page_vars(*image);
+		free_page(*image);
+	}
+	*image = iarray_to_page(&w);
+	iarray_free_writer(&w);
+	return true;
+}
+
+static bool MainEXFile_Load(possibly_unused struct page **image)
+{
+	// Восстанавливать нечего: движок не накапливает изменений EX.
+	return true;
+}
+
 static void MainEXFile_PreLink(void);
 
 HLL_LIBRARY(MainEXFile,
@@ -896,6 +948,8 @@ HLL_LIBRARY(MainEXFile,
 	    HLL_EXPORT(_ModuleFini, MainEXFile_ModuleFini),
 	    HLL_EXPORT(_PreLink, MainEXFile_PreLink),
 	    HLL_EXPORT(ReloadDebugEXFile, MainEXFile_ReloadDebugEXFile),
+	    HLL_EXPORT(Save, MainEXFile_Save),
+	    HLL_EXPORT(Load, MainEXFile_Load),
 	    HLL_EXPORT(Handle, MainEXFile_Handle),
 	    HLL_EXPORT(AHandle, MainEXFile_AHandle),
 	    HLL_EXPORT(A2Handle, MainEXFile_A2Handle),

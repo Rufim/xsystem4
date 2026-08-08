@@ -734,6 +734,9 @@ struct parts_message_window {
 	int msg_num;
 	struct string *msg_func_name;
 	int msg_ver, msg_step;
+	// Базовый цвет текста из раскладки (SetMessageWindowTextFont): к нему
+	// возвращаемся после 既読-перекраски прочитанных реплик.
+	SDL_Color text_color;
 	// Шрифт руби: своего носителя у него нет (служебная часть текста хранит только
 	// основной), поэтому лежит здесь.
 	struct text_style ruby_ts;

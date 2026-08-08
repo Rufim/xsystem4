@@ -867,6 +867,7 @@ extern struct static_library lib_HTTPDownloader;
 extern struct static_library lib_IbisInputEngine;
 extern struct static_library lib_InputDevice;
 extern struct static_library lib_InputString;
+extern struct static_library lib_HashMap;
 extern struct static_library lib_Int;
 extern struct static_library lib_KiwiSoundEngine;
 extern struct static_library lib_LoadCG;
@@ -998,6 +999,7 @@ static struct static_library *static_libraries[] = {
 	&lib_IbisInputEngine,
 	&lib_InputDevice,
 	&lib_InputString,
+	&lib_HashMap,
 	&lib_Int,
 	&lib_KiwiSoundEngine,
 	&lib_LoadCG,
