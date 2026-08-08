@@ -155,9 +155,32 @@ int PE_get_layoutbox_padding_right(int parts_no)
 	return parts->states[0].layout_box.padding_right;
 }
 
+static void parts_layout_calc_size_horizontal(struct parts_layout_box *lb, struct parts *parts,
+		int *total_w, int *total_h);
+static void parts_layout_calc_size_vertical(struct parts_layout_box *lb, struct parts *parts,
+		int *total_w, int *total_h);
+
 static void parts_get_layout_size(struct parts *parts, int *w, int *h)
 {
 	struct parts_state *state = &parts->states[parts->state];
+	/*
+	 * ВЛОЖЕННЫЙ КОНТЕЙНЕР измеряется ПО СОДЕРЖИМОМУ. Своей картинки у layout box
+	 * нет, и `common.w/h` у него нули — а раскладка родителя по этим нулям
+	 * укладывала все подконтейнеры в ОДНУ ТОЧКУ. Живой случай: титул Haha Ranman
+	 * (`レイアウト：項目`, горизонтальный) состоит из четырёх вложенных боксов
+	 * (`：システム`, `：おまけ`, `：ロード`, `：ゲームスタート`) — пункты меню
+	 * сбивались в кучу по центру вместо ряда по всей ширине.
+	 */
+	if (state->type == PARTS_LAYOUT_BOX) {
+		struct parts_layout_box *lb = &state->layout_box;
+		if (lb->layout_type != PARTS_LAYOUT_FREE) {
+			if (lb->layout_type == PARTS_LAYOUT_HORIZONTAL)
+				parts_layout_calc_size_horizontal(lb, parts, w, h);
+			else
+				parts_layout_calc_size_vertical(lb, parts, w, h);
+			return;
+		}
+	}
 	if (state->type == PARTS_FLAT && state->flat.flat) {
 		// The layout size of Flat is specified in the header, and this may
 		// differ from the hitbox size.
