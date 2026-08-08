@@ -3807,10 +3807,249 @@ static void vm_sigusr1_handler(int sig)
 	sys_warning("=== end VM call stack (instr_ptr=0x%zx) ===\n", instr_ptr);
 }
 
+/*
+ * `XSYS4_WHO_REFS=<имя структуры>|slot:<N>` + `kill -USR2` — КТО ДЕРЖИТ живой объект.
+ * Вотч (`XSYS4_STRUCT_WATCH`) отвечает «когда ссылку взяли», но в живом прогоне слоты
+ * переиспользуются тысячи раз, и по ref/unref виновника не собрать; а ссылка, ПРИШЕДШАЯ
+ * ИЗ СЕЙВА, вообще не имеет события REF. Здесь наоборот: обходим кучу и печатаем, кто
+ * ссылается на объект СЕЙЧАС.
+ *
+ * Держатель сам может быть безымянной страницей (делегат, окружение лямбды), поэтому
+ * обход идёт ВВЕРХ ПО ЦЕПОЧКЕ (XSYS4_WHO_DEPTH, по умолчанию 3 уровня): «объект держит
+ * делегат, делегат держит поле структуры, …» — иначе ответ обрывается на «<делегат>» и
+ * не говорит ничего. У страниц делегатов дополнительно печатается СОДЕРЖИМОЕ (чьи методы
+ * подписаны) — именно оно называет виновную подписку.
+ */
+static const char *who_page_owner_name(struct page *op, int i, const char **field)
+{
+	*field = NULL;
+	if (op->type == STRUCT_PAGE && op->index >= 0 && op->index < ain->nr_structures) {
+		if (i >= 0 && i < ain->structures[op->index].nr_members)
+			*field = ain->structures[op->index].members[i].name;
+		return ain->structures[op->index].name;
+	}
+	if (op->type == LOCAL_PAGE && op->index >= 0 && op->index < ain->nr_functions) {
+		if (i >= 0 && i < ain->functions[op->index].nr_vars)
+			*field = ain->functions[op->index].vars[i].name;
+		return ain->functions[op->index].name;
+	}
+	if (op->type == GLOBAL_PAGE) {
+		if (i >= 0 && i < ain->nr_globals)
+			*field = ain->globals[i].name;
+		return "<глобалы>";
+	}
+	if (op->type == ARRAY_PAGE)
+		return "<массив>";
+	if (op->type == DELEGATE_PAGE)
+		return "<делегат>";
+	return "?";
+}
+
+// Слот держит ссылку на объект, только если его тип объектный. Без этой проверки обход
+// тонет в ложных совпадениях: образ сейва живёт в куче как array<int>, и любое число,
+// равное номеру слота, выглядело «держателем».
+static bool who_slot_is_objref(struct page *op, int i)
+{
+	enum ain_data_type t = AIN_VOID;
+	if (op->type == STRUCT_PAGE && op->index >= 0 && op->index < ain->nr_structures
+			&& i < ain->structures[op->index].nr_members)
+		t = ain->structures[op->index].members[i].type.data;
+	else if (op->type == LOCAL_PAGE && op->index >= 0 && op->index < ain->nr_functions
+			&& i < ain->functions[op->index].nr_vars)
+		t = ain->functions[op->index].vars[i].type.data;
+	else if (op->type == GLOBAL_PAGE && i < ain->nr_globals)
+		t = ain->globals[i].type.data;
+	else if (op->type == ARRAY_PAGE)
+		t = op->a_type;
+	else if (op->type == DELEGATE_PAGE)
+		// Запись делегата: [0]=receiver, [1]=функция, [2]=поколение, [3]=окружение
+		// лямбды. Ссылками на страницы держат ПЕРВЫЙ и ЧЕТВЁРТЫЙ слоты.
+		return (i % DG_ENTRY_SLOTS) == 0 || (i % DG_ENTRY_SLOTS) == 3;
+	switch (t) {
+	case AIN_STRUCT: case AIN_REF_STRUCT:
+	case AIN_IFACE: case AIN_IFACE_WRAP:
+	case AIN_WRAP: case AIN_ARRAY_STRUCT: case AIN_REF_ARRAY_STRUCT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void who_dump_delegate(struct page *dp, const char *indent)
+{
+	int nr = dp->nr_vars / DG_ENTRY_SLOTS;
+	for (int e = 0; e < nr; e++) {
+		int obj = dp->values[e*DG_ENTRY_SLOTS + 0].i;
+		int fno = dp->values[e*DG_ENTRY_SLOTS + 1].i;
+		int env = dp->values[e*DG_ENTRY_SLOTS + 3].i;
+		const char *fn = (fno >= 0 && fno < ain->nr_functions) ? ain->functions[fno].name : "?";
+		sys_warning("%sподписка: receiver=%d env=%d fn=%s\n", indent, obj, env, display_sjis0(fn));
+	}
+}
+
+static void vm_sigusr2_handler(int sig)
+{
+	(void)sig;
+	const char *want = getenv("XSYS4_WHO_REFS");
+	if (!want || !*want) {
+		sys_warning("SIGUSR2: XSYS4_WHO_REFS не задан\n");
+		return;
+	}
+	int depth_limit = getenv("XSYS4_WHO_DEPTH") ? atoi(getenv("XSYS4_WHO_DEPTH")) : 3;
+	// XSYS4_WHO_GLOBAL=<номер> — заодно печатать значение глобала: у Haha Ranman
+	// «текущий стек сцен» (g286) — главный подозреваемый в висячей ссылке после
+	// resume, и его значение надо видеть рядом с картиной держателей.
+	const char *wg = getenv("XSYS4_WHO_GLOBAL");
+	if (wg && *wg) {
+		int gi = atoi(wg);
+		struct page *gp = heap_get_page(0);
+		if (gp && gp->type == GLOBAL_PAGE && gi >= 0 && gi < gp->nr_vars)
+			sys_warning("  глобал %d (%s) = %d\n", gi,
+			            gi < ain->nr_globals ? display_sjis0(ain->globals[gi].name) : "?",
+			            gp->values[gi].i);
+		else
+			sys_warning("  глобал %d недоступен (страница глобалов не в слоте 0)\n", gi);
+	}
+
+	if (depth_limit < 1) depth_limit = 1;
+	sys_warning("=== SIGUSR2: кто держит '%s' (глубина %d) ===\n", want, depth_limit);
+
+	enum { WHO_MAX = 256 };
+	static int targets[WHO_MAX], next[WHO_MAX], seen[WHO_MAX];
+	int nr_targets = 0, nr_seen = 0;
+
+	if (!strncmp(want, "slot:", 5)) {
+		int s = atoi(want + 5);
+		if (s >= 0 && (size_t)s < heap_size) {
+			sys_warning("  слот %d, ref=%d\n", s, heap[s].ref);
+			targets[nr_targets++] = s;
+		}
+	} else {
+		for (size_t s = 0; s < heap_size && nr_targets < WHO_MAX; s++) {
+			if (heap[s].type != VM_PAGE || !heap[s].page)
+				continue;
+			struct page *p = heap[s].page;
+			if (p->type != STRUCT_PAGE || p->index < 0 || p->index >= ain->nr_structures)
+				continue;
+			const char *name = ain->structures[p->index].name;
+			if (!name || strcmp(name, want))
+				continue;
+			sys_warning("  объект '%s' слот %d, ref=%d\n", name, (int)s, heap[s].ref);
+			targets[nr_targets++] = (int)s;
+		}
+	}
+	if (!nr_targets) {
+		sys_warning("  живых объектов не найдено\n");
+		sys_warning("=== end SIGUSR2 ===\n");
+		return;
+	}
+	for (int i = 0; i < nr_targets && nr_seen < WHO_MAX; i++)
+		seen[nr_seen++] = targets[i];
+
+	for (int level = 0; level < depth_limit && nr_targets; level++) {
+		int nr_next = 0, found = 0;
+		for (size_t o = 0; o < heap_size; o++) {
+			if (heap[o].type != VM_PAGE || !heap[o].page)
+				continue;
+			struct page *op = heap[o].page;
+			for (int i = 0; i < op->nr_vars; i++) {
+				int hit = -1;
+				for (int k = 0; k < nr_targets; k++) {
+					if (op->values[i].i == targets[k]) { hit = targets[k]; break; }
+				}
+				if (hit < 0 || !who_slot_is_objref(op, i))
+					continue;
+				const char *field = NULL;
+				const char *owner = who_page_owner_name(op, i, &field);
+				/*
+				 * СИЛА ссылки — половина ответа. Делегат держит receiver СЛАБО
+				 * (пара «объект + поколение»: умри объект, запись выбросит сам
+				 * delegate_numof), владеет он только окружением лямбды. А у
+				 * кадра функции ОДОЛЖЕНЫ аргументы типов `ref <интерфейс>` и
+				 * `wrap<структура>` — сайт кладёт их без копии (см.
+				 * delete_page_vars). Без этой пометки «держателем» выглядит
+				 * каждое упоминание, и завышенный счётчик не отличить от
+				 * настоящего владельца.
+				 */
+				const char *strength = "сильная";
+				if (op->type == DELEGATE_PAGE)
+					strength = (i % DG_ENTRY_SLOTS) == 0 ? "СЛАБАЯ (receiver)"
+					                                     : "сильная (окружение)";
+				else if (op->type == LOCAL_PAGE && op->index >= 0
+						&& op->index < ain->nr_functions
+						&& i < ain->functions[op->index].nr_args) {
+					enum ain_data_type at = ain->functions[op->index].vars[i].type.data;
+					if (at == AIN_IFACE || at == AIN_WRAP)
+						strength = "СЛАБАЯ (одолженный аргумент)";
+				}
+				sys_warning("  [%d] цель %d <- слот %d (%s) поле %d%s%s ref=%d [%s]\n",
+				            level, hit, (int)o, display_sjis0(owner), i,
+				            field ? " = " : "", field ? display_sjis0(field) : "",
+				            heap[o].ref, strength);
+				if (op->type == DELEGATE_PAGE)
+					who_dump_delegate(op, "      ");
+				found++;
+				// Безымянных держателей (делегат, окружение лямбды, массив)
+				// разворачиваем дальше — именно они и прячут виновника.
+				bool anon = op->type == DELEGATE_PAGE || op->type == ARRAY_PAGE
+				            || op->type == LOCAL_PAGE;
+				bool dup = false;
+				for (int k = 0; k < nr_seen; k++)
+					if (seen[k] == (int)o) { dup = true; break; }
+				if (anon && !dup && nr_next < WHO_MAX && nr_seen < WHO_MAX) {
+					next[nr_next++] = (int)o;
+					seen[nr_seen++] = (int)o;
+				}
+			}
+		}
+		// КАДРЫ СТЕКА ВЫЗОВОВ — тоже держатели: `this` метода (struct_page) и
+		// локальная страница кадра берут ссылку. Без них картина не сходится даже
+		// в норме: у живого экрана сохранения ref=4 при одном найденном держателе.
+		if (level == 0) {
+			for (int ci = 0; ci < call_stack_ptr; ci++) {
+				for (int k = 0; k < nr_targets; k++) {
+					if (call_stack[ci].struct_page == targets[k]) {
+						sys_warning("  [0] цель %d <- КАДР %d (%s) this\n", targets[k], ci,
+						            display_sjis0(ain->functions[call_stack[ci].fno].name));
+						found++;
+					}
+					if (call_stack[ci].page_slot == targets[k]) {
+						sys_warning("  [0] цель %d <- КАДР %d (%s) локальная страница\n",
+						            targets[k], ci,
+						            display_sjis0(ain->functions[call_stack[ci].fno].name));
+						found++;
+					}
+				}
+			}
+		}
+		// СТЕК ЗНАЧЕНИЙ VM — тоже держатель: ссылки на нём учитываются в refcount
+		// (SP_INC/heap_ref), а при resume он восстанавливается из сейва целиком.
+		// Без его просмотра «держателей нет» — ложный вывод.
+		if (level == 0) {
+			for (int si = 0; si < stack_ptr; si++) {
+				for (int k = 0; k < nr_targets; k++) {
+					if (stack[si].i != targets[k])
+						continue;
+					sys_warning("  [0] цель %d <- СТЕК ЗНАЧЕНИЙ VM, позиция %d из %d\n",
+					            targets[k], si, (int)stack_ptr);
+					found++;
+				}
+			}
+		}
+		if (!found)
+			sys_warning("  [%d] держателей нет (счётчик ссылок завышен)\n", level);
+		nr_targets = nr_next;
+		for (int i = 0; i < nr_next; i++)
+			targets[i] = next[i];
+	}
+	sys_warning("=== end SIGUSR2 ===\n");
+}
+
 int vm_execute_ain(struct ain *program)
 {
 	ain = program;
 	signal(SIGUSR1, vm_sigusr1_handler);
+	signal(SIGUSR2, vm_sigusr2_handler);
 	setjmp(reset_buf);
 
 	// initialize VM state
@@ -3956,6 +4195,17 @@ void vm_stack_trace(void)
 		struct ain_function *f = &ain->functions[call_stack[i].fno];
 		uint32_t addr = (i == call_stack_ptr - 1) ? instr_ptr : call_stack[i+1].call_address;
 		sys_warning("\t0x%08x in %s\n", addr, display_sjis0(f->name));
+	}
+}
+
+// Тот же стек игры, но в файл — для вотча кучи, чей вывод идёт мимо общего лога
+// (XSYS4_HEAP_WATCH_FILE) и не должен резаться его лимитом строк.
+void vm_stack_trace_file(FILE *out)
+{
+	for (int i = call_stack_ptr - 1; i >= 0; i--) {
+		struct ain_function *f = &ain->functions[call_stack[i].fno];
+		uint32_t addr = (i == call_stack_ptr - 1) ? instr_ptr : call_stack[i+1].call_address;
+		fprintf(out, "\t0x%08x in %s\n", addr, display_sjis0(f->name));
 	}
 }
 

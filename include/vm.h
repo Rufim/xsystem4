@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include "system4.h"
 
 struct ain;
@@ -140,6 +141,7 @@ enum string_format_type {
 struct string *string_format(struct string *fmt, union vm_value arg, enum string_format_type type);
 
 void vm_stack_trace(void);
+void vm_stack_trace_file(FILE *out);
 // Есть ли на стеке вызовов игровая функция, чьё имя содержит `substr` (сырые
 // байты имени, то есть Shift-JIS). Только для диагностики: позволяет печатать
 // трейс лишь для интересных путей вызова, когда сам HLL-обработчик дёргается

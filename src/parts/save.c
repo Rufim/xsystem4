@@ -22,7 +22,7 @@
 #include "parts_internal.h"
 #include "../hll/iarray.h"
 
-#define CURRENT_SAVE_VERSION 5
+#define CURRENT_SAVE_VERSION 7
 
 // Насколько глубоко уводится снимок бэк-сцены под UI вьювера (см. load_parts).
 #define BACK_SCENE_Z_SHIFT 1000000
@@ -663,6 +663,16 @@ static void save_parts(struct iarray_writer *w, struct parts *parts)
 	save_parts_params(w, &parts->global);
 	iarray_write(w, parts->parent ? parts->parent->no : -1);
 	iarray_write(w, parts->delegate_index);
+	/*
+	 * v7: `event_unique_id` (PartsEngine.SetEventID). Игра ищет набор обработчиков
+	 * ДВАЖДЫ: сперва по delegate_index, потом сверяет `GetMessageUniqueID` с
+	 * `GetUniqueID` найденного набора — и если они не совпали, молча возвращает
+	 * false. Пока поле не сохранялось, после загрузки сейва оно было -1, и КНОПКИ
+	 * ИНТЕРФЕЙСА не отзывались вовсе: сообщение MOUSE_CLICK до части доходило
+	 * (видно в XSYS4_MSG_TRACE), а игра его отбрасывала — клик проваливался
+	 * «сквозь» кнопку в сцену и просто листал реплику.
+	 */
+	iarray_write(w, parts->event_unique_id);
 	iarray_write(w, parts->sprite_deform);
 	iarray_write(w, parts->clickable);
 	iarray_write(w, parts->on_cursor_sound);
@@ -733,6 +743,8 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 	if (back_scene && parts->pending_parent >= 0)
 		parts->pending_parent += BACK_SCENE_PARTS_OFFSET;
 	parts->delegate_index = iarray_read(r);
+	if (version >= 7)
+		parts->event_unique_id = iarray_read(r);
 	parts->sprite_deform = iarray_read(r);
 	parts->clickable = iarray_read(r);
 	parts->on_cursor_sound = iarray_read(r);
@@ -872,6 +884,18 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 	// v5: реестр активностей (имя парта -> номер) — без него после загрузки
 	// GetActivityPartsNumber(«ルートパーツ») отдавал -1 и CActivityWrap ассертил.
 	pe_activities_save(&w);
+	/*
+	 * v6: РАЗРЕШЁН ЛИ ВВОД (PartsEngine.SetEnableInput). Это состояние
+	 * parts-движка, и вернуть его может только образ: игра выключает ввод ПЕРЕД
+	 * загрузкой (`SaveLoadScene@Load`: `SetEnableInput(0)` → `LoadFile`), а
+	 * включить обратно ей уже негде — `ResumeSave` возвращает 0 внутри
+	 * `gamesave::detail::セーブ実行`, то есть управление уходит в стек МОМЕНТА
+	 * СОХРАНЕНИЯ, и код после `LoadFile` никогда не исполняется.
+	 * Симптом был: после загрузки мир жив и ждёт клика, а клики не доходят вовсе
+	 * («чёрный экран»/«вис» у пользователя); в логе видно по тому, что
+	 * `PE_UpdateInputState` выходит на первой же строке (`!parts_input_enabled`).
+	 */
+	iarray_write(&w, PE_IsEnableInput());
 
 	unsigned count_pos = iarray_writer_pos(&w);
 	iarray_write(&w, 0); // size of parts list
@@ -879,6 +903,16 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 	unsigned count = 0;
 	struct parts *parts;
 	PARTS_LIST_FOREACH(parts) {
+		/*
+		 * ПАРТ С НОМЕРОМ 0 В ОБРАЗ НЕ ПИШЕМ. Ноль — не игровой номер: в
+		 * parts-сообщениях `parts_no == 0` означает «вся сцена» (whole), а не
+		 * часть, поэтому настоящего парта 0 у игры быть не может — он заводится
+		 * только там, где в обращение к парту попало чужое число. Хуже того, он
+		 * САМОВОСПРОИЗВОДИЛСЯ через сейвы: попал в образ → восстановился при
+		 * загрузке → снова попал в следующий образ.
+		 */
+		if (parts->no == 0)
+			continue;
 		if (!save_hidden && !parts->global.show)
 			continue;
 		if (back_scene ? !parts->want_save_back_scene : !parts->want_save)
@@ -991,6 +1025,19 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 		if (!pe_activities_load(&r, restore_globals))
 			return false;
 	}
+	if (version >= 6) {
+		// v6: состояние ввода (см. writer). Как и таблица numeral-шрифтов, это
+		// ГЛОБАЛЬНОЕ состояние движка, а не часть хранимого экрана, поэтому для
+		// бэк-сцены значение читается, но НЕ применяется.
+		bool enable_input = !!iarray_read(&r);
+		if (restore_globals)
+			PE_SetEnableInput(enable_input);
+	} else if (restore_globals && !back_scene) {
+		// Сейв сборки, которая флаг ещё не писала: восстанавливаем ввод. В момент
+		// сохранения он был включён заведомо — иначе игрок не смог бы нажать SAVE, —
+		// а игра его к этому времени уже выключила ради загрузки.
+		PE_SetEnableInput(true);
+	}
 
 	int nr_parts = iarray_read(&r);
 	if (nr_parts < 0) {
@@ -1000,6 +1047,27 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 
 	for (int i = 0; i < nr_parts; i++) {
 		load_parts(&r, version, back_scene);
+	}
+
+	// XSYS4_XPE_TRACE=1 — что именно пришло из образа: сколько партов и как они
+	// разложены по слоям. Отвечает на «этот оверлей восстановлен из сейва или
+	// остался от живого экрана», которое иначе приходится гадать по дампу.
+	if (getenv("XSYS4_XPE_TRACE")) {
+		NOTICE("XPE load: version=%d parts=%d (restore_globals=%d back_scene=%d)",
+		       version, nr_parts, restore_globals, back_scene);
+		static int per_ctrl[PARTS_CONTROLLER_STACK_MAX + 2];
+		memset(per_ctrl, 0, sizeof(per_ctrl));
+		struct parts *p;
+		PARTS_LIST_FOREACH(p) {
+			int c = p->controller_no;
+			if (c < 0 || c > PARTS_CONTROLLER_STACK_MAX)
+				c = PARTS_CONTROLLER_STACK_MAX + 1;
+			per_ctrl[c]++;
+		}
+		for (int i = 0; i <= PARTS_CONTROLLER_STACK_MAX + 1; i++) {
+			if (per_ctrl[i])
+				NOTICE("XPE load:   слой %d: %d партов", i, per_ctrl[i]);
+		}
 	}
 
 	parts_engine_clean();

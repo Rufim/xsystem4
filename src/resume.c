@@ -250,18 +250,44 @@ static struct rsave_heap_array *array_page_to_rsave(struct page *page, int slot)
  * а главное — heap-слот локальной страницы после загрузки уже ничего не значит.
  * После загрузки env = -1, и X_GETENV откатывается на поиск по стеку вызовов.
  */
+/*
+ * ★ОКРУЖЕНИЕ ЛЯМБД В ОБРАЗЕ. Формат AliceSoft хранит запись делегата ТРОЙКОЙ
+ * (receiver, функция, поколение) — четвёртого слота, нашего `env` (heap-слот
+ * локальной страницы объемлющей функции, из которого лямбда читает захваченные
+ * переменные), в нём нет. Пока мы его теряли, ломались ДВЕ вещи разом:
+ *
+ *  - поведение: после загрузки лямбда-обработчик получал env = -1, то есть
+ *    исполнялся без захваченного окружения;
+ *  - ВЛАДЕНИЕ: `delegate_append` берёт ссылку на страницу окружения
+ *    (`delegate_env_ref`), и эта ссылка входит в сохранённый refcount страницы —
+ *    а записей, которые её отпустят (`delegate_release_env`), после загрузки
+ *    больше нет. Счётчик оставался завышенным НАВСЕГДА.
+ *
+ * Чем это кончалось у Haha Ranman: страница-окружение конструктора
+ * `SaveLoadScene@0` (ref=10 при НОЛЕ реальных держателей — замер `XSYS4_WHO_REFS`)
+ * держала аргумент `ref SceneStack`, стек сцен экрана сохранения не умирал, его
+ * `EraseLayer` не вызывался — и после загрузки поверх игры навсегда оставался
+ * экран сейвов (153 парта слоя 18).
+ *
+ * Пишем ЧЕТВЁРКАМИ под маркером в нулевом слоте: у AliceSoft там лежит receiver
+ * (heap-слот, всегда >= -1), поэтому отрицательный маркер ни с чем не спутать, а
+ * чужие сейвы по-прежнему читаются как тройки.
+ */
+#define RSAVE_DG_ENV_MAGIC (-777)
+
 static struct rsave_heap_delegate *delegate_page_to_rsave(struct page *page, int slot)
 {
 	int nr_entries = page->nr_vars / DG_ENTRY_SLOTS;
-	int nr_slots = nr_entries * 3;
+	int nr_slots = 1 + nr_entries * 4;
 	struct rsave_heap_delegate *o = xcalloc(1, sizeof(struct rsave_heap_delegate) + nr_slots * sizeof(int32_t));
 	o->tag = RSAVE_DELEGATE;
 	o->ref = heap[slot].ref;
 	o->seq = heap[slot].seq;
 	o->nr_slots = nr_slots;
+	o->slots[0] = RSAVE_DG_ENV_MAGIC;
 	for (int i = 0; i < nr_entries; i++) {
-		for (int k = 0; k < 3; k++)
-			o->slots[i*3 + k] = page->values[i*DG_ENTRY_SLOTS + k].i;
+		for (int k = 0; k < 4; k++)
+			o->slots[1 + i*4 + k] = page->values[i*DG_ENTRY_SLOTS + k].i;
 	}
 	return o;
 }
@@ -770,17 +796,41 @@ static void load_rsave_struct(int slot, struct rsave_heap_struct *s)
 	heap[slot].seq = s->seq;
 	heap[slot].type = VM_PAGE;
 	heap[slot].page = page;
+
+	/*
+	 * `XSYS4_STRUCT_WATCH` ставит вотч в `alloc_struct`, то есть только на
+	 * объекты, СОЗДАННЫЕ в этом прогоне. Объекты, ПРИШЕДШИЕ ИЗ СЕЙВА, мимо него
+	 * проходят — а именно за ними надо следить после загрузки (у Haha Ranman
+	 * внутренний `SceneStack` SAVE-экрана не разрушается, и его слой висит на
+	 * экране поверх ADV). Ставим вотч и здесь, по тому же имени типа.
+	 */
+	const char *w = getenv("XSYS4_STRUCT_WATCH");
+	if (w && *w && as->name) {
+		bool hit = (w[0] == '=') ? !strcmp(as->name, w + 1) : !!strstr(as->name, w);
+		if (hit) {
+			NOTICE("STRUCTWATCH из сейва: '%s' в слоте %d (ref=%d) — следим",
+			       as->name, slot, heap[slot].ref);
+			heap_watch_slot_set(slot);
+		}
+	}
 }
 
 static void load_rsave_delegate(int slot, struct rsave_heap_delegate *d)
 {
-	// Обратная конверсия к внутреннему формату: тройки файла → четвёрки с env=-1.
-	int nr_entries = d->nr_slots / 3;
+	// Наш образ (маркер в нулевом слоте, см. delegate_page_to_rsave) — четвёрки с
+	// окружением; чужой/старый — тройки, окружение в нём не сохранено (env = -1).
+	bool with_env = d->nr_slots > 0 && d->slots[0] == RSAVE_DG_ENV_MAGIC;
+	int nr_entries = with_env ? (d->nr_slots - 1) / 4 : d->nr_slots / 3;
 	struct page *page = alloc_page(DELEGATE_PAGE, 0, nr_entries * DG_ENTRY_SLOTS);
 	for (int i = 0; i < nr_entries; i++) {
-		for (int k = 0; k < 3; k++)
-			page->values[i*DG_ENTRY_SLOTS + k].i = d->slots[i*3 + k];
-		page->values[i*DG_ENTRY_SLOTS + 3].i = -1;
+		if (with_env) {
+			for (int k = 0; k < 4; k++)
+				page->values[i*DG_ENTRY_SLOTS + k].i = d->slots[1 + i*4 + k];
+		} else {
+			for (int k = 0; k < 3; k++)
+				page->values[i*DG_ENTRY_SLOTS + k].i = d->slots[i*3 + k];
+			page->values[i*DG_ENTRY_SLOTS + 3].i = -1;
+		}
 	}
 
 	alloc_heap_slot(slot);
@@ -880,6 +930,16 @@ static void load_rsave_call_stack(struct rsave *save)
 				return_address = -1;
 			else
 				return_address = ain->functions[fno].address + rr->local_addr;
+			// XSYS4_RESUME_TRACE=1 — восстановленный стек с пометкой кадров,
+			// вызванных ДВИЖКОМ. На таком кадре выполнение после resume
+			// ОСТАНАВЛИВАЕТСЯ (VM_RETURN), то есть всё, что было выше него в
+			// момент сохранения, не доигрывается: у Haha Ranman так остаётся
+			// неразрушенным второй стек сцен SAVE-экрана (его слой висит на
+			// экране поверх ADV).
+			if (getenv("XSYS4_RESUME_TRACE"))
+				NOTICE("RESUME frame %2d: %s%s", call_stack_ptr - 1,
+				       display_sjis0(ain->functions[fno].name),
+				       return_address == -1 ? "   <- кадр движка (VM_RETURN)" : "");
 		}
 		if (++rr == save->return_records + save->nr_return_records)
 			rr = &save->ip;

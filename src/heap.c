@@ -16,6 +16,8 @@
 
 #define VM_PRIVATE
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -94,6 +96,43 @@ void heap_init(void)
 #define HEAP_WATCH_MAX 512
 static int heap_watch_slots[HEAP_WATCH_MAX];
 static int heap_watch_nr = -1;
+
+// XSYS4_HEAP_WATCH_FILE=<путь> — события вотча писать в ОТДЕЛЬНЫЙ файл, минуя
+// общий лог: тот режется на 200000 строк, а вотч по типу (STRUCT_WATCH=SceneStack)
+// даёт ~130k событий за прогон — конец сценария (закрытие экрана, FREE) не влезал.
+static FILE *heap_watch_out(void)
+{
+	static FILE *f;
+	static bool tried;
+	if (!tried) {
+		tried = true;
+		const char *p = getenv("XSYS4_HEAP_WATCH_FILE");
+		if (p && *p) {
+			f = fopen(p, "w");
+			if (f)
+				setvbuf(f, NULL, _IOLBF, 0);
+		}
+	}
+	return f;
+}
+
+// Бухгалтерия ссылок сводится по паре «какая инструкция в какой функции», поэтому
+// каждая строка несёт instr_ptr + опкод + функцию игры; в файл — без префиксов лога.
+static void heap_watch_msg(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	FILE *f = heap_watch_out();
+	if (f) {
+		vfprintf(f, fmt, ap);
+		fputc('\n', f);
+	} else {
+		char buf[1024];
+		vsnprintf(buf, sizeof(buf), fmt, ap);
+		sys_warning("*WATCH*: %s\n", buf);
+	}
+	va_end(ap);
+}
 static bool heap_watched(int32_t slot)
 {
 	if (heap_watch_nr == -1) {
@@ -151,7 +190,8 @@ int32_t heap_alloc_slot(enum vm_pointer_type type)
 	heap[slot].free_addr = 0;
 #endif
 	if (unlikely(heap_watched(slot)))
-		WARNING("HEAPWATCH %d ALLOC type=%d @%X", slot, type, instr_ptr);
+		heap_watch_msg("HEAPWATCH %d ALLOC type=%d @%X in %s", slot, type, instr_ptr,
+			       display_sjis0(vm_current_function_name()));
 	return slot;
 }
 
@@ -160,8 +200,12 @@ static void heap_free_slot(int32_t slot)
 	// Наблюдаемый слот умер — печатаем СТЕК ИГРЫ: момент смерти важнее момента
 	// падения (падение при чтении случается позже и в другом месте).
 	if (unlikely(heap_watched(slot))) {
-		WARNING("HEAPWATCH %d FREE — стек вызовов игры:", slot);
-		vm_stack_trace();
+		heap_watch_msg("HEAPWATCH %d FREE — стек вызовов игры:", slot);
+		FILE *f = heap_watch_out();
+		if (f)
+			vm_stack_trace_file(f);
+		else
+			vm_stack_trace();
 	}
 	heap[slot].seq = 0;
 	heap_free_stack[--heap_free_ptr] = slot;
@@ -203,7 +247,7 @@ void heap_ref(int32_t slot)
 	}
 	heap[slot].ref++;
 	if (unlikely(heap_watched(slot)))
-		WARNING("HEAPWATCH %d REF -> %d @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
+		heap_watch_msg("HEAPWATCH %d REF -> %d @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
 #ifdef DEBUG_HEAP
 	heap[slot].ref_addr[heap[slot].ref_nr++ % 16] = instr_ptr;
 #endif
@@ -212,7 +256,7 @@ void heap_ref(int32_t slot)
 void heap_unref(int slot)
 {
 	if (unlikely(heap_watched(slot)))
-		WARNING("HEAPWATCH %d UNREF (ref=%d) @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
+		heap_watch_msg("HEAPWATCH %d UNREF (ref=%d) @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
 	if (unlikely(heap[slot].ref <= 0)) {
 		heap_double_free(slot);
 		VM_ERROR("double free");
@@ -245,8 +289,13 @@ void heap_unref(int slot)
 void exit_unref(int slot)
 {
 	if (unlikely(heap_watched(slot))) {
-		WARNING("HEAPWATCH %d EXIT_UNREF (ref=%d) @%X", slot, heap[slot].ref, instr_ptr);
-		vm_stack_trace();
+		heap_watch_msg("HEAPWATCH %d EXIT_UNREF (ref=%d) @%X in %s", slot, heap[slot].ref,
+			       instr_ptr, display_sjis0(vm_current_function_name()));
+		FILE *f = heap_watch_out();
+		if (f)
+			vm_stack_trace_file(f);
+		else
+			vm_stack_trace();
 	}
 	if (slot < 0 || (size_t)slot >= heap_size) {
 		WARNING("out of bounds heap index: %d", slot);

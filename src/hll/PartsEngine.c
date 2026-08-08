@@ -1465,6 +1465,12 @@ bool pe_activities_load(struct iarray_reader *r, bool apply)
 		WARNING("сейв-образ партов: битое число активностей %d", n);
 		return false;
 	}
+	// XSYS4_XPE_TRACE=1 — состав реестра активностей в образе. От него зависит,
+	// сможет ли игра ПОСЛЕ загрузки снять наборы обработчиков (ReleaseActivity
+	// отдаёт delegate-индексы по партам активности): пустой реестр = подписки
+	// останутся жить и будут держать объекты сцены.
+	if (getenv("XSYS4_XPE_TRACE"))
+		NOTICE("XPE load: активностей в образе: %d (apply=%d)", n, apply);
 	if (apply && pe_activities) {
 		ht_foreach_value(pe_activities, PE_Activity_free);
 		ht_free(pe_activities);
@@ -1479,6 +1485,9 @@ bool pe_activities_load(struct iarray_reader *r, bool apply)
 			return false;
 		}
 		struct pe_activity *a = NULL;
+		if (getenv("XSYS4_XPE_TRACE"))
+			NOTICE("XPE load:   активность '%s': %d партов",
+			       display_sjis0(name->text), nr_parts);
 		if (apply) {
 			PE_CreateActivity(name);
 			a = pe_act_find(name);
@@ -1549,6 +1558,67 @@ static bool PE_IsExistActivity(struct string *name)
 	return pe_act_find(name) != NULL;
 }
 
+struct pe_sub_release {
+	const char *prefix;
+	size_t prefix_len;
+	struct string **names;
+	int nr_names;
+};
+
+static void pe_act_collect_sub_cb(struct ht_slot *slot, void *data)
+{
+	struct pe_sub_release *ctx = data;
+	if (!slot->value || !slot->key)
+		return;
+	if (strncmp(slot->key, ctx->prefix, ctx->prefix_len))
+		return;
+	ctx->names = xrealloc_array(ctx->names, ctx->nr_names, ctx->nr_names + 1,
+	                            sizeof(struct string *));
+	ctx->names[ctx->nr_names++] = cstr_to_string(slot->key);
+}
+
+/*
+ * Освободить активности, ВЛОЖЕННЫЕ в `name`, и дописать их delegate-индексы в
+ * `indices`/`nr` (буфер вызывающего, ёмкость `cap`).
+ *
+ * Индексы обязаны попасть в тот же массив, что и у корневой активности: игра
+ * передаёт его целиком в `CPartsMessageManager@ReleaseFunctionSetList`, и только
+ * так снимаются наборы обработчиков. Пока индексы вложенных терялись, подписки
+ * кнопок слотов оставались жить (по одной на слот, `env` = окружение
+ * конструктора `SaveLoadScene@0`), окружение держало `ref SceneStack`, стек сцены
+ * не умирал — и его слой некому было снести.
+ */
+static void pe_release_sub_activities(struct string *name, int *indices, int *nr, int cap)
+{
+	if (!pe_activities || !name)
+		return;
+	// Разделитель — ПОЛНОШИРИННЫЙ слэш «／» (в SJIS 0x815E), тот же, что в
+	// именах узлов раскладки.
+	char prefix[512];
+	int len = snprintf(prefix, sizeof(prefix), "%s\x81\x5e", name->text);
+	if (len <= 0 || (size_t)len >= sizeof(prefix))
+		return;
+	struct pe_sub_release ctx = { prefix, (size_t)len, NULL, 0 };
+	ht_foreach(pe_activities, pe_act_collect_sub_cb, &ctx);
+	for (int i = 0; i < ctx.nr_names; i++) {
+		struct pe_activity *sub = pe_act_find(ctx.names[i]);
+		if (sub) {
+			for (int j = 0; j < sub->nr_parts; j++) {
+				int di = PE_GetDelegateIndex(sub->parts[j].number);
+				if (di >= 0 && indices && *nr < cap)
+					indices[(*nr)++] = di;
+				PE_ReleaseParts(sub->parts[j].number);
+			}
+			struct ht_slot *slot = ht_put(pe_activities, ctx.names[i]->text, NULL);
+			if (slot->value == sub)
+				slot->value = NULL;
+			PE_Activity_free(sub);
+		}
+		free_string(ctx.names[i]);
+	}
+	free(ctx.names);
+}
+
 static bool PE_ReleaseActivity(struct string *name, struct page **out)
 {
 	struct pe_activity *a = pe_act_find(name);
@@ -1563,12 +1633,39 @@ static bool PE_ReleaseActivity(struct string *name, struct page **out)
 	// `CPartsMessageManager@ReleaseFunctionSetList` (см. разбор в
 	// PE_RemoveController). Парты без набора обработчиков в список не попадают.
 	int nr = 0;
-	int *indices = n ? xcalloc(n, sizeof(int)) : NULL;
+	// Ёмкость с запасом: в тот же массив идут индексы ВЛОЖЕННЫХ активностей
+	// (у экрана сохранения их два десятка — слоты и кнопки страниц).
+	int cap = n + 1024;
+	int *indices = xcalloc(cap, sizeof(int));
 	for (int i = 0; i < n; i++) {
 		int di = PE_GetDelegateIndex(a->parts[i].number);
-		if (di >= 0)
+		if (di >= 0 && nr < cap)
 			indices[nr++] = di;
 	}
+	if (a && !getenv("XSYS4_RA_KEEP_PARTS")) {
+		/*
+		 * ★ОСВОБОЖДАЕМ И САМИ ПАРТЫ активности (вместе с вложенными). Прежде
+		 * чистился только реестр, и после загрузки сейва получался ЗАМКНУТЫЙ
+		 * КРУГ: парты экрана сохранения живы → живы их наборы обработчиков →
+		 * те держат окружение конструктора сцены (`SaveLoadScene@0`) → жив
+		 * `SceneStack` → его `EraseLayer` не вызывается → парты живы. В обычной
+		 * игре круг рвёт закрытие сцены (снос слоя по кнопке), а после resume
+		 * закрывать её некому — и экран сохранения оставался поверх игры.
+		 * Индексы собираем ДО освобождения: у снятой части их уже не спросишь.
+		 * Откат для замеров: `XSYS4_RA_KEEP_PARTS=1`.
+		 */
+		for (int i = 0; i < n; i++)
+			PE_ReleaseParts(a->parts[i].number);
+		// Вместе с активностью уходят и ВЛОЖЕННЫЕ: игра именует их
+		// «<родитель>／<узел>[:<индекс>]» (у экрана сохранения это `／項目:0..8`
+		// — рамки слотов и `／ページボタン:0..9` — кнопки страниц). Их
+		// собственный ReleaseActivity после загрузки уже не придёт: обёртки,
+		// которые его зовут, держит тот же круг.
+		pe_release_sub_activities(name, indices, &nr, cap);
+	}
+	if (getenv("XSYS4_BS_TRACE"))
+		NOTICE("BS ReleaseActivity('%s'): отдано delegate-индексов %d (партов у корня %d)",
+		       display_sjis0(name->text), nr, n);
 	union vm_value dim = { .i = nr };
 	struct page *page = alloc_array(1, &dim, AIN_ARRAY_INT, 0, false);
 	for (int i = 0; i < nr; i++)
