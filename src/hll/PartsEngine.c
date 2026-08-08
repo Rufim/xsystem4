@@ -2515,6 +2515,38 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			NOTICE("PT vscrollbar no=%d base=(%d,%d) len=%d w=%d up=%d down=%d total=%d view=%d rate=%.3f",
 			       no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
 		PE_SetClickable(no, true);
+	} else if (ptype == 8 && ti) {
+		/*
+		 * `レイアウトボックス` (パーツタイプ=8) — контейнер, сам раскладывающий детей.
+		 * Загрузчик его не настраивал вовсе: тип раскладки, выравнивание, перенос и
+		 * поля оставались нулевыми, и `parts_do_layout` укладывал кнопки слева
+		 * направо от точки привязки независимо от того, что написано в раскладке.
+		 *
+		 * Симптом — системные кнопки ADV (`AdvSystemButton.x`): у `LayoutRight`
+		 * (`座標` 1263,653, `原点座標モード` 3 — привязка к правому краю) кнопки
+		 * должны расти ВЛЕВО от 1263, а уезжали вправо за экран: `ButtonAuto` в
+		 * x=1315, `ButtonBackLog` в x=1523 при ширине экрана 1280 — то есть AUTO и
+		 * History просто не попадали в кадр. У `LayoutLeft` иконки, наоборот, стояли
+		 * на 104 px правее оригинальных: места ушедших в `LayoutHide` соседей
+		 * (`BackScene`, `Config`) оставались зарезервированными.
+		 *
+		 * Поля ложатся на HLL-сеттеры один в один, ими же потом пользуется игра.
+		 * `折り返しサイズ` — вещественное, но `SetLayoutBoxReturn` принимает int:
+		 * во всех раскладках Dohna значения целые (200.0 и т.п.).
+		 */
+		PE_SetLayoutBoxLayoutType(no, act_int(ti, "レイアウトタイプ", 0));
+		PE_SetLayoutBoxAlign(no, act_int(ti, "配置", 0));
+		PE_SetLayoutBoxReturn(no, act_int(ti, "折り返し許可", 0) != 0,
+			(int)act_float(ti, "折り返しサイズ", 0.0f));
+		PE_set_layoutbox_padding(no,
+			act_list_int(ti, "パディング", 0, 0),
+			act_list_int(ti, "パディング", 1, 0),
+			act_list_int(ti, "パディング", 2, 0),
+			act_list_int(ti, "パディング", 3, 0));
+		if (getenv("XSYS4_PT_TRACE"))
+			NOTICE("PT layoutbox no=%d type=%d align=%d wrap=%d/%d", no,
+			       act_int(ti, "レイアウトタイプ", 0), act_int(ti, "配置", 0),
+			       act_int(ti, "折り返し許可", 0), (int)act_float(ti, "折り返しサイズ", 0.0f));
 	} else if (ptype == 1 && ti) {
 		// checkbox (パーツタイプ=1): ＣＧ名 is a base; the box has checked/unchecked
 		// variants. テキスト is the label drawn to the right of the box.
@@ -2788,6 +2820,19 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			        act_list_int(node, "原点座標", 1, 0));
 		}
 	}
+	/*
+	 * `マージン` — отступы части, которые учитывает раскладка контейнера
+	 * (`parts_do_layout` прибавляет их к размеру ребёнка). Поле не читалось, и
+	 * кнопки в layout box стояли вплотную: у системных кнопок ADV каждая объявляет
+	 * `マージン = (0, 0, 0, 8)`, то есть 8 px справа, — без них шаг выходил 44
+	 * вместо 52. Порядок значений — как у `パディング` бокса (верх, низ, лево, право).
+	 * По всей игре поле ненулевое у 120 с небольшим частей, у остальных нули.
+	 */
+	PE_SetComponentMargin(no,
+		act_list_int(node, "マージン", 0, 0),
+		act_list_int(node, "マージン", 1, 0),
+		act_list_int(node, "マージン", 2, 0),
+		act_list_int(node, "マージン", 3, 0));
 	PE_SetAlpha(no, act_int(node, "アルファ", 255));
 	// 拡大縮小 (scale x,y): e.g. the config sample-window system icons are 0.5.
 	float sx = act_list_float(node, "拡大縮小", 0, 1.0f);
