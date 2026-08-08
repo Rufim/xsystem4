@@ -35,14 +35,23 @@
  * UTF-8 (см. sjis_to_utf8_tmp) — в SJIS второй байт символа может совпасть,
  * например, с `[`, и шаблон бы «резал» строку внутри символа.
  *
- * `Split(ref string, string separators, int removeEmpty)` режет по НАБОРУ
+ * `Split(ref string, string separators, int options)` режет по НАБОРУ
  * символов-разделителей, а не по строке-разделителю целиком: один из сайтов
  * передаёт `"[]|"` (три символа), который как единый разделитель не встретился
- * бы никогда. Третий аргумент — флаг «убрать пустые части»: сайт переноса строк
- * бэклога (`AddWrappingLog`) зовёт `Split(text, " ", 1)`, т.е. режет на слова, и
- * пустые куски от подряд идущих пробелов там недопустимы; остальные 42 сайта
- * передают 0 и пустые части сохраняют (`Split(s, "[]|", 0)` в разборе
- * motion-параметров, дальше `.Select(Trim)`).
+ * бы никогда. Третий аргумент — БИТОВАЯ МАСКА, а не булев флаг: у Dohna он
+ * принимает 0 (40 сайтов), 1 (2 сайта) и 2 (1 сайт). Бит 0 — «убрать пустые
+ * части»: сайт переноса строк бэклога (`AddWrappingLog`) зовёт
+ * `Split(text, " ", 1)`, т.е. режет на слова, и пустые куски от подряд идущих
+ * пробелов там недопустимы.
+ *
+ * ★Значение 2 пустые части ОСТАВЛЯЕТ (бит 0 не взведён) — как `StringSplitOptions`
+ * .NET, где 1 = RemoveEmptyEntries, 2 = TrimEntries. Пока любое ненулевое
+ * значение означало «убрать пустые», ломался единственный сайт с двойкой —
+ * `Footer@SetButtonText`: подписи кнопок футера приходят одной строкой через
+ * запятую и позиционно («Save,Load,Items,Next→» у дома, `",,,Back"` у магазина).
+ * Со схлопнутыми пустыми `",,,Back"` давало ["Back"], и подпись садилась на
+ * кнопку 0 — «Back» рисовался СЛЕВА вместо правого края, а кнопки 0–2 не
+ * получали `Show(false)` и оставались на экране лишними плашками.
  */
 
 #include <stdlib.h>
@@ -345,8 +354,10 @@ static bool is_separator(const char *sep, size_t sep_size, const char *p, int le
 	return false;
 }
 
-static int String_Split(struct string **s, struct string *sep, int remove_empty)
+static int String_Split(struct string **s, struct string *sep, int options)
 {
+	bool remove_empty = options & 1;   // 1 = RemoveEmptyEntries
+	bool trim_entries = options & 2;   // 2 = TrimEntries
 	struct string *src = self_or_empty(s);
 	int slot = heap_alloc_slot(VM_PAGE);
 	union vm_value dim = { .i = 0 };
@@ -361,7 +372,14 @@ static int String_Split(struct string **s, struct string *sep, int remove_empty)
 			continue;
 		}
 		if (i > start || !remove_empty) {
-			struct string *part = make_string(src->text + start, i - start);
+			int b = start, e = i;
+			if (trim_entries) {
+				while (b < e && (src->text[b] == ' ' || src->text[b] == '\t'))
+					b++;
+				while (e > b && (src->text[e - 1] == ' ' || src->text[e - 1] == '\t'))
+					e--;
+			}
+			struct string *part = make_string(src->text + b, e - b);
 			union vm_value v = { .i = heap_alloc_string(part) };
 			out = array_pushback_n(out, &v, 1, AIN_ARRAY_STRING, 0);
 		}
