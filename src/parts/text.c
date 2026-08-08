@@ -256,7 +256,7 @@ bool PE_SetFont(int parts_no, int type, int size, int r, int g, int b, float bol
 {
 	if (!parts_state_valid(--state))
 		return false;
-	if (getenv("XSYS4_FONT_TRACE")) NOTICE("SETFONT part=%d type=%d size=%d edge=%.1f", parts_no, type, size, edge_weight);
+	if (getenv("XSYS4_FONT_TRACE")) NOTICE("SETFONT part=%d type=%d size=%d edge=%.1f bold=%.2f", parts_no, type, size, edge_weight, bold_weight);
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_text *text = parts_get_text(parts, state);
@@ -287,6 +287,23 @@ bool PE_SetFont(int parts_no, int type, int size, int r, int g, int b, float bol
 		text->ts.size = e ? size * strtof(e, NULL) : size;
 	}
 	text->ts.color = (SDL_Color) { r, g, b, 255 };
+	/*
+	 * `フォント太さ` — ДИЛАТАЦИЯ ШТРИХА в пикселях, и её место — `bold_width`.
+	 * Раньше толщина уходила только в `weight` (= 太さ×1000), а тот при 0.4 даёт
+	 * 400, то есть обычное начертание (gfx_int_to_font_weight: всё до 550 —
+	 * NORMAL). Итог: жирность не рисовалась вовсе, а заголовки выходили тоньше и
+	 * у́же оригинала. `weight` оставляем как был — он для игр, где вес приходит
+	 * тысячными долями.
+	 *
+	 * Эталон: заголовок достижения «Nicely Dohna» (`太さ = 0.4`, `縁取り = 0`,
+	 * `字間隔 = −4`) — у оригинала строка 94 px и 783 тёмных пикселя, у нас было
+	 * 72 px и 562. Разница по ширине ложилась ровно на промежутки между глифами:
+	 * +10 px на шести буквах «Nicely» (5 промежутков) и +8 на пяти «Dohna»
+	 * (4 промежутка) — по 2 px на промежуток, то есть ceil(0.4) = 1 px на сторону
+	 * (см. text_style_advance_padding).
+	 * Ручка XSYS4_NO_BOLD_WIDTH=1 возвращает прежнее поведение для A/B.
+	 */
+	text->ts.bold_width = getenv("XSYS4_NO_BOLD_WIDTH") ? 0.0f : bold_weight;
 	text->ts.weight = bold_weight * 1000;
 	text->ts.edge_color = (SDL_Color) { edge_r, edge_g, edge_b, 255 };
 	text_style_set_edge_width(&text->ts, edge_weight);
