@@ -26,8 +26,11 @@
 #include <string.h>
 
 #include "system4.h"
+#include "system4/ain.h"
 #include "system4/string.h"
+#include "system4/utfsjis.h"
 
+#include "vm.h"
 #include "xsystem4.h"
 #include "parts.h"
 #include "parts_internal.h"
@@ -61,9 +64,11 @@ struct parts_message_window *parts_message_window_alloc(void)
 {
 	struct parts_message_window *mw = xcalloc(1, sizeof(*mw));
 	mw->inactive_multiply_color = (SDL_Color) { 255, 255, 255, 255 };
+	mw->text_color = (SDL_Color) { 255, 255, 255, 255 };
 	mw->text_parts_no = -1;
 	mw->mark_parts_no = -1;
 	mw->text_fixed = true;
+	mw->msg_num = -1;
 	return mw;
 }
 
@@ -500,6 +505,48 @@ bool PE_StepMessageWindowFlatFinalFrame(int parts_no)
 
 // ----------------------------------------------------------------- HLL: текст
 
+// Конфиг-глобал игры g_既読メッセージ色変更: включена ли 既読-перекраска.
+// Индекс глобала ищется по имени один раз; в играх без него — режим выключен.
+static bool mw_read_color_mode(void)
+{
+	static int varno = -2;
+	if (varno == -2) {
+		const char *u8 = "g_既読メッセージ色変更";
+		char *sjis = utf2sjis(u8, strlen(u8));
+		varno = ain_get_global(ain, sjis);
+		free(sjis);
+	}
+	return varno >= 0 && global_get(varno).i;
+}
+
+/*
+ * 既読-перекраска: уже прочитанная реплика рисуется цветом Ｅ＿既読メッセージ色
+ * из главного .ex. У оригинала это делает САМ ДВИЖОК: у message::detail::
+ * GetReadMessageTextColor нет ни одного вызова в байткоде — это контракт SDK,
+ * и вся игровая логика вокруг g_既読メッセージ касается только скип-режима.
+ * Флаг «прочитано» — база MsgSkip: игра сама ставит его после проявления
+ * реплики (CReadMessageTextManager → MsgSkip.SetFlag), поэтому при первом
+ * показе реплика ещё «не прочитана» и идёт базовым цветом раскладки.
+ * Цвет ставится ПЕРЕД PE_SetText: PE_SetPartsFontColor меняет стиль текстовой
+ * части насовсем, так что для непрочитанных базовый цвет возвращаем явно.
+ */
+static void mw_apply_read_color(struct parts_message_window *mw)
+{
+	int tp = mw_text_parts(mw);
+	if (tp < 0)
+		return;
+	int r = mw->text_color.r, g = mw->text_color.g, b = mw->text_color.b;
+	if (mw->msg_num >= 0 && msgskip_message_is_read(mw->msg_num)
+	    && mw_read_color_mode()) {
+		// Дефолты — как у config::detail::GetReadTextColor.
+		r = 255; g = 127; b = 127;
+		mainex_list_int_get("Ｅ＿既読メッセージ色", 0, &r);
+		mainex_list_int_get("Ｅ＿既読メッセージ色", 1, &g);
+		mainex_list_int_get("Ｅ＿既読メッセージ色", 2, &b);
+	}
+	PE_SetPartsFontColor(tp, r, g, b, 1);
+}
+
 void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
                              struct string *func_name, int ver, int step)
 {
@@ -517,6 +564,7 @@ void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
 		NOTICE("MWTEXT part=%d msg=%d ver=%d step=%d raw='%s'", parts_no, msg_num,
 		       ver, step, text ? display_sjis0(text->text) : "(nil)");
 
+	mw_apply_read_color(mw);
 	struct string *plain = mw_strip_markup(text);
 	PE_SetText(mw_text_parts(mw), plain, 1);
 	free_string(plain);
@@ -614,6 +662,7 @@ void PE_SetMessageWindowTextFont(int parts_no, int type, int size, int r, int g,
 	struct parts_message_window *mw = mw_require(parts_no, "SetMessageWindowTextFont");
 	if (!mw)
 		return;
+	mw->text_color = (SDL_Color) { r, g, b, 255 };
 	PE_SetFont(mw_text_parts(mw), type, size, r, g, b, bold_weight,
 	           edge_r, edge_g, edge_b, edge_weight, 1);
 }

@@ -117,7 +117,13 @@ static void MsgSkip_SetFlag(int msgnum)
 {
 	if (msgnum < 0 || msgnum >= nr_flags)
 		return;
+	if (flags[msgnum >> 3] & (0x80 >> (msgnum & 7)))
+		return;
 	flags[msgnum >> 3] |= 0x80 >> (msgnum & 7);
+	// Пишем сразу: atexit не срабатывает при краше/SIGKILL, и без этого
+	// прочитанное (а с ним 既読-перекраска и скип) терялось бы. Новых флагов
+	// за сессию немного — по одному на впервые прочитанную реплику.
+	msgskip_save();
 }
 
 static int MsgSkip_GetFlag(int msgnum)
@@ -125,6 +131,17 @@ static int MsgSkip_GetFlag(int msgnum)
 	if (msgnum < 0 || msgnum >= nr_flags)
 		return 0;
 	return !!(flags[msgnum >> 3] & 0x80 >> (msgnum & 7));
+}
+
+/*
+ * Прямой опрос флага «сообщение прочитано» движковыми модулями: им окно
+ * сообщений выбирает 既読-цвет уже прочитанных реплик. До Init и на
+ * невалидном номере — «не прочитано».
+ */
+bool msgskip_message_is_read(int msgnum)
+{
+	return flags && msgnum >= 0 && msgnum < nr_flags
+		&& (flags[msgnum >> 3] & (0x80 >> (msgnum & 7)));
 }
 
 static void MsgSkip_SetEnable(int enable)

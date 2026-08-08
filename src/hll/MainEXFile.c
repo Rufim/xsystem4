@@ -889,6 +889,28 @@ static int MEX_d_A2Int(struct string *name, int row, int col, int def, int id) {
 static float MEX_d_A2Float(struct string *name, int row, int col, float def, int id) { (void)id; float v; return hv_float(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : def; }
 static struct string *MEX_d_A2String(struct string *name, int row, int col, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : string_ref(def); }
 
+/*
+ * Прямое чтение int-элемента list-значения главного .ex движковыми модулями
+ * (既読-цвет окна сообщений: список «Ｅ＿既読メッセージ色»). Ключ — UTF-8,
+ * внутри конвертируется в SJIS ключей .ex. false — .ex не загружен, ключа/
+ * элемента нет или тип не int; *out при этом не трогается.
+ */
+bool mainex_list_int_get(const char *key_utf8, int index, int *out)
+{
+	if (!ex)
+		return false;
+	char *sjis = utf2sjis(key_utf8, strlen(key_utf8));
+	struct ex_value *v = ex_get(ex, sjis);
+	free(sjis);
+	if (!v || v->type != EX_LIST)
+		return false;
+	struct ex_value *item = ex_list_get(v->list, index);
+	if (!item || item->type != EX_INT)
+		return false;
+	*out = item->i;
+	return true;
+}
+
 static void MainEXFile_PreLink(void);
 
 HLL_LIBRARY(MainEXFile,
