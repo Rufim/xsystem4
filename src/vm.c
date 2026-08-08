@@ -2119,6 +2119,24 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Ixseal added a third operand describing the element type of a generic
 		// container (see hll_call). Older games emit only two.
 		int elem_class = instructions[CALLHLL].nr_args >= 3 ? get_argument(2) : 0;
+		/*
+		 * XSYS4_HLL_IN_FUNC=<подстрока> — печатать HLL-вызовы, сделанные ИЗ игровой
+		 * функции с таким именем (по всему стеку вызовов). Нужна, когда игра ходит
+		 * в движок через интерфейсные методы: в байткоде видно только смещение в
+		 * vtable (`PUSH 226; ADD; X_REF 1; CALLMETHOD`), а во что оно превращается —
+		 * нет. Так разбирается `Tutorial::MoveSceneParent`, где `<226>`/`<50>` не
+		 * дают ни одного наблюдаемого эффекта.
+		 */
+		{
+			const char *w = getenv("XSYS4_HLL_IN_FUNC");
+			if (w && *w && vm_called_from(w)) {
+				int lib = get_argument(0), fun = get_argument(1);
+				NOTICE("HLLIN %s.%s <- %s",
+				       ain->libraries[lib].name,
+				       ain->libraries[lib].functions[fun].name,
+				       display_sjis0(vm_current_function_name()));
+			}
+		}
 		hll_call(get_argument(0), get_argument(1), elem_class);
 		break;
 	}

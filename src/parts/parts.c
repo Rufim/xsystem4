@@ -2346,6 +2346,11 @@ void PE_SetPos(int parts_no, int x, int y)
 
 void PE_SetZ(int parts_no, int z)
 {
+	// Под XSYS4_PARTS_TRACE: без этого не видно, кто и когда переставляет порядок
+	// (у Dohna `Tutorial::SetPartsZandClipper` опускает корни сцен, чтобы поверх них
+	// легла полосатая подложка обучения).
+	if (getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("PARTS SetZ(%d, %d)", parts_no, z);
 	parts_set_z(parts_get(parts_no), z);
 }
 
