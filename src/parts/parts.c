@@ -54,6 +54,19 @@ struct pending_ctype { int type; int state; };
 
 static void pending_ctype_set(int parts_no, int type, int state)
 {
+	/*
+	 * Невалидный номер — мина замедленного действия: игра зовёт
+	 * SetComponentType(GetPartsNumber(...), 17), и когда парт не найден (-1),
+	 * заявка «парт -1 — контейнер» оседала в таблице. Дальше любой обход
+	 * детей, наткнувшись на дырку перечисления (GetChild → -1), спрашивал
+	 * GetComponentType(-1) == 17 и обходил «детей -1» — все КОРНЕВЫЕ парты —
+	 * заново, до переполнения стека вызовов (после загрузки сейва).
+	 */
+	if (parts_no < 0) {
+		WARNING("SetComponentType(%d, %d): невалидный номер парта, заявка отброшена",
+		        parts_no, type);
+		return;
+	}
 	if (!pending_ctype_table)
 		pending_ctype_table = ht_create(64);
 	struct ht_slot *slot = ht_put_int(pending_ctype_table, parts_no, NULL);
@@ -1474,6 +1487,20 @@ void PE_UpdateComponent(possibly_unused int passed_time)
 		if (parts->pending_parent == parts->no)
 			parts->pending_parent = -1;
 		struct parts *parent;
+		// Цикл предков: подвесить парт к собственному потомку нельзя — обход
+		// детей (CallUserComponentEventWithChild) уходит в бесконечную
+		// рекурсию (переполнение call_stack после загрузки сейва).
+		if (parts->pending_parent >= 0) {
+			struct parts *anc = parts_try_get(parts->pending_parent);
+			for (; anc; anc = anc->parent) {
+				if (anc == parts) {
+					WARNING("парт %d: родитель %d — его же потомок, связь отвергнута",
+					        parts->no, parts->pending_parent);
+					parts->pending_parent = -1;
+					break;
+				}
+			}
+		}
 		if (parts->pending_parent >= 0 && (parent = parts_try_get(parts->pending_parent))) {
 			if (parts->parent) {
 				TAILQ_REMOVE(&parts->parent->children, parts, child_list_entry);
@@ -2536,6 +2563,10 @@ static int parts_effective_parent_no(struct parts *p)
 
 int PE_NumofChild(int parts_no)
 {
+	// «Дети парта -1» — это ВСЕ корневые парты: effective_parent сироты
+	// тоже -1, и обход с невалидным номером зацикливал всё дерево.
+	if (parts_no < 0)
+		return 0;
 	int n = 0;
 	struct parts *p;
 	PARTS_LIST_FOREACH(p) {
@@ -2547,7 +2578,7 @@ int PE_NumofChild(int parts_no)
 
 int PE_GetChild(int parts_no, int index)
 {
-	if (index < 0)
+	if (parts_no < 0 || index < 0)
 		return -1;
 	int n = 0;
 	struct parts *p;

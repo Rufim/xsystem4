@@ -22,7 +22,7 @@
 #include "parts_internal.h"
 #include "../hll/iarray.h"
 
-#define CURRENT_SAVE_VERSION 4
+#define CURRENT_SAVE_VERSION 5
 
 // Насколько глубоко уводится снимок бэк-сцены под UI вьювера (см. load_parts).
 #define BACK_SCENE_Z_SHIFT 1000000
@@ -856,7 +856,22 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 	if (parts_multi_controller) {
 		iarray_write(&w, ctrl_stack.active);
 		iarray_write(&w, ctrl_stack.nr_controllers);
+		/*
+		 * v5: полный стек контроллеров. Прежде хранилась только ГЛУБИНА, и
+		 * восстановление придумывало id заново (0..nr-1) — а id монотонные,
+		 * и игра после загрузки сейва ставит активный слой по НАСТОЯЩЕМУ id
+		 * из своих восстановленных глобалов (g_ActiveLayerID): на несуществующем
+		 * id падало «Invalid controller number».
+		 */
+		iarray_write(&w, ctrl_stack.next_id);
+		for (int i = 0; i < ctrl_stack.nr_controllers; i++) {
+			iarray_write(&w, ctrl_stack.stack[i]);
+			iarray_write(&w, ctrl_stack.hidden[i]);
+		}
 	}
+	// v5: реестр активностей (имя парта -> номер) — без него после загрузки
+	// GetActivityPartsNumber(«ルートパーツ») отдавал -1 и CActivityWrap ассертил.
+	pe_activities_save(&w);
 
 	unsigned count_pos = iarray_writer_pos(&w);
 	iarray_write(&w, 0); // size of parts list
@@ -948,10 +963,33 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 	if (parts_multi_controller) {
 		int active = iarray_read(&r);
 		int nr_controllers = iarray_read(&r);
-		if (restore_globals) {
+		if (version >= 5) {
+			// v5: настоящие id слоёв (см. writer выше).
+			int next_id = iarray_read(&r);
+			int nr = nr_controllers;
+			if (nr < 0) nr = 0;
+			if (nr > PARTS_CONTROLLER_STACK_MAX) nr = PARTS_CONTROLLER_STACK_MAX;
+			for (int i = 0; i < nr_controllers; i++) {
+				int id = iarray_read(&r);
+				bool hid = iarray_read(&r);
+				if (restore_globals && i < nr) {
+					ctrl_stack.stack[i] = id;
+					ctrl_stack.hidden[i] = hid;
+				}
+			}
+			if (restore_globals) {
+				ctrl_stack.nr_controllers = nr;
+				ctrl_stack.next_id = next_id;
+				ctrl_stack.active = active;
+			}
+		} else if (restore_globals) {
 			// Стек id восстанавливаем целиком: в сейве лежит только глубина.
 			parts_controller_stack_restore(nr_controllers, active);
 		}
+	}
+	if (version >= 5) {
+		if (!pe_activities_load(&r, restore_globals))
+			return false;
 	}
 
 	int nr_parts = iarray_read(&r);

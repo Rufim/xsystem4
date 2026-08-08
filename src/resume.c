@@ -154,6 +154,26 @@ static cJSON *vm_image_to_json(const char *key)
 	return image;
 }
 
+/*
+ * Каноничное имя функции для сейва: у новых игр имена перегружены (одна
+ * строка у разных функций — у Haha Ranman сотни таких), а фреймы и стек
+ * вызовов идентифицируются ИМЕНЕМ. Голое имя на загрузке разрешается в
+ * ПЕРВУЮ перегрузку — не обязательно ту, что сохранялась («call frame has
+ * too many variables», «CRC mismatch»). Для неоднозначных пишем `имя#N` —
+ * эту форму ain_get_function понимает.
+ */
+static char *rsave_function_name(struct ain_function *f)
+{
+	int ord = ain_get_function_index(ain, f);
+	if (ord > 0) {
+		size_t len = strlen(f->name) + 16;
+		char *s = xmalloc(len);
+		snprintf(s, len, "%s#%d", f->name, ord);
+		return s;
+	}
+	return strdup(f->name);
+}
+
 static struct rsave_heap_frame *frame_page_to_rsave(struct page *page, int slot)
 {
 	struct rsave_heap_frame *o = xcalloc(1, sizeof(struct rsave_heap_frame) + page->nr_vars * sizeof(int32_t));
@@ -168,7 +188,7 @@ static struct rsave_heap_frame *frame_page_to_rsave(struct page *page, int slot)
 	} else {
 		struct ain_function *f = &ain->functions[page->index];
 		o->tag = RSAVE_LOCALS;
-		o->func.name = strdup(f->name);
+		o->func.name = rsave_function_name(f);
 		assert(page->nr_vars == f->nr_vars);
 		vars = f->vars;
 		o->struct_ptr = page->local.struct_ptr;
@@ -328,10 +348,24 @@ static void save_call_stack_to_rsave(struct rsave *rs)
 		rs->call_frames[i + 1].local_ptr = call->page_slot;
 		rs->call_frames[i + 1].struct_ptr = call->struct_page;
 		if (i > 0) {
-			rs->return_records[i].return_addr = call->return_address;
-			rs->return_records[i].local_addr = call->return_address - prev_func->address;
+			/*
+			 * Кадр, вызванный ДВИЖКОМ (vm_call: NEW-конструктор, делегат)
+			 * возвращается в VM_RETURN (-1). Формат AliceSoft для записи с
+			 * return_addr == -1 не пишет имя/local_addr/crc — информация о
+			 * кадре терялась, и такой сейв не загружался (у Haha Ranman игра
+			 * сохраняется ИЗНУТРИ конструктора сцены: NEW CActionSelectScene
+			 * → цепочка событий → セーブ実行). Пишем маркер -2: поля
+			 * сохраняются, загрузчик восстанавливает VM_RETURN.
+			 */
+			if (call->return_address == -1) {
+				rs->return_records[i].return_addr = -2;
+				rs->return_records[i].local_addr = -2;
+			} else {
+				rs->return_records[i].return_addr = call->return_address;
+				rs->return_records[i].local_addr = call->return_address - prev_func->address;
+			}
 		}
-		rs->return_records[i + 1].caller_func = strdup(func->name);
+		rs->return_records[i + 1].caller_func = rsave_function_name(func);
 		rs->return_records[i + 1].crc = func->crc;
 		prev_func = func;
 	}
@@ -340,16 +374,28 @@ static void save_call_stack_to_rsave(struct rsave *rs)
 	rs->ip.local_addr = instr_ptr - prev_func->address + 6;
 }
 
-static void save_stack_to_rsave(struct rsave *rs)
+/*
+ * Снимок value-стека зависит от того, КАК позвали ResumeSave:
+ *  - CALLSYS (старые игры): аргументы (key, filename) в момент vm_save_image
+ *    ЕЩЁ на стеке — их надо исключить («exclude two values»), а возврат после
+ *    резюма кладёт load-время CALLSYS RESUME_LOAD (`stack_push(0)`).
+ *  - CALLHLL (v14, system.ResumeSave): ffi снял ВСЕ аргументы до вызова —
+ *    резать нечего (резалось два ЧУЖИХ значения, и после загрузки ссылки на
+ *    стеке съезжали: «Out of bounds page index» в первом же X_REF), а возврат
+ *    никто не положит — load-время ResumeLoad объявлен void. Поэтому кладём
+ *    его В СНИМОК сами: 0 = «возврат из загрузки» (семантика fork, как у
+ *    CALLSYS-пути; по нему セーブ実行 уходит в ロード後復帰処理).
+ */
+static void save_stack_to_rsave(struct rsave *rs, bool hll_convention)
 {
-	// For compatibility with the AliceSoft's implementation, exclude two values
-	// (the SYS_RESUME_SAVE arguments) at the top of the stack.
-	rs->stack_size = stack_ptr - 2;
+	rs->stack_size = hll_convention ? stack_ptr + 1 : stack_ptr - 2;
 
 	rs->stack = xcalloc(rs->stack_size, sizeof(int32_t));
-	for (int i = 0; i < rs->stack_size; i++) {
+	for (int i = 0; i < rs->stack_size && i < stack_ptr; i++) {
 		rs->stack[i] = stack[i].i;
 	}
+	if (hll_convention)
+		rs->stack[stack_ptr] = 0;
 }
 
 static void save_func_names_to_rsave(struct rsave *rs)
@@ -375,20 +421,20 @@ static struct rsave *make_rsave(const char *key)
 	return save;
 }
 
-static struct rsave *vm_image_to_rsave(const char *key)
+static struct rsave *vm_image_to_rsave(const char *key, bool hll_convention)
 {
 	struct rsave *save = make_rsave(key);
 	save->next_seq = heap_next_seq;
 	save_heap_to_rsave(save);
 	save_call_stack_to_rsave(save);
-	save_stack_to_rsave(save);
+	save_stack_to_rsave(save, hll_convention);
 	save_func_names_to_rsave(save);
 	return save;
 }
 
-static int save_rsave_image(const char *key, const char *path)
+static int save_rsave_image(const char *key, const char *path, bool hll_convention)
 {
-	struct rsave *save = vm_image_to_rsave(key);
+	struct rsave *save = vm_image_to_rsave(key, hll_convention);
 	if (!save)
 		return 0;
 	char *full_path = savedir_path(path);
@@ -419,11 +465,11 @@ static int save_json_image(const char *key, const char *path)
 	return r;
 }
 
-int vm_save_image(const char *key, const char *path)
+int vm_save_image(const char *key, const char *path, bool hll_convention)
 {
 	switch (config.save_format) {
 	case SAVE_FORMAT_RSM:
-		return save_rsave_image(key, path);
+		return save_rsave_image(key, path, hll_convention);
 	case SAVE_FORMAT_JSON:
 		return save_json_image(key, path);
 	}
@@ -591,6 +637,18 @@ static int resolve_struct_symbol(struct rsave_symbol *sym)
 	return ain_get_struct(ain, sym->name);
 }
 
+// Подходит ли функция под сохранённый фрейм: типы переменных совпадают.
+static bool rsave_frame_fits(int func, struct rsave_heap_frame *f)
+{
+	if (func < 0 || ain->functions[func].nr_vars < f->nr_types)
+		return false;
+	for (int i = 0; i < f->nr_types; i++) {
+		if (f->types[i] != ain->functions[func].vars[i].type.data)
+			return false;
+	}
+	return true;
+}
+
 static void load_rsave_frame(int slot, struct rsave_heap_frame *f)
 {
 	struct page *page;
@@ -602,6 +660,26 @@ static void load_rsave_frame(int slot, struct rsave_heap_frame *f)
 		vars = ain->globals;
 	} else {
 		int func = resolve_func_symbol(&f->func);
+		/*
+		 * Сейвы, записанные до канонизации `имя#N` (см. frame_page_to_rsave),
+		 * хранят у перегруженных функций голое имя — оно разрешается в первую
+		 * перегрузку, не обязательно ту. Подбираем перегрузку по сохранённым
+		 * ТИПАМ переменных фрейма. resolve_func_symbol уже отрезал `#N` от
+		 * имени, так что f->func.name здесь — базовое.
+		 */
+		if (f->func.name && !rsave_frame_fits(func, f)) {
+			char buf[512];
+			for (int n = 0; ; n++) {
+				snprintf(buf, sizeof(buf), "%s#%d", f->func.name, n);
+				int cand = ain_get_function(ain, buf);
+				if (cand < 0)
+					break;
+				if (rsave_frame_fits(cand, f)) {
+					func = cand;
+					break;
+				}
+			}
+		}
 		page = alloc_page(LOCAL_PAGE, func, f->nr_slots);
 		nr_vars = ain->functions[func].nr_vars;
 		vars = ain->functions[func].vars;
@@ -761,9 +839,32 @@ static void load_rsave_call_stack(struct rsave *save)
 	int32_t return_address = -1;
 	for (int i = 0; i < save->nr_call_frames; i++) {
 		if (save->call_frames[i].type != RSAVE_CALL_STACK_BOTTOM) {
+			// Голая запись -1 посреди стека — сейв сборки, которая ещё не
+			// писала маркер -2 для кадров движка (см. save_call_stack_to_rsave):
+			// имя/crc кадра в файле отсутствуют, стек не восстановить.
+			if (!rr->caller_func)
+				VM_ERROR("Failed to load VM image: сейв сделан сборкой без "
+				         "поддержки кадров движка в стеке — пересохранитесь");
 			int fno = ain_get_function(ain, rr->caller_func);
 			if (fno < 0)
 				VM_ERROR("Failed to load VM image: function '%s' not found", display_sjis0(rr->caller_func));
+			// Голое имя из сейва старой сборки у перегруженной функции
+			// разрешилось в первую перегрузку — подбираем по CRC (он
+			// однозначно указывает нужную). ain_get_function уже отрезал
+			// `#N`, так что rr->caller_func здесь — базовое имя.
+			if (ain->functions[fno].crc != rr->crc) {
+				char buf[512];
+				for (int n = 0; ; n++) {
+					snprintf(buf, sizeof(buf), "%s#%d", rr->caller_func, n);
+					int cand = ain_get_function(ain, buf);
+					if (cand < 0)
+						break;
+					if (ain->functions[cand].crc == rr->crc) {
+						fno = cand;
+						break;
+					}
+				}
+			}
 			if (ain->functions[fno].crc != rr->crc)
 				VM_ERROR("Failed to load VM image: CRC mismatch for function '%s'", display_sjis0(rr->caller_func));
 			call_stack[call_stack_ptr++] = (struct function_call) {
@@ -774,7 +875,11 @@ static void load_rsave_call_stack(struct rsave *save)
 			};
 			// Calculate return address from the function address and offset
 			// to make it robust to ain changes.
-			return_address = ain->functions[fno].address + rr->local_addr;
+			// -2 — кадр движка (vm_call): возврат в VM_RETURN, не в байткод.
+			if (rr->local_addr == -2)
+				return_address = -1;
+			else
+				return_address = ain->functions[fno].address + rr->local_addr;
 		}
 		if (++rr == save->return_records + save->nr_return_records)
 			rr = &save->ip;
@@ -846,6 +951,7 @@ static void load_json_image(const char *key, const char *path)
 	} else {
 		heap_next_seq = heap_size;
 	}
+	vm_image_generation++;
 	cJSON_Delete(save);
 }
 
@@ -863,6 +969,15 @@ static enum savefile_error load_rsave_image(const char *key, const char *path)
 	load_rsave_call_stack(save);
 	load_rsave_stack(save);
 	rsave_free(save);
+	vm_image_generation++;
+	// Диагностика: XSYS4_HEAP_WATCH_AFTER_LOAD=<slot> — вотч на слот
+	// ВОССТАНОВЛЕННОЙ кучи (обычный XSYS4_HEAP_WATCH зашумляет лог жизнью
+	// слота до загрузки — номера переиспользуются).
+	{
+		const char *w = getenv("XSYS4_HEAP_WATCH_AFTER_LOAD");
+		if (w && *w)
+			heap_watch_slot_set(atoi(w));
+	}
 	return SAVEFILE_SUCCESS;
 }
 

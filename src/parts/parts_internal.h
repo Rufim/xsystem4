@@ -798,6 +798,12 @@ struct parts_controller_stack {
 	int stack[PARTS_CONTROLLER_STACK_MAX + 1];
 };
 extern struct parts_controller_stack ctrl_stack;
+
+// hll/PartsEngine.c: реестр активностей в сейв-образе партов (XPE v5).
+struct iarray_writer;
+struct iarray_reader;
+void pe_activities_save(struct iarray_writer *w);
+bool pe_activities_load(struct iarray_reader *r, bool apply);
 extern bool parts_multi_controller;
 
 struct parts *parts_try_get(int parts_no);

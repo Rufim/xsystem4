@@ -554,7 +554,16 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 				return vm_int(slot);
 			}
 			struct gsave_flat_array *fa = array->flat_arrays;
-			enum ain_data_type elem = fa->nr_values ? fa->values[0].type : fa->type;
+			// ПУСТОЙ generic-массив живёт NULL-страницей (variable_initval:
+			// типизированная страница материализуется первым PushBack по
+			// объявлению сайта). Пустая страница с придуманным типом ломала
+			// игру: у array<структура> без элементов struct_type неоткуда
+			// взять, и после загрузки код звука падал на Out of bounds.
+			if (!fa->nr_values) {
+				heap[slot].page = NULL;
+				return vm_int(slot);
+			}
+			enum ain_data_type elem = fa->values[0].type;
 			enum ain_data_type container;
 			int elem_struct = -1;
 			switch (elem) {

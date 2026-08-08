@@ -1241,7 +1241,7 @@ static void system_call(enum syscall_code code)
 		union vm_value *success = stack_pop_var();
 		struct string *filename = stack_peek_string(0);
 		struct string *keyname = stack_peek_string(1);
-		success->i = vm_save_image(keyname->text, filename->text);
+		success->i = vm_save_image(keyname->text, filename->text, false);
 		heap_unref(stack_pop().i);
 		heap_unref(stack_pop().i);
 		stack_push(1);

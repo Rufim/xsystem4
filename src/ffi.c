@@ -545,6 +545,7 @@ void hll_call(int libno, int fno, int elem_class)
 		NOTICE("ARR %s consumed %d slots (sp %d->%d)", f->name, dbg_sp0 - stack_ptr, dbg_sp0, stack_ptr);
 
 	union vm_value r;
+	uint32_t image_generation = vm_image_generation;
 	if (lenient_noop) {
 		r.i = 0;
 		if (f->return_type.data == AIN_STRING)
@@ -566,6 +567,17 @@ void hll_call(int libno, int fno, int elem_class)
 		hll_current_fn = saved_fn;
 	}
 
+	/*
+	 * ResumeLoad подменил ВЕСЬ VM-образ (кучу, оба стека): номера слотов
+	 * аргументов этого вызова принадлежат СТАРОМУ миру — их финализация и
+	 * write-back'и били бы по чужим слотам новой кучи (double free слота 1
+	 * сразу после загрузки сейва), а push возврата ломал бы восстановленный
+	 * стек: возврат «0 = мы из загрузки» уже лежит в снимке (см.
+	 * save_stack_to_rsave). CALLSYS-путь ведёт себя так же: RESUME_LOAD
+	 * не делает unref аргументов.
+	 */
+	if (image_generation != vm_image_generation)
+		return;
 
 	for (int i = 0, j = 0; i < f->nr_arguments; i++, j++) {
 		// XXX: We don't increase the ref count when passing ref arguments to HLL

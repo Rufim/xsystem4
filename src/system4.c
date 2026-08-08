@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <getopt.h>
+#include <signal.h>
 #include <time.h>
 #include <math.h>
 #include <limits.h>
@@ -470,6 +471,11 @@ enum {
 #endif
 };
 
+static void handle_sigusr1(possibly_unused int sig)
+{
+	vm_stack_trace();
+}
+
 static void error_handler(const char *msg)
 {
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "xsystem4", msg, NULL);
@@ -657,5 +663,9 @@ int main(int argc, char *argv[])
 		set_msgskip_delay(ain, config.msgskip_delay);
 	asset_manager_init();
 	dbg_init(debug_info_path);
+	// Диагностика зависаний: kill -USR1 <pid> печатает стек вызовов ИГРЫ
+	// (vm_stack_trace) без остановки процесса. Печать из сигнала не
+	// async-safe, но для отладочного среза этого достаточно.
+	signal(SIGUSR1, handle_sigusr1);
 	sys_exit(vm_execute_ain(ain));
 }

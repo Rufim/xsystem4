@@ -224,7 +224,7 @@ static inline float get_argument_float(int n)
 uint32_t get_switch_address(int no, int val);
 uint32_t get_strswitch_address(int no, struct string *str);
 
-int vm_save_image(const char *key, const char *path);
+int vm_save_image(const char *key, const char *path, bool hll_convention);
 void vm_load_image(const char *key, const char *path);
 struct page *vm_load_image_comments(const char *key, const char *path, int *success);
 int vm_write_image_comments(const char *key, const char *path, struct page *comments);

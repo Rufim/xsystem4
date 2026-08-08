@@ -77,6 +77,25 @@ static int SystemService_GetPlatformType(void)
 }
 
 /*
+ * Хук закрытия приложения: у оригинала при HookCloseApp=true крестик окна не
+ * закрывает игру сразу, а отдаёт событие игре (диалог «выйти?»). Наш движок
+ * обрабатывает закрытие сам, поэтому честно храним только сам флаг — игра
+ * ставит/снимает его в пост-загрузочном восстановлении (ロード後復帰処理),
+ * и без функции загрузка сейва валилась фатальной Unimplemented.
+ */
+static bool hook_close_app = false;
+
+static void SystemService_SetHookCloseApp(bool hook)
+{
+	hook_close_app = hook;
+}
+
+static bool SystemService_IsHookCloseApp(void)
+{
+	return hook_close_app;
+}
+
+/*
  * Анти-тамппер: `main` сверяет строку версии рантайма System4 по фиксированным
  * позициям — склеивает несколько `String.GetPart(v, index, len)` и сравнивает со
  * своей строковой константой, а рядом требует `ToInt(v[i]) == ToInt(v[j])`. Не
@@ -959,6 +978,8 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(SetMixerMute, mixer_set_mute),
 	    HLL_EXPORT(GetGameVersion, SystemService_GetGameVersion),
 	    HLL_EXPORT(GetPlatformType, SystemService_GetPlatformType),
+	    HLL_EXPORT(SetHookCloseApp, SystemService_SetHookCloseApp),
+	    HLL_EXPORT(IsHookCloseApp, SystemService_IsHookCloseApp),
 	    HLL_EXPORT(GetGameVersionByText, SystemService_GetGameVersionByText),
 	    HLL_EXPORT(GetGameName, SystemService_GetGameName),
 	    HLL_EXPORT(AddURLMenu, SystemService_AddURLMenu),

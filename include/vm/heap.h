@@ -53,6 +53,7 @@ extern struct vm_pointer *heap;
 extern size_t heap_size;
 
 void heap_init(void);
+extern uint32_t vm_image_generation;
 void heap_delete(void);
 void heap_grow(size_t new_size);
 

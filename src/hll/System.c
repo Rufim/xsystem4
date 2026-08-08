@@ -41,7 +41,7 @@
 #include "hll.h"
 
 /* Declared under VM_PRIVATE in vm.h; re-declare for the HLL wrappers. */
-int vm_save_image(const char *key, const char *path);
+int vm_save_image(const char *key, const char *path, bool hll_convention);
 void vm_load_image(const char *key, const char *path);
 struct page *vm_load_image_comments(const char *key, const char *path, int *success);
 int vm_write_image_comments(const char *key, const char *path, struct page *comments);
@@ -208,7 +208,7 @@ static bool System_BackupSaveFile(struct string *dst, struct string *src)
 
 static bool System_ResumeSave(struct string *key, struct string *filename, void *out)
 {
-	int r = vm_save_image(key->text, filename->text);
+	int r = vm_save_image(key->text, filename->text, true);
 	/*
 	 * У новых игр (Ixseal v14) третий аргумент — `wrap<int> result`,
 	 * out-параметр (ffi отдаёт указатель на значение): gamesave::detail::

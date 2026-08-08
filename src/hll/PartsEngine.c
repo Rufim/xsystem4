@@ -37,6 +37,7 @@
 #include "input.h"
 #include "xsystem4.h"
 #include "hll.h"
+#include "iarray.h"
 
 static void PartsEngine_ModuleInit(void)
 {
@@ -650,6 +651,28 @@ static void PE_GetTextBoxFontProperty(int no, int *type, int *size, int *r, int 
 	{ tb_get_font_property(no, false, type, size, r, g, b, bold, er, eg, eb, ew); }
 static void PE_SetTextBoxText(int no, struct string *s) { tb_set_text(no, false, s); }
 static void PE_GetTextBoxText(int no, struct string **s) { tb_get_text(no, false, s); }
+
+/*
+ * Одноаргументная форма — `string GetTextBoxText(int)` (Haha Ranman; у
+ * Tsumamigui 3 та же функция объявлена out-параметром `(int, ref string)`).
+ * Формы различаются ТОЛЬКО арностью, линковка по имени вела 1-арговую в
+ * out-параметровую: `s` приходил мусорным регистром, а в возврат уходил void —
+ * так комментарий сейва «вводился, но не сохранялся» (Ｐ＿テキストボックス＿
+ * テキスト取得 отдавал пустоту/мусор).
+ */
+static struct string *PE_GetTextBoxText1(int no)
+{
+	struct string *s = NULL;
+	tb_get_text(no, false, &s);
+	return s;
+}
+
+static struct string *PE_GetMultiTextBoxText1(int no)
+{
+	struct string *s = NULL;
+	tb_get_text(no, true, &s);
+	return s;
+}
 static void PE_SetTextBoxMaxTextLength(int no, int len) { tb_set_max_length(no, false, len); }
 static int PE_GetTextBoxMaxTextLength(int no) { return tb_get_max_length(no, false); }
 static void PE_SetTextBoxSelectColor(int no, int r, int g, int b) { tb_set_select_color(no, false, r, g, b); }
@@ -1353,6 +1376,9 @@ static struct pe_activity *pe_act_find(struct string *name)
 static void PE_Activity_free(void *p)
 {
 	struct pe_activity *a = p;
+	// ht_foreach_value обходит и пустые слоты (value == NULL).
+	if (!a)
+		return;
 	for (int i = 0; i < a->nr_parts; i++) {
 		free_string(a->parts[i].name);
 		for (int j = 0; j < a->parts[i].nr_intent_dests; j++)
@@ -1378,6 +1404,144 @@ static bool PE_CreateActivity(struct string *name)
 	if (getenv("XSYS4_ACT_TRACE"))
 		NOTICE("ACT CreateActivity(name='%s')", display_sjis0(name->text));
 	return true;
+}
+
+/*
+ * --- Сериализация активностей в сейв-образ партов (XPE v5) ---
+ *
+ * Оригинальный PartsEngine.dll хранит реестр активностей в своём сейв-образе:
+ * после загрузки сейва игра сразу спрашивает GetActivityPartsNumber
+ * («ルートパーツ» и др.) — без реестра CActivityWrap ассертил (nonnull) m_root,
+ * и загрузка «завершалась чёрным экраном».
+ */
+struct pe_act_save_ctx { struct iarray_writer *w; int n; };
+
+static void pe_act_count_cb(struct ht_slot *slot, void *data)
+{
+	if (slot->value)
+		(*(int*)data)++;
+}
+
+static void pe_act_write_cb(struct ht_slot *slot, void *data)
+{
+	struct iarray_writer *w = data;
+	struct pe_activity *a = slot->value;
+	if (!a)
+		return;
+	struct string *name = cstr_to_string(slot->key);
+	iarray_write_string(w, name);
+	free_string(name);
+	iarray_write(w, a->nr_parts);
+	for (int i = 0; i < a->nr_parts; i++) {
+		struct pe_act_part *p = &a->parts[i];
+		iarray_write_string(w, p->name);
+		iarray_write(w, p->number);
+		iarray_write(w, p->intent_type);
+		iarray_write(w, p->nr_intent_dests);
+		for (int j = 0; j < p->nr_intent_dests; j++)
+			iarray_write_string(w, p->intent_dests[j]);
+	}
+	iarray_write_string_or_null(w, a->ex_text);
+	iarray_write(w, a->ex_id);
+	iarray_write(w, a->nr_end_keys);
+	for (int i = 0; i < a->nr_end_keys; i++)
+		iarray_write(w, a->end_keys[i]);
+}
+
+void pe_activities_save(struct iarray_writer *w)
+{
+	int n = 0;
+	if (pe_activities)
+		ht_foreach(pe_activities, pe_act_count_cb, &n);
+	iarray_write(w, n);
+	if (pe_activities)
+		ht_foreach(pe_activities, pe_act_write_cb, w);
+}
+
+bool pe_activities_load(struct iarray_reader *r, bool apply)
+{
+	int n = iarray_read(r);
+	if (n < 0 || n > 100000) {
+		WARNING("сейв-образ партов: битое число активностей %d", n);
+		return false;
+	}
+	if (apply && pe_activities) {
+		ht_foreach_value(pe_activities, PE_Activity_free);
+		ht_free(pe_activities);
+		pe_activities = NULL;
+	}
+	for (int i = 0; i < n; i++) {
+		struct string *name = iarray_read_string(r);
+		int nr_parts = iarray_read(r);
+		if (nr_parts < 0 || nr_parts > 100000 || r->error) {
+			WARNING("сейв-образ партов: битая активность");
+			free_string(name);
+			return false;
+		}
+		struct pe_activity *a = NULL;
+		if (apply) {
+			PE_CreateActivity(name);
+			a = pe_act_find(name);
+			a->parts = xcalloc(nr_parts ? nr_parts : 1, sizeof(struct pe_act_part));
+			a->nr_parts = nr_parts;
+		}
+		for (int j = 0; j < nr_parts; j++) {
+			struct string *pn = iarray_read_string(r);
+			int number = iarray_read(r);
+			int intent_type = iarray_read(r);
+			int nr_dests = iarray_read(r);
+			if (nr_dests < 0 || nr_dests > 10000 || r->error) {
+				free_string(pn);
+				free_string(name);
+				return false;
+			}
+			struct string **dests = NULL;
+			if (apply && nr_dests)
+				dests = xcalloc(nr_dests, sizeof(struct string*));
+			for (int k = 0; k < nr_dests; k++) {
+				struct string *d = iarray_read_string(r);
+				if (dests)
+					dests[k] = d;
+				else
+					free_string(d);
+			}
+			if (a) {
+				a->parts[j].name = pn;
+				a->parts[j].number = number;
+				a->parts[j].intent_type = intent_type;
+				a->parts[j].intent_dests = dests;
+				a->parts[j].nr_intent_dests = nr_dests;
+			} else {
+				free_string(pn);
+			}
+		}
+		struct string *ex_text = iarray_read_string_or_null(r);
+		int ex_id = iarray_read(r);
+		int nr_end_keys = iarray_read(r);
+		if (nr_end_keys < 0 || nr_end_keys > 1000 || r->error) {
+			free_string(name);
+			if (ex_text) free_string(ex_text);
+			return false;
+		}
+		int *keys = NULL;
+		if (a && nr_end_keys)
+			keys = xcalloc(nr_end_keys, sizeof(int));
+		for (int k = 0; k < nr_end_keys; k++) {
+			int v = iarray_read(r);
+			if (keys)
+				keys[k] = v;
+		}
+		if (a) {
+			a->ex_text = ex_text;
+			a->ex_id = ex_id;
+			a->end_keys = keys;
+			a->nr_end_keys = nr_end_keys;
+		} else if (ex_text) {
+			free_string(ex_text);
+		}
+		free_string(name);
+	}
+	return !r->error;
 }
 
 static bool PE_IsExistActivity(struct string *name)
@@ -4305,6 +4469,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetTextBoxFontProperty, PE_SetTextBoxFontProperty),
 	    HLL_EXPORT(GetTextBoxFontProperty, PE_GetTextBoxFontProperty),
 	    HLL_EXPORT(SetTextBoxText, PE_SetTextBoxText),
+	    HLL_EXPORT_N(GetTextBoxText, 1, PE_GetTextBoxText1),
 	    HLL_EXPORT(GetTextBoxText, PE_GetTextBoxText),
 	    HLL_EXPORT(SetTextBoxMaxTextLength, PE_SetTextBoxMaxTextLength),
 	    HLL_EXPORT(GetTextBoxMaxTextLength, PE_GetTextBoxMaxTextLength),
@@ -4359,6 +4524,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetMultiTextBoxFontProperty, PE_SetMultiTextBoxFontProperty),
 	    HLL_EXPORT(GetMultiTextBoxFontProperty, PE_GetMultiTextBoxFontProperty),
 	    HLL_EXPORT(SetMultiTextBoxText, PE_SetMultiTextBoxText),
+	    HLL_EXPORT_N(GetMultiTextBoxText, 1, PE_GetMultiTextBoxText1),
 	    HLL_EXPORT(GetMultiTextBoxText, PE_GetMultiTextBoxText),
 	    HLL_EXPORT(SetMultiTextBoxMaxTextLength, PE_SetMultiTextBoxMaxTextLength),
 	    HLL_EXPORT(GetMultiTextBoxMaxTextLength, PE_GetMultiTextBoxMaxTextLength),
