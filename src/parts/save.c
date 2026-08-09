@@ -22,7 +22,7 @@
 #include "parts_internal.h"
 #include "../hll/iarray.h"
 
-#define CURRENT_SAVE_VERSION 7
+#define CURRENT_SAVE_VERSION 8
 
 // Насколько глубоко уводится снимок бэк-сцены под UI вьювера (см. load_parts).
 #define BACK_SCENE_Z_SHIFT 1000000
@@ -687,6 +687,39 @@ static void save_parts(struct iarray_writer *w, struct parts *parts)
 	// version 4: независимые флаги зеркалирования (SetComponentReverseLR/TB, v14)
 	iarray_write(w, parts->reverse_lr);
 	iarray_write(w, parts->reverse_tb);
+	/*
+	 * v8: ВИД КОМПОНЕНТА. У движка кнопка, чекбокс, полосы прокрутки и
+	 * `ユーザコンポーネント` — не вид отрисовки, а ФЛАГИ на обычной части
+	 * (см. PE_SetComponentType), и только по ним `PE_GetComponentType` отдаёт
+	 * игре 0/1/2/3/17. В образ они не входили, и после загрузки часть теряла
+	 * свой вид: `GetComponentType` вместо 17 возвращал вид отрисовки.
+	 *
+	 * Отсюда шли ПУСТЫЕ СЛОТЫ ЭКРАНА SAVE после загрузки. Разрушение активности
+	 * (`AFL_Activity_Release` и `CActivity@ReleaseActivity`) начинается с обхода
+	 * дерева партов `CallUserComponentEventWithChild`: он снимает регистрацию
+	 * лишь с тех частей, у которых `GetComponentType == 17`. После загрузки таких
+	 * не находилось (замер: 286 обходов, 0 вызовов `RemoveUserComponent`), и
+	 * список `CUserComponentManager.userComponentList` — он приходит из образа VM
+	 * и потому помнит компоненты экрана, открытого в момент сохранения —
+	 * оставался грязным. На следующем открытии SAVE `SetComponent` ищет в нём
+	 * совпадение по паре (имя активности, имя части), находит старую запись и
+	 * пропускает регистрацию с 「既に登録済みのユーザコンポーネント…」 — карточки
+	 * слотов не строятся вовсе.
+	 */
+	iarray_write(w, parts->is_button);
+	iarray_write(w, parts->is_checkbox);
+	iarray_write(w, parts->is_vscrollbar);
+	iarray_write(w, parts->is_hscrollbar);
+	iarray_write(w, parts->is_user_component);
+	// Имя класса компонента и его «ключ→значение»: игра читает их у части
+	// (`CUserComponentParts@ComponentName::get`, `@GetTextData`), чтобы найти
+	// зарегистрированный класс. Обход выше берёт имя через GetUserComponentName.
+	iarray_write_string_or_null(w, parts->user_component_name);
+	iarray_write(w, parts->nr_user_component_data);
+	for (int i = 0; i < parts->nr_user_component_data; i++) {
+		iarray_write_string_or_null(w, parts->user_component_data[i].key);
+		iarray_write_string_or_null(w, parts->user_component_data[i].value);
+	}
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and save unconditionally
 	if (parts_multi_controller) {
@@ -769,6 +802,62 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 	if (version > 3) {
 		parts->reverse_lr = iarray_read(r);
 		parts->reverse_tb = iarray_read(r);
+	}
+	// v8: вид компонента (кнопка/чекбокс/полосы/`ユーザコンポーネント`) — см.
+	// комментарий в save_parts. Сейвы прежних сборок читаются как есть: флагов в
+	// них нет, и часть остаётся без вида — то самое поведение, что было до правки.
+	if (version >= 8) {
+		// Откат для замеров A/B на одном бинаре: поля читаются всегда (иначе
+		// собьётся поток), но не применяются — поведение сборок до v8.
+		bool apply_ctype = !getenv("XSYS4_NO_CTYPE_RESTORE");
+		int f_button = iarray_read(r);
+		int f_checkbox = iarray_read(r);
+		int f_vscroll = iarray_read(r);
+		int f_hscroll = iarray_read(r);
+		int f_uc = iarray_read(r);
+		if (apply_ctype) {
+			parts->is_button = f_button;
+			parts->is_checkbox = f_checkbox;
+			parts->is_vscrollbar = f_vscroll;
+			parts->is_hscrollbar = f_hscroll;
+			parts->is_user_component = f_uc;
+		}
+		struct string *uc_name = iarray_read_string_or_null(r);
+		if (apply_ctype) {
+			if (parts->user_component_name)
+				free_string(parts->user_component_name);
+			parts->user_component_name = uc_name;
+		} else if (uc_name) {
+			free_string(uc_name);
+		}
+		int nr_uc = iarray_read(r);
+		if (nr_uc < 0 || nr_uc > 100000) {
+			WARNING("сейв-образ партов: битый список данных user-компонента (%d)", nr_uc);
+			nr_uc = 0;
+		}
+		if (apply_ctype) {
+			for (int i = 0; i < parts->nr_user_component_data; i++) {
+				if (parts->user_component_data[i].key)
+					free_string(parts->user_component_data[i].key);
+				if (parts->user_component_data[i].value)
+					free_string(parts->user_component_data[i].value);
+			}
+			free(parts->user_component_data);
+			parts->user_component_data = nr_uc
+				? xcalloc(nr_uc, sizeof(*parts->user_component_data)) : NULL;
+			parts->nr_user_component_data = nr_uc;
+		}
+		for (int i = 0; i < nr_uc; i++) {
+			struct string *k = iarray_read_string_or_null(r);
+			struct string *v = iarray_read_string_or_null(r);
+			if (apply_ctype) {
+				parts->user_component_data[i].key = k;
+				parts->user_component_data[i].value = v;
+			} else {
+				if (k) free_string(k);
+				if (v) free_string(v);
+			}
+		}
 	}
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
