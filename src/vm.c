@@ -3776,6 +3776,35 @@ static enum opcode execute_instruction(enum opcode opcode)
 				struct_page_slot(),
 				(cf >= 0 && cf < ain->nr_functions) ? ain->functions[cf].name : "?");
 		}
+		/*
+		 * XSYS4_DG_BIG=<N> — назвать РАЗДУТЫЕ делегаты: тип, число подписчиков и
+		 * функция-источник, по разу на тип. В отличие от XSYS4_DG_WATCH тут не надо
+		 * знать номер типа заранее — ручка сама находит те, где подписчиков от N.
+		 * Нужна, когда рассылка события съедает секунды: список подписчиков растёт
+		 * от прогона к прогону (дубликаты подписок), и обход становится O(n²).
+		 */
+		{
+			static int dg_big = -1;
+			static bool dg_big_seen[4096];
+			if (dg_big == -1) {
+				const char *e = getenv("XSYS4_DG_BIG");
+				dg_big = (e && *e) ? atoi(e) : 0;
+			}
+			if (dg_big > 0 && dg_no < 4096 && !dg_big_seen[dg_no]) {
+				struct page *p = (dg_page > 0 && heap_index_valid(dg_page))
+					? heap[dg_page].page : NULL;
+				int numof = (p && p->type == DELEGATE_PAGE)
+					? p->nr_vars / DG_ENTRY_SLOTS : -1;
+				if (numof >= dg_big) {
+					dg_big_seen[dg_no] = true;
+					int cf = call_stack[call_stack_ptr-1].fno;
+					WARNING("DGBIG делегат '%s' (тип %d): подписчиков %d, вызов из %s",
+						dg->name ? dg->name : "?", dg_no, numof,
+						(cf >= 0 && cf < ain->nr_functions)
+							? display_sjis0(ain->functions[cf].name) : "?");
+				}
+			}
+		}
 		for (int i = 0; i < dg->nr_arguments; i++) {
 			int pos = (stack_ptr - dg->nr_arguments) + i;
 			stack[pos-1] = stack[pos];

@@ -1696,6 +1696,24 @@ struct page *delegate_append(struct page *dst, int obj, int fun, int env)
 	dst->values[dst->nr_vars+3].i = env;
 	delegate_env_ref(env);
 	dst->nr_vars += DG_ENTRY_SLOTS;
+	/*
+	 * XSYS4_DG_GROW=<шаг> — СТЕК ИГРЫ на каждом кратном шаге длины списка
+	 * подписчиков. Отвечает на «кто подписывается тысячами»: рассылка такого
+	 * делегата обходит всех, и удаление части начинает стоить секунды
+	 * (живой случай — `DG_DeletedHandler` у Haha Ranman, 8379 подписчиков).
+	 */
+	{
+		static int step = -1;
+		if (step == -1) {
+			const char *e = getenv("XSYS4_DG_GROW");
+			step = (e && *e) ? atoi(e) : 0;
+		}
+		int n = dst->nr_vars / DG_ENTRY_SLOTS;
+		if (step > 0 && n % step == 0) {
+			WARNING("DGGROW подписчиков стало %d (fun %d) — стек вызовов игры:", n, fun);
+			vm_stack_trace();
+		}
+	}
 	return dst;
 }
 
@@ -1710,6 +1728,36 @@ static void delegate_remove_slot(struct page *page, int i)
 	page->nr_vars -= DG_ENTRY_SLOTS;
 }
 
+/*
+ * Сборка мусора в списке подписчиков ЗА ОДИН ПРОХОД: живые записи уплотняются к
+ * началу, мёртвые (объект умер — `seq` не совпадает) отбрасываются.
+ *
+ * ★Было по-другому: каждая мёртвая запись снималась `delegate_remove_slot`, а он
+ * сдвигает ВЕСЬ ХВОСТ, то есть чистка стоила O(n²). На длинных списках это
+ * превращалось в фриз: у Haha Ranman `DG_DeletedHandler` набирает тысячи
+ * подписчиков (обёртки частей живут один кадр, а записи остаются до ближайшего
+ * обхода — замер `XSYS4_DG_BIG`: 8379), и снятие компонентов после загрузки
+ * вставало на десятки секунд — `SLOW 39832 ms Array.Erase <-
+ * CUserComponentManager@RemoveComponent`, 15 стеков подряд в
+ * `CPartsFunctionSet@CallFunctionDeleted`. Уплотнение делает ту же работу за O(n).
+ */
+static void delegate_compact(struct page *page)
+{
+	int w = 0;
+	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
+		if (heap_get_seq(page->values[i].i) != page->values[i+2].i) {
+			delegate_env_unref(page->values[i+3].i);
+			continue;
+		}
+		if (w != i) {
+			for (int k = 0; k < DG_ENTRY_SLOTS; k++)
+				page->values[w+k].i = page->values[i+k].i;
+		}
+		w += DG_ENTRY_SLOTS;
+	}
+	page->nr_vars = w;
+}
+
 int delegate_numof(struct page *page)
 {
 	if (!page)
@@ -1717,13 +1765,7 @@ int delegate_numof(struct page *page)
 	if (page->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
 
-	// garbage collection
-	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
-		if (heap_get_seq(page->values[i].i) != page->values[i+2].i) {
-			delegate_remove_slot(page, i);
-			i -= DG_ENTRY_SLOTS;
-		}
-	}
+	delegate_compact(page);
 	return page->nr_vars / DG_ENTRY_SLOTS;
 }
 
@@ -1797,6 +1839,11 @@ bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out, int *env
 		return false;
 	if (page->type != DELEGATE_PAGE)
 		VM_ERROR("Not a delegate");
+	// ★Мёртвые записи снимаем ОДНИМ проходом в начале обхода, а не по одной на
+	// каждом шаге: `delegate_remove_slot` сдвигает весь хвост, и на списке из
+	// тысяч подписчиков чистка выходила квадратичной (см. delegate_compact).
+	if (i == 0)
+		delegate_compact(page);
 	while (i*DG_ENTRY_SLOTS < page->nr_vars) {
 		int at = i * DG_ENTRY_SLOTS;
 		if (heap_get_seq(page->values[at].i) == page->values[at+2].i) {
