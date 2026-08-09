@@ -4478,3 +4478,63 @@ bool PE_ReleaseParts3DLayerPluginID(int parts_no, int state)
 	}
 	return true;
 }
+
+/*
+ * Часть ПЕРЕЖИЛА свой слой, и игра к ней снова обратилась — переносим её вместе
+ * с поддеревом на слой, который сейчас активен.
+ *
+ * Зачем: у частей мёртвого слоя ключ сортировки — 0 (см. parts_get_sprite_z),
+ * то есть они уходят ПОД ВСЁ и на экране их не видно. Для брошенного экрана это
+ * ровно то, что нужно, а вот окно реплик ADV игра переиспользует между сценами:
+ * номера частей она помнит с пролога и продолжает слать в них
+ * SetMessageWindowText. Симптом — диалог после фазы Hustling: имя персонажа и
+ * кнопки есть, реплики нет; замер показывал, что игра текст ПОДАЁТ
+ * (`MWTEXT part=90000088 msg=101 raw='О, привет, Порно…'`), а часть висит на
+ * `ctrl=4` при стеке `0 19`.
+ *
+ * Переносим ТОЛЬКО по явному обращению — те части, которых игра больше не
+ * трогает, так и остаются под всем.
+ */
+void parts_adopt_to_active_layer(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	if (ctrl_stack_pos(parts->controller_no) >= 0)
+		return;   // слой жив — трогать нечего
+	int active = ctrl_stack.active;
+	if (ctrl_stack_pos(active) < 0)
+		return;
+	if (getenv("XSYS4_ADOPT_TRACE"))
+		NOTICE("ADOPT part=%d: слой %d мёртв -> %d", parts_no,
+		       parts->controller_no, active);
+	/*
+	 * Поддерево целиком: у окна реплик это подложка, текст и маркер «дальше».
+	 * ★Сначала СОБИРАЕМ, потом переносим: parts_list_resort переставляет часть в
+	 * том же списке, по которому идёт обход, и правка на лету уводила итерацию —
+	 * окно переезжало, а его текст оставался на мёртвом слое (видно дампом:
+	 * `90000088 ctrl=19`, а `90000089 ctrl=4`).
+	 */
+	int *moved = NULL;
+	int nr_moved = 0;
+	struct parts *p;
+	PARTS_LIST_FOREACH(p) {
+		for (struct parts *anc = p; anc; anc = anc->parent) {
+			if (anc->no != parts_no)
+				continue;
+			moved = xrealloc_array(moved, nr_moved, nr_moved + 1, sizeof(int));
+			moved[nr_moved++] = p->no;
+			break;
+		}
+	}
+	for (int i = 0; i < nr_moved; i++) {
+		struct parts *q = parts_try_get(moved[i]);
+		if (!q)
+			continue;
+		q->controller_no = active;
+		parts_list_resort(q);
+	}
+	free(moved);
+	parts->controller_no = active;
+	parts_list_resort(parts);
+}

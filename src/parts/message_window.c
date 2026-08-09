@@ -48,8 +48,14 @@ static struct parts_message_window *mw_get(int parts_no)
  * окну, которого нет, — это НЕ «игра ошиблась», а «движок не опознал узел».
  * Молчать нельзя: тихий no-op превратился бы в пустое окно без единой жалобы.
  */
+void parts_adopt_to_active_layer(int parts_no);
+
 static struct parts_message_window *mw_require(int parts_no, const char *fn)
 {
+	// Игра переиспользует окно реплик между сценами: если его слой уже снесён,
+	// поднимаем окно на актуальный (иначе оно уходит под фон, см.
+	// parts_adopt_to_active_layer).
+	parts_adopt_to_active_layer(parts_no);
 	struct parts_message_window *mw = mw_get(parts_no);
 	if (!mw) {
 		static bool warned = false;
