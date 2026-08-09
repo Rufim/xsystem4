@@ -358,10 +358,32 @@ void parts_do_layout(struct parts *parts)
 	int align_x = align_offset_x(align, total_w);
 	int align_y = align_offset_y(align, total_h);
 
+	/*
+	 * `cur_x`/`cur_y` — ВЕДУЩИЙ КРАЙ потока: левый при выравнивании влево,
+	 * правый при выравнивании вправо. У левого и правого `origin_x - align_x`
+	 * даёт ровно его (align_x там 0 и −total соответственно), а вот при
+	 * ЦЕНТРИРУЮЩЕМ выравнивании (2·5·8 по X, 4·5·6 по Y) та же формула
+	 * сдвигала начало на пол-контента — как будто у бокса один ребёнок,
+	 * которого и надо отцентрировать. Поток должен начинаться с края
+	 * контента, а центрирование — приходиться на КАЖДОГО ребёнка отдельно
+	 * (см. `mx`/`my` ниже: там прибавляется половина его ширины/высоты).
+	 *
+	 * Живой случай — счётчик вариантов на экране просмотра CG Haha Ranman
+	 * (`ＣＧモード／閲覧`, бокс с `配置 = 2` и `原点座標モード = 9` в точке
+	 * 1270,710). При `2 / 10` части выходили на 1228..1246 · 1246..1264 ·
+	 * 1249..1285: слэш ложился на первую цифру знаменателя, а хвост уезжал
+	 * за правый край экрана. С правкой — 1204..1222 · 1218..1236 · 1234..1270,
+	 * то есть контент ровно упирается правым краем в точку привязки.
+	 * Откат для замеров: XSYS4_NO_CENTER_LAYOUT_FIX=1.
+	 */
+	bool center_fix = !getenv("XSYS4_NO_CENTER_LAYOUT_FIX");
+	bool center_x = center_fix && !is_left && !is_right;
+	bool center_y = center_fix && !is_top && !is_bottom;
+
 	int start_x = (is_left ? lb->padding_left : -lb->padding_right)
-		+ (origin_x - align_x);
+		+ (center_x ? origin_x : origin_x - align_x);
 	int start_y = (is_top ? lb->padding_top : -lb->padding_bottom)
-		+ (origin_y - align_y);
+		+ (center_y ? origin_y : origin_y - align_y);
 
 	int x_dir = is_right ? -1 : 1;
 	int y_dir = is_bottom ? -1 : 1;
@@ -401,9 +423,14 @@ void parts_do_layout(struct parts *parts)
 			}
 		}
 
-		// margin offset depends on alignment direction
-		int mx = is_left ? child->margin_left : is_right ? -child->margin_right : 0;
-		int my = is_top ? child->margin_top : is_bottom ? -child->margin_bottom : 0;
+		// margin offset depends on alignment direction; при центрирующем
+		// выравнивании бокс ставит ребёнку `origin_mode = align`, то есть его
+		// координата — СЕРЕДИНА, а не левый/верхний край: прибавляем половину
+		// собственного размера ребёнка (см. пояснение к start_x выше).
+		int mx = is_left ? child->margin_left : is_right ? -child->margin_right
+			: center_x ? child->margin_left + child_w / 2 : 0;
+		int my = is_top ? child->margin_top : is_bottom ? -child->margin_bottom
+			: center_y ? child->margin_top + child_h / 2 : 0;
 
 		int pos_x = cur_x + mx;
 		int pos_y = cur_y + my;
