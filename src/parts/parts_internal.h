@@ -1033,6 +1033,8 @@ void parts_flat_emitter_resolve_layer(
 
 // layoutbox.c
 void parts_do_layout(struct parts *parts);
+// Размер части-обёртки по прямоугольнику, который занимают её потомки.
+void parts_get_content_size(struct parts *parts, int *w, int *h);
 
 // message_window.c
 struct parts_message_window *parts_message_window_alloc(void);

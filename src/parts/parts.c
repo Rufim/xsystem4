@@ -615,6 +615,49 @@ void parts_recalculate_hitbox(struct parts *parts)
  * рамки-подсветки, которые обводят элемент, к которому относится подсказка,
  * не совпадали с этим элементом.
  */
+/*
+ * Часть-ЯКОРЬ: своего вида у неё нет (`w == h == 0`), но задан `原点座標モード` ≠ 1,
+ * и тогда точка привязки относится к её СОДЕРЖИМОМУ — весь поддеревом сдвигается
+ * так, чтобы указанный угол содержимого попал в заданную координату.
+ *
+ * Живой случай (пункт 17 доводки Dohna): панель `TP / ROOMS / TALENT / GARAGE`
+ * в правом верхнем углу экрана Garage. В раскладке `SceneGarage.x` это часть
+ * `GarageInfo` — `ユーザコンポーネント` в (1258, 19) с `原点座標モード = 3`
+ * (привязка по ПРАВОМУ краю). Своего размера у неё нет, содержимое приходит из
+ * отдельной активности `GarageInformation`, поэтому `calculate_offset` по её
+ * собственным нулям давал сдвиг 0, и панель уезжала вправо ровно на свою ширину:
+ * замер по розовой заливке — у оригинала панель занимает x 893–1250, у нас от неё
+ * оставался уголок 1255–1273, а ширина содержимого 362 ≈ величина промаха.
+ *
+ * ★Раскладочные боксы (`パーツタイプ = レイアウトボックス` с непустым типом) СЮДА НЕ
+ * ПОПАДАЮТ: у них тот же `原点座標モード` уже учитывает `parts_do_layout`
+ * (`align_offset_*`), и второй сдвиг был бы двойным счётом. В диалоге FEEL таких
+ * боксов с origin 7 и нулевым размером несколько — там всё считает раскладка.
+ */
+static Point parts_anchor_shift(struct parts *parts)
+{
+	if (!parts || parts->origin_mode == 1)
+		return (Point) { 0, 0 };
+	struct parts_state *state = &parts->states[parts->state];
+	if (state->common.w || state->common.h)
+		return (Point) { 0, 0 };
+	if (state->type == PARTS_LAYOUT_BOX
+			&& state->layout_box.layout_type != PARTS_LAYOUT_FREE)
+		return (Point) { 0, 0 };
+	int w = 0, h = 0;
+	parts_get_content_size(parts, &w, &h);
+	if (!w && !h)
+		return (Point) { 0, 0 };
+	return calculate_offset(parts->origin_mode, w, h);
+}
+
+// Точка, ОТ КОТОРОЙ отсчитываются потомки: позиция части плюс её сдвиг привязки.
+static Point parts_child_origin(struct parts *parts)
+{
+	Point shift = parts_anchor_shift(parts);
+	return (Point) { parts->global.pos.x + shift.x, parts->global.pos.y + shift.y };
+}
+
 static void parts_update_global_pos(struct parts *parts, Point parent_pos,
 		float parent_scale_x, float parent_scale_y)
 {
@@ -623,9 +666,10 @@ static void parts_update_global_pos(struct parts *parts, Point parent_pos,
 		parent_pos.y + (int)roundf(parts->local.pos.y * parent_scale_y)
 	};
 
+	Point child_origin = parts_child_origin(parts);
 	struct parts *child;
 	PARTS_FOREACH_CHILD(child, parts) {
-		parts_update_global_pos(child, parts->global.pos,
+		parts_update_global_pos(child, child_origin,
 				parts->global.scale.x, parts->global.scale.y);
 	}
 }
@@ -645,7 +689,7 @@ static float parts_parent_scale_y(struct parts *parts)
 static void parts_reposition_family(struct parts *parts)
 {
 	parts_update_global_pos(parts,
-			parts->parent ? parts->parent->global.pos : root_pos,
+			parts->parent ? parts_child_origin(parts->parent) : root_pos,
 			parts_parent_scale_x(parts), parts_parent_scale_y(parts));
 }
 
@@ -1475,6 +1519,13 @@ static void parts_update_component(struct parts *parts)
 {
 	if (parts->parent) {
 		parts_combine_params(&parts->parent->global, &parts->local, &parts->global);
+		// Позиция считается ДВУМЯ путями (здесь и в parts_update_global_pos), и
+		// сдвиг привязки родителя-якоря нужен в обоих: иначе один путь затирает
+		// другой при ближайшем UpdateComponent. Ровно на этом правка сперва и не
+		// подействовала — панель Garage осталась за кромкой.
+		Point shift = parts_anchor_shift(parts->parent);
+		parts->global.pos.x += shift.x;
+		parts->global.pos.y += shift.y;
 	}
 	if (parts_get_sprite_z(parts) != parts->sp.z
 			|| parts_get_sprite_z2(parts) != parts->sp.z2) {

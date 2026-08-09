@@ -168,7 +168,7 @@ static void parts_get_layout_size(struct parts *parts, int *w, int *h);
  * такого узла их расставляет не раскладка, а сама игра), поэтому берём
  * объединение `позиция + размер`.
  */
-static void parts_get_content_size(struct parts *parts, int *w, int *h)
+void parts_get_content_size(struct parts *parts, int *w, int *h)
 {
 	int max_x = 0, max_y = 0;
 	struct parts *child;
