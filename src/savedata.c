@@ -92,6 +92,67 @@ static int get_group_index(const char *name)
 
 static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, struct gsave *save);
 
+/*
+ * ТОЖДЕСТВО ОБЪЕКТОВ. Формат разворачивает каждую запись как ДЕРЕВО, поэтому
+ * объект, на который ссылаются два поля, без реестра сохранялся дважды и при
+ * загрузке становился ДВУМЯ разными объектами. Для мира Dohna это неверно:
+ * `receiver` делегата, контекст игры, сцены — общие узлы графа, и игра
+ * сравнивает их по тождеству.
+ *
+ * Две таблицы живут ровно одну операцию (save_struct_list / load_struct_list):
+ *   сохранение — heap-слот объекта → индекс записи,
+ *   загрузка   — индекс записи → heap-слот объекта.
+ * Регистрируем ДО заполнения полей: иначе цикл в графе уходит в бесконечную
+ * рекурсию (объект ссылается на себя через сцену).
+ */
+struct obj_rec_pair { int slot; int32_t rec; };
+static struct obj_rec_pair *save_obj_map;
+static int save_obj_nr;
+static struct obj_rec_pair *load_rec_map;
+static int load_rec_nr;
+
+static int32_t save_obj_lookup(int slot)
+{
+	for (int i = 0; i < save_obj_nr; i++) {
+		if (save_obj_map[i].slot == slot)
+			return save_obj_map[i].rec;
+	}
+	return -1;
+}
+
+static void save_obj_remember(int slot, int32_t rec)
+{
+	save_obj_map = xrealloc_array(save_obj_map, save_obj_nr, save_obj_nr + 1,
+	                              sizeof(*save_obj_map));
+	save_obj_map[save_obj_nr].slot = slot;
+	save_obj_map[save_obj_nr].rec = rec;
+	save_obj_nr++;
+}
+
+static int load_rec_lookup(int32_t rec)
+{
+	for (int i = 0; i < load_rec_nr; i++) {
+		if (load_rec_map[i].rec == rec)
+			return load_rec_map[i].slot;
+	}
+	return -1;
+}
+
+static void load_rec_remember(int32_t rec, int slot)
+{
+	load_rec_map = xrealloc_array(load_rec_map, load_rec_nr, load_rec_nr + 1,
+	                              sizeof(*load_rec_map));
+	load_rec_map[load_rec_nr].rec = rec;
+	load_rec_map[load_rec_nr].slot = slot;
+	load_rec_nr++;
+}
+
+static void obj_maps_reset(void)
+{
+	free(save_obj_map); save_obj_map = NULL; save_obj_nr = 0;
+	free(load_rec_map); load_rec_map = NULL; load_rec_nr = 0;
+}
+
 static struct gsave_flat_array *collect_flat_arrays(struct page *page, struct gsave_flat_array *fa, struct gsave *save)
 {
 	if (page->array.rank > 1) {
@@ -113,20 +174,97 @@ static struct gsave_flat_array *collect_flat_arrays(struct page *page, struct gs
 static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, struct gsave *save)
 {
 	switch (type) {
+	/*
+	 * ★ДЕЛЕГАТ не сохраняем: в его слоте лежит номер heap-СТРАНИЦЫ (список пар
+	 * «объект + метод»), а он привязан к текущему миру. Записав число, мы
+	 * получали после загрузки ссылку в пустоту: `Invalid page index` на первом
+	 * же `DG_CALL` — у Dohna на `LocalSave@Load`, который сразу после успешной
+	 * загрузки зовёт свой `OnLoadEvent`.
+	 *
+	 * Пусто (−1) здесь безопаснее восстановления: обработчики событий игра
+	 * подписывает заново при построении сцен, а вот воскрешать подписки на
+	 * объекты старого мира нельзя.
+	 */
+	case AIN_DELEGATE:
+		{
+			struct page *page = val.i >= 0 ? heap_get_page(val.i) : NULL;
+			if (!page || page->type != DELEGATE_PAGE)
+				return -1;
+			/*
+			 * Пишем ТРОЙКАМИ в обычный массив: (запись получателя, функция,
+			 * поколение). Получатель — ИНДЕКС ЗАПИСИ, а не heap-слот: слоты
+			 * принадлежат текущему миру, и после загрузки такой номер ведёт в
+			 * пустоту (`Invalid page index` на первом же `DG_CALL`). Благодаря
+			 * реестру тождества получатель совпадёт с тем же объектом, что
+			 * восстановлен по другим ссылкам.
+			 *
+			 * Окружение лямбды (`env`, четвёртый слот) НЕ сохраняем: это
+			 * локальная страница функции, которой после загрузки уже нет.
+			 */
+			int n = delegate_numof(page);
+			struct gsave_array array = {
+				.rank = 1,
+				.dimensions = xcalloc(1, sizeof(int32_t)),
+				.nr_flat_arrays = 1,
+			};
+			array.dimensions[0] = n * 3;
+			array.flat_arrays = xcalloc(1, sizeof(struct gsave_flat_array));
+			array.flat_arrays[0].type = AIN_INT;
+			array.flat_arrays[0].nr_values = n * 3;
+			array.flat_arrays[0].values = xcalloc(n * 3, sizeof(struct gsave_array_value));
+			for (int i = 0; i < n; i++) {
+				int obj = -1, fun = -1, env = -1;
+				delegate_get(page, i, &obj, &fun, &env);
+				int32_t obj_rec = -1;
+				if (obj >= 0) {
+					union vm_value ov = { .i = obj };
+					obj_rec = add_value_to_gsave(AIN_STRUCT, ov, save);
+				}
+				int32_t v[3] = { obj_rec, fun, 0 };
+				for (int k = 0; k < 3; k++) {
+					array.flat_arrays[0].values[i*3 + k].type = AIN_INT;
+					array.flat_arrays[0].values[i*3 + k].value = v[k];
+				}
+			}
+			return gsave_add_array(save, &array);
+		}
 	case AIN_VOID:
 	case AIN_INT:
 	case AIN_BOOL:
 	case AIN_FUNC_TYPE:
-	case AIN_DELEGATE:
 	case AIN_LONG_INT:
 	case AIN_FLOAT:
+	// Перечисления Ixseal (`enum#N`) — обычные int в слоте; `AIN_ENUM2` тот же
+	// тип в роли элемента массива. Без этой ветки поле уходило в default и
+	// сохранялось как -1: у Dohna так терялась ФАЗА ИГРЫ (`GamePhase#92`), и
+	// после загрузки `DohnaDohna@RunGame` крутил `SWITCH` по пустому значению —
+	// экран оставался чёрным, а игра живой (стек по SIGUSR1: Phase::get ←
+	// RunGame ← Run ← game_main).
+	case AIN_ENUM:
+	case AIN_ENUM2:
 		return val.i;
 	case AIN_STRING:
+		// Пустой слот (−1) — законное состояние поля: строку туда ещё не
+		// клали, либо это `option<string>` без значения. `heap[-1].s` уносил
+		// движок в SEGV прямо в gsave_add_string при сохранении Dohna.
+		if (val.i < 0)
+			return gsave_add_string(save, &EMPTY_STRING);
 		return gsave_add_string(save, heap[val.i].s);
 	case AIN_STRUCT:
 		{
+			// Та же оговорка: объектное поле может быть пустым (−1).
+			if (val.i < 0)
+				return -1;
 			struct page *page = heap_get_page(val.i);
+			if (!page)
+				return -1;
 			assert(page->type == STRUCT_PAGE);
+			// Этот объект уже записан — отдаём ТУ ЖЕ запись, чтобы после
+			// загрузки он остался одним объектом, а не размножился по числу
+			// ссылок (см. «тождество объектов» выше).
+			int32_t known = save_obj_lookup(val.i);
+			if (known >= 0)
+				return known;
 			struct ain_struct *st = &ain->structures[page->index];
 			assert(st->nr_members == page->nr_vars);
 			struct gsave_record rec = {
@@ -140,17 +278,58 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 				if (rec.struct_index < 0)
 					rec.struct_index = gsave_add_struct_def(save, st);
 			}
+			// Запись регистрируем ДО заполнения полей: граф циклический
+			// (объект → сцена → обратно), иначе рекурсия не кончится.
+			int32_t rec_no = gsave_add_record(save, &rec);
+			save_obj_remember(val.i, rec_no);
+			struct gsave_record *recp = &save->records[rec_no];
 			for (int i = 0; i < page->nr_vars; i++) {
 				enum ain_data_type type = st->members[i].type.data;
-				int32_t value = add_value_to_gsave(type, page->values[i], save);
+				int32_t value;
+				/*
+				 * Обёртки Ixseal — `wrap<T>` (82), `option<T>` (86) и ссылка на
+				 * интерфейс (89). В слоте у них либо heap-слот объекта, либо
+				 * скаляр (для `option<int>`), а «пусто» = −1. Уходя в default,
+				 * они сохранялись как −1 ВСЕГДА: после загрузки объектные поля
+				 * оказывались пустыми, и первая же попытка игры разыменовать их
+				 * валила движок в отладочный REPL («Out of bounds page index»
+				 * в `CPartsMessageManager@GetFunctionSet` при пересборке
+				 * интерфейса домашней сцены).
+				 *
+				 * Что внутри — решает объявленный тип, а не догадка по значению:
+				 * читать `heap_get_page` от скаляра нельзя. Тег `option`
+				 * (последний слот) и база интерфейса (второй слот) объявлены
+				 * отдельными членами-филлерами `<void>` и сохраняются числом
+				 * сами по себе.
+				 */
+				if (type == AIN_WRAP || type == AIN_OPTION || type == AIN_IFACE) {
+					struct ain_type *inner = st->members[i].type.array_type;
+					bool is_obj = type == AIN_IFACE || !inner
+						|| inner->data == AIN_STRUCT
+						|| inner->data == AIN_IFACE
+						|| inner->data == AIN_IFACE_WRAP;
+					if (!is_obj)
+						value = add_value_to_gsave(inner->data, page->values[i], save);
+					else if (page->values[i].i < 0)
+						value = -1;
+					else
+						value = add_value_to_gsave(AIN_STRUCT, page->values[i], save);
+				} else {
+					value = add_value_to_gsave(type, page->values[i], save);
+				}
 				struct gsave_keyval kv = {
 					.name = strdup(st->members[i].name),
 					.type = type,
 					.value = value,
 				};
-				rec.indices[i] = gsave_add_keyval(save, &kv);
+				// ★Через recp, а не через локальную rec: gsave_add_record уже
+				// скопировал структуру в массив сейва, и наши indices должны
+				// попасть именно в неё. Массив records при этом может быть
+				// перевыделен вложенными записями — берём указатель заново.
+				save->records[rec_no].indices[i] = gsave_add_keyval(save, &kv);
 			}
-			return gsave_add_record(save, &rec);
+			(void)recp;
+			return rec_no;
 		}
 	// Generic-массив (array<?>, Ixseal): контейнер сериализуется так же, как
 	// типизированный — ранг, размеры и тип элементов берутся из самой страницы,
@@ -183,7 +362,8 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 	case AIN_REF_TYPE:
 		return -1;
 	default:
-		WARNING("Unhandled type: %s", ain_strtype(ain, type, -1));
+		strict_or_warn("сохранение", "тип %s не сериализуется — поле потеряно",
+		                ain_strtype(ain, type, -1));
 		return -1;
 	}
 }
@@ -341,7 +521,8 @@ static union vm_value json_to_vm_value(enum ain_data_type type, enum ain_data_ty
 	case AIN_REF_TYPE:
 		return vm_int(-1);
 	default:
-		WARNING("Unhandled data type: %s", ain_strtype(ain, type, -1));
+		strict_or_warn("загрузка", "тип %s не восстанавливается — поле осталось пустым",
+		                ain_strtype(ain, type, -1));
 		return vm_int(-1);
 	}
 }
@@ -464,8 +645,141 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 			VM_ERROR("Bad save file: unexpected array element type");
 		union vm_value val = gsave_to_vm_value(save, data_type, struct_type, array_rank, flat_array->values[i].value);
 		page->values[i] = val;
+		// Та же проверка, что и у полей структуры: 0 в объектном слоте —
+		// heap-слот глобальной страницы, то есть чужое число.
+		{
+			enum ain_data_type t = data_type;
+			bool objref = t == AIN_STRING || t == AIN_STRUCT
+				|| t == AIN_ARRAY || t == AIN_ARRAY_INT
+				|| t == AIN_ARRAY_STRING || t == AIN_ARRAY_STRUCT;
+			if (objref && val.i == 0)
+				strict_or_warn("загрузка",
+					"элемент %d массива (%s) восстановлен как 0",
+					i, ain_strtype(ain, t, -1));
+		}
 	}
 	return flat_array + 1;
+}
+
+/*
+ * Заполнить УЖЕ СУЩЕСТВУЮЩУЮ страницу структуры значениями из записи сейва.
+ *
+ * ★Ключевое: вложенные объекты не пересоздаются, если приёмник уже держит объект
+ * той же структуры — тогда заполняется ОН САМ. Прежняя версия всегда создавала
+ * новые страницы и подставляла их в поля, и граф после загрузки расходился с тем,
+ * на что ссылались игра и PartsEngine: они продолжали держать прежние объекты.
+ * Ловилось это не там, где ломалось, — падало на посторонней строке `Schedule1`
+ * (литерал в SceneHome@SetSchedule, которого в сейве нет вовсе), потому что
+ * осиротевшие слоты уходили в переиспользование.
+ *
+ * Что исключение отдельных типов не помогало, а исключение ВСЕХ объектных полей
+ * помогало, и указало на идентичность графа, а не на конкретный тип.
+ */
+static void gsave_fill_struct(struct gsave *save, struct page *page,
+		struct gsave_record *rec, struct gsave_struct_def *sd,
+		const char *struct_name, struct ain_struct *st)
+{
+	for (int i = 0; i < rec->nr_indices; i++) {
+		struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
+		const char *field_name = sd ? sd->fields[i].name : kv->name;
+		enum ain_data_type field_type = sd ? sd->fields[i].type : kv->type;
+		int index = struct_member_index(st, field_name);
+		if (index < 0) {
+			strict_or_warn("загрузка", "у структуры %s нет члена %s — поле сейва потеряно",
+			               display_sjis0(struct_name), display_sjis1(field_name));
+			continue;
+		}
+		int f_struct_type, f_array_rank;
+		enum ain_data_type data_type = variable_type(page, index, &f_struct_type, &f_array_rank);
+		if (data_type != field_type)
+			VM_ERROR("Bad save file: structure member type mismatch");
+
+
+		// Обёртки — зеркало записи (см. add_value_to_gsave): пусто оставляем
+		// как −1, объект поднимаем записью структуры, скаляр читаем по
+		// внутреннему типу. Тип записи в сейве остаётся «обёрточным», так что
+		// сверка выше проходит.
+		int32_t rec_index = -1;         // запись структуры, если поле объектное
+		int obj_struct_type = -1;
+		if (data_type == AIN_WRAP || data_type == AIN_OPTION || data_type == AIN_IFACE) {
+			struct ain_type *inner = st->members[index].type.array_type;
+			bool is_obj = data_type == AIN_IFACE || !inner
+				|| inner->data == AIN_STRUCT
+				|| inner->data == AIN_IFACE
+				|| inner->data == AIN_IFACE_WRAP;
+			if (!is_obj) {
+				variable_fini(page->values[index], inner->data, false);
+				page->values[index] = gsave_to_vm_value(save, inner->data,
+					inner->struc, inner->rank, kv->value);
+				continue;
+			}
+			if (kv->value < 0) {
+				variable_fini(page->values[index], AIN_STRUCT, false);
+				page->values[index].i = -1;
+				continue;
+			}
+			// Имя структуры знает сама запись — у интерфейсной ссылки
+			// статического типа нет.
+			struct gsave_record *r = &save->records[kv->value];
+			struct gsave_struct_def *d = save->version >= 7
+				? &save->struct_defs[r->struct_index] : NULL;
+			obj_struct_type = ain_get_struct(ain, d ? d->name : r->struct_name);
+			if (obj_struct_type < 0) {
+				strict_or_warn("загрузка", "обёртка %s: неизвестная структура %s",
+					display_sjis1(field_name),
+					display_sjis0(d ? d->name : r->struct_name));
+				continue;
+			}
+			rec_index = kv->value;
+		} else if (data_type == AIN_STRUCT && kv->value >= 0) {
+			rec_index = kv->value;
+			obj_struct_type = f_struct_type;
+		}
+
+		if (rec_index >= 0) {
+			// ★Приёмник уже держит объект нужной структуры — заполняем ЕГО,
+			// сохраняя идентичность: на этот объект могут ссылаться и игра,
+			// и движок.
+			struct page *cur = page->values[index].i >= 0
+				? heap_get_page(page->values[index].i) : NULL;
+			struct gsave_record *r = &save->records[rec_index];
+			struct gsave_struct_def *d = save->version >= 7
+				? &save->struct_defs[r->struct_index] : NULL;
+			const char *sname = d ? d->name : r->struct_name;
+			if (cur && cur->type == STRUCT_PAGE && cur->index == obj_struct_type) {
+				gsave_fill_struct(save, cur, r, d, sname,
+				                  &ain->structures[obj_struct_type]);
+				continue;
+			}
+			variable_fini(page->values[index], AIN_STRUCT, false);
+			page->values[index] = gsave_to_vm_value(save, AIN_STRUCT,
+				obj_struct_type, 0, rec_index);
+			continue;
+		}
+
+		// Прежнее значение освобождаем: иначе счётчик ссылок не сходится и
+		// слот уходит в переиспользование (см. историю с `Schedule1`).
+		variable_fini(page->values[index], data_type, false);
+		page->values[index] = gsave_to_vm_value(save, data_type, f_struct_type,
+		                                        f_array_rank, kv->value);
+	}
+	/*
+	 * Проверка на месте: в ОБЪЕКТНОМ слоте не может лежать 0 — это heap-слот
+	 * глобальной страницы. Первое же освобождение такого поля печатает
+	 * «попытка освободить heap-слот 0», а следующее обращение валит движок.
+	 */
+	for (int i = 0; i < page->nr_vars && i < st->nr_members; i++) {
+		enum ain_data_type t = st->members[i].type.data;
+		// (AIN_ARRAY_TYPE — макрос case-меток, в выражении не годится.)
+		bool objref = t == AIN_STRING || t == AIN_STRUCT
+			|| t == AIN_ARRAY || t == AIN_ARRAY_INT
+			|| t == AIN_ARRAY_STRING || t == AIN_ARRAY_STRUCT
+			|| t == AIN_WRAP || t == AIN_OPTION || t == AIN_IFACE;
+		if (objref && page->values[i].i == 0)
+			strict_or_warn("загрузка", "%s.%s: в объектный слот (%s) попал 0",
+				display_sjis0(st->name), display_sjis1(st->members[i].name),
+				ain_strtype(ain, t, -1));
+	}
 }
 
 static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value)
@@ -476,7 +790,43 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 	case AIN_BOOL:
 	case AIN_LONG_INT:
 	case AIN_FLOAT:
+	// Зеркало add_value_to_gsave: перечисления Ixseal и хэндлы функций/делегатов
+	// лежат в слоте целым числом. Запись их и раньше работала, а вот чтение
+	// падало в default — значение терялось, и `GamePhase#92` возвращался пустым.
+	case AIN_ENUM:
+	case AIN_ENUM2:
+	case AIN_FUNC_TYPE:
 		return vm_int(value);
+	case AIN_DELEGATE:
+		{
+			// Зеркало записи: тройки (запись получателя, функция, поколение).
+			// Получателя поднимаем через реестр тождества — он окажется ТЕМ ЖЕ
+			// объектом, что и в остальном восстановленном графе.
+			if (value < 0)
+				return vm_int(-1);
+			struct gsave_array *array = &save->arrays[value];
+			int slot = heap_alloc_slot(VM_PAGE);
+			struct page *page = alloc_page(DELEGATE_PAGE, 0, 0);
+			if (array->rank == 1 && array->nr_flat_arrays == 1) {
+				struct gsave_flat_array *fa = &array->flat_arrays[0];
+				for (int i = 0; i + 2 < fa->nr_values; i += 3) {
+					int32_t obj_rec = fa->values[i].value;
+					int fun = fa->values[i + 1].value;
+					int obj = -1;
+					if (obj_rec >= 0) {
+						struct gsave_record *r = &save->records[obj_rec];
+						struct gsave_struct_def *d = save->version >= 7
+							? &save->struct_defs[r->struct_index] : NULL;
+						int sno = ain_get_struct(ain, d ? d->name : r->struct_name);
+						if (sno >= 0)
+							obj = gsave_to_vm_value(save, AIN_STRUCT, sno, 0, obj_rec).i;
+					}
+					page = delegate_append(page, obj, fun, -1);
+				}
+			}
+			heap_set_page(slot, page);
+			return vm_int(slot);
+		}
 	case AIN_STRING:
 		{
 			int slot = heap_alloc_slot(VM_STRING);
@@ -485,6 +835,9 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 		}
 	case AIN_STRUCT:
 		{
+			// Пустое объектное поле записано как −1 (см. add_value_to_gsave).
+			if (value < 0)
+				return vm_int(-1);
 			struct gsave_record *rec = &save->records[value];
 			struct ain_struct *st = &ain->structures[struct_type];
 			struct gsave_struct_def *sd =
@@ -492,24 +845,17 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			const char *struct_name = sd ? sd->name : rec->struct_name;
 			if (strcmp(struct_name, st->name))
 				VM_ERROR("Bad save file: structure name mismatch");
-			int slot = alloc_struct(struct_type);
-			struct page *page = heap[slot].page;
-			for (int i = 0; i < rec->nr_indices; i++) {
-				struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
-				const char *field_name = sd ? sd->fields[i].name : kv->name;
-				enum ain_data_type field_type = sd ? sd->fields[i].type : kv->type;
-				int index = struct_member_index(st, field_name);
-				if (index < 0) {
-					WARNING("structure %s has no member named %s", display_sjis0(struct_name), display_sjis1(field_name));
-					continue;
-				}
-				int struct_type, array_rank;
-				enum ain_data_type data_type = variable_type(page, index, &struct_type, &array_rank);
-				if (data_type != field_type)
-					VM_ERROR("Bad save file: structure member type mismatch");
-				union vm_value val = gsave_to_vm_value(save, data_type, struct_type, array_rank, kv->value);
-				page->values[index] = val;
+			// Эту запись уже поднимали — отдаём ТОТ ЖЕ объект (см. «тождество
+			// объектов»). Ссылку добавляем: поле-владелец освободит её само.
+			int known = load_rec_lookup(value);
+			if (known >= 0) {
+				heap_ref(known);
+				return vm_int(known);
 			}
+			int slot = alloc_struct(struct_type);
+			// Регистрируем ДО заполнения: граф циклический.
+			load_rec_remember(value, slot);
+			gsave_fill_struct(save, heap[slot].page, rec, sd, struct_name, st);
 			return vm_int(slot);
 		}
 	case AIN_ARRAY_TYPE:
@@ -591,8 +937,8 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 				}
 				break;
 			default:
-				WARNING("array<?> с элементом %s в сейве не поддержан",
-				        ain_strtype(ain, elem, -1));
+				strict_or_warn("загрузка", "array<?> с элементом %s не поддержан",
+				               ain_strtype(ain, elem, -1));
 				heap[slot].page = NULL;
 				return vm_int(slot);
 			}
@@ -605,7 +951,8 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 	case AIN_REF_TYPE:
 		return vm_int(-1);
 	default:
-		WARNING("Unhandled data type: %s", ain_strtype(ain, type, -1));
+		strict_or_warn("загрузка", "тип %s не восстанавливается — поле осталось пустым",
+		                ain_strtype(ain, type, -1));
 		return vm_int(-1);
 	}
 }
@@ -665,6 +1012,172 @@ int load_globals(const char *keyname, const char *filename, const char *group_na
 		free(path);
 		return 0;
 	}
+}
+
+/*
+ * `system.SerializeStruct(fileName, array<int> structPageList, bool saveFolder)` —
+ * сохранение ПРОИЗВОЛЬНОГО НАБОРА СТРУКТУР, отдельное от глобалов и от образа VM.
+ * Через него Dohna пишет метаданные слота (`SaveObject`: миниатюра, комментарий,
+ * день, деньги) — `LocalSave@Save` → `SaveObject@Save` → `AFL_GameSave_StructSave`.
+ * Пока функция была заглушкой, игра получала false и показывала «Failed to save
+ * SaveData1000.asd»: сохраниться было нельзя вообще.
+ *
+ * Список приходит СТРАНИЦАМИ (не парами «объект + база интерфейса»): его готовит
+ * `Array.SYSTEMONLY_GetStructPageList`. Каждую структуру кладём в gsave тем же
+ * `add_value_to_gsave`, что и глобалы, — формат уже умеет записи структур с
+ * определениями полей (`gsave_add_struct_def`), так что своего формата не нужно.
+ * Имена «глобалов» здесь служебные (порядковый номер): при загрузке они не ищутся
+ * в `ain->globals`, разбор идёт по позиции.
+ */
+int save_struct_list(const char *filename, struct page *list)
+{
+	obj_maps_reset();
+	int n = list && list->type == ARRAY_PAGE ? list->nr_vars : 0;
+	struct gsave *save = gsave_create(get_gsave_version(), "", ain->nr_globals, NULL);
+	gsave_add_globals_record(save, n);
+	for (int i = 0; i < n; i++) {
+		char name[16];
+		snprintf(name, sizeof(name), "%d", i);
+		struct gsave_global *g = &save->globals[i];
+		g->name = strdup(name);
+		g->type = AIN_STRUCT;
+		g->value = add_value_to_gsave(AIN_STRUCT, list->values[i], save);
+	}
+
+	char *path = savedir_path(filename);
+	FILE *fp = file_open_utf8(path, "wb");
+	if (!fp) {
+		WARNING("SerializeStruct: не открыть %s: %s", display_utf0(path), strerror(errno));
+		free(path);
+		gsave_free(save);
+		return 0;
+	}
+	free(path);
+
+	bool encrypt = !AIN_VERSION_GTE(ain, 6, 0);
+	int compression_level = AIN_VERSION_GTE(ain, 6, 0) ? 1 : 9;
+	enum savefile_error error = gsave_write(save, fp, encrypt, compression_level);
+	if (error != SAVEFILE_SUCCESS)
+		WARNING("SerializeStruct: %s", savefile_strerror(error));
+	fclose(fp);
+	gsave_free(save);
+	return error == SAVEFILE_SUCCESS;
+}
+
+/*
+ * Обратная сторона: структуры ЗАПОЛНЯЮТСЯ на месте. Игра передаёт список уже
+ * созданных объектов-приёмников и держит на них ссылки (`wrap<ISerializable>`),
+ * поэтому подменяем СТРАНИЦУ в heap-слоте приёмника, а не сам слот — иначе
+ * ссылки вызывающей стороны указывали бы на старое, незаполненное содержимое.
+ */
+int load_struct_list(const char *filename, struct page *list)
+{
+	obj_maps_reset();
+	int n = list && list->type == ARRAY_PAGE ? list->nr_vars : 0;
+	char *path = savedir_path(filename);
+	enum savefile_error error;
+	struct gsave *save = gsave_read(path, &error);
+	if (error != SAVEFILE_SUCCESS) {
+		// «Файла нет» — обычное дело: игра каждый запуск пробует прочитать
+		// Collection/CommonSystemData, которых на чистом профиле ещё нет.
+		if (error != SAVEFILE_FILE_ERROR)
+			WARNING("DeserializeStruct: %s: %s", display_utf0(path),
+			        savefile_strerror(error));
+		free(path);
+		return 0;
+	}
+	free(path);
+
+	// A/B: XSYS4_DESER_DRY=1 — файл читается (значит игра считает загрузку
+	// удавшейся и идёт дальше), но в приёмники НИЧЕГО не пишется. Разделяет две
+	// версии падения после загрузки: «испорчены восстановленные данные» против
+	// «ломается сам путь загрузки, что бы мы туда ни положили».
+	int nr = getenv("XSYS4_DESER_DRY") ? 0 : (save->nr_globals < n ? save->nr_globals : n);
+	for (int i = 0; i < nr; i++) {
+		int dst_slot = list->values[i].i;
+		struct page *dst = heap_get_page(dst_slot);
+		if (!dst || dst->type != STRUCT_PAGE) {
+			WARNING("DeserializeStruct: приёмник %d не структура", i);
+			continue;
+		}
+		/*
+		 * ★Заполняем ПРИЁМНИК НА МЕСТЕ, а не строим временный объект с переносом
+		 * значений. Игра держит эти структуры не только heap-слотом, но и
+		 * прямыми ссылками (`wrap<ISerializable>`, интерфейсные пары), и любая
+		 * подстановка чужих объектов рвала граф: падало потом на посторонней
+		 * строке `Schedule1` в `SceneHome@SetSchedule` — литерале, которого в
+		 * сейве нет вовсе (осиротевшие слоты уходили в переиспользование).
+		 */
+		int32_t rec_index = save->globals[i].value;
+		if (rec_index < 0)
+			continue;
+		struct gsave_record *rec = &save->records[rec_index];
+		struct gsave_struct_def *sd = save->version >= 7
+			? &save->struct_defs[rec->struct_index] : NULL;
+		const char *sname = sd ? sd->name : rec->struct_name;
+		struct ain_struct *st = &ain->structures[dst->index];
+		if (strcmp(sname, st->name)) {
+			strict_or_warn("загрузка", "приёмник %d — %s, а в сейве %s",
+			               i, display_sjis0(st->name), display_sjis1(sname));
+			continue;
+		}
+		gsave_fill_struct(save, dst, rec, sd, sname, st);
+	}
+	gsave_free(save);
+	obj_maps_reset();
+	return 1;
+}
+
+/*
+ * Комментарий слота — ОТДЕЛЬНАЯ пара вызовов
+ * (`system.Write/ReadSerializeStructComment`), а не поле внутри структуры: игра
+ * пишет его сразу после сохранения (`AFL_GameSave_WriteStructSaveComment`) и
+ * читает при построении списка слотов (`LocalSave::GetComment`). Пока обе были
+ * заглушками, слот показывал заготовки конструктора `SaveObjectParam@0` —
+ * «Day0 <None>», хотя сам сейв уже читался.
+ *
+ * Храним сайдкаром рядом с сейвом (`<имя>.cmt`, SJIS как есть). Формат наш:
+ * оригинальный .asd, судя по всему, держит комментарий внутри, но лезть в
+ * готовый gsave ради строки — значит переписывать записи и рисковать сейвом,
+ * который в остальном совместим.
+ */
+static char *comment_path(const char *filename)
+{
+	char *name = xmalloc(strlen(filename) + 5);
+	sprintf(name, "%s.cmt", filename);
+	char *path = savedir_path(name);
+	free(name);
+	return path;
+}
+
+int save_struct_comment(const char *filename, struct string *comment)
+{
+	char *path = comment_path(filename);
+	FILE *fp = file_open_utf8(path, "wb");
+	if (!fp) {
+		WARNING("WriteSerializeStructComment: не открыть %s: %s",
+		        display_utf0(path), strerror(errno));
+		free(path);
+		return 0;
+	}
+	free(path);
+	size_t n = comment && comment->size > 0 ? (size_t)comment->size : 0;
+	bool ok = !n || fwrite(comment->text, n, 1, fp) == 1;
+	fclose(fp);
+	return ok;
+}
+
+struct string *load_struct_comment(const char *filename)
+{
+	char *path = comment_path(filename);
+	size_t len = 0;
+	char *buf = file_read(path, &len);
+	free(path);
+	if (!buf)
+		return NULL;
+	struct string *s = make_string(buf, len);
+	free(buf);
+	return s;
 }
 
 int delete_save_file(const char *filename)

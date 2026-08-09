@@ -208,6 +208,12 @@ static bool System_BackupSaveFile(struct string *dst, struct string *src)
 
 static bool System_ResumeSave(struct string *key, struct string *filename, void *out)
 {
+	// XSYS4_SAVE_TRACE=1 — кто и в какой файл пишет: у Dohna сохранение идёт
+	// ДВУМЯ путями (образ VM и структуры метаданных), и важно знать, не метят
+	// ли они в одно имя.
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE ResumeSave key='%s' file='%s'",
+		       display_sjis0(key->text), display_sjis1(filename->text));
 	int r = vm_save_image(key->text, filename->text, true);
 	/*
 	 * У новых игр (Ixseal v14) третий аргумент — `wrap<int> result`,
@@ -228,6 +234,9 @@ static bool System_ResumeSave(struct string *key, struct string *filename, void 
 
 static void System_ResumeLoad(struct string *key, struct string *filename)
 {
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE ResumeLoad key='%s' file='%s'",
+		       display_sjis0(key->text), display_sjis1(filename->text));
 	vm_load_image(key->text, filename->text);
 }
 
@@ -272,28 +281,65 @@ static bool System_ReadGroupSaveComment(struct string *key, struct string *filen
 	return false;
 }
 
-static bool System_SerializeStruct(struct string *filename, int struct_type, bool b)
+/*
+ * `bool SerializeStruct(string fileName, array<int> structPageList, bool saveFolder)`
+ * — второй аргумент приходит СТРАНИЦЕЙ (список готовит
+ * `Array.SYSTEMONLY_GetStructPageList`), а не числом: прежняя сигнатура с `int`
+ * читала бы номер слота как значение. Через эту пару Dohna пишет и читает
+ * метаданные слота (`SaveObject`), и пока обе были заглушками, сохранение
+ * не работало вовсе — игра показывала «Failed to save SaveData1000.asd».
+ */
+// ★Второй аргумент приходит НОМЕРОМ heap-слота, а не указателем на страницу:
+// `array<int>` для ffi — обычное значение (проверено падением: list=0x3340,
+// то есть слот 13120, разыменованный как указатель).
+static bool System_SerializeStruct(struct string *filename, int list_slot, bool save_folder)
 {
-	(void)filename; (void)struct_type; (void)b;
-	return false;
+	(void)save_folder;  // путь и так строится от папки сейвов (savedir_path)
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE SerializeStruct file='%s'", display_sjis0(filename->text));
+	return save_struct_list(filename->text, heap_get_page(list_slot));
 }
 
-static bool System_DeserializeStruct(struct string *filename, int struct_type, bool b)
+static bool System_DeserializeStruct(struct string *filename, int list_slot, bool save_folder)
 {
-	(void)filename; (void)struct_type; (void)b;
-	return false;
+	(void)save_folder;
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE DeserializeStruct file='%s'", display_sjis0(filename->text));
+	// A/B-ручка: XSYS4_NO_DESER=1 возвращает прежнее поведение-заглушку. Нужна,
+	// чтобы отделить наши структуры от восстановления образа VM (ResumeLoad):
+	// падение после загрузки может идти от любого из двух.
+	if (getenv("XSYS4_NO_DESER"))
+		return false;
+	return load_struct_list(filename->text, heap_get_page(list_slot));
 }
 
+/*
+ * Комментарий слота. Игра пишет его сразу после сохранения и читает, когда
+ * строит список слотов (`LocalSave::GetComment`). Пока пара была заглушками,
+ * список показывал заготовки конструктора — «Day0 <None>».
+ * Out-параметр объявлен как `wrap<string>`: ffi отдаёт указатель на heap-слот
+ * строки, туда и пишем (та же форма, что у TextFile.ReadAll).
+ */
 static bool System_WriteSerializeStructComment(struct string *filename, struct string *comment, bool b)
 {
-	(void)filename; (void)comment; (void)b;
-	return false;
+	(void)b;
+	return save_struct_comment(filename->text, comment);
 }
 
-static bool System_ReadSerializeStructComment(struct string *filename, struct page **comment, bool b)
+static bool System_ReadSerializeStructComment(struct string *filename, struct string **comment, bool b)
 {
-	(void)filename; (void)comment; (void)b;
-	return false;
+	(void)b;
+	struct string *s = load_struct_comment(filename->text);
+	if (!s)
+		return false;
+	if (comment) {
+		if (*comment)
+			free_string(*comment);
+		*comment = s;
+	} else {
+		free_string(s);
+	}
+	return true;
 }
 
 HLL_LIBRARY(system,

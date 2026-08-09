@@ -27,5 +27,16 @@ cJSON *load_json(const char *filename);
 int save_globals(const char *keyname, const char *filename, const char *group_name, int *n);
 int load_globals(const char *keyname, const char *filename, const char *group_name, int *n);
 int delete_save_file(const char *filename);
+// system.SerializeStruct/DeserializeStruct: набор структур отдельным файлом
+// (у Dohna — метаданные слота сохранения). Список приходит страницами от
+// Array.SYSTEMONLY_GetStructPageList.
+struct page;
+int save_struct_list(const char *filename, struct page *list);
+int load_struct_list(const char *filename, struct page *list);
+// Комментарий слота (system.Write/ReadSerializeStructComment): сайдкар <имя>.cmt
+// рядом с сейвом. load возвращает NULL, если комментария нет.
+struct string;
+int save_struct_comment(const char *filename, struct string *comment);
+struct string *load_struct_comment(const char *filename);
 
 #endif /* SYSTEM4_SAVEDATA_H */
