@@ -676,11 +676,50 @@ static void set_struct_page(int slot)
 		heap_ref(slot);
 }
 
+/*
+ * Диагностика XSYS4_PAGEWATCH_FN=<имя функции> [XSYS4_PAGEWATCH_VAR=<номер>]:
+ * маяки для gdb. На mark вешается аппаратный watchpoint на слот локальной
+ * страницы (кто пишет в переменную), на unmark — снимается (страница ушла,
+ * дальше этот адрес переиспользует кто угодно). Сами по себе — no-op.
+ */
+static int pagewatch_fno = -2;
+static int pagewatch_var = 1;
+
+__attribute__((noinline)) void xsys4_pagewatch_mark(int slot, union vm_value *addr)
+{
+	__asm__ volatile("" : : "r"(slot), "r"(addr));
+}
+
+__attribute__((noinline)) void xsys4_pagewatch_unmark(int slot)
+{
+	__asm__ volatile("" : : "r"(slot));
+}
+
+static void pagewatch_on_call(int fno, int slot)
+{
+	if (pagewatch_fno == -2) {
+		const char *w = getenv("XSYS4_PAGEWATCH_FN");
+		pagewatch_fno = w ? ain_get_function(ain, (char*)w) : -1;
+		const char *v = getenv("XSYS4_PAGEWATCH_VAR");
+		if (v)
+			pagewatch_var = atoi(v);
+		if (w && pagewatch_fno < 0)
+			WARNING("PAGEWATCH: функция '%s' не найдена в .ain", w);
+	}
+	if (fno != pagewatch_fno || pagewatch_fno < 0)
+		return;
+	if (pagewatch_var < 0 || pagewatch_var >= heap[slot].page->nr_vars)
+		return;
+	xsys4_pagewatch_mark(slot, &heap[slot].page->values[pagewatch_var]);
+}
+
 static void unref_call_frame(struct function_call *frame)
 {
 	if (frame->struct_page >= 0 && AIN_VERSION_GTE(ain, 6, 1))
 		heap_unref(frame->struct_page);
 	heap_unref(frame->page_slot);
+	if (frame->fno == pagewatch_fno && pagewatch_fno >= 0)
+		xsys4_pagewatch_unmark(frame->page_slot);
 }
 
 static void scenario_jump(int address)
@@ -744,6 +783,7 @@ static int _function_call(int fno, int return_address)
 	}
 	// Ixseal: локальные option'ы — пустые (аргументы приходят со стека, их не трогаем)
 	init_option_vars(heap[slot].page, f->vars, f->nr_vars, f->nr_args);
+	pagewatch_on_call(fno, slot);
 	// jump to function start
 	instr_ptr = ain->functions[fno].address;
 
