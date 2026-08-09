@@ -1378,6 +1378,49 @@ struct pe_activity {
 };
 static struct hash_table *pe_activities;
 
+/*
+ * Принадлежит ли часть какой-нибудь ЖИВОЙ активности.
+ *
+ * Проверка для эксперимента `XSYS4_KEEP_ACT_PARTS`: игра ведёт СВОЙ пул
+ * экземпляров активностей (`IdArray<string, ActivityInstances>`), и
+ * `ActivityInstances@Request` при повторном открытии экрана достаёт оттуда
+ * прежний экземпляр БЕЗ перезагрузки — то есть считает его части живыми (видно
+ * трейсом `XSYS4_HLL_IN_FUNC=SaveThumbnailView`: первое открытие идёт через
+ * `IsLoaded` → `ReadFile`, второе — сразу `Array.First` → `GetPartsNumber`).
+ * А у нас части активности лежат на активном слое и умирают вместе с ним по
+ * `EraseLayer`, который зовёт сама игра.
+ */
+struct pe_act_scan { int number; bool found; };
+
+static void pe_act_scan_cb(struct ht_slot *slot, void *data)
+{
+	struct pe_act_scan *s = data;
+	struct pe_activity *a = slot->value;
+	if (!a || s->found)
+		return;
+	for (int i = 0; i < a->nr_parts; i++) {
+		if (a->parts[i].number == s->number) {
+			s->found = true;
+			return;
+		}
+	}
+	for (int i = 0; i < a->nr_helpers; i++) {
+		if (a->helpers[i] == s->number) {
+			s->found = true;
+			return;
+		}
+	}
+}
+
+bool pe_parts_in_activity(int parts_no)
+{
+	if (!pe_activities)
+		return false;
+	struct pe_act_scan s = { .number = parts_no, .found = false };
+	ht_foreach(pe_activities, pe_act_scan_cb, &s);
+	return s.found;
+}
+
 static struct pe_activity *pe_act_find(struct string *name)
 {
 	if (!pe_activities)

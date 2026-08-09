@@ -4018,12 +4018,41 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 		return;
 	}
 
-	// Collect and release parts belonging to this controller
+	/*
+	 * ★ЧАСТЬ, ЧИСЛЯЩАЯСЯ ЗА ЖИВОЙ АКТИВНОСТЬЮ, СО СЛОЕМ НЕ СНОСИТСЯ: её время
+	 * жизни игра ведёт САМА — своим пулом экземпляров
+	 * (`IdArray<string, ActivityInstances>`), и снимает такую часть только
+	 * `ReleaseActivity`.
+	 *
+	 * Улика — экран Load, открытый ИЗ ИГРЫ второй раз за сессию. Первое открытие
+	 * идёт честно: `ActivityInstances@Request` → `IsLoaded` (0) → `ReadFile` →
+	 * `GetPartsNumber`. Закрытие: игра зовёт `EraseLayer`, мы сносим слой 9 и с
+	 * ним 57 частей вьюх (`システム／汎用リスト／ボタン／通常`). Второе открытие:
+	 * `Request` достаёт из пула ПРЕЖНИЙ экземпляр — `Array.First`, без `IsLoaded`
+	 * и без `ReadFile`, — и сразу просит `GetActivityPartsNumber(…, "Button")`.
+	 * Тот отдавал номер снесённой части (`жива=0 ctype=-1`), `CompParts` не
+	 * узнавал в ней кнопку и возвращал пустой wrap, а игра ассертила
+	 * `(nonnull) m_act.GetButton("Button")` — `SaveThumbnailView.jaf:21`,
+	 * стек `SceneLoad@Run` → `SaveThumbnailViewCollection@CreateView`.
+	 * (Замер снят `XSYS4_HLL_IN_FUNC=SaveThumbnailView` и `XSYS4_ACT_TRACE`.)
+	 *
+	 * Проверено и отвергнуто: «обработчики держат объект» — при сносе слоя 9 мы
+	 * отдаём игре 53 delegate-индекса из 57 частей, наборы снимаются штатно.
+	 *
+	 * Экран при этом всё равно исчезает: слой снят со стека, и части на нём не
+	 * рисуются. Откат для замеров: `XSYS4_ERASE_ACT_PARTS=1`.
+	 */
+	bool pe_parts_in_activity(int parts_no);
+	bool keep_act = !getenv("XSYS4_ERASE_ACT_PARTS");
 	int released = 0;
 	const char *sample = "";
 	struct parts *p = TAILQ_FIRST(&parts_list);
 	while (p) {
 		struct parts *next = TAILQ_NEXT(p, parts_list_entry);
+		if (p->controller_no == ctrl_no && keep_act && pe_parts_in_activity(p->no)) {
+			p = next;
+			continue;
+		}
 		if (p->controller_no == ctrl_no) {
 			if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
 				released++;
@@ -4056,7 +4085,9 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	}
 
 	if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
-		NOTICE("   ctrl %d: освобождено партов %d, напр. cg=\"%s\"", ctrl_no, released, sample);
+		NOTICE("   ctrl %d: освобождено партов %d, delegate-индексов отдано %d, напр. cg=\"%s\"",
+		       ctrl_no, released,
+		       *erase_number_list ? (*erase_number_list)->nr_vars : 0, sample);
 		// Снос пустого слоя — признак того, что парты легли не туда: печатаем, где
 		// они на самом деле, и каков стек. Ровно этот вывод показал, что расходится
 		// не чтение аргумента RemoveController, а привязка партов к слоям.
