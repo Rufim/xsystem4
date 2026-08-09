@@ -874,25 +874,74 @@ static int Array_ix_Last(struct page **self, union vm_value *fn)
 	return n > 0 ? n - 1 : -1;
 }
 
-// int Min/Max(self, компаратор) — индекс крайнего элемента по `less`.
-// Форма БЕЗ компаратора в байт-коде обеих игр не встречается (все сайты кладут
-// лямбду), а «естественный» порядок для произвольного элемента не определён —
-// поэтому она сообщает о себе, а не тихо возвращает мусор.
-static int Array_ix_Min(struct page **self, union vm_value *fn)
+/*
+ * Min/Max БЕЗ компаратора — порядок ПО САМОМУ ЗНАЧЕНИЮ. Форма встречается:
+ * `PlayerCollection@GetMaxFeelEventLevel` (@FUNC 27792) собирает `array<int>`
+ * уровней через `ArrayExtensions::Select<int, Player&>` и зовёт `Array Max 1`.
+ * Пока форма только печатала WARNING и отдавала -1, игра шла по ветке «пусто» и
+ * дальше валилась в `PartySkillView@Set` на `X_REF` с индексом кучи -1 —
+ * это и роняло экран FEEL-события (иконка справа от Garage).
+ *
+ * Сравниваем как число: у элемента-скаляра (int/bool/float/long) значение лежит
+ * в одном слоте, и естественный порядок для него определён однозначно. Для
+ * СТРУКТУР и строк порядка нет — там по-прежнему честный WARNING, а не выдумка:
+ * такие сайты в байт-коде обеих игр кладут лямбду.
+ *
+ * Возвращается ИНДЕКС элемента: `hll_call` материализует из него двухслотовую
+ * ссылку по типу возврата (AIN_REF_HLL_PARAM, как у `Array.At`), а -1 игра
+ * проверяет сама — `PUSH -1; EQUALE` сразу после вызова.
+ */
+static bool ix_elem_is_scalar(enum ain_data_type dt)
 {
-	if (hll_current_nr_args < 2 || !ix_arg_is_func(1)) {
-		WARNING("Array.Min без компаратора: форма не встречалась в байт-коде");
+	switch (array_type(dt)) {
+	case AIN_INT: case AIN_BOOL: case AIN_FLOAT: case AIN_LONG_INT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool ix_value_less(struct page *a, int i, int j)
+{
+	int slots = array_elem_slots(a);
+	union vm_value x = a->values[i * slots];
+	union vm_value y = a->values[j * slots];
+	if (array_type(ix_dtype(a)) == AIN_FLOAT)
+		return x.f < y.f;
+	return x.i < y.i;
+}
+
+static int ix_extreme_by_value(struct page **self, bool want_max, const char *who)
+{
+	if (!self || !*self)
+		return -1;
+	struct page *a = *self;
+	if (!ix_elem_is_scalar(ix_dtype(a))) {
+		WARNING("Array.%s без компаратора: у элемента этого типа порядок не определён", who);
 		return -1;
 	}
+	int n = array_numof(a, 1);
+	if (n == 0)
+		return -1;
+	int best = 0;
+	for (int i = 1; i < n; i++) {
+		if (want_max ? ix_value_less(a, best, i) : ix_value_less(a, i, best))
+			best = i;
+	}
+	return best;
+}
+
+static int Array_ix_Min(struct page **self, union vm_value *fn)
+{
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1))
+		return ix_extreme_by_value(self, false, "Min");
 	return ix_extreme(self, fn, false);
 }
 
 static int Array_ix_Max(struct page **self, union vm_value *fn)
 {
-	if (hll_current_nr_args < 2 || !ix_arg_is_func(1)) {
-		WARNING("Array.Max без компаратора: форма не встречалась в байт-коде");
-		return -1;
-	}
+	if (hll_current_nr_args < 2 || !ix_arg_is_func(1))
+		return ix_extreme_by_value(self, true, "Max");
 	return ix_extreme(self, fn, true);
 }
 
