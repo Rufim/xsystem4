@@ -1577,7 +1577,10 @@ bool pe_activities_load(struct iarray_reader *r, bool apply)
 
 static bool PE_IsExistActivity(struct string *name)
 {
-	return pe_act_find(name) != NULL;
+	bool r = pe_act_find(name) != NULL;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT IsExistActivity('%s') -> %d", display_sjis0(name->text), r);
+	return r;
 }
 
 struct pe_sub_release {
@@ -3102,7 +3105,32 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		act_set_state_cg(no, ti, "キーダウン状態", 3);
 	}
 
-	PE_SetPos(no, act_list_int(node, "座標", 0, 0), act_list_int(node, "座標", 1, 0));
+	/*
+	 * `座標をレートとして認識する = 1` — координаты части заданы ДОЛЕЙ экрана,
+	 * а не пикселями: `座標 = { 0.5, 0.5 }` значит центр, а не «полпикселя».
+	 * Поле не читалось, и `act_list_int` усекал 0.5 в 0.
+	 *
+	 * Живой случай — экран просмотра CG Haha Ranman (`ＣＧモード／閲覧`): части
+	 * `構築：イベント` и `構築：カットイン` собирают поверхность 1380×820 (экран с
+	 * запасом по 50 px на сторону) и стоят с `原点座標モード = 5`, то есть
+	 * привязаны СВОИМ ЦЕНТРОМ к центру экрана. С нулевой позицией центр
+	 * поверхности оказывался в левом верхнем углу, и от картинки было видно
+	 * только её правую нижнюю четверть — открытый CG рисовался «в углу
+	 * поверх сетки» вместо полного экрана.
+	 *
+	 * По всей игре поле = 1 всего у трёх частей (две здесь, одна в
+	 * `ＭＳＧ枠／プロット`), у остальных 0 — прежнее поведение не меняется.
+	 * Базис — размер ЛОГИЧЕСКОГО ЭКРАНА: обе части висят прямо на корне
+	 * активности, своей геометрии у него нет.
+	 */
+	// Откат для замеров: XSYS4_NO_POS_RATE=1 — читать координаты как пиксели.
+	if (act_int(node, "座標をレートとして認識する", 0) && !getenv("XSYS4_NO_POS_RATE")) {
+		float rx = act_list_float(node, "座標", 0, 0.0f);
+		float ry = act_list_float(node, "座標", 1, 0.0f);
+		PE_SetPos(no, lroundf(rx * config.view_width), lroundf(ry * config.view_height));
+	} else {
+		PE_SetPos(no, act_list_int(node, "座標", 0, 0), act_list_int(node, "座標", 1, 0));
+	}
 	PE_SetZ(no, act_list_int(node, "座標", 2, 0));
 	// 原点座標モード (origin/anchor mode): which point of the part 座標 refers to, on
 	// the 1-9 grid (1=top-left ... 5=middle-center ... 9=bottom-right) — the same
