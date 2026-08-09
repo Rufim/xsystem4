@@ -2167,7 +2167,37 @@ static enum opcode execute_instruction(enum opcode opcode)
 				break;
 			}
 		}
-		hll_call(get_argument(0), get_argument(1), elem_class);
+		{
+			int lib = get_argument(0), fun = get_argument(1);
+			hll_call(lib, fun, elem_class);
+			/*
+			 * ★Форма возврата: если .ain объявляет ОБЪЕКТНЫЙ возврат (массив,
+			 * структура, строка, обёртка), а реализация положила на стек 0 —
+			 * это рассинхрон сигнатуры, а не законный ответ. Ноль в объектном
+			 * слоте = heap-слот ГЛОБАЛЬНОЙ страницы: игра запишет его в свою
+			 * переменную, `variable_fini` сделает `heap_unref(0)`, и падать
+			 * будет далеко от причины (см. комментарий в page.c). Ровно так
+			 * рассинхрон `FileOperation.GetFileList` уничтожал глобалы.
+			 * Печатаем под XSYS4_STRICT (там же остановка) — за такими
+			 * находками и заводился строгий режим.
+			 */
+			if (xsys4_strict() && ain->libraries[lib].functions[fun].return_type.data != AIN_VOID) {
+				enum ain_data_type rt = ain->libraries[lib].functions[fun].return_type.data;
+				// ★Обёртки (`wrap<?>`) сюда НЕ входят: их реализации возвращают
+				// ИНДЕКС элемента, из которого hll_call уже строит ссылку, и
+				// ноль там законен (первый элемент) — на этом проверка сперва
+				// поймала невиновную `Array.EmplaceBack`. Остаются типы, где
+				// возврат — настоящий heap-слот.
+				bool objret = rt == AIN_STRING || rt == AIN_STRUCT
+					|| rt == AIN_ARRAY || rt == AIN_ARRAY_INT
+					|| rt == AIN_ARRAY_STRING || rt == AIN_ARRAY_STRUCT;
+				if (objret && stack_peek(0).i == 0)
+					strict_or_warn("HLL", "%s.%s объявлена как %s, а вернула 0",
+					               ain->libraries[lib].name,
+					               ain->libraries[lib].functions[fun].name,
+					               ain_strtype(ain, rt, -1));
+			}
+		}
 		break;
 	}
 	case RETURN: {

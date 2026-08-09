@@ -22,6 +22,7 @@
 #include "vm.h"
 #include "vm/heap.h"
 #include "vm/page.h"
+#include "xsystem4.h"
 
 #define NR_CACHES 8
 #define CACHE_SIZE 64
@@ -458,6 +459,10 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
 				WARNING("variable_fini: попытка освободить heap-слот 0 "
 					"(глобальная страница) как значение типа %d — "
 					"в объектный слот попало чужое число", type);
+				// ★Стек ИГРЫ в этот момент — единственное, что указывает,
+				// ЧЬЯ переменная испорчена: само освобождение происходит
+				// далеко от места, где ноль был записан.
+				vm_stack_trace();
 			}
 			break;
 		}
@@ -797,6 +802,32 @@ void delete_page_vars(struct page *page)
 			    && page->values[i].i > 0)
 				variable_fini(page->values[i], AIN_STRING, true);
 			continue;
+		}
+		/*
+		 * Диагностика порчи: 0 в объектном слоте — чужое число (heap-слот 0 —
+		 * глобальная страница). Здесь, в отличие от variable_fini, известны
+		 * НОМЕР и ИМЯ переменной, а по типу страницы — чья она. Без этого
+		 * приходилось гадать, какой из локалов испорчен.
+		 */
+		if (page->values[i].i == 0 && (t == AIN_STRING || t == AIN_STRUCT)) {
+			static int reported = 0;
+			if (reported < 5) {
+				reported++;
+				const char *owner = "?", *vname = "?";
+				if (page->type == LOCAL_PAGE && page->index >= 0
+				    && page->index < ain->nr_functions) {
+					owner = ain->functions[page->index].name;
+					if (i < ain->functions[page->index].nr_vars)
+						vname = ain->functions[page->index].vars[i].name;
+				} else if (page->type == STRUCT_PAGE && page->index >= 0
+				    && page->index < ain->nr_structures) {
+					owner = ain->structures[page->index].name;
+					if (i < ain->structures[page->index].nr_members)
+						vname = ain->structures[page->index].members[i].name;
+				}
+				WARNING("ZERO-SLOT: %s.%s (переменная %d, тип %d, страница %d) = 0",
+					display_sjis0(owner), display_sjis1(vname), i, t, page->type);
+			}
 		}
 		variable_fini(page->values[i], t, true);
 	}
