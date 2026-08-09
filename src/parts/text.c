@@ -88,6 +88,13 @@ static const char *parts_text_append_char(struct parts_text *t, const char *str)
 	int height = text_style_height(&t->ts);
 	gfx_init_texture_rgba(&ch->t, width, height, (SDL_Color){0,0,0,0});
 	ch->advance = gfx_render_textf(&ch->t, 0, 0, ch->ch, &t->ts, false);
+	if (getenv("XSYS4_NUMTEXT_TRACE")) {
+		NOTICE("TXTW \"%s\" (bytes %02x %02x) face=%u size=%.1f bold=%.2f edge=%.2f "
+		       "spacing=%.2f -> width=%d advance=%.2f h=%d",
+		       ch->ch, (unsigned char)ch->ch[0], (unsigned char)ch->ch[1],
+		       t->ts.face, t->ts.size, t->ts.bold_width, t->ts.edge_left,
+		       t->ts.font_spacing, width, ch->advance, height);
+	}
 
 	line->width += ch->advance;
 	line->height = max(line->height, height);
@@ -106,11 +113,26 @@ void parts_text_append(struct parts *parts, struct parts_text *t, struct string 
 		msgp = parts_text_append_char(t, msgp);
 	}
 
-	// calculate dimensions of the text
+	/*
+	 * Ширина строки — сумма ШАГОВ, а шаг несёт в себе `字間隔`: интервал идёт
+	 * МЕЖДУ символами, и после последнего его быть не должно. Числовая часть
+	 * это уже учитывает (`total - num->space` в parts_numeral_font_update), а
+	 * текстовая — нет, и при отрицательном интервале часть выходила уже
+	 * нарисованного текста.
+	 *
+	 * Живой случай — счётчики на экране Garage у Dohna («TALENT 3/5»,
+	 * «GARAGE 0/10»). Слэш там отдельная текстовая часть: `テキスト = "／"`,
+	 * кегль 14, `字間隔 = -4`. Один символ, шаг 8 при нарисованных 12 — и
+	 * горизонтальный бокс ставил знаменатель на 4 px левее, надвигая цифры на
+	 * слэш. Замер по кадру оригинала: у него дробь шире нашей ровно на эти 4 px.
+	 */
 	float f_width = 0;
 	int height = 0;
 	for (int i = 0; i < t->nr_lines; i++) {
-		f_width = max(f_width, t->lines[i].width);
+		float line_w = t->lines[i].width;
+		if (t->lines[i].nr_chars > 0)
+			line_w -= t->ts.font_spacing;
+		f_width = max(f_width, line_w);
 		if (i > 0)
 			height += t->line_space;
 		height += t->lines[i].height;

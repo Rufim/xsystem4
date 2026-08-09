@@ -1190,6 +1190,13 @@ static bool parts_numeral_font_update(struct parts *parts, struct parts_numeral 
 		total += text_style_width(&num->ts, ch) + num->space;
 	}
 	int w = max(1, (int)ceilf(total - num->space));
+	if (getenv("XSYS4_NUMTEXT_TRACE")) {
+		char first[3] = { buf[0], 0, 0 };
+		NOTICE("NUMW part=%d \"%s\" face=%u size=%.1f bold=%.2f edge=%.2f,%.2f space=%d adv_first=%.2f -> w=%d h=%d",
+		       parts->no, buf, num->ts.face, num->ts.size, num->ts.bold_width,
+		       num->ts.edge_left, num->ts.edge_right, num->space,
+		       gfx_size_char(&num->ts, first), w, h);
+	}
 
 	gfx_delete_texture(&num->common.texture);
 	gfx_init_texture_rgba(&num->common.texture, w, h, (SDL_Color){0, 0, 0, 0});
