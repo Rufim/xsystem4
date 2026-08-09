@@ -1363,6 +1363,18 @@ struct pe_activity {
 	 */
 	int *end_keys;
 	int nr_end_keys;
+	/*
+	 * СЛУЖЕБНЫЕ ЧАСТИ, которые создаёт сам загрузчик раскладки: надписи кнопок и
+	 * подписи чекбоксов, три части декора полосы прокрутки, текст и «мигалка»
+	 * окна сообщений. Имени в раскладке у них нет, игра о них не знает и снять их
+	 * не может — а `ReleaseActivity` шёл только по `parts`, и они оставались
+	 * сиротами: родителя сняли, часть жива и рисуется. Так надписи прежней
+	 * вкладки CONFIG наслаивались на новую (10 сирот за два переключения).
+	 * Отдельным списком, а не записями в `parts`, чтобы не менять ни то, что
+	 * игра видит через `NumofActivityParts`/`GetActivityParts`, ни формат сейва.
+	 */
+	int *helpers;
+	int nr_helpers;
 };
 static struct hash_table *pe_activities;
 
@@ -1371,6 +1383,15 @@ static struct pe_activity *pe_act_find(struct string *name)
 	if (!pe_activities)
 		return NULL;
 	return ht_get(pe_activities, name->text, NULL);
+}
+
+static void pe_act_add_helper(struct pe_activity *a, int parts_no)
+{
+	if (!a)
+		return;
+	a->helpers = xrealloc_array(a->helpers, a->nr_helpers, a->nr_helpers + 1,
+			sizeof(*a->helpers));
+	a->helpers[a->nr_helpers++] = parts_no;
 }
 
 static void PE_Activity_free(void *p)
@@ -1386,6 +1407,7 @@ static void PE_Activity_free(void *p)
 		free(a->parts[i].intent_dests);
 	}
 	free(a->parts);
+	free(a->helpers);
 	if (a->ex_text)
 		free_string(a->ex_text);
 	free(a->end_keys);
@@ -1656,6 +1678,10 @@ static bool PE_ReleaseActivity(struct string *name, struct page **out)
 		 */
 		for (int i = 0; i < n; i++)
 			PE_ReleaseParts(a->parts[i].number);
+		// Служебные части загрузчика (см. `helpers`): игра их не знает, снять
+		// может только движок — иначе они остаются сиротами на экране.
+		for (int i = 0; i < a->nr_helpers; i++)
+			PE_ReleaseParts(a->helpers[i]);
 		// Вместе с активностью уходят и ВЛОЖЕННЫЕ: игра именует их
 		// «<родитель>／<узел>[:<индекс>]» (у экрана сохранения это `／項目:0..8`
 		// — рамки слотов и `／ページボタン:0..9` — кнопки страниц). Их
@@ -2560,6 +2586,7 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			if (ch <= 0) ch = bh;
 			int fsize = act_int(ti, "フォントサイズ", 16);
 			int tno = ++pe_act_part_seq;
+			pe_act_add_helper(a, tno);
 			PE_SetText(tno, btxt, 1);
 			PE_SetFont(tno, act_int(ti, "フォントタイプ", 0), fsize,
 				act_list_int(ti, "フォント色", 0, 0),
@@ -2748,6 +2775,7 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			for (int d = 0; d < 3; d++) {
 				struct string *full = act_cg_suffix(cg, deco[d].sfx);
 				int dno = ++pe_act_part_seq;
+				pe_act_add_helper(a, dno);
 				bool ok = PE_SetPartsCG(dno, full, 0, 1);
 				free_string(full);
 				if (ok) {
@@ -2826,14 +2854,13 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetClickable(no, true);
 		struct string *txt = act_str(ti, "テキスト");
 		if (txt && txt->size) {
-			int base_x = act_list_int(node, "座標", 0, 0);
-			int base_y = act_list_int(node, "座標", 1, 0);
 			int box_w = PE_GetPartsWidth(no, 1);
 			if (box_w <= 0) box_w = act_list_int(ti, "サイズ", 0, 0);
 			if (box_w <= 0) box_w = 32;
 			int box_h = PE_GetPartsHeight(no, 1);
 			int fsize = act_int(ti, "フォントサイズ", 16);
 			int tno = ++pe_act_part_seq;
+			pe_act_add_helper(a, tno);
 			PE_SetText(tno, txt, 1);
 			PE_SetFont(tno, act_int(ti, "フォントタイプ", 0), fsize,
 				act_list_int(ti, "フォント色", 0, 255),
@@ -2844,10 +2871,20 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				act_list_int(ti, "フォント縁取り色", 1, 0),
 				act_list_int(ti, "フォント縁取り色", 2, 0),
 				act_float(ti, "フォント縁取り", 0.0f), 1);
-			int ty = base_y + (box_h > fsize ? (box_h - fsize) / 2 : 0);
-			PE_SetPos(tno, base_x + box_w + 4, ty);
-			if (parent_no >= 0)
-				PE_SetParentPartsNumber(tno, parent_no);
+			/*
+			 * ПОДПИСЬ — РЕБЁНОК САМОГО БОКСА, координаты локальные. Прежде она
+			 * висела на том же родителе, что и бокс, с абсолютной позицией из
+			 * раскладки: под свободной раскладкой это совпадало, но у
+			 * контейнера с `レイアウトタイプ` подпись стала ОТДЕЛЬНЫМ элементом
+			 * ряда — вертикальная раскладка ставила её своей строкой, и пара
+			 * «бокс + подпись» разъезжалась (вкладка 入力 в CONFIG: шаг 90 и
+			 * подписи не на своих местах вместо ряда с шагом 55, сверено с
+			 * `screenshots/orig-haharanman-config-input.png`). Ребёнком она
+			 * едет вместе с боксом, куда бы тот ни встал.
+			 */
+			int ty = box_h > fsize ? (box_h - fsize) / 2 : 0;
+			PE_SetPos(tno, box_w + 4, ty);
+			PE_SetParentPartsNumber(tno, no);
 			PE_SetShow(tno, 1);
 		}
 	} else if (ti && act_parts_type_v14(ti) == 14) {
@@ -2957,6 +2994,8 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		 */
 		int mw_text_no = ++pe_act_part_seq;
 		int mw_mark_no = ++pe_act_part_seq;
+		pe_act_add_helper(a, mw_text_no);
+		pe_act_add_helper(a, mw_mark_no);
 		PE_CreateMessageWindow(no, mw_text_no, mw_mark_no);
 		PE_SetMessageWindowInactiveMultipleColor(no,
 			act_list_int(ti, "非アクティブ時の乗算カラー", 0, 255),
