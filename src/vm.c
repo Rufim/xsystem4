@@ -2171,6 +2171,23 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case RETURN: {
+		// XSYS4_FN_TRACE_RET=<подстрока> — печатать ВОЗВРАЩАЕМОЕ значение
+		// функций, чьё имя содержит подстроку. Вход трейсит XSYS4_FN_TRACE_NS,
+		// но на вопрос «что игра решила» отвечает только возврат (живой случай:
+		// какой слот отдаёт `CSaveFileInfo::GetNewestIndex`).
+		{
+			static const char *ret_ns = (const char *)1;
+			if (ret_ns == (const char *)1)
+				ret_ns = getenv("XSYS4_FN_TRACE_RET");
+			if (ret_ns && *ret_ns && call_stack_ptr > 0) {
+				int fno = call_stack[call_stack_ptr - 1].fno;
+				const char *n = fno >= 0 && fno < ain->nr_functions
+					? ain->functions[fno].name : NULL;
+				if (n && strstr(n, ret_ns))
+					WARNING("RETTRACE %s -> %d", n,
+						stack_ptr > 0 ? stack[stack_ptr - 1].i : 0);
+			}
+		}
 		function_return();
 		break;
 	}
@@ -2946,6 +2963,14 @@ static enum opcode execute_instruction(enum opcode opcode)
 			if (unlikely(!heap_index_valid(dst_page) || !heap[dst_page].page
 					|| member < 0 || member >= heap[dst_page].page->nr_vars))
 				VM_ERROR("SR_ASSIGN: bad member ref %d/%d", dst_page, member);
+			if (getenv("XSYS4_SRA_TRACE")) {
+				int st = -1;
+				enum ain_data_type dt = variable_type(heap[dst_page].page,
+						member, &st, NULL);
+				NOTICE("SRA dst_page=%d member=%d тип=%d struct=%d знач=%d src=%d",
+				       dst_page, member, (int)dt, st,
+				       heap[dst_page].page->values[member].i, src);
+			}
 			heap_struct_assign(heap[dst_page].page->values[member].i, src);
 			stack_push(src);
 			break;
