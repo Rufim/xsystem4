@@ -860,8 +860,23 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 				edge_r, edge_g, edge_b, edge_weight,
 				char_space, line_space, state);
 		break;
+	/*
+	 * Вертикальный градиент (`色１` сверху → `色２` снизу; «Horizon» здесь про
+	 * ГОРИЗОНТАЛЬНЫЕ линии заливки, а не про направление перехода). Сама
+	 * отрисовка была давно — не хватало этой ветки, и путь ИЗ РАСКЛАДКИ молча
+	 * пропускался с WARNING на каждом экране, где такой узел есть.
+	 *
+	 * ★Прямоугольник из раскладки НУЛЕВОЙ: у всех четырёх мест, где Dohna зовёт
+	 * команду 9 (`SceneAchievementNotify`, `SceneGameOver`,
+	 * `BattleResultPlayerView`, `PlayerParamDetailView`), поля `元矩形` и
+	 * `先矩形` — сплошные нули, а заданы только цвета, например
+	 * `色１ = 255,255,64` и `色２ = 255,90,90`. Значит заливать надо ВЕСЬ холст —
+	 * размер его известен только в момент исполнения процедуры, поэтому нули
+	 * превращаются в флаг `full_size` (ровно как у MulFilter).
+	 */
 	case 9:  // CASConstructionProcess::SetFillGradationHorizon
-		WARNING("AddConstructProcess: FillGradationHorizon unimplemented");
+		PE_AddFillGradationHorizonToPartsConstructionProcess(parts_no,
+				dx, dy, dw, dh, r, g, b, r2, g2, b2, state);
 		break;
 	case 10:  // CASConstructionProcess::SetDrawRect
 		PE_AddDrawRectToPartsConstructionProcess(parts_no,
