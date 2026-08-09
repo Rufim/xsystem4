@@ -2578,8 +2578,6 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		 */
 		struct string *btxt = act_str(ti, "テキスト");
 		if (btxt && btxt->size && !act_is_placeholder_text(btxt)) {
-			int base_x = act_list_int(node, "座標", 0, 0);
-			int base_y = act_list_int(node, "座標", 1, 0);
 			int cw = PE_GetPartsWidth(no, 1);
 			int ch = PE_GetPartsHeight(no, 1);
 			if (cw <= 0) cw = bw;
@@ -2597,21 +2595,36 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 				act_list_int(ti, "フォント縁取り色", 1, 0),
 				act_list_int(ti, "フォント縁取り色", 2, 0),
 				act_float(ti, "フォント縁取り", 0.0f), 1);
+			/*
+			 * ★Подпись — ребёнок САМОЙ КНОПКИ, а не её родителя. Пока она
+			 * висела сестрой, она жила своей жизнью: показ, масштаб и альфа
+			 * кнопки её не касались. Что это давало на экране CONFIG у Dohna:
+			 *  — `SYS_背景音声ボタン` (`エディタ上表示 = 0`) скрыт правилом
+			 *    части-образца, плашки нет — а надпись `初期化` осталась висеть
+			 *    поверх фона под кнопкой Reset у Voices (замер: скрытая часть
+			 *    1048,352 130x44, подпись 1089,366 48x16, lshow=1 при lshow=0
+			 *    у хозяина);
+			 *  — у мелких кнопок Reset (`拡大縮小 = 0.8`) плашка ужималась, а
+			 *    подпись рисовалась в натуральный кегль и вылезала за неё.
+			 * Ребёнку и показ, и масштаб, и позиция достаются от родителя
+			 * (parts_update_global_*), поэтому координаты теперь ОТНОСИТЕЛЬНЫЕ:
+			 * centering считается внутри бокса кнопки, а не от её места на экране.
+			 */
 			int tw = PE_GetPartsWidth(tno, 1);
-			int tx = base_x + (cw > tw ? (cw - tw) / 2 : 0);
-			int ty = base_y + (ch > fsize ? (ch - fsize) / 2 : 0);
+			int tx = (cw > tw ? (cw - tw) / 2 : 0);
+			int ty = (ch > fsize ? (ch - fsize) / 2 : 0);
 			PE_SetPos(tno, tx, ty);
-			if (parent_no >= 0)
-				PE_SetParentPartsNumber(tno, parent_no);
+			PE_SetParentPartsNumber(tno, no);
 			// ★Подпись лежит ПОВЕРХ плашки кнопки: с равным z она уходила под
 			// картинку кнопки и не была видна (плашки «Reset» в CONFIG выходили
 			// пустыми, хотя текст в часть ставился — видно в XSYS4_SETTEXT_TRACE).
-			PE_SetZ(tno, act_list_int(node, "座標", 2, 0) + 1);
+			// Z у ребёнка складывается с родительским, поэтому здесь просто +1.
+			PE_SetZ(tno, 1);
 			PE_SetShow(tno, 1);
 			struct pe_button_state *b = pe_button_get(no, true);
 			b->text_no = tno;
-			b->text_x = base_x;
-			b->text_y = base_y;
+			b->text_x = 0;
+			b->text_y = 0;
 			b->box_w = cw;
 			b->box_h = ch;
 			b->font_size = fsize;
@@ -3577,6 +3590,27 @@ static struct pe_button_state *pe_button_get(int parts_no, bool create)
 	return b;
 }
 
+/*
+ * Снос кнопки уносит и её подпись. `parts_release` намеренно НЕ рекурсивен
+ * (см. оговорку там же — «Release забирает всё поддерево» ломает семантику у
+ * живых игровых обёрток), а подпись из раскладки — не игровая часть, а наша
+ * служебная, и без хозяина она сирота.
+ *
+ * Так на экране CONFIG у Dohna оставалась надпись `デバッグ` в правом верхнем
+ * углу: кнопку отладки (`デバッグボタン`, 1148,12, у неё ни ＣＧ名, ни フラット名)
+ * релизная игра сносит сама, и в дампе частей её уже нет — а подпись, заведённая
+ * сестрой, продолжала висеть. У оригинала там пусто.
+ */
+static void PartsEngine_ReleaseParts(int parts_no)
+{
+	struct pe_button_state *b = pe_button_get(parts_no, false);
+	if (b && b->text_no) {
+		PE_ReleaseParts(b->text_no);
+		b->text_no = 0;
+	}
+	PE_ReleaseParts(parts_no);
+}
+
 static void pe_button_remember_cg(int parts_no, struct string *cg_base)
 {
 	if (!cg_base || !cg_base->size)
@@ -4417,7 +4451,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(AddDrawTextToPartsConstructionProcess, PE_AddDrawTextToPartsConstructionProcess),
 	    HLL_EXPORT(AddCopyTextToPartsConstructionProcess, PE_AddCopyTextToPartsConstructionProcess),
 	    HLL_EXPORT(SetPartsConstructionSurfaceArea, PE_SetPartsConstructionSurfaceArea),
-	    HLL_EXPORT(ReleaseParts, PE_ReleaseParts),
+	    HLL_EXPORT(ReleaseParts, PartsEngine_ReleaseParts),
 	    HLL_EXPORT(ReleaseAllParts, PE_ReleaseAllParts),
 	    HLL_EXPORT(ReleaseAllPartsWithoutSystem, PE_ReleaseAllPartsWithoutSystem),
 	    HLL_EXPORT(SetPos, PE_SetPos),
@@ -4520,7 +4554,7 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(AddPartsConstructionProcess, PE_AddPartsConstructionProcess),
 	    HLL_EXPORT(Parts_GetPartsConstructionProcessCount, PE_GetPartsConstructionProcessCount),
 	    HLL_EXPORT(GetPartsConstructionProcess, PE_GetPartsConstructionProcess),
-	    HLL_EXPORT(Release, PE_ReleaseParts),
+	    HLL_EXPORT(Release, PartsEngine_ReleaseParts),
 	    HLL_TODO_EXPORT(ReleaseAll, PartsEngine_ReleaseAll),
 	    HLL_EXPORT(ReleaseAllWithoutSystem, PE_ReleaseAllWithoutSystem),
 	    HLL_EXPORT(GetFreeNumber, PE_GetFreeNumber),
