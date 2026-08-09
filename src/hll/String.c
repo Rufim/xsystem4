@@ -35,23 +35,39 @@
  * UTF-8 (см. sjis_to_utf8_tmp) — в SJIS второй байт символа может совпасть,
  * например, с `[`, и шаблон бы «резал» строку внутри символа.
  *
- * `Split(ref string, string separators, int options)` режет по НАБОРУ
+ * `Split(ref string, string separators, int containsMode)` режет по НАБОРУ
  * символов-разделителей, а не по строке-разделителю целиком: один из сайтов
  * передаёт `"[]|"` (три символа), который как единый разделитель не встретился
- * бы никогда. Третий аргумент — БИТОВАЯ МАСКА, а не булев флаг: у Dohna он
- * принимает 0 (40 сайтов), 1 (2 сайта) и 2 (1 сайт). Бит 0 — «убрать пустые
- * части»: сайт переноса строк бэклога (`AddWrappingLog`) зовёт
- * `Split(text, " ", 1)`, т.е. режет на слова, и пустые куски от подряд идущих
- * пробелов там недопустимы.
+ * бы никогда. Третий аргумент (имя параметра в .ain — `containsMode`) —
+ * БИТОВАЯ МАСКА; смысл битов снят по САЙТАМ ВЫЗОВА, а не по догадке. У Dohna
+ * из 43 вызовов 40 идут с 0, два с 1 и один с 2:
  *
- * ★Значение 2 пустые части ОСТАВЛЯЕТ (бит 0 не взведён) — как `StringSplitOptions`
- * .NET, где 1 = RemoveEmptyEntries, 2 = TrimEntries. Пока любое ненулевое
- * значение означало «убрать пустые», ломался единственный сайт с двойкой —
- * `Footer@SetButtonText`: подписи кнопок футера приходят одной строкой через
- * запятую и позиционно («Save,Load,Items,Next→» у дома, `",,,Back"` у магазина).
- * Со схлопнутыми пустыми `",,,Back"` давало ["Back"], и подпись садилась на
- * кнопку 0 — «Back» рисовался СЛЕВА вместо правого края, а кнопки 0–2 не
- * получали `Show(false)` и оставались на экране лишними плашками.
+ *   бит 0 (значение 1) — РАЗДЕЛИТЕЛИ возвращаются отдельными элементами.
+ *     Доказательство — `ConditionMatcher@InnerMatchIntFlag` (FUNC 27303):
+ *     `Split(section, "[]!<-=> ", 1)`, затем `Array.EraseAll` выкидывает куски,
+ *     равные `" "`, и дальше идут сравнения `token[1] == "["`, `token[3] == "-"`,
+ *     `token[5] == "]"`. Скобки и дефис в результат попасть могут ТОЛЬКО как
+ *     разделители-элементы. Второй сайт — перенос строк бэклога
+ *     (`AddWrappingLog`, `Split(text, " ", 1)`): пробелы нужны, чтобы собрать
+ *     строку обратно.
+ *
+ *   бит 1 (значение 2) — ПУСТЫЕ куски СОХРАНЯЮТСЯ (позиционный список).
+ *     Единственный сайт — `Footer@SetButtonText` (FUNC 31073):
+ *     `Split(text, ",", 2)`, дальше `foreach` по индексу ставит подпись в
+ *     кнопку `index` и зовёт `Show(текст != "")`. Подписи приходят одной
+ *     строкой позиционно: `"Scenes,Peeps,Songs,Back"` у Collections,
+ *     `",,,Back"` у экрана LOAD — три пустые кнопки и `Back` справа.
+ *
+ *   0 — ни того, ни другого: разделителей нет, пустые схлопнуты. Замер по
+ *     Haha Ranman: поля сейва пакуются в одну строку через `@savecode@`
+ *     (`SetSaveFileComment`) и разбираются `Split(..., 0)`, а `GetSaveFileComment`
+ *     ждёт РОВНО 6 элементов — с сохранёнными пустыми выходило больше сорока.
+ *
+ * Пока ЛЮБОЕ ненулевое значение означало «вернуть разделители», сайт с двойкой
+ * ломался: `",,,Back"` давало [",", ",", ",", "Back"], и запятые садились
+ * подписями на кнопки — на экране LOAD три лишние розовые плашки с «,» вместо
+ * пустоты, в Collections `Scenes / , / Peeps / ,` вместо
+ * `Scenes / Peeps / Songs / Back` (замер: кадры `/tmp/coll.png`, `/tmp/load-screen.png`).
  */
 
 #include <stdlib.h>
@@ -344,7 +360,7 @@ static struct string *String_TrimEnd(struct string **s, struct string *set)
  * (сырой page* прочитался бы как индекс слота); вызывающий владеет слотом и
  * освобождает его своим DELETE.
  *
- * ★ПУСТЫЕ КУСКИ НЕ ОТДАЮТСЯ — подряд идущие разделители съедаются, как у
+ * ★ПРИ 0 ПУСТЫЕ КУСКИ НЕ ОТДАЮТСЯ — подряд идущие разделители съедаются, как у
  * strtok. Прежде третий аргумент читался как биты «removeEmpty|trimEntries»
  * (догадка), и при нуле пустые куски попадали в результат. Замер, который это
  * опроверг: Haha Ranman пакует поля сейва в одну строку через `@savecode@`
@@ -355,8 +371,9 @@ static struct string *String_TrimEnd(struct string **s, struct string *set)
  * оставался незаполненный «score»: LOAD LATEST всегда брал первый слот, а
  * заметки к сейвам не отображались.
  *
- * Третий аргумент — `containSeparator`: разделители возвращаются как отдельные
- * элементы (у Dohna так зовут `Split(" ", 1)` в разборе параметров motion).
+ * Третий аргумент — маска `containsMode` (разбор битов и доказательства — в
+ * шапке файла): бит 0 возвращает разделители отдельными элементами, бит 1
+ * сохраняет пустые куски.
  */
 static bool is_separator(const char *sep, size_t sep_size, const char *p, int len)
 {
@@ -369,8 +386,10 @@ static bool is_separator(const char *sep, size_t sep_size, const char *p, int le
 	return false;
 }
 
-static int String_Split(struct string **s, struct string *sep, int contain_separator)
+static int String_Split(struct string **s, struct string *sep, int contains_mode)
 {
+	const bool contain_separator = contains_mode & 1;
+	const bool mode_keeps_empty = contains_mode & 2;
 	struct string *src = self_or_empty(s);
 	int slot = heap_alloc_slot(VM_PAGE);
 	union vm_value dim = { .i = 0 };
@@ -384,13 +403,13 @@ static int String_Split(struct string **s, struct string *sep, int contain_separ
 			i += clen;
 			continue;
 		}
-		// XSYS4_SPLIT_KEEP_EMPTY=1 — вернуть прежнее поведение (пустые куски
-		// попадают в результат): откат для замеров, если где-то игра ждёт
-		// позиционный список, а не сжатый.
-		static int keep_empty = -1;
-		if (keep_empty < 0)
-			keep_empty = getenv("XSYS4_SPLIT_KEEP_EMPTY") ? 1 : 0;
-		if (i > start || keep_empty) {
+		// XSYS4_SPLIT_KEEP_EMPTY=1 — принудительно сохранять пустые куски при
+		// ЛЮБОМ режиме: A/B-ручка для замеров, если где-то ещё окажется, что
+		// игра ждёт позиционный список, а маска этого не говорит.
+		static int force_keep_empty = -1;
+		if (force_keep_empty < 0)
+			force_keep_empty = getenv("XSYS4_SPLIT_KEEP_EMPTY") ? 1 : 0;
+		if (i > start || mode_keeps_empty || force_keep_empty) {
 			struct string *part = make_string(src->text + start, i - start);
 			union vm_value v = { .i = heap_alloc_string(part) };
 			out = array_pushback_n(out, &v, 1, AIN_ARRAY_STRING, 0);
