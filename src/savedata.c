@@ -396,6 +396,14 @@ int save_globals(const char *keyname, const char *filename, const char *group_na
 	struct gsave *save = gsave_create(get_gsave_version(), keyname, ain->nr_globals, group_name);
 	gsave_add_globals_record(save, nr_vars);
 
+	/*
+	 * ★Реестр тождества — НА ОПЕРАЦИЮ. Групповые сейвы пишутся сериями
+	 * (AFCommon → AFInfo → ...), и без сброса объект, попавший в реестр при
+	 * записи ПЕРВОГО файла, во втором отдавался индексом записи, которой в
+	 * ЭТОМ файле нет — стартовые бэкапы Haha Ranman выходили битыми.
+	 */
+	obj_maps_reset();
+
 	if (nr_vars > 0) {
 		struct gsave_global *global = save->globals;
 		for (int i = 0; i < ain->nr_globals; i++) {
@@ -804,16 +812,37 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			// объектом, что и в остальном восстановленном графе.
 			if (value < 0)
 				return vm_int(-1);
+			/*
+			 * ★ЛЕГАСИ-СЕЙВЫ: до формата троек делегат писался СЫРЫМ числом
+			 * (heap-слот старого мира) — прежний код и читал его как число.
+			 * Такое значение НЕ индекс массива: трактовка «как тройки» читала
+			 * мусор из save->arrays и строила делегат из случайных пар
+			 * (obj, fun) — Haha Ranman падала на СТАРТЕ при живой сейв-папке
+			 * («Out of bounds page index: 7184/1» в CallPartsUpdateEvent).
+			 * Проверяем форму: валидный индекс + ранг 1 + один flat-массив
+			 * целых, кратный тройке. Всё прочее — легаси-число, подписки
+			 * игра восстановит сама при построении сцен: пусто (−1).
+			 */
+			if ((size_t)value >= (size_t)save->nr_arrays) {
+				NOTICE("делегат из сейва: значение %d вне arrays (%d) — легаси-формат, пусто", value, save->nr_arrays);
+				return vm_int(-1);
+			}
 			struct gsave_array *array = &save->arrays[value];
+			if (array->rank != 1 || array->nr_flat_arrays != 1
+			    || array->flat_arrays[0].type != AIN_INT
+			    || array->flat_arrays[0].nr_values % 3 != 0) {
+				NOTICE("делегат из сейва: массив %d — не тройки, легаси-формат, пусто", value);
+				return vm_int(-1);
+			}
 			int slot = heap_alloc_slot(VM_PAGE);
 			struct page *page = alloc_page(DELEGATE_PAGE, 0, 0);
-			if (array->rank == 1 && array->nr_flat_arrays == 1) {
+			{
 				struct gsave_flat_array *fa = &array->flat_arrays[0];
 				for (int i = 0; i + 2 < fa->nr_values; i += 3) {
 					int32_t obj_rec = fa->values[i].value;
 					int fun = fa->values[i + 1].value;
 					int obj = -1;
-					if (obj_rec >= 0) {
+					if (obj_rec >= 0 && obj_rec < save->nr_records) {
 						struct gsave_record *r = &save->records[obj_rec];
 						struct gsave_struct_def *d = save->version >= 7
 							? &save->struct_defs[r->struct_index] : NULL;
@@ -967,6 +996,15 @@ int load_globals_from_gsave(struct gsave *save, const char *keyname, const char 
 		save->group = strdup("");
 	if (strcmp(group_name, save->group))
 		VM_ERROR("Attempted to load save data with wrong group name: '%s'", display_sjis0(group_name));
+
+	/*
+	 * ★Зеркало save_globals: реестр «запись → объект» живёт одну операцию.
+	 * Индексы записей НАЧИНАЮТСЯ ЗАНОВО в каждом файле, и без сброса запись
+	 * №N второго файла находила в реестре объект из ПЕРВОГО — при полной
+	 * сейв-папке (несколько групповых загрузок подряд) весь граф расползался;
+	 * один файл в одиночку падения не давал, что и путало бисект.
+	 */
+	obj_maps_reset();
 
 	for (struct gsave_global *g = save->globals; g < save->globals + save->nr_globals; g++) {
 		int global_index = ain_get_global(ain, g->name);
