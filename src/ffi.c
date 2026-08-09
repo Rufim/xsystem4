@@ -664,12 +664,6 @@ void hll_call(int libno, int fno, int elem_class)
 		// (int/float/bool/...) needs a 2-value ref (array-page slot, index).
 		// Only applies when the call actually had a ref-array self argument;
 		// otherwise fall through to the plain single-value return.
-		struct page *ap = (ref_array_slot >= 0 && heap_index_valid(ref_array_slot))
-			? heap[ref_array_slot].page : NULL;
-		if (!ap) {
-			stack_push(r);
-			break;
-		}
 		/*
 		 * `wrap<array<T>>` — возвращается САМ КОНТЕЙНЕР, а не элемент. Отличить
 		 * от `wrap<T>` можно ПО .ain: у обёртки записан вложенный тип, и у
@@ -680,11 +674,26 @@ void hll_call(int libno, int fno, int elem_class)
 		 * строка, список выходил пустым, и `Footer@0` падал на `m_uiButtons[0]`.
 		 * Функции этой группы работают НА МЕСТЕ, поэтому контейнер — тот же
 		 * массив, что пришёл в self; счётчик поднимаем, вызывающий делает DELETE.
+		 *
+		 * ★Ветка стоит ВЫШЕ проверки страницы: у ПУСТОГО массива слот жив, а
+		 * `page == NULL`, и раньше такой self проваливался в «нет self» ниже —
+		 * на стек уходил сырой NULL из C-реализации, то есть 0. Вызывающий
+		 * делал DELETE этого «хэндла», heap_unref(0) освобождал ГЛОБАЛЬНУЮ
+		 * СТРАНИЦУ, и игра рассыпалась далеко от места (у Dohna — после
+		 * загрузки сейва: `Schedule@GetLatest` сортирует пустое расписание,
+		 * а падало на литерале `Schedule1` в `SceneHome@SetSchedule`).
 		 */
 		if (f->return_type.data == AIN_WRAP && f->return_type.array_type
-		    && ain_is_array_data_type(f->return_type.array_type[0].data)) {
+		    && ain_is_array_data_type(f->return_type.array_type[0].data)
+		    && ref_array_slot >= 0 && heap_index_valid(ref_array_slot)) {
 			heap_ref(ref_array_slot);
 			stack_push(ref_array_slot);
+			break;
+		}
+		struct page *ap = (ref_array_slot >= 0 && heap_index_valid(ref_array_slot))
+			? heap[ref_array_slot].page : NULL;
+		if (!ap) {
+			stack_push(r);
 			break;
 		}
 		int idx = r.i;
