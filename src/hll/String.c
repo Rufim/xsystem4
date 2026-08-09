@@ -384,7 +384,13 @@ static int String_Split(struct string **s, struct string *sep, int contain_separ
 			i += clen;
 			continue;
 		}
-		if (i > start) {
+		// XSYS4_SPLIT_KEEP_EMPTY=1 — вернуть прежнее поведение (пустые куски
+		// попадают в результат): откат для замеров, если где-то игра ждёт
+		// позиционный список, а не сжатый.
+		static int keep_empty = -1;
+		if (keep_empty < 0)
+			keep_empty = getenv("XSYS4_SPLIT_KEEP_EMPTY") ? 1 : 0;
+		if (i > start || keep_empty) {
 			struct string *part = make_string(src->text + start, i - start);
 			union vm_value v = { .i = heap_alloc_string(part) };
 			out = array_pushback_n(out, &v, 1, AIN_ARRAY_STRING, 0);
