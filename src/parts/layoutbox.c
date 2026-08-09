@@ -250,6 +250,13 @@ static void parts_get_layout_size(struct parts *parts, int *w, int *h)
  */
 static bool layout_skip(struct parts *child)
 {
+	// Откат для замеров A/B на одном бинаре: XSYS4_NO_HIDDEN_SKIP=1 — скрытый
+	// ребёнок снова занимает место в потоке (поведение до этой правки).
+	static const char *off = (const char *)1;
+	if (off == (const char *)1)
+		off = getenv("XSYS4_NO_HIDDEN_SKIP");
+	if (off && *off)
+		return false;
 	return !child->local.show;
 }
 
