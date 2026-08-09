@@ -441,6 +441,17 @@ void parts_do_layout(struct parts *parts)
 
 		int pos_x = cur_x + mx;
 		int pos_y = cur_y + my;
+		// XSYS4_LAYOUT_TRACE — печатать УКЛАДКУ ребёнка в момент, когда она реально
+		// сдвигает его: полный трейс (каждый UpdateComponent × каждый ребёнок) даёт
+		// сотни МБ за прогон, а интересны ровно перестановки.
+		if (getenv("XSYS4_LAYOUT_TRACE")
+				&& (child->local.pos.x != pos_x || child->local.pos.y != pos_y)) {
+			NOTICE("LAYOUT box=%d type=%d align=%d child=%d st=%d ctype=%d w=%d h=%d "
+			       "ml=%d mr=%d cw=%d cur_x=%d -> pos=%d,%d",
+			       parts->no, lb->layout_type, align, child->no, child->state,
+			       child->states[child->state].type, child_w, child_h,
+			       child->margin_left, child->margin_right, cw, cur_x, pos_x, pos_y);
+		}
 		if (child->local.pos.x != pos_x || child->local.pos.y != pos_y) {
 			child->local.pos.x = pos_x;
 			child->local.pos.y = pos_y;

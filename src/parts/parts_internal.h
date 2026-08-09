@@ -563,7 +563,15 @@ struct parts {
 	// и у обоих есть геттер. В рендере складываются с `sprite_deform`.
 	bool reverse_lr;
 	bool reverse_tb;
-	bool clickable;
+	/*
+	 * Право на клик — ТРИ состояния, а не два: 0 — игра ничего не говорила,
+	 * 1 — разрешила явно, −1 — ЗАПРЕТИЛА явно (`SetClickable(false)`, а через
+	 * него и `SetButtonEnable(false)`). Двух значений не хватало: дефолт от
+	 * `xcalloc` — ноль, и «выключено игрой» было неотличимо от «не задано», а
+	 * новые игры `SetClickable` почти не зовут, поэтому клик разрешался по
+	 * `!pass_cursor` (см. parts_update_mouse) и запрет молча терялся.
+	 */
+	int8_t clickable;
 	// True for activity "button" parts (パーツタイプ=0) created by ReadActivityFile.
 	// Such parts render as CG (hover/click state-switch) but must report component
 	// type 0 to the game, which enables click handlers only on type-0 parts.
