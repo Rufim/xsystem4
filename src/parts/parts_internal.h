@@ -216,6 +216,15 @@ struct parts_gauge {
 	 */
 	float numerator;
 	float denominator;
+	/*
+	 * `Reverse` (Parts_SetHGaugeReverse/SetVGaugeReverse): шкала заполняется от
+	 * ПРОТИВОПОЛОЖНОГО края — горизонтальная справа налево, вертикальная снизу
+	 * вверх. Без этого экран Squad у Dohna ронял движок на первой же полосе
+	 * (`CHGaugeParts@Reverse::set` ← `PlayerSummaryView@SetParam`), потому что
+	 * незнакомая HLL-функция у нас фатальна. В сейв не пишется (формат не
+	 * меняем): игра выставляет флаг заново при построении экрана.
+	 */
+	bool reverse;
 };
 
 // Serialized in save data. Do not reorder.

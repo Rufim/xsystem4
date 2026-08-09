@@ -71,6 +71,11 @@ bool PE_SetVGaugeCG_by_index(int parts_no, int cg_no, int state);
 bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int state);
 bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int state);
 bool PE_SetVGaugeSurfaceArea(int parts_no, int x, int y, int w, int h, int state);
+// `Reverse`: шкала заполняется от противоположного края (H — справа, V — сверху).
+void PE_SetHGaugeReverse(int parts_no, bool enable, int state);
+bool PE_IsHGaugeReverse(int parts_no, int state);
+void PE_SetVGaugeReverse(int parts_no, bool enable, int state);
+bool PE_IsVGaugeReverse(int parts_no, int state);
 // Дробь заполнения, которой игра задала калибр (она же её и читает обратно).
 float PE_GetHGaugeNumerator(int parts_no, int state);
 float PE_GetHGaugeDenominator(int parts_no, int state);

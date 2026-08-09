@@ -2009,8 +2009,17 @@ void parts_hgauge_set_rate(struct parts *parts, struct parts_gauge *g, float rat
 		return;
 	}
 	int pixels = rate * g->cg.w;
-	gfx_copy_with_alpha_map(&g->common.texture, 0, 0, &g->cg, 0, 0, pixels, g->cg.h);
-	gfx_fill_amap(&g->common.texture, pixels, 0, g->cg.w - pixels, g->cg.h, 0);
+	if (g->reverse) {
+		// Заполнение от ПРАВОГО края: видимой остаётся правая полоса шириной
+		// pixels, гасим левую. Координаты источника и приёмника совпадают —
+		// картинка не сдвигается, меняется только какая её часть видна.
+		int x = g->cg.w - pixels;
+		gfx_copy_with_alpha_map(&g->common.texture, x, 0, &g->cg, x, 0, pixels, g->cg.h);
+		gfx_fill_amap(&g->common.texture, 0, 0, x, g->cg.h, 0);
+	} else {
+		gfx_copy_with_alpha_map(&g->common.texture, 0, 0, &g->cg, 0, 0, pixels, g->cg.h);
+		gfx_fill_amap(&g->common.texture, pixels, 0, g->cg.w - pixels, g->cg.h, 0);
+	}
 	parts_dirty(parts);
 	g->rate = rate;
 }
@@ -2022,8 +2031,16 @@ void parts_vgauge_set_rate(struct parts *parts, struct parts_gauge *g, float rat
 		return;
 	}
 	int pixels = rate * g->cg.h;
-	gfx_copy_with_alpha_map(&g->common.texture, 0, pixels, &g->cg, 0, pixels, g->cg.w, g->cg.h - pixels);
-	gfx_fill_amap(&g->common.texture, 0, 0, g->cg.w, pixels, 0);
+	if (g->reverse) {
+		// Зеркально горизонтальной: обычная вертикальная шкала растёт СНИЗУ
+		// (видима нижняя часть), обратная — сверху.
+		int h = g->cg.h - pixels;
+		gfx_copy_with_alpha_map(&g->common.texture, 0, 0, &g->cg, 0, 0, g->cg.w, h);
+		gfx_fill_amap(&g->common.texture, 0, h, g->cg.w, pixels, 0);
+	} else {
+		gfx_copy_with_alpha_map(&g->common.texture, 0, pixels, &g->cg, 0, pixels, g->cg.w, g->cg.h - pixels);
+		gfx_fill_amap(&g->common.texture, 0, 0, g->cg.w, pixels, 0);
+	}
 	parts_dirty(parts);
 	g->rate = rate;
 }
@@ -2062,6 +2079,55 @@ bool PE_SetVGaugeRate(int parts_no, float numerator, float denominator, int stat
 bool PE_SetVGaugeRate_int(int parts_no, int numerator, int denominator, int state)
 {
 	return PE_SetVGaugeRate(parts_no, numerator, denominator, state);
+}
+
+static const struct parts_gauge *gauge_for_get(int parts_no, int state, bool vert);
+
+/*
+ * `Reverse` у шкалы: заполнение идёт от ПРОТИВОПОЛОЖНОГО края (горизонтальная —
+ * справа налево, вертикальная — сверху вниз). Пара сеттер/геттер на обе оси.
+ * Пока функций не было, экран Squad у Dohna ронял движок на первой же полосе:
+ * `CHGaugeParts@Reverse::set` ← `PlayerSummaryView@SetParam` ←
+ * `PartyPlayerViewCollection@CreateView`, а незнакомая HLL-функция у нас фатальна.
+ * Флаг применяется СРАЗУ: игра ставит его после того, как задала отношение, и без
+ * перерисовки полоса осталась бы заполненной с прежнего края.
+ */
+void PE_SetHGaugeReverse(int parts_no, bool enable, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_gauge *g = parts_get_hgauge(parts, state);
+	if (g->reverse == enable)
+		return;
+	g->reverse = enable;
+	if (g->common.texture.handle)
+		parts_hgauge_set_rate(parts, g, g->rate);
+}
+
+bool PE_IsHGaugeReverse(int parts_no, int state)
+{
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, false);
+	return g && g->reverse;
+}
+
+void PE_SetVGaugeReverse(int parts_no, bool enable, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+	struct parts *parts = parts_get(parts_no);
+	struct parts_gauge *g = parts_get_vgauge(parts, state);
+	if (g->reverse == enable)
+		return;
+	g->reverse = enable;
+	if (g->common.texture.handle)
+		parts_vgauge_set_rate(parts, g, g->rate);
+}
+
+bool PE_IsVGaugeReverse(int parts_no, int state)
+{
+	const struct parts_gauge *g = gauge_for_get(parts_no, state, true);
+	return g && g->reverse;
 }
 
 /*
