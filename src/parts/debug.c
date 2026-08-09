@@ -431,7 +431,7 @@ cJSON *parts_to_json(struct parts *parts, bool recursive, bool verbose)
 	cJSON_AddNumberToObject(obj, "sprite_deform", parts->sprite_deform);
 	cJSON_AddBoolToObject(obj, "reverse_lr", parts->reverse_lr);
 	cJSON_AddBoolToObject(obj, "reverse_tb", parts->reverse_tb);
-	cJSON_AddBoolToObject(obj, "clickable", parts->clickable);
+	cJSON_AddBoolToObject(obj, "clickable", parts->clickable > 0);
 	cJSON_AddBoolToObject(obj, "pass_cursor", parts->pass_cursor);
 	cJSON_AddBoolToObject(obj, "lock_input_state", parts->lock_input_state);
 	cJSON_AddBoolToObject(obj, "want_save", parts->want_save);

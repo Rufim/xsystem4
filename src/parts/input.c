@@ -161,7 +161,7 @@ static bool parts_can_take_cursor(struct parts *parts)
 {
 	// ★`wheelable` СЮДА НЕ ГОДИТСЯ: его дефолт — true у КАЖДОЙ части (parts_init),
 	// то есть признаком способности к вводу он не является и обнулял весь гейт.
-	bool own_input = parts->clickable || parts->is_button || parts->pixel_hittest
+	bool own_input = parts->clickable > 0 || parts->is_button || parts->pixel_hittest
 			|| parts->is_checkbox || parts->is_hscrollbar || parts->is_vscrollbar
 			|| parts->draggable;
 	enum parts_type t = parts->states[parts->state].type;
@@ -307,7 +307,27 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		return;
 	}
 
-	bool click_eligible = parts->clickable || !parts->pass_cursor;
+	/*
+	 * ЯВНЫЙ ЗАПРЕТ игры сильнее любого фолбэка: `clickable == −1` — это
+	 * `SetClickable(false)`, а чаще `SetButtonEnable(false)`, которым игра
+	 * ГАСИТ кнопку (тот же вызов подменяет её CG на `／無効`).
+	 *
+	 * Живой случай — домашняя сцена Dohna: плитки `Squad` и `Shop` до открытия
+	 * по сюжету нарисованы серыми (CG `システム／アジト／ボタン／メンバー／無効`,
+	 * `／ショップ／無効`), и в оригинале они НЕ НАЖИМАЮТСЯ. У нас клик проходил
+	 * насквозь — игра уходила в `SceneAzito@OpenParty`, то есть в экраны, до
+	 * которых игрок дойти не должен; там и словили падение на
+	 * `Parts_SetHGaugeReverse`. В дампе частей видно ровно это: у серых плиток
+	 * `clk=0 btn=1`, у живых `Garage`/`Talent` — `clk=1 btn=1`, значит запрет
+	 * до движка доходил и терялся уже здесь.
+	 */
+	// Погашенная кнопка не подсвечивается и не звучит под курсором — но курсор
+	// у частей за собой всё же перехватывает: она непрозрачная и лежит поверх.
+	if (parts->clickable < 0) {
+		parts_set_state(parts, PARTS_STATE_DEFAULT);
+		return;
+	}
+	bool click_eligible = parts->clickable > 0 || !parts->pass_cursor;
 	if (!click_eligible || *click_consumed) {
 		if (!was_hovered)
 			parts_play_sound(parts->on_cursor_sound);
@@ -666,7 +686,8 @@ bool PE_GetPartsPassCursor(int parts_no)
 
 void PE_SetClickable(int parts_no, bool clickable)
 {
-	parts_get(parts_no)->clickable = !!clickable;
+	// Ноль тут не годится: он означает «игра молчала» (см. поле в parts_internal.h).
+	parts_get(parts_no)->clickable = clickable ? 1 : -1;
 }
 
 void PE_SetPartsIsButton(int parts_no, bool is_button)
@@ -696,7 +717,8 @@ void PE_SetPartsWheelable(int parts_no, bool wheelable)
 
 bool PE_GetPartsClickable(int parts_no)
 {
-	return parts_get(parts_no)->clickable;
+	// Игре видны только «да/нет»: −1 (запрещено явно) и 0 (не задано) — оба «нет».
+	return parts_get(parts_no)->clickable > 0;
 }
 
 void PE_SetPartsGroupDecideOnCursor(possibly_unused int group_no, possibly_unused bool decide_on_cursor)
