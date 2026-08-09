@@ -160,6 +160,32 @@ static void parts_layout_calc_size_horizontal(struct parts_layout_box *lb, struc
 static void parts_layout_calc_size_vertical(struct parts_layout_box *lb, struct parts *parts,
 		int *total_w, int *total_h);
 
+static void parts_get_layout_size(struct parts *parts, int *w, int *h);
+
+/*
+ * Размер УЗЛА-ОБЁРТКИ, у которого нет своего вида: по прямоугольнику, который
+ * занимают потомки. Каждый потомок стоит на своей локальной позиции (внутри
+ * такого узла их расставляет не раскладка, а сама игра), поэтому берём
+ * объединение `позиция + размер`.
+ */
+static void parts_get_content_size(struct parts *parts, int *w, int *h)
+{
+	int max_x = 0, max_y = 0;
+	struct parts *child;
+	PARTS_FOREACH_CHILD(child, parts) {
+		int child_w, child_h;
+		parts_get_layout_size(child, &child_w, &child_h);
+		int x = child->local.pos.x + child->margin_left + child_w + child->margin_right;
+		int y = child->local.pos.y + child->margin_top + child_h + child->margin_bottom;
+		if (x > max_x)
+			max_x = x;
+		if (y > max_y)
+			max_y = y;
+	}
+	*w = max_x;
+	*h = max_y;
+}
+
 static void parts_get_layout_size(struct parts *parts, int *w, int *h)
 {
 	struct parts_state *state = &parts->states[parts->state];
@@ -190,6 +216,15 @@ static void parts_get_layout_size(struct parts *parts, int *w, int *h)
 		*w = state->common.w;
 		*h = state->common.h;
 	}
+	/*
+	 * Своего вида у части нет вовсе (`PARTS_UNINITIALIZED`, либо layout box со
+	 * СВОБОДНОЙ раскладкой) — размер несут потомки. Списки Haha Ranman
+	 * (MUSIC / RECOLLECTION / CG) собраны ровно так: элемент — пустая обёртка,
+	 * внутри неё FREE-бокс, и только под ним картинка 397×42. По нулям все 25
+	 * элементов ложились с шагом одной маржи (12 px) друг на друга вместо сетки.
+	 */
+	if (*w == 0 && *h == 0)
+		parts_get_content_size(parts, w, h);
 }
 
 static int align_offset_x(int align, int total_w)

@@ -660,7 +660,11 @@ static bool ix_less(union vm_value *fn, struct page *a, int i, int j)
 		argv[k] = a->values[i * slots + k];
 		argv[slots + k] = a->values[j * slots + k];
 	}
-	return vm_call_hll_func(fn, argv, argc).i != 0;
+	bool r = vm_call_hll_func(fn, argv, argc).i != 0;
+	if (getenv("XSYS4_SORT_TRACE"))
+		NOTICE("SORT less(%d,%d) argc=%d obj=%d fno=%d -> %d",
+		       i, j, argc, fn[0].i, fn[1].i, (int)r);
+	return r;
 }
 
 // Индекс первого/последнего элемента [begin, end), удовлетворяющего предикату
@@ -964,10 +968,28 @@ static struct page *Array_ix_Sort(struct page **self, union vm_value *fn)
 		return NULL;
 	// Sort/QuickSort(self, компаратор): лямбда — `less(a, b)` -> bool (взято из
 	// её сигнатуры в .ain: два аргумента-элемента, возврат 47).
-	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
+	bool with_pred = hll_current_nr_args >= 2 && ix_arg_is_func(1);
+	if (getenv("XSYS4_SORT_TRACE") && *self) {
+		int n = array_numof(*self, 1), slots = array_elem_slots(*self);
+		char buf[256] = "";
+		for (int i = 0; i < n && i < 12; i++)
+			snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), " %d",
+				 (*self)->values[i * slots].i);
+		NOTICE("SORT до: nr_args=%d pred=%d n=%d slots=%d elems:%s",
+		       hll_current_nr_args, (int)with_pred, n, slots, buf);
+	}
+	if (with_pred)
 		ix_sort_pred(self, fn);
 	else
 		array_sort(*self, 0);
+	if (getenv("XSYS4_SORT_TRACE") && *self) {
+		int n = array_numof(*self, 1), slots = array_elem_slots(*self);
+		char buf[256] = "";
+		for (int i = 0; i < n && i < 12; i++)
+			snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), " %d",
+				 (*self)->values[i * slots].i);
+		NOTICE("SORT после: elems:%s", buf);
+	}
 	return NULL;
 }
 

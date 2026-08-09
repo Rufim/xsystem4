@@ -22,6 +22,7 @@
 #include "xsystem4.h"
 #include "parts.h"
 #include "parts_internal.h"
+#include "vm.h"
 
 // true while at least one BeginClick/BeginInput session is open
 bool parts_began_click = false;
@@ -675,6 +676,11 @@ void PE_SetPartsIsButton(int parts_no, bool is_button)
 
 void PE_SetEnableInputProcess(int parts_no, bool enable)
 {
+	if (getenv("XSYS4_EIP_TRACE")) {
+		NOTICE("EIP SetEnableInputProcess(%d, %d)", parts_no, (int)enable);
+		if (getenv("XSYS4_EIP_TRACE_STACK"))
+			vm_stack_trace();
+	}
 	parts_get(parts_no)->enable_input_process = !!enable;
 }
 

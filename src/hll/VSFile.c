@@ -105,6 +105,9 @@ static bool vsfile_open(struct string *filename, bool read)
 	if (!vs_file) {
 		WARNING("Failed to open '%s': %s", display_utf0(u), strerror(errno));
 	}
+	if (getenv("XSYS4_VSF_TRACE"))
+		NOTICE("VSF open%s '%s' -> %s", read ? "R" : "W",
+		       display_utf1(filename->text), vs_file ? "ок" : "НЕТ");
 	free(u);
 	return !!vs_file;
 }
