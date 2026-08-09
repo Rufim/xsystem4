@@ -919,11 +919,49 @@ void parts_set_rotation_z(struct parts *parts, float rot)
 	parts_dirty(parts);
 }
 
+/*
+ * Размер части ИЗМЕНИЛСЯ — раскладка предков-боксов, посчитанная по прежнему
+ * размеру, устарела. Сам по себе `parts_dirty` этого не чинит: он лишь просит
+ * перерисовать кадр, а `parts_do_layout` выполняется только для узлов, попавших
+ * в `dirty_list` через `parts_component_dirty`.
+ *
+ * Живой случай — бейдж вариантов на карточке экрана CG Haha Ranman
+ * (`ＣＧモード／項目`, бокс `差分` с детьми `数字：枚数` · `ＣＧ：スラッシュ` ·
+ * `数字：最大枚数`). Порядок такой: активность строится с однозначными числами,
+ * бокс раскладывает трёх детей шагом 12 px (один глиф), и лишь потом игра ставит
+ * реальные значения `SetNumeralNumber(10)` и `(65)`. Числовые части стали по
+ * 24 px, а позиции остались от шага 12 — второй глиф каждого числа накрывал
+ * соседа, и слэш пропадал под цифрой: на экране `1065` вместо `10 / 65`.
+ * Замер (`XSYS4_DUMP_PARTS`): у видимой карточки `wh=24x18 / 12x18 / 24x18`
+ * при позициях `-18 / -6 / +6`, тогда как у карточек, чьи числа были известны
+ * ДО раскладки, — `-30 / -6 / +6`, то есть по фактическим ширинам.
+ *
+ * Помечаем ВСЮ цепочку предков-боксов, а не только прямого родителя: контейнер
+ * без своего вида меряется по содержимому (`parts_get_content_size`), поэтому
+ * изменение размера внука меняет и размер деда.
+ */
+static void parts_invalidate_ancestor_layout(struct parts *parts)
+{
+	// Откат для замеров: XSYS4_NO_RELAYOUT_ON_RESIZE=1 — прежнее поведение.
+	if (getenv("XSYS4_NO_RELAYOUT_ON_RESIZE"))
+		return;
+	for (struct parts *p = parts->parent; p; p = p->parent) {
+		if (p->states[0].type != PARTS_LAYOUT_BOX)
+			continue;
+		if (p->states[0].layout_box.layout_type == PARTS_LAYOUT_FREE)
+			continue;
+		parts_component_dirty(p);
+	}
+}
+
 void parts_set_dims(struct parts *parts, struct parts_common *common, int w, int h)
 {
+	bool resized = common->w != w || common->h != h;
 	common->w = w;
 	common->h = h;
 	parts_common_recalculate_hitbox(parts, common);
+	if (resized)
+		parts_invalidate_ancestor_layout(parts);
 }
 
 bool _parts_cg_set(struct parts *parts, struct parts_cg *parts_cg, struct cg *cg, int cg_no,
