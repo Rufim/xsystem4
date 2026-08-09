@@ -163,6 +163,47 @@ char *savedir_path(const char *path)
 	return resolve_path(config.save_dir, path);
 }
 
+/*
+ * `XSYS4_STRICT=1` — не проглатывать молча то, что ПОРТИТ ДАННЫЕ.
+ *
+ * Движок по умолчанию терпим: неизвестный тип в сейве, поле без пары в
+ * структуре, неизвестная команда раскладки — всё это WARNING, после которого
+ * игра идёт дальше с мусором в руках. Ловится это потом за километр от причины:
+ * сохранение Dohna теряло `GamePhase#92` (перечисление уходило в default), и
+ * симптомом был ЧЁРНЫЙ ЭКРАН после загрузки — игра крутила SWITCH по пустой
+ * фазе. Со строгим режимом движок встаёт ровно там, где данные разошлись, и
+ * печатает стек игры, а не удобное «продолжаем».
+ *
+ * Терпимость по умолчанию сохранена: строгий режим — инструмент проверки, а не
+ * поведение для игрока.
+ */
+bool xsys4_strict(void)
+{
+	static int on = -1;
+	if (on < 0)
+		on = getenv("XSYS4_STRICT") ? 1 : 0;
+	return on;
+}
+
+void strict_or_warn(const char *where, const char *fmt, ...)
+{
+	char msg[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+
+	if (!xsys4_strict()) {
+		sys_warning("*WARNING*(%s): %s\n", where, msg);
+		return;
+	}
+	sys_message("*STRICT*(%s): %s\n", where, msg);
+	// Стек ИГРЫ — по нему видно, какая сцена и какое поле разошлись; без него
+	// строгая остановка сообщает «что», но не «где».
+	vm_stack_trace();
+	sys_error("*STRICT*(%s): %s\n", where, msg);
+}
+
 void get_date(int *year, int *month, int *mday, int *wday)
 {
 	time_t t = time(NULL);

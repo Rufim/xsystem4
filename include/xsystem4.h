@@ -80,6 +80,12 @@ char *unix_path(const char *path);
 char *gamedir_path(const char *path);
 char *gamedir_path_icase(const char *path);
 char *savedir_path(const char *path);
+// XSYS4_STRICT=1: останавливаться на том, что молча портит данные (неизвестный
+// тип в сейве, потерянное поле), вместо WARNING и продолжения. См. util.c.
+bool xsys4_strict(void);
+// Сообщить о расхождении: в строгом режиме — фатально, со стеком игры; иначе
+// обычный WARNING. Возвращает управление только в терпимом режиме.
+void strict_or_warn(const char *where, const char *fmt, ...);
 
 void get_date(int *year, int *month, int *mday, int *wday);
 void get_time(int *hour, int *min, int *sec, int *ms);
