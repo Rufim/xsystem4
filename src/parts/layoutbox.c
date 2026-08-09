@@ -227,6 +227,32 @@ static void parts_get_layout_size(struct parts *parts, int *w, int *h)
 		parts_get_content_size(parts, w, h);
 }
 
+/*
+ * СКРЫТЫЙ ребёнок места в раскладке НЕ ЗАНИМАЕТ. Раскладка — это способ уложить
+ * то, что видно; невидимое из потока выпадает (как `display: none`, а не
+ * `visibility: hidden`).
+ *
+ * Симптом, на котором это поймали: диалог FEEL-события у Dohna
+ * (`SceneFeelEventResultDialog`, иконка справа от Garage на домашней сцене).
+ * Текст разъезжался вверх и вниз от белой подложки: `Feel Event`/имя уходили
+ * ВЫШЕ неё, `Feeling Up`/числа — НИЖЕ, при том что по X всё совпадало с
+ * оригиналом до пикселя, а сама подложка стояла ровно на месте.
+ *
+ * Замер (дамп частей на живом диалоге): вертикальный бокс `90000483`, origin 4,
+ * пятеро детей — `90000484` (44 px), `90000485` (57), `90000486` (98, lshow=0),
+ * `90000489` (108, lshow=0), `90000498` (78). Двое скрытых стоят РОВНО МЕЖДУ
+ * двумя видимыми группами и раздвигали их: у оригинала расстояние между текстами
+ * 88 px, у нас было 407.
+ *
+ * ★Проверять именно `local.show`, а не `global.show`: у ребёнка внутри скрытого
+ * поддерева global.show нулевой у всех, и раскладка внутри такого поддерева
+ * схлопнулась бы в точку — а она должна остаться готовой к моменту показа.
+ */
+static bool layout_skip(struct parts *child)
+{
+	return !child->local.show;
+}
+
 static int align_offset_x(int align, int total_w)
 {
 	switch (align) {
@@ -252,6 +278,8 @@ static void parts_layout_calc_size_horizontal(struct parts_layout_box *lb, struc
 	int row_w = 0, max_row_w = 0, max_row_h = 0, total_h = 0;
 	struct parts *child;
 	PARTS_FOREACH_CHILD(child, parts) {
+		if (layout_skip(child))
+			continue;
 		int child_w, child_h;
 		parts_get_layout_size(child, &child_w, &child_h);
 		int cw = child->margin_left + child_w + child->margin_right;
@@ -281,6 +309,8 @@ static void parts_layout_calc_size_vertical(struct parts_layout_box *lb, struct 
 	int col_h = 0, max_col_h = 0, max_col_w = 0, total_w = 0;
 	struct parts *child;
 	PARTS_FOREACH_CHILD(child, parts) {
+		if (layout_skip(child))
+			continue;
 		int child_w, child_h;
 		parts_get_layout_size(child, &child_w, &child_h);
 		int cw = child->margin_left + child_w + child->margin_right;
@@ -342,6 +372,8 @@ void parts_do_layout(struct parts *parts)
 
 	struct parts *child;
 	PARTS_FOREACH_CHILD(child, parts) {
+		if (layout_skip(child))
+			continue;
 		int child_w, child_h;
 		parts_get_layout_size(child, &child_w, &child_h);
 		int cw = child->margin_left + child_w + child->margin_right;
