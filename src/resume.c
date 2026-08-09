@@ -874,6 +874,58 @@ static void load_json_call_stack(cJSON *json)
 	}
 }
 
+/*
+ * ПРИГОДЕН ЛИ СЕЙВ — проверка ДО применения. `load_rsave_*` перезаписывают кучу
+ * и стек, поэтому отказ на середине восстановления некуда откатить: раньше
+ * непригодный сейв валил движок в REPL (`VM_ERROR`), и игра вставала насмерть.
+ * Игре отказ отдавать НЕКУДА, кроме возврата из `system.ResumeLoad`: сразу за
+ * этим вызовом у неё стоит своё сообщение (`gamesave::detail::ロード実行`:
+ * `CALLHLL system ResumeLoad` → `S_PUSH "ロードに失敗しました"` → `system.Error`).
+ * Живой случай: пункт LOAD LATEST берёт самый свежий слот, а им оказывается
+ * сейв сборки, которая ещё не писала маркер кадров движка.
+ *
+ * Условия — те же, что у `load_rsave_call_stack` ниже; расхождение между ними
+ * означает падение вместо отказа, поэтому менять их надо парой.
+ */
+static bool rsave_call_stack_loadable(struct rsave *save)
+{
+	if (save->nr_return_records == 0 || save->return_records[0].return_addr != -1)
+		return false;
+	struct rsave_return_record *rr = save->return_records;
+	if (save->nr_return_records == save->nr_call_frames)
+		rr++;
+	else if (save->nr_return_records != save->nr_call_frames - 1)
+		return false;
+
+	for (int i = 0; i < save->nr_call_frames; i++) {
+		if (save->call_frames[i].type != RSAVE_CALL_STACK_BOTTOM) {
+			if (!rr->caller_func)
+				return false;
+			int fno = ain_get_function(ain, rr->caller_func);
+			if (fno < 0)
+				return false;
+			if (ain->functions[fno].crc != rr->crc) {
+				char buf[512];
+				for (int n = 0; ; n++) {
+					snprintf(buf, sizeof(buf), "%s#%d", rr->caller_func, n);
+					int cand = ain_get_function(ain, buf);
+					if (cand < 0)
+						break;
+					if (ain->functions[cand].crc == rr->crc) {
+						fno = cand;
+						break;
+					}
+				}
+			}
+			if (ain->functions[fno].crc != rr->crc)
+				return false;
+		}
+		if (++rr == save->return_records + save->nr_return_records)
+			rr = &save->ip;
+	}
+	return true;
+}
+
 static void load_rsave_call_stack(struct rsave *save)
 {
 	call_stack_ptr = 0;
@@ -1025,6 +1077,12 @@ static enum savefile_error load_rsave_image(const char *key, const char *path)
 		return error;
 	if (strcmp(key, save->key))
 		invalid_save_data("Key doesn't match");
+	// Пригодность — ДО применения: дальше куча и стек перезаписываются,
+	// откатывать нечем (см. rsave_call_stack_loadable).
+	if (!rsave_call_stack_loadable(save)) {
+		rsave_free(save);
+		return SAVEFILE_INVALID;
+	}
 	load_rsave_heap(save);
 	load_rsave_call_stack(save);
 	load_rsave_stack(save);
@@ -1053,7 +1111,27 @@ void vm_load_image(const char *key, const char *path)
 		load_json_image(key, path);
 		return;
 	default:
-		VM_ERROR("Failed to read VM image '%s': %s", display_sjis0(path), savefile_strerror(error));
+		/*
+		 * ★ДИАЛОГ И ВЫХОД — как в оригинале. Прежде здесь стоял `VM_ERROR`, и
+		 * негодный сейв ронял движок в REPL: окно оставалось на экране, игра
+		 * замирала навсегда и о причине не сообщала.
+		 *
+		 * Продолжить игру на этом месте НЕЛЬЗЯ, и это замер, а не догадка:
+		 * начиная загрузку, игра гасит приём ввода у всего экрана
+		 * (пофрагментно, `SetEnableInputProcess`) и рассчитывает, что состояние
+		 * вернёт сам образ сейва. На отказе включать некому — экран остаётся
+		 * целым, но НЕМЫМ (пункты титула живы, `clk=1`, `eip=0`; клик доходит
+		 * до движка и не попадает ни в одну часть). Игра к возврату не готова
+		 * принципиально: в `Ａ＿選択右クリック関数登録` она на этом месте сама
+		 * печатает `system.Error("…ロード処理がおこなわれませんでした")`, то
+		 * есть считает возврат из загрузки аварией.
+		 *
+		 * Поэтому: сказать игроку, ЧТО случилось, и закрыться по OK.
+		 * Состояние на этот момент не тронуто — пригодность сейва проверяется
+		 * до применения (см. rsave_call_stack_loadable).
+		 */
+		sys_error("Failed to load VM image '%s': %s\n", display_sjis0(path),
+		          savefile_strerror(error));
 	}
 }
 
