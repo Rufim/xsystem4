@@ -129,6 +129,16 @@ static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rec
  */
 static int parts_effective_clipper(struct parts *parts)
 {
+	// Откат наследования для замеров A/B на одном бинаре:
+	// XSYS4_NO_CLIPPER_INHERIT=1 — маска действует только на ту часть, где она
+	// выставлена явно (поведение до этой правки). Нужна, когда сцена оказывается
+	// обрезанной прямоугольником: так проверяется, не чужая ли это маска,
+	// доставшаяся детям по цепочке родителей.
+	static const char *no_inherit = (const char *)1;
+	if (no_inherit == (const char *)1)
+		no_inherit = getenv("XSYS4_NO_CLIPPER_INHERIT");
+	if (no_inherit && *no_inherit)
+		return parts->alpha_clipper_parts_no;
 	for (struct parts *p = parts; p; p = p->parent) {
 		if (p->alpha_clipper_parts_no)
 			return p->alpha_clipper_parts_no;

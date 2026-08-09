@@ -636,7 +636,34 @@ void parts_recalculate_hitbox(struct parts *parts)
  */
 static Point parts_anchor_shift(struct parts *parts)
 {
+	// Откат для замеров A/B на одном бинаре: XSYS4_NO_ANCHOR_SHIFT=1 — часть без
+	// своего вида поддерево не двигает (поведение до этой правки).
+	static const char *off = (const char *)1;
+	if (off == (const char *)1)
+		off = getenv("XSYS4_NO_ANCHOR_SHIFT");
+	if (off && *off)
+		return (Point) { 0, 0 };
 	if (!parts || parts->origin_mode == 1)
+		return (Point) { 0, 0 };
+	/*
+	 * ★ТОЛЬКО `ユーザコンポーネント` (место под чужую активность): у него содержимое
+	 * И ЕСТЬ вид части, поэтому точку привязки осмысленно отсчитывать по нему.
+	 * Ради такого случая правка и делалась — `GarageInfo` у Dohna.
+	 *
+	 * Обычный контейнер, созданный САМОЙ ИГРОЙ, сюда попадать не должен: его
+	 * потомки расставлены абсолютными координатами, и сдвиг уводит всё поддерево.
+	 * Живой случай — ADV-сцена Haha Ranman: часть 1000001035 (`origin=5`, свой
+	 * размер 0×0, содержимое 1000×500, стоит в центре экрана 640,360) получала
+	 * сдвиг -500,-250, и сцена съезжала влево-вверх — на экране от неё оставался
+	 * прямоугольник 780×470 в левом верхнем углу («игра не на весь экран»).
+	 * Найдено ручкой XSYS4_NO_ANCHOR_SHIFT + XSYS4_ANCHOR_TRACE.
+	 *
+	 * Прежнее широкое поведение для замеров: XSYS4_ANCHOR_SHIFT_ANY=1.
+	 */
+	static const char *any = (const char *)1;
+	if (any == (const char *)1)
+		any = getenv("XSYS4_ANCHOR_SHIFT_ANY");
+	if (!parts->is_user_component && !(any && *any))
 		return (Point) { 0, 0 };
 	struct parts_state *state = &parts->states[parts->state];
 	if (state->common.w || state->common.h)
@@ -648,7 +675,32 @@ static Point parts_anchor_shift(struct parts *parts)
 	parts_get_content_size(parts, &w, &h);
 	if (!w && !h)
 		return (Point) { 0, 0 };
-	return calculate_offset(parts->origin_mode, w, h);
+	Point shift = calculate_offset(parts->origin_mode, w, h);
+	/*
+	 * XSYS4_ANCHOR_TRACE=1 — назвать части, которым сдвиг реально достаётся (по
+	 * разу на номер): номер, режим привязки, размер содержимого и сам сдвиг, плюс
+	 * признак `ユーザコンポーネント` и родитель. Нужен, когда после этой правки
+	 * СЦЕНА уезжает целиком: по строке видно, какая часть увела поддерево и на
+	 * сколько — сдвиг на половину содержимого выглядит как «экран не во весь рост».
+	 */
+	static const char *tr = (const char *)1;
+	static int seen[256], nr_seen = 0;
+	if (tr == (const char *)1)
+		tr = getenv("XSYS4_ANCHOR_TRACE");
+	if (tr && *tr && (shift.x || shift.y) && nr_seen < 256) {
+		bool dup = false;
+		for (int i = 0; i < nr_seen; i++)
+			if (seen[i] == parts->no) dup = true;
+		if (!dup) {
+			seen[nr_seen++] = parts->no;
+			NOTICE("ANCHOR part=%d origin=%d содержимое=%dx%d сдвиг=%d,%d uc=%d parent=%d pos=%d,%d",
+			       parts->no, parts->origin_mode, w, h, shift.x, shift.y,
+			       parts->is_user_component,
+			       parts->parent ? parts->parent->no : -1,
+			       parts->global.pos.x, parts->global.pos.y);
+		}
+	}
+	return shift;
 }
 
 // Точка, ОТ КОТОРОЙ отсчитываются потомки: позиция части плюс её сдвиг привязки.
