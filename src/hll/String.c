@@ -336,12 +336,27 @@ static struct string *String_TrimEnd(struct string **s, struct string *set)
 
 
 /*
- * array<string> Split(ref string self, string separators, int removeEmpty)
+ * array<string> Split(ref string self, string separators, bool containSeparator)
  *
  * Разделители — НАБОР символов (SJIS-aware: двухбайтный символ считается одним
- * разделителем). Возврат типа 79 уходит на стек как есть, поэтому отдаём
- * heap-СЛОТ страницы, а не указатель (сырой page* прочитался бы как индекс
- * слота); вызывающий владеет слотом и освобождает его своим DELETE.
+ * разделителем); имя параметра в .ain так и стоит — `separators`. Возврат типа
+ * 79 уходит на стек как есть, поэтому отдаём heap-СЛОТ страницы, а не указатель
+ * (сырой page* прочитался бы как индекс слота); вызывающий владеет слотом и
+ * освобождает его своим DELETE.
+ *
+ * ★ПУСТЫЕ КУСКИ НЕ ОТДАЮТСЯ — подряд идущие разделители съедаются, как у
+ * strtok. Прежде третий аргумент читался как биты «removeEmpty|trimEntries»
+ * (догадка), и при нуле пустые куски попадали в результат. Замер, который это
+ * опроверг: Haha Ranman пакует поля сейва в одну строку через `@savecode@`
+ * (`SetSaveFileComment`) и разбирает её этим же Split с третьим аргументом 0,
+ * ожидая РОВНО 6 элементов (`GetSaveFileComment` иначе возвращает false). По
+ * набору символов {@,s,a,v,e,c,o,d} без пустых кусков выходит ровно 6 — с
+ * пустыми выходило больше сорока, игра отбрасывала данные, и у всех слотов
+ * оставался незаполненный «score»: LOAD LATEST всегда брал первый слот, а
+ * заметки к сейвам не отображались.
+ *
+ * Третий аргумент — `containSeparator`: разделители возвращаются как отдельные
+ * элементы (у Dohna так зовут `Split(" ", 1)` в разборе параметров motion).
  */
 static bool is_separator(const char *sep, size_t sep_size, const char *p, int len)
 {
@@ -354,10 +369,8 @@ static bool is_separator(const char *sep, size_t sep_size, const char *p, int le
 	return false;
 }
 
-static int String_Split(struct string **s, struct string *sep, int options)
+static int String_Split(struct string **s, struct string *sep, int contain_separator)
 {
-	bool remove_empty = options & 1;   // 1 = RemoveEmptyEntries
-	bool trim_entries = options & 2;   // 2 = TrimEntries
 	struct string *src = self_or_empty(s);
 	int slot = heap_alloc_slot(VM_PAGE);
 	union vm_value dim = { .i = 0 };
@@ -371,20 +384,18 @@ static int String_Split(struct string **s, struct string *sep, int options)
 			i += clen;
 			continue;
 		}
-		if (i > start || !remove_empty) {
-			int b = start, e = i;
-			if (trim_entries) {
-				while (b < e && (src->text[b] == ' ' || src->text[b] == '\t'))
-					b++;
-				while (e > b && (src->text[e - 1] == ' ' || src->text[e - 1] == '\t'))
-					e--;
-			}
-			struct string *part = make_string(src->text + b, e - b);
+		if (i > start) {
+			struct string *part = make_string(src->text + start, i - start);
 			union vm_value v = { .i = heap_alloc_string(part) };
 			out = array_pushback_n(out, &v, 1, AIN_ARRAY_STRING, 0);
 		}
 		if (at_end)
 			break;
+		if (contain_separator) {
+			struct string *part = make_string(src->text + i, clen);
+			union vm_value v = { .i = heap_alloc_string(part) };
+			out = array_pushback_n(out, &v, 1, AIN_ARRAY_STRING, 0);
+		}
 		i += clen;
 		start = i;
 	}
