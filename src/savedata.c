@@ -633,7 +633,16 @@ static int struct_member_index(struct ain_struct *st, const char *name)
 	return -1;
 }
 
-static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value);
+/*
+ * `container`/`varno` — ГДЕ лежит восстанавливаемое значение (глобальная,
+ * локальная или структурная страница и номер переменной в ней). Нужны ровно
+ * одному случаю — generic-массиву (тип 79): у него тип элемента не выводится
+ * ни из объявления поля (там просто «array<?>»), ни из значения, и раньше его
+ * УГАДЫВАЛИ по сейву. Через контейнер он берётся из .ain, как это делает
+ * variable_initval_var. Кто контейнера не знает (вложенный массив) — передаёт
+ * NULL/-1 и получает прежнее поведение.
+ */
+static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value, struct page *container, int varno);
 
 static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page *page, struct gsave_flat_array *flat_array)
 {
@@ -651,7 +660,8 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 		enum ain_data_type data_type = variable_type(page, i, &struct_type, &array_rank);
 		if (data_type != flat_array->values[i].type)
 			VM_ERROR("Bad save file: unexpected array element type");
-		union vm_value val = gsave_to_vm_value(save, data_type, struct_type, array_rank, flat_array->values[i].value);
+		union vm_value val = gsave_to_vm_value(save, data_type, struct_type, array_rank,
+		                                       flat_array->values[i].value, page, i);
 		page->values[i] = val;
 		// Та же проверка, что и у полей структуры: 0 в объектном слоте —
 		// heap-слот глобальной страницы, то есть чужое число.
@@ -718,7 +728,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 			if (!is_obj) {
 				variable_fini(page->values[index], inner->data, false);
 				page->values[index] = gsave_to_vm_value(save, inner->data,
-					inner->struc, inner->rank, kv->value);
+					inner->struc, inner->rank, kv->value, page, index);
 				continue;
 			}
 			if (kv->value < 0) {
@@ -761,7 +771,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 			}
 			variable_fini(page->values[index], AIN_STRUCT, false);
 			page->values[index] = gsave_to_vm_value(save, AIN_STRUCT,
-				obj_struct_type, 0, rec_index);
+				obj_struct_type, 0, rec_index, page, index);
 			continue;
 		}
 
@@ -769,7 +779,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		// слот уходит в переиспользование (см. историю с `Schedule1`).
 		variable_fini(page->values[index], data_type, false);
 		page->values[index] = gsave_to_vm_value(save, data_type, f_struct_type,
-		                                        f_array_rank, kv->value);
+		                                        f_array_rank, kv->value, page, index);
 	}
 	/*
 	 * Проверка на месте: в ОБЪЕКТНОМ слоте не может лежать 0 — это heap-слот
@@ -790,7 +800,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 	}
 }
 
-static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value)
+static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value, struct page *container, int varno)
 {
 	switch (type) {
 	case AIN_VOID:
@@ -848,7 +858,7 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 							? &save->struct_defs[r->struct_index] : NULL;
 						int sno = ain_get_struct(ain, d ? d->name : r->struct_name);
 						if (sno >= 0)
-							obj = gsave_to_vm_value(save, AIN_STRUCT, sno, 0, obj_rec).i;
+							obj = gsave_to_vm_value(save, AIN_STRUCT, sno, 0, obj_rec, NULL, -1).i;
 					}
 					page = delegate_append(page, obj, fun, -1);
 				}
@@ -906,52 +916,106 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			gsave_load_array(save, page, array->flat_arrays);
 			return vm_int(slot);
 		}
-	// Generic-массив (array<?>): у объявления нет ни ранга, ни типа элемента —
+	// Generic-массив (array<?>): у ЗНАЧЕНИЯ нет ни ранга, ни типа элемента —
 	// и то и другое берём из СЕЙВА (тип элемента — из flat-массива; индекс
 	// структуры — по имени из записи первого элемента). Страница
 	// материализуется типизированной, как это делает Array.PushBack.
+	//
+	// ★ПУСТОЙ массив обязан остаться ТИПИЗИРОВАННОЙ 0-элементной страницей, и
+	// тип для неё берётся из ОБЪЯВЛЕНИЯ (`container`/`varno` → .ain), а не из
+	// сейва — ровно как в variable_initval_var. Пока пустой массив
+	// восстанавливался NULL-страницей, объявленный тип элемента терялся
+	// НАСОВСЕМ, а `Array.PushBack` на NULL угадывает его как int
+	// (ix_dtype(NULL) == AIN_ARRAY_INT). Дальше всё разваливалось тихо:
+	// heap-слоты строк ложились в int-массив СЫРЫМИ числами, без владения,
+	// первый же DELETE уносил строку, слот уходил в переиспользование под
+	// страницу — и `S_EQUALE` звал strcmp(NULL). Живой случай (Haha Ranman):
+	// CollectedCgList.m_aszBase/m_aszCutIn → падение по нажатию CG на титуле
+	// (`CollectedCgList@GetIndex` ← `■ＣＧモードデータ更新`). Порча ещё и
+	// ЗАПИСЫВАЛАСЬ: в Collection.sav у этих полей flat-тип int и сырые номера
+	// слотов вместо строк (strings=0 при 20 именах CG).
 	case AIN_ARRAY:
 		{
 			int slot = heap_alloc_slot(VM_PAGE);
-			// -1 — сейв старой сборки, где тип 79 не сериализовался.
-			if (value < 0) {
-				heap[slot].page = NULL;
-				return vm_int(slot);
-			}
-			struct gsave_array *array = &save->arrays[value];
-			if (array->rank == -1) {
-				heap[slot].page = NULL;
-				return vm_int(slot);
-			}
-			if (array->rank != 1) {
+			// Тип элемента по объявлению; AIN_VOID — контейнер неизвестен
+			// (вложенный массив), тогда работаем как раньше, по сейву.
+			int decl_struct = 0, decl_rank = 1;
+			enum ain_data_type decl_array = AIN_VOID;
+			if (container && varno >= 0
+					&& (container->type == GLOBAL_PAGE
+					    || container->type == LOCAL_PAGE
+					    || container->type == STRUCT_PAGE))
+				decl_array = array_resolve_var_type(container, varno, &decl_struct,
+				                                    &decl_rank, NULL);
+			struct gsave_array *array = value >= 0 ? &save->arrays[value] : NULL;
+			// Пусто: -1 (сейв старой сборки, где тип 79 не сериализовался),
+			// rank -1 (NULL-страница на момент записи) или ранг не 1.
+			bool empty = !array || array->rank != 1;
+			if (array && array->rank > 1)
 				WARNING("array<?> ранга %d в сейве не поддержан", array->rank);
-				heap[slot].page = NULL;
+			if (!empty && !array->flat_arrays->nr_values)
+				empty = true;
+			if (empty) {
+				// ★Размерностей ровно `decl_rank` штук: указатель на ОДНО
+				// значение здесь читался за границей и ронял кучу (у ранга 1
+				// это незаметно, у большего — сразу).
+				if (decl_array != AIN_VOID) {
+					union vm_value *dims = xcalloc(decl_rank < 1 ? 1 : decl_rank,
+					                               sizeof(union vm_value));
+					heap[slot].page = alloc_array(decl_rank, dims, decl_array,
+					                              decl_struct, false);
+					free(dims);
+				} else {
+					heap[slot].page = NULL;
+				}
 				return vm_int(slot);
 			}
 			struct gsave_flat_array *fa = array->flat_arrays;
-			// ПУСТОЙ generic-массив живёт NULL-страницей (variable_initval:
-			// типизированная страница материализуется первым PushBack по
-			// объявлению сайта). Пустая страница с придуманным типом ломала
-			// игру: у array<структура> без элементов struct_type неоткуда
-			// взять, и после загрузки код звука падал на Out of bounds.
-			if (!fa->nr_values) {
-				heap[slot].page = NULL;
-				return vm_int(slot);
-			}
 			enum ain_data_type elem = fa->values[0].type;
-			enum ain_data_type container;
+			/*
+			 * ★Сейв, записанный ДО этой правки: объявлен массив ОБЪЕКТОВ, а в
+			 * файле лежат числа — это те самые сырые heap-слоты, потерявшие
+			 * смысл вместе с миром, в котором писались. Восстанавливать их
+			 * нельзя (получим висячие ссылки и падение), склеить обратно не из
+			 * чего — строк в файле нет вовсе. Отдаём пустой ТИПИЗИРОВАННЫЙ
+			 * массив: игра наполнит его заново.
+			 */
+			if (decl_array != AIN_VOID) {
+				enum ain_data_type decl_elem = array_type(decl_array);
+				bool decl_obj = decl_elem == AIN_STRING || decl_elem == AIN_STRUCT
+					|| decl_elem == AIN_DELEGATE || ain_is_array_data_type(decl_elem);
+				bool save_scalar = elem == AIN_VOID || elem == AIN_INT
+					|| elem == AIN_BOOL || elem == AIN_LONG_INT || elem == AIN_FLOAT;
+				if (decl_obj && save_scalar) {
+					// (ain_strtype отдаёт СТАТИЧЕСКИЙ буфер — два вызова в одном
+					// printf печатают одно и то же имя; тип из сейва даём числом.)
+					WARNING("array<%s>: в сейве элементы лежат скаляром (тип %d) — "
+					        "это сейв старой сборки, содержимое потеряно, "
+					        "восстанавливаю массив пустым",
+					        ain_strtype(ain, decl_elem, -1), (int)elem);
+					union vm_value *dims = xcalloc(decl_rank < 1 ? 1 : decl_rank,
+					                               sizeof(union vm_value));
+					heap[slot].page = alloc_array(decl_rank, dims, decl_array,
+					                              decl_struct, false);
+					free(dims);
+					return vm_int(slot);
+				}
+			}
+			// (переменная названа guessed, а не container: имя container
+			// теперь занято страницей-владельцем значения.)
+			enum ain_data_type guessed;
 			int elem_struct = -1;
 			switch (elem) {
 			case AIN_VOID:
-			case AIN_INT:       container = AIN_ARRAY_INT; break;
-			case AIN_BOOL:      container = AIN_ARRAY_BOOL; break;
-			case AIN_LONG_INT:  container = AIN_ARRAY_LONG_INT; break;
-			case AIN_FLOAT:     container = AIN_ARRAY_FLOAT; break;
-			case AIN_STRING:    container = AIN_ARRAY_STRING; break;
-			case AIN_FUNC_TYPE: container = AIN_ARRAY_FUNC_TYPE; break;
-			case AIN_DELEGATE:  container = AIN_ARRAY_DELEGATE; break;
+			case AIN_INT:       guessed = AIN_ARRAY_INT; break;
+			case AIN_BOOL:      guessed = AIN_ARRAY_BOOL; break;
+			case AIN_LONG_INT:  guessed = AIN_ARRAY_LONG_INT; break;
+			case AIN_FLOAT:     guessed = AIN_ARRAY_FLOAT; break;
+			case AIN_STRING:    guessed = AIN_ARRAY_STRING; break;
+			case AIN_FUNC_TYPE: guessed = AIN_ARRAY_FUNC_TYPE; break;
+			case AIN_DELEGATE:  guessed = AIN_ARRAY_DELEGATE; break;
 			case AIN_STRUCT:
-				container = AIN_ARRAY_STRUCT;
+				guessed = AIN_ARRAY_STRUCT;
 				if (fa->nr_values) {
 					struct gsave_record *rec = &save->records[fa->values[0].value];
 					char *name = save->version >= 7
@@ -972,7 +1036,7 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 				return vm_int(slot);
 			}
 			union vm_value dim = { .i = array->dimensions[0] };
-			struct page *page = alloc_array(1, &dim, container, elem_struct, false);
+			struct page *page = alloc_array(1, &dim, guessed, elem_struct, false);
 			heap[slot].page = page;
 			gsave_load_array(save, page, array->flat_arrays);
 			return vm_int(slot);
@@ -1018,7 +1082,8 @@ int load_globals_from_gsave(struct gsave *save, const char *keyname, const char 
 			return 0;
 		}
 		bool call_dtors = false; // Destructors for old objects should not be called.
-		global_set(global_index, gsave_to_vm_value(save, type->data, type->struc, type->rank, g->value), call_dtors);
+		global_set(global_index, gsave_to_vm_value(save, type->data, type->struc, type->rank,
+		                                           g->value, heap_get_page(0), global_index), call_dtors);
 		if (n)
 			(*n)++;
 	}
