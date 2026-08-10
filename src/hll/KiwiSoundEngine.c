@@ -269,9 +269,19 @@ static bool kse_prepare_name(int id, struct string *name)
 			wav_set_loop_start_pos(id, si->loop_begin);
 			wav_set_loop_end_pos(id, si->loop_end);
 		}
-		if (KSE_SND_TRACE())
-			NOTICE("KSE route id=%d '%s' -> группа %d (петля %d..%d)",
-			       id, name->text, si->group, si->loop_begin, si->loop_end);
+		if (KSE_SND_TRACE()) {
+			// Громкость и мьют группы — прямо в трассу: «запустилось, но не слышно»
+			// иначе не отличить от «глушится микшером», а по логу это видно сразу.
+			int vol = -1, mute = -1, mvol = -1, mmute = -1;
+			mixer_get_volume(si->group, &vol);
+			mixer_get_mute(si->group, &mute);
+			mixer_get_volume(0, &mvol);
+			mixer_get_mute(0, &mmute);
+			NOTICE("KSE route id=%d '%s' -> группа %d (петля %d..%d) "
+			       "громкость группы %d%% mute=%d, группа 0: %d%% mute=%d",
+			       id, name->text, si->group, si->loop_begin, si->loop_end,
+			       vol, mute, mvol, mmute);
+		}
 	}
 	return true;
 }
@@ -321,7 +331,46 @@ static bool KiwiSoundEngine_flat_Seek(int id, int millisec) { wav_seek(id, milli
 static bool KiwiSoundEngine_flat_SetLoopCount(int id, int n) { wav_set_loop_count(id, n); return true; }
 static bool KiwiSoundEngine_flat_SetSeParam(int a, int b, bool c) { (void)a; (void)b; (void)c; return true; }
 static int KiwiSoundEngine_flat_GetLength(int id) { return wav_get_time_length(id); }
-static int KiwiSoundEngine_flat_GetLengthFromFile(struct string *s) { (void)s; return 0; }
+/*
+ * Длина трека ПО ИМЕНИ ФАЙЛА, без занятия канала. Была заглушка `return 0`, и экран
+ * MUSIC печатал знаменатель `タイム 00：27／00：00`: игра берёт общее время через
+ * `AFL_Sound_GetLength(dataName)` → сюда, а канальный `GetLength(id)` (он же
+ * `sound::detail::CASBGM@GetLength`) отдаёт верные 192000 мс и остаётся нетронутым.
+ *
+ * Канал под это не заводим: `channel_open_archive_data` читает лишь заголовок через
+ * libsndfile, а длина считается из `info.frames`. Ответ кэшируем — экран спрашивает
+ * длину каждый кадр, а распаковка записи из .afa на кадр стоила бы дороже всего
+ * остального вместе взятого.
+ */
+static struct hash_table *kse_length_cache;
+
+static int KiwiSoundEngine_flat_GetLengthFromFile(struct string *s)
+{
+	if (!s || !s->text[0])
+		return 0;
+	if (!kse_length_cache)
+		kse_length_cache = ht_create(256);
+	struct ht_slot *slot = ht_put(kse_length_cache, s->text, NULL);
+	if (slot->value)
+		return (int)(intptr_t)slot->value - 1;   // 0 мс тоже кэшируем, отсюда +1
+
+	int len = 0;
+	struct archive_data *dfile = kse_get_sound_by_name(s->text);
+	if (dfile) {
+		// channel_open_archive_data забирает dfile себе (и освобождает при ошибке).
+		struct channel *ch = channel_open_archive_data(dfile);
+		if (ch) {
+			len = channel_get_time_length(ch);
+			channel_close(ch);
+		}
+	} else if (KSE_SND_TRACE()) {
+		NOTICE("KSE GetLengthFromFile: '%s' не найден", s->text);
+	}
+	if (KSE_SND_TRACE())
+		NOTICE("KSE GetLengthFromFile('%s') -> %d мс", s->text, len);
+	slot->value = (void *)(intptr_t)(len + 1);
+	return len;
+}
 static int KiwiSoundEngine_flat_GetPos(int id) { return wav_get_pos(id); }
 static int KiwiSoundEngine_flat_GetLoopCount(int id) { return wav_get_loop_count(id); }
 static int KiwiSoundEngine_flat_GetGroupNum(int id) { (void)id; return 0; }

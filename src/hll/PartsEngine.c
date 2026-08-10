@@ -2522,6 +2522,18 @@ static int act_hover_nr;
 struct act_radio_pending { int box_no; struct string *child_name; };
 static struct act_radio_pending *act_radio_pending;
 static int act_radio_nr;
+/*
+ * `アルファクリッパー` — ИМЯ части, чьей альфой обрезается эта. Загрузчик поле не читал,
+ * и «эффект воспроизведения» на экране MUSIC у Haha Ranman светил целиком: `再生効果／光`
+ * (белая полоса-стрелка с осью в центре полукруга, `原点座標モード=6`) объявляет
+ * клиппером своего же родителя `再生効果／ベース` — золотую дугу 192×79. Без маски
+ * рисуются ОБЕ части целиком: дуга горит по всему кольцу, а полоса ложится поверх
+ * кнопок 停止/再生. Поле непустое ровно у этой части (`音楽モード.pactex:3212`).
+ * Отложенно и по именам ЭТОЙ постройки — по тем же причинам, что у hover-связей.
+ */
+struct act_clipper_pending { int parts_no; struct string *clipper_name; };
+static struct act_clipper_pending *act_clipper_pending;
+static int act_clipper_nr;
 struct act_built_name { struct string *name; int no; };
 static struct act_built_name *act_built;
 static int act_built_nr;
@@ -2572,6 +2584,29 @@ static void act_apply_pending_hover_links(void)
 			NOTICE("RB группа %d <- кнопка '%s' (часть %d)", act_radio_pending[i].box_no,
 			       display_sjis0(act_radio_pending[i].child_name->text), child_no);
 	}
+	for (int i = 0; i < act_clipper_nr; i++) {
+		int clipper_no = -1;
+		for (int j = 0; j < act_built_nr; j++) {
+			if (act_name_eq(act_built[j].name, act_clipper_pending[i].clipper_name)) {
+				clipper_no = act_built[j].no;
+				break;
+			}
+		}
+		if (clipper_no < 0) {
+			WARNING("act_build_part: アルファクリッパー '%s' не найден в этой активности",
+			        display_sjis0(act_clipper_pending[i].clipper_name->text));
+			continue;
+		}
+		PE_SetPartsAlphaClipperPartsNumber(act_clipper_pending[i].parts_no, clipper_no);
+		if (getenv("XSYS4_PARTS_TRACE") || getenv("XSYS4_ACT_TRACE"))
+			NOTICE("ACT alpha-clipper: часть %d обрезается по '%s' (часть %d)",
+			       act_clipper_pending[i].parts_no,
+			       display_sjis0(act_clipper_pending[i].clipper_name->text), clipper_no);
+	}
+	free(act_clipper_pending);
+	act_clipper_pending = NULL;
+	act_clipper_nr = 0;
+
 	free(act_radio_pending);
 	act_radio_pending = NULL;
 	act_radio_nr = 0;
@@ -2602,6 +2637,14 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		act_hover_pending[act_hover_nr].parts_no = no;
 		act_hover_pending[act_hover_nr].target_name = hover_target;
 		act_hover_nr++;
+	}
+	struct string *clipper_name = act_str(node, "アルファクリッパー");
+	if (clipper_name && clipper_name->size > 0) {
+		act_clipper_pending = xrealloc_array(act_clipper_pending, act_clipper_nr,
+		                                     act_clipper_nr + 1, sizeof(*act_clipper_pending));
+		act_clipper_pending[act_clipper_nr].parts_no = no;
+		act_clipper_pending[act_clipper_nr].clipper_name = clipper_name;
+		act_clipper_nr++;
 	}
 
 	// register name -> number so the game can resolve it (GetActivityPartsNumber)
@@ -3471,6 +3514,9 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 		struct act_radio_pending *saved_radio = act_radio_pending;
 		int saved_radio_nr = act_radio_nr;
 		act_radio_pending = NULL; act_radio_nr = 0;
+		struct act_clipper_pending *saved_clipper = act_clipper_pending;
+		int saved_clipper_nr = act_clipper_nr;
+		act_clipper_pending = NULL; act_clipper_nr = 0;
 		struct act_hover_pending *saved_pending = act_hover_pending;
 		int saved_pending_nr = act_hover_nr;
 		struct act_built_name *saved_built = act_built;
@@ -3483,6 +3529,7 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 
 		act_hover_pending = saved_pending; act_hover_nr = saved_pending_nr;
 		act_radio_pending = saved_radio; act_radio_nr = saved_radio_nr;
+		act_clipper_pending = saved_clipper; act_clipper_nr = saved_clipper_nr;
 		act_built = saved_built; act_built_nr = saved_built_nr;
 		if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_DUMP_PARTS")) {
 			NOTICE("=== parts right after ReadActivityFile build ===");
