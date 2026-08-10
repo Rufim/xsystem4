@@ -44,6 +44,10 @@ bool key_state[VK_NR_KEYCODES];
  * work on any display (Xvfb/Xephyr/real), bypassing X/Wayland input routing:
  *   key <name>       press+release a key (RETURN, SPACE, Z, ESCAPE, UP, DOWN, LEFT, RIGHT)
  *   click <x> <y>    left click at window coords (x,y)
+ *   mousedown <x> <y>  press and HOLD the left button (released only by `mouseup`)
+ *   mouseup <x> <y>    release the left button — the pair gives real dragging
+ *                      (sliders/scrollbars follow motion while the button is held;
+ *                      `click` alone can only jump to a point)
  *   move <x> <y>     set reported mouse position (window coords)
  *   text <строка>    ввод ТЕКСТА (SDL_TEXTINPUT) — им набирается текст в полях
  *                    ввода PartsEngine: печатные символы приходят виджету не
@@ -202,6 +206,32 @@ static void test_input_update(void)
 			up.button.state = SDL_RELEASED;
 			test_queue_release(&up);
 			NOTICE("TEST_INPUT: click %d,%d", x, y);
+		} else if (sscanf(line, "mousedown %d %d", &x, &y) == 2) {
+			// Кнопка ЗАЖИМАЕТСЯ до явного `mouseup` (в отличие от `click`, который
+			// отпускает её сам через TEST_HOLD_MS). Нужно для ПЕРЕТАСКИВАНИЯ: ползунок
+			// ведётся по движениям мыши, пока кнопка держится, а `click` даёт только
+			// «прыжок в точку» и настоящую протяжку не воспроизводит.
+			test_mouse_x = x; test_mouse_y = y;
+			mouse_set_pos(x, y);
+			SDL_Event down = {0};
+			down.type = SDL_MOUSEBUTTONDOWN;
+			down.button.button = SDL_BUTTON_LEFT;
+			down.button.state = SDL_PRESSED;
+			down.button.clicks = 1;
+			down.button.x = x; down.button.y = y;
+			SDL_PushEvent(&down);
+			NOTICE("TEST_INPUT: mousedown %d,%d", x, y);
+		} else if (sscanf(line, "mouseup %d %d", &x, &y) == 2) {
+			test_mouse_x = x; test_mouse_y = y;
+			mouse_set_pos(x, y);
+			SDL_Event up = {0};
+			up.type = SDL_MOUSEBUTTONUP;
+			up.button.button = SDL_BUTTON_LEFT;
+			up.button.state = SDL_RELEASED;
+			up.button.clicks = 1;
+			up.button.x = x; up.button.y = y;
+			SDL_PushEvent(&up);
+			NOTICE("TEST_INPUT: mouseup %d,%d", x, y);
 		} else if (sscanf(line, "move %d %d", &x, &y) == 2) {
 			test_mouse_x = x; test_mouse_y = y;
 			// Also warp the real SDL cursor so game code that reads the raw SDL
