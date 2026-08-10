@@ -15,6 +15,7 @@
  */
 
 #include <string.h>
+#include <time.h>
 #include "system4.h"
 #include "system4/ain.h"
 #include "system4/instructions.h"
@@ -23,12 +24,31 @@
 #include "vm/heap.h"
 #include "vm/page.h"
 #include "xsystem4.h"
+#include "gfx/gfx.h"
 
 #define NR_CACHES 8
 #define CACHE_SIZE 64
 
 static void delegate_env_ref(int env);
 static void delegate_env_unref(int env);
+
+// Диагностика XSYS4_DG_GROW: секунды от первой подписки и средний темп подписок.
+static double dg_grow_elapsed(void)
+{
+	struct timespec ts;
+	static double t0 = -1;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	double now = ts.tv_sec + ts.tv_nsec / 1e9;
+	if (t0 < 0)
+		t0 = now;
+	return now - t0;
+}
+
+static double dg_grow_rate(int n)
+{
+	double dt = dg_grow_elapsed();
+	return dt > 0.001 ? n / dt : 0;
+}
 
 static const char *pagetype_strtab[] = {
 	[GLOBAL_PAGE] = "GLOBAL_PAGE",
@@ -873,6 +893,10 @@ struct page *copy_page(struct page *src)
 	 */
 	// Копия делегата ссылается на ТЕ ЖЕ окружения — каждой нужен свой счётчик.
 	if (src->type == DELEGATE_PAGE) {
+		// У DELEGATE_PAGE в `index` живёт глубина рассылки: копию НИКТО не
+		// рассылает, иначе она унаследовала бы поднятый счётчик оригинала и
+		// навсегда лишилась амортизированной чистки.
+		dst->index = 0;
 		for (int i = 0; i < src->nr_vars; i++)
 			dst->values[i] = src->values[i];
 		for (int i = 0; i + DG_ENTRY_SLOTS <= src->nr_vars; i += DG_ENTRY_SLOTS)
@@ -1649,6 +1673,38 @@ struct page *delegate_new_from_method(int obj, int fun, int env)
 	return page;
 }
 
+// Через сколько добавлений проходить список и выбрасывать мёртвые записи.
+#define DG_COMPACT_EVERY 256
+
+static void delegate_compact(struct page *page);
+
+/*
+ * Идёт ли ПРЯМО СЕЙЧАС рассылка этого делегата. Состояние обхода (индекс) живёт
+ * на стеке VM, поэтому глубину держим в самой странице: поле `index` у
+ * DELEGATE_PAGE не занято (см. vm/page.h), и оно переживает xrealloc при
+ * добавлении подписчика — в отличие от указателя на страницу.
+ *
+ * Если рассылку оборвут на середине (обработчик увёл управление), счётчик
+ * останется поднятым и страница просто перестанет чиститься при добавлении —
+ * то есть вернётся к прежнему поведению, но не к пропуску обработчиков.
+ */
+static bool delegate_dispatching(struct page *page)
+{
+	return page && page->type == DELEGATE_PAGE && page->index > 0;
+}
+
+void delegate_dispatch_begin(struct page *page)
+{
+	if (page && page->type == DELEGATE_PAGE)
+		page->index++;
+}
+
+void delegate_dispatch_end(struct page *page)
+{
+	if (page && page->type == DELEGATE_PAGE && page->index > 0)
+		page->index--;
+}
+
 static bool delegate_contains_env(struct page *dst, int obj, int fun, int env)
 {
 	if (!dst)
@@ -1710,8 +1766,43 @@ struct page *delegate_append(struct page *dst, int obj, int fun, int env)
 		}
 		int n = dst->nr_vars / DG_ENTRY_SLOTS;
 		if (step > 0 && n % step == 0) {
-			WARNING("DGGROW подписчиков стало %d (fun %d) — стек вызовов игры:", n, fun);
+			// ★ТЕМП подписок: сам по себе размер списка не отвечает, движковая
+			// это беда или игровая. Одна подписка на кадр — цена оболочки,
+			// которую игра пересоздаёт по замыслу; десятки на кадр — это уже
+			// мы зовём источник чаще, чем следует.
+			WARNING("DGGROW подписчиков стало %d (fun %d) t=%.1fс темп=%.0f/с fps=%.1f — стек вызовов игры:",
+				n, fun, dg_grow_elapsed(), dg_grow_rate(n), gfx_get_frame_rate());
 			vm_stack_trace();
+		}
+	}
+	/*
+	 * ★АМОРТИЗИРОВАННАЯ чистка. Мёртвая запись (объект-подписчик умер) снимается
+	 * только при ОБХОДЕ списка, а обхода может не быть минутами: у Haha Ranman
+	 * индикатор авто-режима на каждом кадре заново оборачивает часть, и каждая
+	 * оболочка подписывается на «часть удалена» — замер XSYS4_DG_GROW дал ~350
+	 * подписок в секунду при 135 кадрах/с (то есть 2–3 на кадр, оболочки игра
+	 * пересоздаёт по замыслу — `parts::detail::Wrap` всегда делает NEW) и НИ ОДНОГО
+	 * уплотнения за сеанс. Отсюда 8379 записей в пользовательском сейве.
+	 *
+	 * Раз в DG_COMPACT_EVERY добавлений проходим список один раз и выбрасываем
+	 * мёртвых: длина держится около «живые + порог», а стоимость размазана
+	 * (O(1) на добавление в среднем). Выбрасываем ровно тех, кого выбросил бы
+	 * обход, — новых отписок это не вносит.
+	 */
+	{
+		static int off = -1;
+		if (off == -1)
+			off = getenv("XSYS4_NO_DG_AUTOCOMPACT") ? 1 : 0;
+		int n = dst->nr_vars / DG_ENTRY_SLOTS;
+		// Во время рассылки НЕ трогаем: обход идёт по возрастающему индексу на
+		// стеке VM, а уплотнение сдвигает хвост влево — ещё не вызванные живые
+		// обработчики уехали бы под курсор и были бы пропущены.
+		if (!off && n >= DG_COMPACT_EVERY && n % DG_COMPACT_EVERY == 0) {
+			if (!delegate_dispatching(dst))
+				delegate_compact(dst);
+			else if (getenv("XSYS4_DG_GROW"))
+				WARNING("DGGROW чистка пропущена: идёт рассылка, глубина=%d, длина=%d",
+					dst->index, n);
 		}
 	}
 	return dst;
@@ -1743,6 +1834,7 @@ static void delegate_remove_slot(struct page *page, int i)
  */
 static void delegate_compact(struct page *page)
 {
+	int was = page->nr_vars / DG_ENTRY_SLOTS;
 	int w = 0;
 	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (heap_get_seq(page->values[i].i) != page->values[i+2].i) {
@@ -1756,6 +1848,20 @@ static void delegate_compact(struct page *page)
 		w += DG_ENTRY_SLOTS;
 	}
 	page->nr_vars = w;
+	// ★Под XSYS4_DG_GROW видно и обратную сторону: КОГДА список схлопывается.
+	// Если между ростом до тысяч уплотнений не было — значит делегат просто
+	// не обходят, и записи копятся до первой рассылки.
+	{
+		static int step = -1;
+		if (step == -1) {
+			const char *e = getenv("XSYS4_DG_GROW");
+			step = (e && *e) ? atoi(e) : 0;
+		}
+		int now = w / DG_ENTRY_SLOTS;
+		if (step > 0 && was - now >= step)
+			WARNING("DGGROW уплотнение: было %d, стало %d (t=%.1fс)",
+				was, now, dg_grow_elapsed());
+	}
 }
 
 int delegate_numof(struct page *page)
