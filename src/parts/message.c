@@ -122,9 +122,23 @@ static int msg_type_out(int type)
 	case PARTS_MSG_KEY_UP:      return 18;
 	case PARTS_MSG_SCROLL:      return 21;
 	/*
+	 * ChangedFlg (переключён чекбокс) — `CallEvent1<bool>` с
+	 * `CPartsFunctionSet@CallFunctionChangedFlg(bool)`, у Dohna это ветка
+	 * `.CASE 289:24 23`, то есть номер типа 23.
+	 * ★В строке `.CASE <switch>:<A> <B>` номер сообщения — ВТОРОЕ число: у
+	 * MouseClick это `.CASE 289:5 4`, а рабочий номер клика у нас 4 (первое, 5, —
+	 * внутренний v7-номер, совпадение случайное). На этой путанице событие
+	 * уходило с номером 24, игра его принимала и молча выбрасывала: галочка
+	 * переключалась, а список ярлыков не менялся.
+	 * Номер v7 не установлен — у Tsumamigui 3 и Escalayer Reboot чекбоксов с
+	 * обработчиком нет вовсе, проверить не на чем.
+	 */
+	case PARTS_MSG_CHANGED_FLG: return 23;
+	/*
 	 * `Fixed` («ввод подтверждён») в нумерации v14 — 26, а не 25: движок слал номер,
 	 * снятый с ДРУГОЙ игры, и предупреждение «type 25 has no Ixseal number» оставалось
-	 * незамеченным, потому что 25 у v14 тоже занят (ChangedFlg) и сообщение молча
+	 * незамеченным, потому что 25 у v14 тоже занят (`Selected`, см. раскладку ниже; в
+	 * первой редакции этой заметки тут по ошибке значился ChangedFlg — он 23) и сообщение молча
 	 * уходило не туда. Из-за этого пропадала заметка к сейву: игра подписывалась
 	 * (`CTextBoxParts@FixedEvent::add` — 2 вызова), сообщение доходило и вычитывалось
 	 * (`MSG POP type=25 parts=90000443 nvars=0`), а обработчик не вызывался ни разу.
@@ -140,8 +154,8 @@ static int msg_type_out(int type)
 	 * один — это и есть её проверка.
 	 */
 	case PARTS_MSG_FIXED:       return 26;
-	// `ChangedFlg` и `Changed` — соседние ветки того же диспетчера (см. раскладку выше).
-	case PARTS_MSG_CHANGED_FLG: return 23;
+	// `Changed` — соседняя ветка того же диспетчера (см. раскладку выше). Его ждёт
+	// ГРУППА радиокнопок: обработчик берёт кнопки группы по именам и читает их `Checked`.
 	case PARTS_MSG_CHANGED:     return 22;
 	}
 	// Вместо тихого дефолта — проверка допущения: enum выше покрыт целиком, поэтому
@@ -328,18 +342,27 @@ float PE_GetMessageVariableFloat(possibly_unused int index)
 	return 0.0f;
 }
 
+/*
+ * Переменные сообщения хранятся как int (см. msg_push_v), поэтому булев читатель
+ * обязан отдавать тот же int признаком «ненулевой», а не константу. Пока здесь
+ * стояло `false`, ЛЮБОЕ событие с булевым аргументом приходило игре как «ложь»:
+ * галочки System Menu в ADV читались как «снято» независимо от того, поставил их
+ * игрок или снял (`SceneAdvButtonMenu@AssignCheckEvent` → `GetMessageVariable#2`
+ * → `GetMessageVariableBool`), и набор ярлыков не менялся вовсе.
+ * ★Тот же корень независимо всплыл на CONFIG у Haha Ranman: нужный `AFL_Config_Set…`
+ * вызывался — «событие дошло», — но ВСЕГДА со значением 0, и настройка не менялась ни в
+ * игре, ни в сохранённом `AFConfig.asd`.
+ */
 bool PE_GetMessageVariableBool(int index)
 {
-	/*
-	 * ★Была ЗАГЛУШКА `return false`, и на ней молча терялся флаг чекбокса.
-	 * Переменные сообщения у нас все целые (см. `msg_push_v`), а игра читает их
-	 * ТИПИЗИРОВАННО: `CallEvent1<bool>` (диспетчер `CPartsMessageManager`) берёт
-	 * значение через `GetMessageVariableBool`, и обработчик конфига получает флаг
-	 * только оттуда. Симптом был обманчивым: нужный `AFL_Config_Set…` вызывался,
-	 * то есть «событие дошло», — но всегда со значением 0, и настройка не менялась
-	 * ни в игре, ни в сохранённом `AFConfig.asd`.
-	 */
-	return PE_GetMessageVariableInt(index) != 0;
+	bool r = PE_GetMessageVariableInt(index) != 0;
+	if (getenv("XSYS4_MSG_TRACE")) {
+		struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+		NOTICE("MSG VAR bool[%d] -> %d (type=%d parts=%d nvars=%d)", index, (int)r,
+		       msg ? msg->type : -1, msg ? msg->parts_no : -1,
+		       msg ? msg->nr_variables : -1);
+	}
+	return r;
 }
 
 void PE_GetMessageVariableString(possibly_unused int index, struct string **out)

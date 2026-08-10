@@ -629,6 +629,16 @@ struct parts {
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
 	/*
+	 * ДОСТУПНОСТЬ чекбокса (`有効状態` в раскладке, `SetCheckBoxEnable` в рантайме).
+	 * Выключенный не переключается кликом и рисуется отдельным файлом `／無効`
+	 * (у Dohna есть и `／チェック／無効` — серая рамка с галочкой).
+	 * Живой случай: System Menu в ADV разрешает ровно ЧЕТЫРЕ ярлыка, и когда их
+	 * набрано четыре, `SceneAdvButtonMenu@UpdateCheckable` гасит остальные строки.
+	 * Пока обе функции были заглушками, недоступных не было вовсе и отметить
+	 * можно было сколько угодно.
+	 */
+	bool checkbox_enabled;
+	/*
 	 * `テキストボックス` (パーツタイプ=4) — ПОЛЕ ВВОДА. Само состояние поля (текст,
 	 * шрифт, фокус) движок ведёт отдельной таблицей в src/hll/PartsEngine.c, но ВИД
 	 * компонента обязан отдавать сам парт: игра берёт поле обёрткой
@@ -917,6 +927,7 @@ void parts_list_resort(struct parts *parts);
 void parts_component_dirty(struct parts *parts);
 void parts_recalculate_hitbox(struct parts *parts);
 void parts_debug_dump(void);
+bool parts_take_debug_dump_request(void);
 void parts_state_reset(struct parts_state *state, enum parts_type type);
 bool parts_cg_set(struct parts *parts, struct parts_cg *cg, struct string *cg_name);
 bool parts_cg_set_by_index(struct parts *parts, struct parts_cg *cg, int cg_no);
@@ -997,23 +1008,29 @@ enum parts_message_type {
 	 * `Ｐ＿テキストボックス＿テキスト取得`, прячет поле и возвращает подсказку.
 	 * Пока движок это сообщение не слал, комментарий в сейв не попадал вообще.
 	 */
-	PARTS_MSG_FIXED          = 25,
 	/*
-	 * CHANGED_FLG — «флаг части изменён», аргумент один: новое состояние.
-	 * Так игра узнаёт о ЧЕКБОКСЕ: `Config::MessagePage@Create` берёт
-	 * `IActivity@GetCheckBox(имя)` и вешает делегат `(номер, флаг)`, который зовёт
-	 * соответствующий `AFL_Config_Set…`. Движок переключал галочку сам и не слал
-	 * ничего — настройка менялась на экране, до игры не доходила и перезапуск не
-	 * переживала. Номер внутренний; игровой (v14) — в `msg_type_out`.
+	 * CHANGED_FLG — «переключён чекбокс», ОДИН аргумент bool с новым состоянием.
+	 * Номер снят из того же диспетчера игры: `.CASE 289:24` → `CallEvent1<bool>` с
+	 * методом `CPartsFunctionSet@CallFunctionChangedFlg(bool check)`.
+	 * На него игра вешает всю логику ярлыков ADV: лямбда
+	 * `SceneAdvButtonMenu@AssignCheckEvent` (FUNC 36712) по `Check` добавляет или
+	 * убирает пункт в `GameConfig.Shortcuts` и сразу зовёт `UpdateCheckable`.
+	 * Пока сообщения не было, движок переключал галочку ЛОКАЛЬНО и игра об этом не
+	 * узнавала: набор кнопок внизу экрана не менялся вообще (замер — кадры до и
+	 * после клика по `Skip Mode` совпадают по нижней полосе).
+	 * ★То же сообщение несёт и настройки CONFIG у Haha Ranman: `Config::MessagePage@Create`
+	 * берёт `IActivity@GetCheckBox(имя)` и вешает делегат `(номер, флаг)`, который зовёт
+	 * соответствующий `AFL_Config_Set…`.
 	 */
-	PARTS_MSG_CHANGED_FLG    = 26,
+	PARTS_MSG_CHANGED_FLG    = 24,
+	PARTS_MSG_FIXED          = 25,
 	/*
 	 * CHANGED — «значение части изменилось». Его ждёт ГРУППА радиокнопок: обработчик
 	 * `Config::WindowPage@Create()(67, 79)` берёт по имени обе кнопки группы, читает их
 	 * `Checked` и зовёт `AFL_Config_SetScalingType`. Аргумент один (индекс кнопки),
 	 * и сам обработчик его не использует — состояние он читает с частей.
 	 */
-	PARTS_MSG_CHANGED        = 27,
+	PARTS_MSG_CHANGED        = 26,
 };
 
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);
@@ -1022,8 +1039,8 @@ bool parts_msg_api_new(void);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
 void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y);
 void PE_OnVScrollbarDragged(int parts_no, float rate);
+bool parts_checkbox_toggle(struct parts *parts);
 void PE_OnHScrollbarDragged(int parts_no, float rate);
-void parts_checkbox_toggle(struct parts *parts);
 
 // construction.c
 void parts_cp_op_free(struct parts_cp_op *op);

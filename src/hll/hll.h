@@ -77,6 +77,16 @@ extern struct ain_hll_function *hll_current_fn;
  * потом `Имя@f` / обычное `Имя`.
  */
 #define HLL_EXPORT_N(fname, nargs, funptr) { .name = #fname "@" #nargs, .fun = funptr }
+/*
+ * Перегрузка ОДНОЙ АРНОСТИ, различимая только ТИПОМ аргумента: `Имя@<n>f` берётся,
+ * когда среди аргументов есть лямбда (`AIN_HLL_FUNC`). Образец: у Dohna три
+ * `Array.Erase` — `(refarray,int,int)`, `(refarray,hll_func)` и
+ * `(refarray,wrap<array>)`; вторая и третья обе двухаргументные, и по одной лишь
+ * арности их не развести. Из-за этого `GameConfig@EraseShortcut` (удаление ярлыка
+ * ADV предикатом) уходил в вариант «по индексу» и не удалял НИЧЕГО: галочка в
+ * System Menu снималась, а список ярлыков оставался прежним.
+ */
+#define HLL_EXPORT_NF(fname, nargs, funptr) { .name = #fname "@" #nargs "f", .fun = funptr }
 #define HLL_TODO_EXPORT(fname, funptr) { .name = #fname, .fun = NULL }
 
 #define HLL_LIBRARY(lname, ...)				\

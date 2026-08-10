@@ -15,6 +15,7 @@
  */
 
 #include <assert.h>
+#include <signal.h>
 
 #include "system4.h"
 #include "system4/cg.h"
@@ -154,6 +155,7 @@ static void parts_init(struct parts *parts)
 	// Игра зовёт SetWantSaveBackScene только с enable=0 (пять мест в байткоде) ⇒ дефолт «да».
 	parts->want_save_back_scene = true;
 	parts->enable_input_process = true;
+	parts->checkbox_enabled = true;
 	parts->wheelable = true;
 	parts->on_cursor_sound = -1;
 	parts->on_click_sound = -1;
@@ -1463,6 +1465,25 @@ void parts_release(int parts_no)
 	free(parts);
 	slot->value = NULL;
 	parts_engine_dirty();
+}
+
+/*
+ * Заявка на разовый дамп (см. parts_request_debug_dump в parts.h). Флаг ставит
+ * обработчик сигнала, снимает и исполняет — обработчик ввода в главном цикле.
+ */
+static volatile sig_atomic_t dump_requested = 0;
+
+void parts_request_debug_dump(void)
+{
+	dump_requested = 1;
+}
+
+bool parts_take_debug_dump_request(void)
+{
+	if (!dump_requested)
+		return false;
+	dump_requested = 0;
+	return true;
 }
 
 void parts_debug_dump(void)
@@ -3438,6 +3459,19 @@ static struct parts *parts_radio_box_of(struct parts *parts, int *idx_out)
 	return NULL;
 }
 
+/*
+ * Номер ГРУППЫ, которой принадлежит кнопка, и её индекс в группе; -1, если кнопка вне
+ * группы. Нужно слою ввода: сообщение о выборе адресовано ГРУППЕ, а не кнопке.
+ */
+int parts_radio_box_number(int parts_no, int *index_out)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return -1;
+	struct parts *box = parts_radio_box_of(parts, index_out);
+	return box ? box->no : -1;
+}
+
 // Пометить часть как ПОЛЕ ВВОДА. Зовёт загрузчик раскладки (パーツタイプ=4): само
 // состояние поля живёт в таблице src/hll/PartsEngine.c, а вид компонента отдаёт парт.
 void parts_mark_textbox(int parts_no)
@@ -3829,13 +3863,20 @@ static void parts_checkbox_reload_cg(struct parts *parts)
 	if (!parts->is_checkbox || !parts->checkbox_cg_base)
 		return;
 	static const char *const sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+	// НЕДОСТУПНЫЙ чекбокс во ВСЕХ трёх состояниях показывает `／無効`: наведение и
+	// нажатие на него ничего не меняют, значит и вида «оン»/«ダウン» у него быть не
+	// должно. Файлы есть отдельно и для отмеченного (`／チェック／無効`), поэтому
+	// галочка при гашении не пропадает — ровно как в оригинале, где четыре выбранных
+	// пункта System Menu остаются с галочками, а остальные сереют.
+	static const char *const sfx_off[4] = { NULL, "／無効", "／無効", "／無効" };
+	const char *const *suffix = parts->checkbox_enabled ? sfx : sfx_off;
 	const char *chk = parts->checkbox_checked ? "／チェック" : "";
 	int base_no = parts->no;
 	for (int s = 1; s <= 3; s++) {
 		char u8[64];
 		int n = 0;
 		for (const char *p = chk; *p; p++) u8[n++] = *p;
-		for (const char *p = sfx[s]; *p; p++) u8[n++] = *p;
+		for (const char *p = suffix[s]; *p; p++) u8[n++] = *p;
 		u8[n] = '\0';
 		char *sjis = utf2sjis(u8, n);
 		struct string *suf = make_string(sjis, strlen(sjis));
@@ -3925,24 +3966,26 @@ struct string *PE_GetUserComponentData(int parts_no, struct string *key)
 }
 
 // Toggle on user click; the game reads the new state via IsCheckBoxChecked.
-void parts_checkbox_toggle(struct parts *parts)
+// Возвращает true, если состояние действительно изменилось: по этому признаку
+// обработчик ввода решает, слать ли игре сообщение CHANGED_FLG. Недоступный
+// чекбокс кликом не переключается — иначе в System Menu можно было бы набрать
+// больше четырёх ярлыков, чем игра и не рассчитывает управлять.
+bool parts_checkbox_toggle(struct parts *parts)
 {
-	if (!parts->is_checkbox)
-		return;
+	if (!parts->is_checkbox || !parts->checkbox_enabled)
+		return false;
 
 	/*
 	 * РАДИОКНОПКА (кнопка внутри `ラジオボタンボックス`) ведёт себя иначе, чем чекбокс:
 	 * клик по ней ВЫБИРАЕТ её и гасит остальные кнопки группы, а повторный клик по уже
-	 * выбранной ничего не меняет. Исключительность — на движке: замером проверено, что
-	 * игра её НЕ наводит (после `SetScalingType` обе кнопки оставались зажжёнными, пока
-	 * гашение не делал движок).
+	 * выбранной ничего не меняет. Исключительность — на ДВИЖКЕ: замером проверено, что
+	 * игра её не наводит (после `SetScalingType` обе кнопки продолжали гореть, пока
+	 * гашение не начал делать движок).
 	 *
-	 * Порядок важен: сначала гасим соседей, потом объявляем событие. Обработчик игры
-	 * (`Config::WindowPage@Create()(67, 79)`) читает `Checked` у ВСЕХ кнопок группы и
-	 * берёт последнюю зажжённую — при непогашенном соседе он получил бы чужое значение.
+	 * Погашенным соседям событий не шлём: их обработчик-«если включили» получил бы ноль
+	 * после нашей единицы и обнулил только что выбранное.
 	 */
-	int my_idx = -1;
-	struct parts *box = parts_radio_box_of(parts, &my_idx);
+	struct parts *box = parts_radio_box_of(parts, NULL);
 	if (box) {
 		for (int i = 0; i < box->nr_radio_children; i++) {
 			if (box->radio_children[i] == parts->no)
@@ -3953,35 +3996,37 @@ void parts_checkbox_toggle(struct parts *parts)
 				parts_checkbox_reload_cg(other);
 			}
 		}
-		if (!parts->checkbox_checked) {
-			parts->checkbox_checked = true;
-			parts_checkbox_reload_cg(parts);
-		}
-		if (getenv("XSYS4_CB_TRACE"))
-			NOTICE("CB группа %d <- кнопка %d (индекс %d)", box->no, parts->no, my_idx);
-		/*
-		 * ★Объявляем ОБА события, и это не перестраховка, а замер: страницы конфига
-		 * подписаны ПО-РАЗНОМУ. `ウィンドウ` вешает обработчик на ГРУППУ
-		 * (`GetRadioButtonBox(...).ChangedEvent`) и читает состояния кнопок сам;
-		 * `入力` вешает его на САМИ КНОПКИ, как на обычные чекбоксы
-		 * (`SetMoveMouseCursorSpeed`, `SetWheelForward` приходят только оттуда).
-		 * Погашенным соседям НЕ шлём ничего: их обработчик-«если включили» иначе
-		 * получил бы ноль после нашей единицы и обнулил только что выбранное.
-		 */
-		parts_msg_push(parts, PARTS_MSG_CHANGED_FLG, "i", 1);
-		// Событию группы аргумент — индекс выбранной кнопки (обработчик конфига его не
-		// использует: состояние он читает с самих частей).
-		parts_msg_push(box, PARTS_MSG_CHANGED, "i", my_idx < 0 ? 0 : my_idx);
-		return;
+		if (parts->checkbox_checked)
+			return false;          // уже выбрана — ничего не изменилось
+		parts->checkbox_checked = true;
+		parts_checkbox_reload_cg(parts);
+		return true;
 	}
 
 	parts->checkbox_checked = !parts->checkbox_checked;
 	parts_checkbox_reload_cg(parts);
-	// ★Объявить игре. Без этого галочка меняется только на экране: конфиг вешает на
-	// чекбокс делегат `(номер, флаг)` и по нему зовёт `AFL_Config_Set…`.
+	return true;
+}
+
+void PE_SetPartsCheckBoxEnable(int parts_no, bool enable)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	bool en = !!enable;
+	if (parts->checkbox_enabled == en)
+		return;
+	parts->checkbox_enabled = en;
 	if (getenv("XSYS4_CB_TRACE"))
-		NOTICE("CB toggle part %d -> checked=%d", parts->no, parts->checkbox_checked);
-	parts_msg_push(parts, PARTS_MSG_CHANGED_FLG, "i", parts->checkbox_checked ? 1 : 0);
+		NOTICE("CB enable part %d <- %d (checked=%d)", parts_no, (int)en,
+		       (int)parts->checkbox_checked);
+	parts_checkbox_reload_cg(parts);
+}
+
+bool PE_GetPartsCheckBoxEnable(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->checkbox_enabled : true;
 }
 
 // Checkbox label colour. Stored so the game can read it back; the checkbox is

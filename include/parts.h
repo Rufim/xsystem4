@@ -107,6 +107,10 @@ void PE_ReleaseAllParts(void);
 void PE_ReleaseAllPartsWithoutSystem(void);
 void PE_ReleaseAllWithoutSystem(struct page **erase_number_list);
 void parts_debug_dump(void);
+// Разовый дамп ПО СИГНАЛУ: обработчик SIGUSR1 только поднимает флаг, а печать идёт
+// из главного цикла (из обработчика сигнала звать это нельзя). Нужен, когда баг
+// ловится руками на живом прогоне и включить XSYS4_DUMP_PARTS заранее было нечем.
+void parts_request_debug_dump(void);
 int PE_GetComponentAbsoluteMaxPosZ(int comp);
 void PE_SetPos(int parts_no, int x, int y);
 int PE_GetPartsX(int parts_no);
@@ -305,6 +309,10 @@ bool PE_GetPartsCheckBoxChecked(int parts_no);
 void PE_InitPartsCheckBox(int parts_no, struct string *cg_base, bool checked);
 void PE_SetPartsColorFill(int parts_no, int w, int h);
 void PE_SetPartsCheckBoxColor(int parts_no, int r, int g, int b);
+// Доступность чекбокса: выключенный не переключается кликом и рисуется `／無効`
+// (System Menu в ADV гасит лишние пункты, когда ярлыков набрано четыре).
+void PE_SetPartsCheckBoxEnable(int parts_no, bool enable);
+bool PE_GetPartsCheckBoxEnable(int parts_no);
 int PE_GetPartsCheckBoxR(int parts_no);
 int PE_GetPartsCheckBoxG(int parts_no);
 int PE_GetPartsCheckBoxB(int parts_no);
@@ -403,6 +411,8 @@ void parts_mark_textbox(int parts_no);
 void parts_mark_radio_box(int parts_no);
 // Записать кнопку в состав группы (см. src/parts/parts.c).
 void parts_radio_box_add_child(int box_no, int child_no);
+// Номер группы, которой принадлежит кнопка, и её индекс в ней (-1 = вне группы).
+int parts_radio_box_number(int parts_no, int *index_out);
 bool PE_AddPartsText(int parts_no, struct string *text, int state);
 void PE_SetTextEnableTag(int parts_no, bool enable, int state);
 bool PE_IsTextEnableTag(int parts_no, int state);

@@ -36,6 +36,7 @@
 #include "system4/utfsjis.h"
 
 #include "xsystem4.h"
+#include "parts.h"
 #include "asset_manager.h"
 #include "debugger.h"
 #include "gfx/gfx.h"
@@ -474,6 +475,12 @@ enum {
 static void handle_sigusr1(possibly_unused int sig)
 {
 	vm_stack_trace();
+	// ★И ЗАОДНО ДАМП ЧАСТЕЙ, если попросили: XSYS4_SIG_DUMP_PARTS=1. Пригодилось,
+	// когда баг ловится руками на живом прогоне («после фазы ничего не нажимается»)
+	// и заранее включить XSYS4_DUMP_PARTS было нечем — а перезапуск состояние теряет.
+	// Здесь только флаг: печать идёт из главного цикла (parts/input.c).
+	if (getenv("XSYS4_SIG_DUMP_PARTS"))
+		parts_request_debug_dump();
 }
 
 static void error_handler(const char *msg)
