@@ -140,6 +140,8 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_BLUR_FILTER:
 	case PARTS_CP_FILL_GRADATION_HORIZON:
 	case PARTS_CP_MUL_FILTER:
+	case PARTS_CP_ADD_FILTER:
+	case PARTS_CP_FILL_GRADATION_AMAP:
 		break;
 	case PARTS_CP_DRAW_TEXT:
 	case PARTS_CP_COPY_TEXT:
@@ -409,8 +411,6 @@ bool PE_AddBlurFilterToPartsConstructionProcess(int parts_no, int x, int y, int 
 	return true;
 }
 
-bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
-		int r, int g, int b, bool full_size, int state);
 bool PE_AddDrawLineToPartsConstructionProcess(int parts_no, int x1, int y1, int x2, int y2,
 		int r, int g, int b, int a, int state);
 
@@ -448,6 +448,43 @@ bool PE_AddMulFilterToPartsConstructionProcess(int parts_no, int x, int y, int w
 		.x = x, .y = y, .w = w, .h = h,
 		.r = r, .g = g, .b = b,
 		.full_size = full_size
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
+bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		int r, int g, int b, bool full_size, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_ADD_FILTER;
+	op->color_filter = (struct parts_cp_color_filter) {
+		.x = x, .y = y, .w = w, .h = h,
+		.r = r, .g = g, .b = b,
+		.full_size = full_size
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
+bool PE_AddFillGradationAMapToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, int a1, int a2, bool vertical, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_FILL_GRADATION_AMAP;
+	op->gradation_amap = (struct parts_cp_gradation_amap) {
+		.x = x, .y = y, .w = w, .h = h,
+		.a1 = a1, .a2 = a2, .vertical = vertical
 	};
 
 	parts_add_cp_op(cproc, op);
@@ -976,6 +1013,43 @@ static bool build_mul_filter(struct parts_construction_process *cproc,
 	return true;
 }
 
+static bool build_add_filter(struct parts_construction_process *cproc,
+		struct parts_cp_color_filter *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	if (op->full_size) {
+		x = 0; y = 0;
+		w = cproc->common.texture.w;
+		h = cproc->common.texture.h;
+	}
+
+	gfx_fill_add(&cproc->common.texture, x, y, w, h, op->r, op->g, op->b);
+	return true;
+}
+
+/*
+ * Градиент в альфа-карту (команды 25 и 26). Прямоугольник приходит из игры и
+ * может вылезать за поверхность — режем его тем же `cp_fill_rect`, что и прочие
+ * заливки: слайд-шоу титула кладёт полосы впритык к краю 640x360.
+ */
+static bool build_fill_gradation_amap(struct parts_construction_process *cproc,
+		struct parts_cp_gradation_amap *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	cp_fill_rect(cproc, &x, &y, &w, &h);
+	if (w <= 0 || h <= 0)
+		return true;
+	if (op->vertical)
+		gfx_fill_amap_gradation_ud(&cproc->common.texture, x, y, w, h, op->a1, op->a2);
+	else
+		gfx_fill_amap_gradation_lr(&cproc->common.texture, x, y, w, h, op->a1, op->a2);
+	return true;
+}
+
 int gfx_save_texture(Texture *t, const char *path, enum cg_type);
 
 bool parts_build_construction_process(struct parts *parts,
@@ -1057,6 +1131,14 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_MUL_FILTER:
 			if (!build_mul_filter(cproc, &op->color_filter))
+				return false;
+			break;
+		case PARTS_CP_ADD_FILTER:
+			if (!build_add_filter(cproc, &op->color_filter))
+				return false;
+			break;
+		case PARTS_CP_FILL_GRADATION_AMAP:
+			if (!build_fill_gradation_amap(cproc, &op->gradation_amap))
 				return false;
 			break;
 		}

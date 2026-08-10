@@ -72,6 +72,7 @@ static struct copy_shader fill_shader;
 static struct copy_shader fill_amap_over_border_shader;
 static struct copy_shader fill_amap_under_border_shader;
 static struct copy_shader fill_amap_gradation_ud_shader;
+static struct copy_shader fill_amap_gradation_lr_shader;
 static struct copy_shader hitbox_shader;
 static struct copy_shader hitbox_noblend_shader;
 static struct copy_shader amap_saturate_shader;
@@ -144,6 +145,7 @@ void gfx_draw_init(void)
 
 	// fill shader that fills the alpha map with a gradient
 	load_copy_shader(&fill_amap_gradation_ud_shader, "shaders/render.v.glsl", "shaders/fill_amap_gradation_ud.f.glsl");
+	load_copy_shader(&fill_amap_gradation_lr_shader, "shaders/render.v.glsl", "shaders/fill_amap_gradation_lr.f.glsl");
 
 	// shader that discards texels that fail a hitbox test
 	load_copy_shader(&hitbox_shader, "shaders/render.v.glsl", "shaders/hitbox.f.glsl");
@@ -570,6 +572,48 @@ void gfx_fill_amap_gradation_ud(Texture *dst, int x, int y, int w, int h, int up
 	data.threshold = up_a / 255.0;
 	data.threshold2 = down_a / 255.0;
 	run_fill_shader(&fill_amap_gradation_ud_shader.s, dst, &data);
+
+	restore_blend_mode();
+}
+
+/*
+ * Горизонтальный градиент альфы (команда 26 процедуры построения) — близнец
+ * `gfx_fill_amap_gradation_ud`. Вместе они обводят поверхность мягкой каймой:
+ * слайд-шоу титула Haha Ranman кладёт полосы 640x15 сверху/снизу (команда 25) и
+ * 15x360 слева/справа (26), и фотография растворяется в бумаге.
+ *
+ * ★Шейдер — это ДАННЫЕ рядом с движком (`read_shader_file`: cwd, затем
+ * XSYS4_DATA_DIR), а не часть бинаря. Новый .glsl обязан попасть в установленный
+ * каталог: без него движок падает на старте `Failed to load shader file` — и
+ * насмерть для ВСЕХ игр. После добавления шейдера нужен `ninja -C build install`.
+ */
+void gfx_fill_amap_gradation_lr(Texture *dst, int x, int y, int w, int h, int left_a, int right_a)
+{
+	glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ZERO);
+
+	struct copy_data data = COPY_DATA(x, y, 0, 0, w, h);
+	data.threshold = left_a / 255.0;
+	data.threshold2 = right_a / 255.0;
+	run_fill_shader(&fill_amap_gradation_lr_shader.s, dst, &data);
+
+	restore_blend_mode();
+}
+
+/*
+ * Аддитивная подкраска (`CASConstructionProcess@SetAddFilter`, команда 16). Альфу
+ * не трогаем — фильтр красит только цвет. Так титул Haha Ranman возвращает тёплый
+ * тон обесцвеченной фотографии: GrayFilter, затем AddFilter(17,5,0).
+ */
+void gfx_fill_add(Texture *dst, int x, int y, int w, int h, int r, int g, int b)
+{
+	glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+
+	struct copy_data data = COPY_DATA(x, y, 0, 0, w, h);
+	data.r = r / 255.0;
+	data.g = g / 255.0;
+	data.b = b / 255.0;
+	data.a = 1.0;
+	run_copy_shader(&fill_shader.s, dst, NULL, &data);
 
 	restore_blend_mode();
 }

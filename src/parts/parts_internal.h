@@ -256,7 +256,13 @@ enum parts_cp_op_type {
 	// `SetCreateCG` — так собран размытый задник экранов (CONFIG, галерея, выбор
 	// фазы): CG фона → HBlur → VBlur, сила в поле `ブラー`.
 	PARTS_CP_BLUR_FILTER,
-#define PARTS_NR_CP_TYPES (PARTS_CP_BLUR_FILTER+1)
+	// v14: аддитивная подкраска (команда 16, `SetAddFilter`) — красит только цвет.
+	PARTS_CP_ADD_FILTER,
+	// v14: ГРАДИЕНТ В АЛЬФА-КАРТУ (команды 25 и 26, вертикальный и горизонтальный).
+	// Ими обводят поверхность мягкой каймой: слайд-шоу титула Haha Ranman кладёт
+	// четыре полосы по 15 px и получает фотографию, растворяющуюся в бумаге.
+	PARTS_CP_FILL_GRADATION_AMAP,
+#define PARTS_NR_CP_TYPES (PARTS_CP_FILL_GRADATION_AMAP+1)
 };
 
 struct parts_cp_create {
@@ -335,6 +341,12 @@ struct parts_cp_color_filter {
 	bool full_size;
 };
 
+struct parts_cp_gradation_amap {
+	int x, y, w, h;
+	int a1, a2;      // альфа в начале и в конце полосы
+	bool vertical;   // true — вдоль Y (команда 25), false — вдоль X (команда 26)
+};
+
 struct parts_cp_op {
 	TAILQ_ENTRY(parts_cp_op) entry;
 	enum parts_cp_op_type type;
@@ -349,6 +361,7 @@ struct parts_cp_op {
 		struct parts_cp_blur blur;
 		struct parts_cp_fill_gradation gradation;
 		struct parts_cp_color_filter color_filter;
+		struct parts_cp_gradation_amap gradation_amap;
 	};
 };
 

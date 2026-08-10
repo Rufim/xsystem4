@@ -332,6 +332,10 @@ bool PE_AddFillGradationHorizonToPartsConstructionProcess(int parts_no, int x, i
 		int state);
 bool PE_AddMulFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, bool full_size, int state);
+bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
+		int r, int g, int b, bool full_size, int state);
+bool PE_AddFillGradationAMapToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, int a1, int a2, bool vertical, int state);
 void PE_Parts_SetSoundNumber(int parts_no, int sound_no, int state);
 int PE_Parts_GetSoundNumber(int parts_no, int state);
 void PE_BeginInput(void);

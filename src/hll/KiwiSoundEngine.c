@@ -328,7 +328,13 @@ static bool KiwiSoundEngine_flat_Fade(int id, int time, float volume, bool stop,
 }
 static bool KiwiSoundEngine_flat_StopFade(int id) { wav_stop_fade(id); return true; }
 static bool KiwiSoundEngine_flat_Seek(int id, int millisec) { wav_seek(id, millisec); return true; }
-static bool KiwiSoundEngine_flat_SetLoopCount(int id, int n) { wav_set_loop_count(id, n); return true; }
+static bool KiwiSoundEngine_flat_SetLoopCount(int id, int n)
+{
+	// Счётчик повторов — то, чем экран MUSIC реализует リピート１曲: 0 = бесконечно.
+	if (KSE_SND_TRACE()) NOTICE("KSE SetLoopCount(id=%d, n=%d)", id, n);
+	wav_set_loop_count(id, n);
+	return true;
+}
 static bool KiwiSoundEngine_flat_SetSeParam(int a, int b, bool c) { (void)a; (void)b; (void)c; return true; }
 static int KiwiSoundEngine_flat_GetLength(int id) { return wav_get_time_length(id); }
 /*
