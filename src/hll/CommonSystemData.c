@@ -118,6 +118,8 @@ static void csd_write_cb(struct ht_slot *slot, void *data)
 
 static void csd_save(void)
 {
+	if (getenv("XSYS4_CSD_TRACE"))
+		NOTICE("CSD save -> %s", save_path ? save_path->text : "(путь НЕ ЗАДАН)");
 	if (!save_path)
 		return;
 	FILE *fp = fopen(save_path->text, "wb");
@@ -212,6 +214,9 @@ static void CommonSystemData_SetFullPathSaveFileName(struct string *filename)
 	if (save_path)
 		free_string(save_path);
 	save_path = string_dup(filename);
+	// XSYS4_CSD_TRACE=1 — куда игра назначила файл общих настроек и что в него пишет.
+	if (getenv("XSYS4_CSD_TRACE"))
+		NOTICE("CSD путь <- '%s'", save_path->text);
 	// Авто-загрузка сохранённых настроек (на случай, если игра не зовёт LoadAtStartup).
 	csd_load();
 }
