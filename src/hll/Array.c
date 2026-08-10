@@ -767,9 +767,28 @@ static bool Array_ix_IsExist(struct page **self, union vm_value *search)
 // как принято у all_of).
 static bool Array_ix_Any(struct page **self, union vm_value *fn)
 {
-	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
-		return ix_find_pred(self, fn, false) >= 0;
-	return self && *self && array_numof(*self, 1) > 0;
+	bool with_pred = hll_current_nr_args >= 2 && ix_arg_is_func(1);
+	bool r = with_pred ? ix_find_pred(self, fn, false) >= 0
+			   : (self && *self && array_numof(*self, 1) > 0);
+	/*
+	 * XSYS4_ANY_TRACE=<подстрока имени функции игры> — размер массива и ответ
+	 * `Any`. Нужен, когда игра принимает решение по «есть ли хоть один
+	 * подходящий», а решение выходит неверным: по одному ответу не понять, пуст
+	 * ли контейнер или предикат не сработал ни на одном элементе.
+	 */
+	{
+		static const char *w = (const char *)1;
+		if (w == (const char *)1)
+			w = getenv("XSYS4_ANY_TRACE");
+		if (w && *w) {
+			const char *fname = vm_current_function_name();
+			if (strstr(fname, w))
+				NOTICE("ANYTRACE n=%d pred=%d -> %d в %s",
+				       (self && *self) ? array_numof(*self, 1) : -1,
+				       (int)with_pred, (int)r, display_sjis0(fname));
+		}
+	}
+	return r;
 }
 
 static bool Array_ix_All(struct page **self, union vm_value *fn)
