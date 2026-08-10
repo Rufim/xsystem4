@@ -121,6 +121,25 @@ static int msg_type_out(int type)
 	case PARTS_MSG_KEY_PRESS:   return 17;
 	case PARTS_MSG_KEY_UP:      return 18;
 	case PARTS_MSG_SCROLL:      return 21;
+	/*
+	 * `Fixed` («ввод подтверждён») в нумерации v14 — 26, а не 25: движок слал номер,
+	 * снятый с ДРУГОЙ игры, и предупреждение «type 25 has no Ixseal number» оставалось
+	 * незамеченным, потому что 25 у v14 тоже занят (ChangedFlg) и сообщение молча
+	 * уходило не туда. Из-за этого пропадала заметка к сейву: игра подписывалась
+	 * (`CTextBoxParts@FixedEvent::add` — 2 вызова), сообщение доходило и вычитывалось
+	 * (`MSG POP type=25 parts=90000443 nvars=0`), а обработчик не вызывался ни разу.
+	 *
+	 * ★Номера сняты с диспетчера ЭТОЙ игры (`CPartsMessageManager@CallDelegate`,
+	 * SWITCH 279): 30 веток идут в порядке кода — MouseEnter, MouseMove, MouseLeave,
+	 * MouseWheel, MouseClick, **MouseDoubleClick**, MouseOnCursor, DragBegin, Draging,
+	 * DragEnd, DropEnter, DropOn, Dropped, DropLeave, KeyTrigger, KeyDown, KeyPress,
+	 * KeyUp, Focus, LostFocus, Scroll, Changed, ChangedFlg, Created, Selected, **Fixed**,
+	 * SwipeBegin, Swiping, SwipeEnd, Closing, — и значения `.CASE` в том же порядке дают
+	 * 0,1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30.
+	 * Все восемнадцать номеров ВЫШЕ этой таблицы совпадают с такой раскладкой один в
+	 * один — это и есть её проверка.
+	 */
+	case PARTS_MSG_FIXED:       return 26;
 	}
 	// Вместо тихого дефолта — проверка допущения: enum выше покрыт целиком, поэтому
 	// сюда попадает только НОВЫЙ тип, для которого номер v14 ещё не установлен.
