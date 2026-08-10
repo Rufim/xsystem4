@@ -2782,6 +2782,36 @@ void PE_SetParentPartsNumber(int parts_no, int parent_parts_no)
 		NOTICE("PARTS SetParentPartsNumber(%d, %d) parent_exists=%d",
 		       parts_no, parent_parts_no,
 		       parent_parts_no >= 0 ? parts_exists(parent_parts_no) : -1);
+	/*
+	 * ★РОДИТЕЛЕМ МОЖЕТ БЫТЬ СЛОЙ, а не часть. «Компонент» у AliceSoft — это и парт,
+	 * и слой (та же двойственность, что у `SetComponentShow`, см.
+	 * `parts_controller_is_layer`): назначить части родителем ID слоя значит
+	 * «перенести её в этот слой», а не «сделать ребёнком части с таким номером».
+	 *
+	 * Живой случай — баннер уведомления Haha Ranman («データをセーブしました»).
+	 * `wholeinfo::CParts@0` берёт `GetSystemOverlayLayer` и кладёт результат в
+	 * `CParts@Parent::set` (замер `XSYS4_FN_TRACE_NS`: `a0=10000`, то есть
+	 * PARTS_CONTROLLER_SYSTEM_OVERLAY). Пока это считалось номером части, баннер
+	 * оставался в слое, где был создан (у Haha Ranman — слой 0, ADV), и при
+	 * сохранении оказывался ПОД экраном SAVE: уведомление не показывалось вовсе.
+	 * После загрузки, когда экран уже закрыт, тот же баннер было видно — отсюда
+	 * и разница между сохранением и загрузкой.
+	 *
+	 * Дети переносить не нужно: слой наследуется от родителя при отрисовке.
+	 * Откат для замеров: `XSYS4_NO_PARENT_AS_LAYER=1`.
+	 */
+	if (parent_parts_no > 0 && !parts_exists(parent_parts_no)
+			&& (parent_parts_no == PARTS_CONTROLLER_SYSTEM_OVERLAY
+				|| ctrl_stack_pos(parent_parts_no) >= 0)
+			&& !getenv("XSYS4_NO_PARENT_AS_LAYER")) {
+		if (getenv("XSYS4_PARTS_TRACE") || parts_watched(parts_no))
+			NOTICE("PARTS   родитель %d — это СЛОЙ: часть %d перенесена в него",
+			       parent_parts_no, parts_no);
+		parts->controller_no = parent_parts_no;
+		parts->pending_parent = -1;
+		parts_component_dirty(parts);
+		return;
+	}
 	parts->pending_parent = parent_parts_no;
 	parts_component_dirty(parts);
 }
