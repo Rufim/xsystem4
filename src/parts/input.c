@@ -499,6 +499,10 @@ void PE_UpdateInputState(int passed_time)
 		}
 	}
 
+	// ★ПЕРЕД ОБХОДОМ — сверяем порядок списка с z: если он устарел, курсор достанется
+	// не той части (см. parts_list_order_check).
+	parts_list_order_check();
+
 	bool hover_consumed = false;
 	bool click_consumed = false;
 	struct parts *parts;

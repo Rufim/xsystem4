@@ -924,6 +924,8 @@ extern int parts_nr_numeral_fonts;
 
 // for save.c
 void parts_list_resort(struct parts *parts);
+// Раз в кадр перед вводом: не разошёлся ли порядок списка с z (см. parts.c).
+bool parts_list_order_check(void);
 void parts_component_dirty(struct parts *parts);
 void parts_recalculate_hitbox(struct parts *parts);
 void parts_debug_dump(void);

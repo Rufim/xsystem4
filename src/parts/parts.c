@@ -4191,6 +4191,57 @@ void PE_SetSpeedupRateByMessageSkip(int parts_no, int rate)
 
 // Порядок слоёв изменился (добавили/сняли слой) — ключ сортировки у ВСЕХ партов
 // зависит от позиции, поэтому список надо пересобрать целиком.
+static void ctrl_stack_resort_all(void);
+
+/*
+ * ПОРЯДОК СПИСКА УСТАРЕВАЕТ — проверяем раз в кадр перед вводом. Список частей
+ * отсортирован по (позиция слоя, global.z), и обработка ввода идёт по нему
+ * front-to-back; кто первый дал hit, тот и забирает курсор. Если чья-то `global.z`
+ * поменялась без `parts_list_resort`, порядок расходится с z — и курсор достаётся
+ * НЕ ТОЙ части.
+ *
+ * Живой случай (отчёт пользователя): при ПОВТОРНОМ открытии экрана Load слоты
+ * переставали нажиматься. Дамп по сигналу: курсор 330,242 — над слотом 90000531
+ * (`z=19`, область 28..656 × 191..285), а курсор забрала полноэкранная панель
+ * 1000001306 (`z=1`) ИЗ ТОГО ЖЕ слоя 12, потому что в списке стояла ПОСЛЕ слота.
+ * Клики при этом доходили (3643 кадра с зажатой кнопкой), но `clicked_parts`
+ * оставался нулевым.
+ *
+ * Проверка стоит O(n) на кадр (у Dohna это 100–200 частей) и срабатывает молча;
+ * при расхождении список пересобирается целиком тем же путём, что и при смене
+ * стека слоёв.
+ */
+bool parts_list_order_check(void)
+{
+	// Откат для A/B на одном бинаре: XSYS4_NO_ORDER_CHECK=1 — прежнее поведение,
+	// когда устаревший порядок оставался как есть.
+	static const char *off = (const char *)1;
+	if (off == (const char *)1)
+		off = getenv("XSYS4_NO_ORDER_CHECK");
+	if (off && *off)
+		return false;
+
+	struct parts *p, *prev = NULL;
+	bool bad = false;
+	PARTS_LIST_FOREACH(p) {
+		if (prev) {
+			int az = parts_get_sprite_z(prev), az2 = parts_get_sprite_z2(prev);
+			int bz = parts_get_sprite_z(p), bz2 = parts_get_sprite_z2(p);
+			if (az > bz || (az == bz && az2 > bz2)) {
+				bad = true;
+				break;
+			}
+		}
+		prev = p;
+	}
+	if (!bad)
+		return false;
+	if (getenv("XSYS4_ORDER_TRACE"))
+		NOTICE("PARTS: порядок списка разошёлся с z — пересортировка");
+	ctrl_stack_resort_all();
+	return true;
+}
+
 static void ctrl_stack_resort_all(void)
 {
 	struct parts *p;
