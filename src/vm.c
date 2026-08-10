@@ -39,6 +39,7 @@
 #include "input.h"
 #include "savedata.h"
 #include "vm.h"
+#include "parts.h"
 #include "vm/heap.h"
 #include "vm/page.h"
 #include "xsystem4.h"
@@ -3983,6 +3984,16 @@ static void vm_sigusr1_handler(int sig)
 	sys_warning("=== SIGUSR1: VM call stack (top first) ===\n");
 	vm_stack_trace();
 	sys_warning("=== end VM call stack (instr_ptr=0x%zx) ===\n", instr_ptr);
+	/*
+	 * ★ЗАЯВКА НА ДАМП ЧАСТЕЙ — ЗДЕСЬ, А НЕ В system4.c. Там обработчик ставится
+	 * ДО `vm_execute_ain`, а он первым делом переставляет SIGUSR1 на себя — и
+	 * прежний код (с флагом дампа) не вызывался НИ РАЗУ. Ошибка была молчаливой и
+	 * дорогой: дамп не печатался, а это по ошибке прочли как «ввод выключен, потому
+	 * печать за гейтом и не вышла» (FINDINGS §5ct) — вывод пришлось отзывать.
+	 * Печатает сам дамп главный цикл (parts/input.c), здесь только флаг.
+	 */
+	if (getenv("XSYS4_SIG_DUMP_PARTS"))
+		parts_request_debug_dump();
 }
 
 /*

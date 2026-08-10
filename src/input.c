@@ -457,16 +457,36 @@ void key_clear_flag(bool no_ctrl)
 
 void mouse_get_pos(int *x, int *y)
 {
-	if (test_input_enabled && test_mouse_x >= 0) {
-		*x = test_mouse_x;
-		*y = test_mouse_y;
-		return;
-	}
 	int wx, wy;
 	SDL_PumpEvents();
 	SDL_GetMouseState(&wx, &wy);
-	*x = (wx - sdl.viewport.x) * sdl.w / sdl.viewport.w;
-	*y = (wy - sdl.viewport.y) * sdl.h / sdl.viewport.h;
+	int rx = (wx - sdl.viewport.x) * sdl.w / sdl.viewport.w;
+	int ry = (wy - sdl.viewport.y) * sdl.h / sdl.viewport.h;
+
+	if (test_input_enabled && test_mouse_x >= 0) {
+		/*
+		 * ★ЖИВАЯ МЫШЬ ОТМЕНЯЕТ ПОДМЕНУ. Раньше первая же команда `move` делала
+		 * позицию курсора НАВСЕГДА синтетической, и после скрипта прохождения
+		 * управлять игрой руками было нельзя: движок считал, что курсор стоит там,
+		 * где его оставил скрипт. Симптом у пользователя выглядел как баг игры —
+		 * «нажимается только правая нижняя кнопка» (скрипт `dohna-user.sh`
+		 * заканчивается на `move 1230 681`, это кнопка футера) и «словно кто-то сам
+		 * жмёт кнопки». Проверено дампом по SIGUSR1: сколько бы игрок ни водил
+		 * мышью, в дампе стояло всё то же `курсор 1230,681`.
+		 * После нашего же `mouse_set_pos` реальная позиция СОВПАДАЕТ с
+		 * синтетической, поэтому расхождение — верный признак живого ввода.
+		 */
+		if (abs(rx - test_mouse_x) <= 2 && abs(ry - test_mouse_y) <= 2) {
+			*x = test_mouse_x;
+			*y = test_mouse_y;
+			return;
+		}
+		test_mouse_x = -1;
+		NOTICE("TEST_INPUT: курсор сдвинут живой мышью (%d,%d) — подмена позиции снята",
+		       rx, ry);
+	}
+	*x = rx;
+	*y = ry;
 }
 
 void mouse_set_pos(int x, int y)

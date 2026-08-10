@@ -475,12 +475,9 @@ enum {
 static void handle_sigusr1(possibly_unused int sig)
 {
 	vm_stack_trace();
-	// ★И ЗАОДНО ДАМП ЧАСТЕЙ, если попросили: XSYS4_SIG_DUMP_PARTS=1. Пригодилось,
-	// когда баг ловится руками на живом прогоне («после фазы ничего не нажимается»)
-	// и заранее включить XSYS4_DUMP_PARTS было нечем — а перезапуск состояние теряет.
-	// Здесь только флаг: печать идёт из главного цикла (parts/input.c).
-	if (getenv("XSYS4_SIG_DUMP_PARTS"))
-		parts_request_debug_dump();
+	// ★Заявку на дамп частей ставит vm_sigusr1_handler (vm.c), а не этот обработчик:
+	// `vm_execute_ain` переставляет SIGUSR1 на себя сразу после старта, и всё, что
+	// добавлено здесь, не вызывается вовсе.
 }
 
 static void error_handler(const char *msg)
