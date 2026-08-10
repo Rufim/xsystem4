@@ -1183,7 +1183,24 @@ static struct hll_function *link_static_library(struct ain_library *ainlib, stru
 		// декорированное числом аргументов — `Имя@<n>`. Нужно там, где у перегрузок
 		// разъезжаются ПОЗИЦИИ параметров и одной C-функцией их не обслужить
 		// (cif строится по .ain): Ixseal-овские четыре `Array.Copy`.
+		// Сначала — АРНОСТЬ + ЛЯМБДА (`Имя@<n>f`, см. HLL_EXPORT_NF): две перегрузки
+		// одной арности различаются только тем, что у одной аргумент — hll_func.
 		{
+			bool has_func = false;
+			for (int a = 0; a < f->nr_arguments; a++) {
+				if (f->arguments[a].type.data == AIN_HLL_FUNC) {
+					has_func = true;
+					break;
+				}
+			}
+			if (has_func) {
+				char decorated[256];
+				snprintf(decorated, sizeof(decorated), "%s@%df", f->name,
+						f->nr_arguments);
+				fun = static_library_lookup(lib, decorated);
+			}
+		}
+		if (!fun) {
 			char decorated[256];
 			snprintf(decorated, sizeof(decorated), "%s@%d", f->name, f->nr_arguments);
 			fun = static_library_lookup(lib, decorated);

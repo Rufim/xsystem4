@@ -629,6 +629,16 @@ struct parts {
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
 	/*
+	 * ДОСТУПНОСТЬ чекбокса (`有効状態` в раскладке, `SetCheckBoxEnable` в рантайме).
+	 * Выключенный не переключается кликом и рисуется отдельным файлом `／無効`
+	 * (у Dohna есть и `／チェック／無効` — серая рамка с галочкой).
+	 * Живой случай: System Menu в ADV разрешает ровно ЧЕТЫРЕ ярлыка, и когда их
+	 * набрано четыре, `SceneAdvButtonMenu@UpdateCheckable` гасит остальные строки.
+	 * Пока обе функции были заглушками, недоступных не было вовсе и отметить
+	 * можно было сколько угодно.
+	 */
+	bool checkbox_enabled;
+	/*
 	 * `ユーザコンポーネント` (тип компонента v14 = 17) — часть-место, куда игровой
 	 * фреймворк подставляет ОТДЕЛЬНУЮ активность (шапка, футер, полоса фазы…).
 	 * Своего рендера у неё нет: содержимое создаёт сама игра и вешает потомками.
@@ -882,6 +892,7 @@ void parts_list_resort(struct parts *parts);
 void parts_component_dirty(struct parts *parts);
 void parts_recalculate_hitbox(struct parts *parts);
 void parts_debug_dump(void);
+bool parts_take_debug_dump_request(void);
 void parts_state_reset(struct parts_state *state, enum parts_type type);
 bool parts_cg_set(struct parts *parts, struct parts_cg *cg, struct string *cg_name);
 bool parts_cg_set_by_index(struct parts *parts, struct parts_cg *cg, int cg_no);
@@ -962,6 +973,18 @@ enum parts_message_type {
 	 * `Ｐ＿テキストボックス＿テキスト取得`, прячет поле и возвращает подсказку.
 	 * Пока движок это сообщение не слал, комментарий в сейв не попадал вообще.
 	 */
+	/*
+	 * CHANGED_FLG — «переключён чекбокс», ОДИН аргумент bool с новым состоянием.
+	 * Номер снят из того же диспетчера игры: `.CASE 289:24` → `CallEvent1<bool>` с
+	 * методом `CPartsFunctionSet@CallFunctionChangedFlg(bool check)`.
+	 * На него игра вешает всю логику ярлыков ADV: лямбда
+	 * `SceneAdvButtonMenu@AssignCheckEvent` (FUNC 36712) по `Check` добавляет или
+	 * убирает пункт в `GameConfig.Shortcuts` и сразу зовёт `UpdateCheckable`.
+	 * Пока сообщения не было, движок переключал галочку ЛОКАЛЬНО и игра об этом не
+	 * узнавала: набор кнопок внизу экрана не менялся вообще (замер — кадры до и
+	 * после клика по `Skip Mode` совпадают по нижней полосе).
+	 */
+	PARTS_MSG_CHANGED_FLG    = 24,
 	PARTS_MSG_FIXED          = 25,
 };
 
@@ -971,7 +994,7 @@ bool parts_msg_api_new(void);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
 void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y);
 void PE_OnVScrollbarDragged(int parts_no, float rate);
-void parts_checkbox_toggle(struct parts *parts);
+bool parts_checkbox_toggle(struct parts *parts);
 
 // construction.c
 void parts_cp_op_free(struct parts_cp_op *op);

@@ -15,6 +15,7 @@
  */
 
 #include <assert.h>
+#include <signal.h>
 
 #include "system4.h"
 #include "system4/cg.h"
@@ -154,6 +155,7 @@ static void parts_init(struct parts *parts)
 	// Игра зовёт SetWantSaveBackScene только с enable=0 (пять мест в байткоде) ⇒ дефолт «да».
 	parts->want_save_back_scene = true;
 	parts->enable_input_process = true;
+	parts->checkbox_enabled = true;
 	parts->wheelable = true;
 	parts->on_cursor_sound = -1;
 	parts->on_click_sound = -1;
@@ -1459,6 +1461,25 @@ void parts_release(int parts_no)
 	free(parts);
 	slot->value = NULL;
 	parts_engine_dirty();
+}
+
+/*
+ * Заявка на разовый дамп (см. parts_request_debug_dump в parts.h). Флаг ставит
+ * обработчик сигнала, снимает и исполняет — обработчик ввода в главном цикле.
+ */
+static volatile sig_atomic_t dump_requested = 0;
+
+void parts_request_debug_dump(void)
+{
+	dump_requested = 1;
+}
+
+bool parts_take_debug_dump_request(void)
+{
+	if (!dump_requested)
+		return false;
+	dump_requested = 0;
+	return true;
 }
 
 void parts_debug_dump(void)
@@ -3683,13 +3704,20 @@ static void parts_checkbox_reload_cg(struct parts *parts)
 	if (!parts->is_checkbox || !parts->checkbox_cg_base)
 		return;
 	static const char *const sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+	// НЕДОСТУПНЫЙ чекбокс во ВСЕХ трёх состояниях показывает `／無効`: наведение и
+	// нажатие на него ничего не меняют, значит и вида «оン»/«ダウン» у него быть не
+	// должно. Файлы есть отдельно и для отмеченного (`／チェック／無効`), поэтому
+	// галочка при гашении не пропадает — ровно как в оригинале, где четыре выбранных
+	// пункта System Menu остаются с галочками, а остальные сереют.
+	static const char *const sfx_off[4] = { NULL, "／無効", "／無効", "／無効" };
+	const char *const *suffix = parts->checkbox_enabled ? sfx : sfx_off;
 	const char *chk = parts->checkbox_checked ? "／チェック" : "";
 	int base_no = parts->no;
 	for (int s = 1; s <= 3; s++) {
 		char u8[64];
 		int n = 0;
 		for (const char *p = chk; *p; p++) u8[n++] = *p;
-		for (const char *p = sfx[s]; *p; p++) u8[n++] = *p;
+		for (const char *p = suffix[s]; *p; p++) u8[n++] = *p;
 		u8[n] = '\0';
 		char *sjis = utf2sjis(u8, n);
 		struct string *suf = make_string(sjis, strlen(sjis));
@@ -3779,12 +3807,38 @@ struct string *PE_GetUserComponentData(int parts_no, struct string *key)
 }
 
 // Toggle on user click; the game reads the new state via IsCheckBoxChecked.
-void parts_checkbox_toggle(struct parts *parts)
+// Возвращает true, если состояние действительно изменилось: по этому признаку
+// обработчик ввода решает, слать ли игре сообщение CHANGED_FLG. Недоступный
+// чекбокс кликом не переключается — иначе в System Menu можно было бы набрать
+// больше четырёх ярлыков, чем игра и не рассчитывает управлять.
+bool parts_checkbox_toggle(struct parts *parts)
 {
-	if (!parts->is_checkbox)
-		return;
+	if (!parts->is_checkbox || !parts->checkbox_enabled)
+		return false;
 	parts->checkbox_checked = !parts->checkbox_checked;
 	parts_checkbox_reload_cg(parts);
+	return true;
+}
+
+void PE_SetPartsCheckBoxEnable(int parts_no, bool enable)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	bool en = !!enable;
+	if (parts->checkbox_enabled == en)
+		return;
+	parts->checkbox_enabled = en;
+	if (getenv("XSYS4_CB_TRACE"))
+		NOTICE("CB enable part %d <- %d (checked=%d)", parts_no, (int)en,
+		       (int)parts->checkbox_checked);
+	parts_checkbox_reload_cg(parts);
+}
+
+bool PE_GetPartsCheckBoxEnable(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->checkbox_enabled : true;
 }
 
 // Checkbox label colour. Stored so the game can read it back; the checkbox is

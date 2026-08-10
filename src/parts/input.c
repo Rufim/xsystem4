@@ -381,8 +381,14 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		clicked_parts = parts->no;
 
 		// Checkbox: flip state on click; the game reads it via IsCheckBoxChecked.
-		if (parts->is_checkbox)
-			parts_checkbox_toggle(parts);
+		// ★И СРАЗУ СООБЩАЕМ ИГРЕ: одного локального переключения мало — вся логика
+		// висит на сообщении CHANGED_FLG (см. parts_internal.h). Шлём ТОЛЬКО когда
+		// состояние действительно изменилось: у недоступного чекбокса toggle
+		// возвращает false, и события быть не должно.
+		if (parts->is_checkbox && parts_checkbox_toggle(parts)) {
+			parts_msg_push(parts, PARTS_MSG_CHANGED_FLG, "i",
+					parts->checkbox_checked ? 1 : 0);
+		}
 
 		// Текстовое поле ввода забирает фокус клавиатуры по клику (и отдаёт
 		// его, если кликнули мимо) — как в оригинале, где каретка видна ровно
@@ -436,6 +442,12 @@ void PE_UpdateInputState(int passed_time)
 		if ((ncalls++ % 30) == 0 || cur_clicking || clicked_parts)
 			NOTICE("INPUT UpdateInputState #%d: clicking=%d pos=%d,%d clicked_parts=%d",
 			       ncalls, cur_clicking, cur_pos.x, cur_pos.y, clicked_parts);
+	}
+	// Разовый дамп по kill -USR1 (см. parts_request_debug_dump): печатаем здесь, в
+	// главном цикле, а не в обработчике сигнала.
+	if (parts_take_debug_dump_request()) {
+		NOTICE("--- PARTS DUMP (по сигналу) ---");
+		parts_debug_dump();
 	}
 	if (getenv("XSYS4_DUMP_PARTS")) {
 		static int dcnt = 0;

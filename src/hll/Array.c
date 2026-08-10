@@ -839,6 +839,26 @@ static bool Array_ix_EraseAll(struct page **self, union vm_value *fn)
 	return any;
 }
 
+/*
+ * bool Erase(self, предикат) — удалить ПЕРВЫЙ подходящий элемент (в отличие от
+ * `EraseAll`, который выносит все). Живой случай: `GameConfig@EraseShortcut` у
+ * Dohna снимает ярлык ADV из `m_shortcutButton` лямбдой-сравнением, и без этой
+ * перегрузки вызов уходил в `Erase(self, index, length)` — список не менялся,
+ * а игра продолжала считать, что ярлыков четыре, и держала остальные пункты
+ * System Menu недоступными.
+ */
+static bool Array_ix_EraseIf(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self || !fn)
+		return false;
+	for (int i = 0; i < array_numof(*self, 1); i++) {
+		if (!ix_pred(fn, *self, i))
+			continue;
+		return ix_erase_at(self, i);
+	}
+	return false;
+}
+
 // bool Remain(self, предикат) — оставить только подходящие (инверсия EraseAll).
 static bool Array_ix_Remain(struct page **self, union vm_value *fn)
 {
@@ -1397,6 +1417,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Add, Array_PushBack),
 	    HLL_EXPORT(PopBack, Array_PopBack),
 	    HLL_EXPORT(Insert, Array_ix_Insert),
+	    HLL_EXPORT_NF(Erase, 2, Array_ix_EraseIf),
 	    HLL_EXPORT(Erase, Array_ix_Erase),
 	    HLL_EXPORT_N(Copy, 5, Array_ix_Copy5),
 	    HLL_EXPORT(Copy, Array_ix_Copy),

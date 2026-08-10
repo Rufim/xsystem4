@@ -121,6 +121,19 @@ static int msg_type_out(int type)
 	case PARTS_MSG_KEY_PRESS:   return 17;
 	case PARTS_MSG_KEY_UP:      return 18;
 	case PARTS_MSG_SCROLL:      return 21;
+	/*
+	 * ChangedFlg (переключён чекбокс) — `CallEvent1<bool>` с
+	 * `CPartsFunctionSet@CallFunctionChangedFlg(bool)`, у Dohna это ветка
+	 * `.CASE 289:24 23`, то есть номер типа 23.
+	 * ★В строке `.CASE <switch>:<A> <B>` номер сообщения — ВТОРОЕ число: у
+	 * MouseClick это `.CASE 289:5 4`, а рабочий номер клика у нас 4 (первое, 5, —
+	 * внутренний v7-номер, совпадение случайное). На этой путанице событие
+	 * уходило с номером 24, игра его принимала и молча выбрасывала: галочка
+	 * переключалась, а список ярлыков не менялся.
+	 * Номер v7 не установлен — у Tsumamigui 3 и Escalayer Reboot чекбоксов с
+	 * обработчиком нет вовсе, проверить не на чем.
+	 */
+	case PARTS_MSG_CHANGED_FLG: return 23;
 	}
 	// Вместо тихого дефолта — проверка допущения: enum выше покрыт целиком, поэтому
 	// сюда попадает только НОВЫЙ тип, для которого номер v14 ещё не установлен.
@@ -306,9 +319,24 @@ float PE_GetMessageVariableFloat(possibly_unused int index)
 	return 0.0f;
 }
 
-bool PE_GetMessageVariableBool(possibly_unused int index)
+/*
+ * Переменные сообщения хранятся как int (см. msg_push_v), поэтому булев читатель
+ * обязан отдавать тот же int признаком «ненулевой», а не константу. Пока здесь
+ * стояло `false`, ЛЮБОЕ событие с булевым аргументом приходило игре как «ложь»:
+ * галочки System Menu в ADV читались как «снято» независимо от того, поставил их
+ * игрок или снял (`SceneAdvButtonMenu@AssignCheckEvent` → `GetMessageVariable#2`
+ * → `GetMessageVariableBool`), и набор ярлыков не менялся вовсе.
+ */
+bool PE_GetMessageVariableBool(int index)
 {
-	return false;
+	bool r = PE_GetMessageVariableInt(index) != 0;
+	if (getenv("XSYS4_MSG_TRACE")) {
+		struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+		NOTICE("MSG VAR bool[%d] -> %d (type=%d parts=%d nvars=%d)", index, (int)r,
+		       msg ? msg->type : -1, msg ? msg->parts_no : -1,
+		       msg ? msg->nr_variables : -1);
+	}
+	return r;
 }
 
 void PE_GetMessageVariableString(possibly_unused int index, struct string **out)

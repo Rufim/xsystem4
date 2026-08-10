@@ -2917,6 +2917,10 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		bool checked = act_int(ti, "チェック状態", 0) != 0;
 		if (cg && cg->size) {
 			PE_InitPartsCheckBox(no, cg, checked);
+			// `有効状態` — начальная доступность (у кнопки то же поле зовётся `有効`).
+			// Ставится ПОСЛЕ Init: тот перезагружает CG под checked, а этот вызов
+			// при нуле подменит их на `／無効`.
+			PE_SetPartsCheckBoxEnable(no, act_int(ti, "有効状態", 1) != 0);
 		} else {
 			// No CG: a colour-swatch button — render a solid fill of its size,
 			// tinted by the checkbox colour the game sets (SetCheckBoxColor).
@@ -3728,10 +3732,6 @@ static bool PartsEngine_IsButtonEnable(int parts_no)
 	struct pe_button_state *b = pe_button_get(parts_no, false);
 	return !b || b->enabled != 0;
 }
-// Чекбоксы — так же: «доступность» не рисуем, но считаем включёнными. Без этих
-// двух System Menu в ADV (SceneAdvButtonMenu@UpdateCheckable) валит движок.
-HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetCheckBoxEnable, int a, bool b);
-HLL_QUIET_UNIMPLEMENTED(true, bool, PartsEngine, IsCheckBoxEnable, int a);
 HLL_QUIET_UNIMPLEMENTED(, void, PartsEngine, SetButtonColor, int a, int b, int c, int d);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonR, int a);
 HLL_QUIET_UNIMPLEMENTED(255, int, PartsEngine, GetButtonG, int a);
@@ -4930,8 +4930,8 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_TODO_EXPORT(SetCheckBoxSize, PartsEngine_SetCheckBoxSize),
 	    HLL_TODO_EXPORT(SetCheckBoxDrag, PartsEngine_SetCheckBoxDrag),
 	    HLL_TODO_EXPORT(IsCheckBoxDrag, PartsEngine_IsCheckBoxDrag),
-	    HLL_EXPORT(SetCheckBoxEnable, PartsEngine_SetCheckBoxEnable),
-	    HLL_EXPORT(IsCheckBoxEnable, PartsEngine_IsCheckBoxEnable),
+	    HLL_EXPORT(SetCheckBoxEnable, PE_SetPartsCheckBoxEnable),
+	    HLL_EXPORT(IsCheckBoxEnable, PE_GetPartsCheckBoxEnable),
 	    HLL_EXPORT(CheckBoxChecked, PE_SetPartsCheckBoxChecked),
 	    HLL_EXPORT(IsCheckBoxChecked, PE_GetPartsCheckBoxChecked),
 	    HLL_EXPORT(SetCheckBoxColor, PE_SetPartsCheckBoxColor),
