@@ -3324,6 +3324,13 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		parts->is_checkbox = true;
 		return;
 	}
+	// Поле ввода (4) — тот же случай: рисуется своим кодом (таблица в
+	// src/hll/PartsEngine.c), а вид компонента обязано отдавать своим, иначе обёртка
+	// `CActivityWrap@GetTextBox` у игры пустая. Номер 4 совпадает в обеих нумерациях.
+	if (type == 4) {
+		parts->is_textbox = true;
+		return;
+	}
 	// Полосы прокрутки (2/3) — тоже ФЛАГ на CG-части (геометрию кладёт загрузчик
 	// раскладок, PE_InitPartsVScrollbar/HScrollbar). Игра выставляет тип сама:
 	// `CVScrollBarParts@0` (@0x3c6b9c) → SetComponentType(no, 2, 1),
@@ -3384,7 +3391,37 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		parts_state_reset(&parts->states[state], pt);
 }
 
+static int pe_get_component_type(int parts_no, int state);
+
+// XSYS4_CTYPE_TRACE=1 — какой вид части движок отдаёт игре. Игра почти везде спрашивает
+// его ПЕРЕД тем, как взять обёртку (`CActivityWrap@CompParts(имя, тип, состояние)`), и при
+// несовпадении молча возвращает null — экран строится, а кусок работы не делается вовсе.
+// Без этой трассы такие места видно только по последствиям.
+// Пометить часть как ПОЛЕ ВВОДА. Зовёт загрузчик раскладки (パーツタイプ=4): само
+// состояние поля живёт в таблице src/hll/PartsEngine.c, а вид компонента отдаёт парт.
+void parts_mark_textbox(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (parts) {
+		parts->is_textbox = true;
+		return;
+	}
+	// ★Часть на этот момент ЕЩЁ НЕ СОЗДАНА: загрузчик раскладки настраивает поле
+	// ввода раньше, чем парт материализуется (замер: `parts_try_get` даёт NULL для
+	// обоих полей `テキストボックス：コメント編集`). Кладём заявку в ту же таблицу
+	// отложенных типов, что и SetComponentType, — она применится при создании.
+	pending_ctype_set(parts_no, 4, 1);
+}
+
 int PE_GetComponentType(int parts_no, int state)
+{
+	int r = pe_get_component_type(parts_no, state);
+	if (getenv("XSYS4_CTYPE_TRACE"))
+		NOTICE("CTYPE no=%d state=%d -> %d", parts_no, state, r);
+	return r;
+}
+
+static int pe_get_component_type(int parts_no, int state)
 {
 	if (!parts_state_valid(--state))
 		return -1;
@@ -3412,6 +3449,12 @@ int PE_GetComponentType(int parts_no, int state)
 	// Проверяется РАНЬШЕ is_button: чекбокс кликабелен, но кнопкой не является.
 	if (parts->is_checkbox)
 		return 1;
+
+	// Поле ввода (パーツタイプ=4) — та же двойственность: рисуется своим кодом, а вид
+	// обязано отдавать своим, иначе `CActivityWrap@GetTextBox` (гейт `CompParts(имя, 4,
+	// состояние)`) отдаёт игре null. Подробности — у флага в parts_internal.h.
+	if (parts->is_textbox)
+		return 4;
 
 	// Полосы прокрутки (縦=2, 横=3) — тот же случай: рисуются CG-ползунком, а
 	// тип обязаны отдавать свой, иначе `CActivityWrap@GetVScrollBar` (@0x202f0,
@@ -3519,7 +3562,35 @@ void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x)
 	if (r < 0.0f) r = 0.0f;
 	if (r > 1.0f) r = 1.0f;
 	parts->hscroll_rate = r;
+	if (getenv("XSYS4_SLIDER_TRACE"))
+		NOTICE("SLIDER drag no=%d rate=%.3f", parts->no, r);
 	parts_hscrollbar_reposition(parts);
+}
+
+/*
+ * Протяжка горизонтальной полосы/слайдера ОБЪЯВЛЯЕТСЯ ИГРЕ — тем же событием прокрутки,
+ * что и у вертикальной (`PE_OnVScrollbarDragged`, src/hll/PartsEngine.c). Обработчик у
+ * игры один и тот же по форме: `DG_ScrollHandler(number, scrollPos, total)`.
+ *
+ * Отличие от вертикальной — ОТКУДА размеры: вертикальной их ведёт HLL-структура
+ * `pe_vscrollbar` (игра задаёт Total/View вызовами), а горизонтальную целиком описывает
+ * раскладка (`長さ/幅/全体スクロール量/表示量` → PE_InitPartsHScrollbar), поэтому Total/View
+ * берём с самой части — и функция живёт здесь, где `struct parts` видна целиком.
+ *
+ * Обработчику конфига позиция не нужна (он перечитывает долю через
+ * GetHSliderBarScrollRate), но передаём честную: полосам прокрутки она нужна.
+ */
+void PE_OnHScrollbarDragged(int parts_no, float rate)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return;
+	int max = parts->sb_total - parts->sb_view;
+	if (max < 0) max = 0;
+	if (rate < 0.0f) rate = 0.0f;
+	if (rate > 1.0f) rate = 1.0f;
+	parts_msg_push(parts, PARTS_MSG_SCROLL, "ii",
+			(int)(rate * max + 0.5f), parts->sb_total);
 }
 
 void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate)
@@ -3557,7 +3628,12 @@ void PE_SetHSliderBarScrollRate(int parts_no, float rate)
 float PE_GetHSliderBarScrollRate(int parts_no)
 {
 	struct parts *parts = parts_try_get(parts_no);
-	return parts ? parts->hscroll_rate : 0.0f;
+	float r = parts ? parts->hscroll_rate : 0.0f;
+	// XSYS4_SLIDER_TRACE=1 — кто и когда СПРАШИВАЕТ долю. Отвечает на вопрос, который
+	// одним дампом частей не закрыть: игра узнаёт о протяжке опросом или событием.
+	if (getenv("XSYS4_SLIDER_TRACE"))
+		NOTICE("SLIDER get no=%d rate=%.3f", parts_no, r);
+	return r;
 }
 
 float PE_GetPartsHScrollbarScrollRate(int parts_no)

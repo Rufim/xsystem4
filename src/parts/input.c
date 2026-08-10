@@ -561,6 +561,14 @@ void PE_UpdateInputState(int passed_time)
 						parts->sb_length, parts->sb_width }
 				: (Rectangle){ px + parts->sb_base_x, py + parts->sb_base_y,
 						parts->sb_width, parts->sb_length };
+			if (getenv("XSYS4_SLIDER_TRACE"))
+				NOTICE("SLIDER track no=%d rect=%d,%d %dx%d parent=%d ppos=%d,%d "
+				       "gpos=%d,%d курсор=%d,%d %s",
+				       parts->no, track.x, track.y, track.w, track.h,
+				       parts->parent ? parts->parent->no : -1, px, py,
+				       parts->global.pos.x, parts->global.pos.y,
+				       cur_pos.x, cur_pos.y,
+				       SDL_PointInRect(&cur_pos, &track) ? "ПОПАЛ" : "");
 			if (SDL_PointInRect(&cur_pos, &track)) {
 				dragging_scrollbar = parts;
 				break;
@@ -570,7 +578,20 @@ void PE_UpdateInputState(int passed_time)
 	if (dragging_scrollbar) {
 		if (cur_clicking) {
 			if (dragging_scrollbar->is_hscrollbar) {
+				// ★Протяжку НАДО ОБЪЯВИТЬ ИГРЕ. Долю она не опрашивает: замер
+				// XSYS4_SLIDER_TRACE на вкладке `メッセージウィンドウ` дал 11
+				// протяжек и НОЛЬ вызовов GetHSliderBarScrollRate. Ползунок
+				// ехал, а прозрачность окна не менялась.
+				// Игра ждёт событие прокрутки: `CAlpha@Active::postset` вешает
+				// на часть DG_ScrollHandler(number, scrollPos, total), и уже
+				// обработчик читает долю и зовёт SetMessageWindowAlphaRate.
+				// У вертикальной полосы это делалось (строкой ниже), у
+				// горизонтальной — нет; отсюда и «ползунок не меняет превью».
+				float old_rate = dragging_scrollbar->hscroll_rate;
 				parts_hscrollbar_drag_to(dragging_scrollbar, cur_pos.x);
+				if (dragging_scrollbar->hscroll_rate != old_rate)
+					PE_OnHScrollbarDragged(dragging_scrollbar->no,
+							dragging_scrollbar->hscroll_rate);
 			} else {
 				parts_vscrollbar_drag_to(dragging_scrollbar, cur_pos.y);
 				PE_OnVScrollbarDragged(dragging_scrollbar->no,

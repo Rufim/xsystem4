@@ -403,6 +403,10 @@ void PE_PauseMotion(bool pause);
 
 // text.c
 bool PE_SetText(int parts_no, struct string *text, int state);
+// Сделать состояние текстовым, ничего в него не кладя (см. src/parts/text.c).
+void PE_MakeTextState(int parts_no, int state);
+// Пометить часть как поле ввода (см. src/parts/parts.c).
+void parts_mark_textbox(int parts_no);
 bool PE_AddPartsText(int parts_no, struct string *text, int state);
 void PE_SetTextEnableTag(int parts_no, bool enable, int state);
 bool PE_IsTextEnableTag(int parts_no, int state);

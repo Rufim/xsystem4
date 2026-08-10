@@ -180,6 +180,24 @@ static void parts_text_clear(struct parts *parts, int state)
 	text->cursor.y = 0;
 }
 
+/*
+ * Сделать состояние ТЕКСТОВЫМ, ничего в него не кладя.
+ *
+ * Нужно раскладкам, где часть объявлена テキストパーツ, а строка в данных ПУСТАЯ, потому что
+ * заполняет её игра. Пока такое состояние оставалось CG, `GetComponentType` отдавал 19
+ * (ＣＧパーツ) вместо 21, и игра, которая перед записью берёт обёртку
+ * `CActivityWrap@GetText` (та гейтится `CompParts(имя, 21, состояние)`), получала null и
+ * МОЛЧА пропускала запись: подсказки 説明 на вкладке `ウィンドウ` конфига Haha Ranman не
+ * появлялись вовсе, хотя тексты игра считала (замер XSYS4_FN_TRACE_NS=AFL_Config_GetHelpText
+ * — четыре вызова, а XSYS4_SETTEXT_TRACE — ни одной записи в эти части).
+ */
+void PE_MakeTextState(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return;
+	parts_get_text(parts_get(parts_no), state);
+}
+
 bool PE_SetText(int parts_no, struct string *text, int state)
 {
 	// XSYS4_SETTEXT_TRACE=1 — кто и какой текст кладёт в текстовые части.

@@ -182,5 +182,8 @@ struct page *delegate_minusa(struct page *dst, struct page *minus);
 struct page *delegate_clear(struct page *page);
 bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out, int *env_out);
 void delegate_release_env(struct page *page);
+// Границы рассылки: пока она идёт, список не уплотняют при добавлении.
+void delegate_dispatch_begin(struct page *page);
+void delegate_dispatch_end(struct page *page);
 
 #endif /* SYSTEM4_PAGE_H */

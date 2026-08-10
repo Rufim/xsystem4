@@ -478,6 +478,8 @@ static void textbox_set_focus(struct textbox_state *t)
 	 * зовёт `Ｐ＿テキストボックス＿テキスト取得`, прячет поле и возвращает подсказку.
 	 * Без него набранный комментарий в сейв не попадал вовсе.
 	 */
+	if (getenv("XSYS4_TB_TRACE"))
+		NOTICE("TBFOCUS было=%d стало=%d", old ? old->parts_no : -1, t ? t->parts_no : -1);
 	if (old)
 		PE_SendFixedEvent(old->parts_no);
 	// Каретка появляется/исчезает — перерисовать оба поля.
@@ -603,6 +605,14 @@ static void tb_set_text(int no, bool multi, struct string *text)
 
 static void tb_get_text(int no, bool multi, struct string **out)
 {
+	// XSYS4_TB_TRACE=1 — кто и что читает из поля ввода. Отделяет «игра не спросила»
+	// от «спросила, а мы отдали пустое».
+	if (getenv("XSYS4_TB_TRACE")) {
+		struct textbox_state *dbg = textbox_get(no, multi, false);
+		NOTICE("TBGET no=%d multi=%d состояние=%s текст='%s'", no, multi,
+		       dbg ? "есть" : "НЕТ",
+		       dbg && dbg->text ? display_sjis0(dbg->text->text) : "");
+	}
 	struct textbox_state *t = textbox_get(no, multi, false);
 	textbox_out_string(out, t ? t->text : NULL);
 }
@@ -2104,7 +2114,18 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		// метрик, и когда игра позже кладёт в неё свой текст, рендер падает
 		// молча (движок умирал на загрузке ADV-сцены, 0 *ERROR* в логе).
 		bool placeholder = txt && act_is_placeholder_text(txt);
-		if (txt && txt->size) {
+		/*
+		 * ★Тип состояния выставляем ВСЕГДА, даже когда `テキスト` пуст. Раньше вся
+		 * ветка стояла под `if (txt && txt->size)`, и часть с пустой строкой
+		 * оставалась CG-частью: `GetComponentType` отдавал 19 вместо 21, обёртка
+		 * `CActivityWrap@GetText` (гейт `CompParts(имя, 21, состояние)`) выходила
+		 * пустой, и игра МОЛЧА пропускала запись текста. Так пропали подсказки
+		 * `説明` на вкладке `ウィンドウ`: тексты игра считает (4 вызова
+		 * AFL_Config_GetHelpText), а Parts_SetText в эти части не приходит ни разу.
+		 * Пустая строка в раскладке — норма: её заполняет игра.
+		 */
+		PE_MakeTextState(no, state);
+		{
 			struct ex_tree *fd = act_child(st, "テキスト装飾");
 			if (fd) {
 				PE_SetFont(no, act_int(fd, "フォントタイプ", 0),
@@ -2743,6 +2764,10 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		 * обводкой 1.25, 背景色 (61,149,220), 最大文字数 10.
 		 */
 		struct textbox_state *t = textbox_get(no, false, true);
+		// Вид компонента отдаёт САМ парт (см. `is_textbox` в parts_internal.h): без
+		// флага обёртка `CActivityWrap@GetTextBox` у игры пустая, и введённый текст
+		// до неё не доходит.
+		parts_mark_textbox(no);
 		if (t) {
 			t->width  = act_list_int(ti, "サイズ", 0, 0);
 			t->height = act_list_int(ti, "サイズ", 1, 0);

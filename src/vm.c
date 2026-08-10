@@ -987,7 +987,12 @@ static void delegate_call(int dg_no, int return_address)
 			vm_stack_trace();
 		}
 	}
-	if (delegate_get(heap_get_delegate_page(dg_page), dg_index, &obj, &fun, &env)) {
+	// Границы рассылки нужны амортизированной чистке списка (delegate_append):
+	// пока обход идёт, уплотнять нельзя — курсор живёт на стеке VM.
+	struct page *dgp = heap_get_delegate_page(dg_page);
+	if (dg_index == 0)
+		delegate_dispatch_begin(dgp);
+	if (delegate_get(dgp, dg_index, &obj, &fun, &env)) {
 		if (fn_trace_count != 0)
 			vm_fn_trace(fun, "DG_CALL");
 		vm_fn_trace_ns(fun);
@@ -1019,6 +1024,7 @@ static void delegate_call(int dg_no, int return_address)
 		call_stack[call_stack_ptr-1].env_page = env;
 	} else {
 		// call finished: clean up stack and jump to return address
+		delegate_dispatch_end(heap_get_delegate_page(dg_page));
 		// Слотов у возврата столько, сколько скажет type_slots(): 2 у
 		// `option<T>`/`AIN_IFACE`/`wrap<интерфейс>`, 3 у `option<wrap<интерфейс>>`.
 		union vm_value r[DG_MAX_RETURN_SLOTS];
