@@ -438,8 +438,10 @@ int save_globals(const char *keyname, const char *filename, const char *group_na
 				continue;
 			global->name = strdup(ain->globals[i].name);
 			global->type = ain->globals[i].type.data;
-			// v9: параметр типа — тип содержимого у обёрток, иначе сам тип.
-			global->type_param = ain->globals[i].type.array_type
+			// v9: параметр типа — тип содержимого ТОЛЬКО у AIN_OPTION, иначе
+			// дублирует тип (правило снято подсчётом пар в сейве оригинала).
+			global->type_param = (ain->globals[i].type.data == AIN_OPTION
+					&& ain->globals[i].type.array_type)
 				? ain->globals[i].type.array_type->data
 				: ain->globals[i].type.data;
 			global->value = add_value_to_gsave(global->type, global_get(i), save);
@@ -1211,16 +1213,47 @@ int save_struct_list(const char *filename, struct page *list)
 {
 	obj_maps_reset();
 	int n = list && list->type == ARRAY_PAGE ? list->nr_vars : 0;
-	struct gsave *save = gsave_create(get_gsave_version(), "", ain->nr_globals, NULL);
+	/*
+	 * ЗАГОЛОВОК ПИШЕМ КАК WINDOWS-СБОРКА, иначе её загрузчик получит чужие значения.
+	 * Снято сравнением четырёх пар файлов (`SaveData1000.asd`, `AFConfig.asd`,
+	 * `AFInfo.asd`, `Collection.asd`) — расхождения были во всех четырёх одинаковы:
+	 *   key и group — «serialize_struct», а не пустые строки;
+	 *   nr_ain_globals — 1, а не полное число глобалов .ain;
+	 *   имя «глобала» — ПУСТОЕ, а не порядковый номер (при загрузке имена всё равно
+	 *     не ищутся: разбор идёт по позиции, см. load_struct_list);
+	 *   глобалов на ОДИН больше — последний нулевой, замыкающий.
+	 * Записи (`records`) при этом совпадали с оригиналом один в один.
+	 */
+	bool v9 = get_gsave_version() >= 9;
+	struct gsave *save = gsave_create(get_gsave_version(),
+			v9 ? "serialize_struct" : "",
+			v9 ? 1 : ain->nr_globals,
+			v9 ? "serialize_struct" : NULL);
 	gsave_add_globals_record(save, n);
+	if (v9) {
+		// ★Запись GLOBALS ссылается на n объектов, а самих глобалов n+1: у оригинала
+		// `record 0` имеет ровно один индекс при двух глобалах. Расширяем ТОЛЬКО
+		// массив глобалов, список индексов записи не трогаем.
+		save->globals = xrealloc_array(save->globals, n, n + 1,
+				sizeof(struct gsave_global));
+		save->nr_globals = n + 1;
+	}
 	for (int i = 0; i < n; i++) {
 		char name[16];
 		snprintf(name, sizeof(name), "%d", i);
 		struct gsave_global *g = &save->globals[i];
-		g->name = strdup(name);
+		g->name = strdup(v9 ? "" : name);
 		g->type = AIN_STRUCT;
 		g->type_param = AIN_STRUCT;   // v9: параметр типа (у не-обёрток дублирует тип)
 		g->value = add_value_to_gsave(AIN_STRUCT, list->values[i], save);
+	}
+	if (v9) {
+		// Замыкающий глобал: тип 0, значение 0, имя пустое — ровно как у оригинала.
+		struct gsave_global *g = &save->globals[n];
+		g->name = strdup("");
+		g->type = AIN_VOID;
+		g->type_param = AIN_VOID;
+		g->value = 0;
 	}
 
 	char *path = savedir_path(filename);
