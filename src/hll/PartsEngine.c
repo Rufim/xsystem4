@@ -2517,6 +2517,11 @@ static struct string *act_cg_suffix(struct string *base, const char *utf8_suffix
 struct act_hover_pending { int parts_no; struct string *target_name; };
 static struct act_hover_pending *act_hover_pending;
 static int act_hover_nr;
+// Состав ГРУПП РАДИОКНОПОК: та же отложенная схема, что и у hover-связей, и по той же
+// причине — кнопки группы строятся позже неё самой.
+struct act_radio_pending { int box_no; struct string *child_name; };
+static struct act_radio_pending *act_radio_pending;
+static int act_radio_nr;
 struct act_built_name { struct string *name; int no; };
 static struct act_built_name *act_built;
 static int act_built_nr;
@@ -2549,6 +2554,28 @@ static void act_apply_pending_hover_links(void)
 			       act_hover_pending[i].parts_no,
 			       display_sjis0(act_hover_pending[i].target_name->text), target_no);
 	}
+	for (int i = 0; i < act_radio_nr; i++) {
+		int child_no = -1;
+		for (int j = 0; j < act_built_nr; j++) {
+			if (act_name_eq(act_built[j].name, act_radio_pending[i].child_name)) {
+				child_no = act_built[j].no;
+				break;
+			}
+		}
+		if (child_no < 0) {
+			WARNING("act_build_part: кнопка группы '%s' не найдена в этой активности",
+			        display_sjis0(act_radio_pending[i].child_name->text));
+			continue;
+		}
+		parts_radio_box_add_child(act_radio_pending[i].box_no, child_no);
+		if (getenv("XSYS4_RB_TRACE"))
+			NOTICE("RB группа %d <- кнопка '%s' (часть %d)", act_radio_pending[i].box_no,
+			       display_sjis0(act_radio_pending[i].child_name->text), child_no);
+	}
+	free(act_radio_pending);
+	act_radio_pending = NULL;
+	act_radio_nr = 0;
+
 	free(act_hover_pending);
 	act_hover_pending = NULL;
 	act_hover_nr = 0;
@@ -2903,6 +2930,29 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			NOTICE("PT vscrollbar no=%d base=(%d,%d) len=%d w=%d up=%d down=%d total=%d view=%d rate=%.3f",
 			       no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
 		PE_SetClickable(no, true);
+	} else if (ptype == 9) {
+		/*
+		 * Группа радиокнопок: своего вида у неё нет, вся роль — отдавать игре свой ВИД
+		 * КОМПОНЕНТА (`CompParts(имя, 9, …)`) и знать СВОЙ СОСТАВ. Состав лежит прямо
+		 * здесь, списком ИМЁН: `種類別情報 → チェックボックスリスト`. Условия на `ti` в
+		 * заголовке ветки нет намеренно — вид надо отдавать и у группы без описания.
+		 * ★XSYS4_RB_TRACE=1 печатает разобранный состав.
+		 */
+		struct ex_tree *cl = act_child(ti, "チェックボックスリスト");
+		if (cl && cl->is_leaf && cl->leaf.value.type == EX_LIST) {
+			struct ex_list *l = cl->leaf.value.list;
+			for (uint32_t i = 0; i < l->nr_items; i++) {
+				struct ex_value *v = &l->items[i].value;
+				if (v->type != EX_STRING || !v->s)
+					continue;
+				act_radio_pending = xrealloc_array(act_radio_pending, act_radio_nr,
+						act_radio_nr + 1, sizeof(*act_radio_pending));
+				act_radio_pending[act_radio_nr].box_no = no;
+				act_radio_pending[act_radio_nr].child_name = v->s;
+				act_radio_nr++;
+			}
+		}
+		parts_mark_radio_box(no);
 	} else if (ptype == 8 && ti) {
 		/*
 		 * `レイアウトボックス` (パーツタイプ=8) — контейнер, сам раскладывающий детей.
@@ -3414,6 +3464,9 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 		}
 		// Списки hover-связей — на ЭТУ постройку; вложенные вызовы (активности
 		// user-компонентов) не должны видеть чужие пары.
+		struct act_radio_pending *saved_radio = act_radio_pending;
+		int saved_radio_nr = act_radio_nr;
+		act_radio_pending = NULL; act_radio_nr = 0;
 		struct act_hover_pending *saved_pending = act_hover_pending;
 		int saved_pending_nr = act_hover_nr;
 		struct act_built_name *saved_built = act_built;
@@ -3425,6 +3478,7 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 		act_apply_pending_hover_links();
 
 		act_hover_pending = saved_pending; act_hover_nr = saved_pending_nr;
+		act_radio_pending = saved_radio; act_radio_nr = saved_radio_nr;
 		act_built = saved_built; act_built_nr = saved_built_nr;
 		if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_DUMP_PARTS")) {
 			NOTICE("=== parts right after ReadActivityFile build ===");

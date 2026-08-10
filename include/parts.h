@@ -399,6 +399,10 @@ bool PE_SetText(int parts_no, struct string *text, int state);
 void PE_MakeTextState(int parts_no, int state);
 // Пометить часть как поле ввода (см. src/parts/parts.c).
 void parts_mark_textbox(int parts_no);
+// Пометить часть как группу радиокнопок (см. src/parts/parts.c).
+void parts_mark_radio_box(int parts_no);
+// Записать кнопку в состав группы (см. src/parts/parts.c).
+void parts_radio_box_add_child(int box_no, int child_no);
 bool PE_AddPartsText(int parts_no, struct string *text, int state);
 void PE_SetTextEnableTag(int parts_no, bool enable, int state);
 bool PE_IsTextEnableTag(int parts_no, int state);

@@ -140,6 +140,9 @@ static int msg_type_out(int type)
 	 * один — это и есть её проверка.
 	 */
 	case PARTS_MSG_FIXED:       return 26;
+	// `ChangedFlg` и `Changed` — соседние ветки того же диспетчера (см. раскладку выше).
+	case PARTS_MSG_CHANGED_FLG: return 23;
+	case PARTS_MSG_CHANGED:     return 22;
 	}
 	// Вместо тихого дефолта — проверка допущения: enum выше покрыт целиком, поэтому
 	// сюда попадает только НОВЫЙ тип, для которого номер v14 ещё не установлен.
@@ -325,9 +328,18 @@ float PE_GetMessageVariableFloat(possibly_unused int index)
 	return 0.0f;
 }
 
-bool PE_GetMessageVariableBool(possibly_unused int index)
+bool PE_GetMessageVariableBool(int index)
 {
-	return false;
+	/*
+	 * ★Была ЗАГЛУШКА `return false`, и на ней молча терялся флаг чекбокса.
+	 * Переменные сообщения у нас все целые (см. `msg_push_v`), а игра читает их
+	 * ТИПИЗИРОВАННО: `CallEvent1<bool>` (диспетчер `CPartsMessageManager`) берёт
+	 * значение через `GetMessageVariableBool`, и обработчик конфига получает флаг
+	 * только оттуда. Симптом был обманчивым: нужный `AFL_Config_Set…` вызывался,
+	 * то есть «событие дошло», — но всегда со значением 0, и настройка не менялась
+	 * ни в игре, ни в сохранённом `AFConfig.asd`.
+	 */
+	return PE_GetMessageVariableInt(index) != 0;
 }
 
 void PE_GetMessageVariableString(possibly_unused int index, struct string **out)

@@ -1454,6 +1454,10 @@ void parts_release(int parts_no)
 		parts->parent = NULL;
 	}
 
+	free(parts->radio_children);
+	parts->radio_children = NULL;
+	parts->nr_radio_children = 0;
+
 	parts_list_remove(parts);
 	dirty_list_remove(parts);
 	free(parts);
@@ -3310,6 +3314,11 @@ void PE_SetComponentType(int parts_no, int type, int state)
 		parts->is_textbox = true;
 		return;
 	}
+	// Группа радиокнопок (9) — тоже флаг на части без своего вида отрисовки.
+	if (type == 9) {
+		parts->is_radio_box = true;
+		return;
+	}
 	// Полосы прокрутки (2/3) — тоже ФЛАГ на CG-части (геометрию кладёт загрузчик
 	// раскладок, PE_InitPartsVScrollbar/HScrollbar). Игра выставляет тип сама:
 	// `CVScrollBarParts@0` (@0x3c6b9c) → SetComponentType(no, 2, 1),
@@ -3376,6 +3385,59 @@ static int pe_get_component_type(int parts_no, int state);
 // его ПЕРЕД тем, как взять обёртку (`CActivityWrap@CompParts(имя, тип, состояние)`), и при
 // несовпадении молча возвращает null — экран строится, а кусок работы не делается вовсе.
 // Без этой трассы такие места видно только по последствиям.
+/*
+ * Пометить часть как ГРУППУ РАДИОКНОПОК. Зовёт загрузчик раскладки (パーツタイプ=9);
+ * как и у поля ввода, парта на этот момент может ещё не быть — тогда заявка ложится в
+ * таблицу отложенных типов.
+ */
+void parts_mark_radio_box(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (parts) {
+		parts->is_radio_box = true;
+		return;
+	}
+	pending_ctype_set(parts_no, 9, 1);
+}
+
+// Записать кнопку в состав группы (зовёт загрузчик раскладки, разрешив имя в номер).
+void parts_radio_box_add_child(int box_no, int child_no)
+{
+	struct parts *box = parts_try_get(box_no);
+	if (!box || child_no < 0)
+		return;
+	box->is_radio_box = true;
+	for (int i = 0; i < box->nr_radio_children; i++)
+		if (box->radio_children[i] == child_no)
+			return;
+	box->radio_children = xrealloc_array(box->radio_children, box->nr_radio_children,
+			box->nr_radio_children + 1, sizeof(*box->radio_children));
+	box->radio_children[box->nr_radio_children++] = child_no;
+}
+
+/*
+ * Группа, которой принадлежит кнопка. В раскладке группа — ПУСТАЯ ЧАСТЬ-СОСЕД: и она, и
+ * сами кнопки лежат детьми одного layout-бокса (замер по `コンフィグ／０６／ウィンドウ`:
+ * бокс 90000075 → группа 90000076 + кнопки 90000077/90000079). Поэтому ищем среди
+ * братьев, а не среди предков.
+ */
+static struct parts *parts_radio_box_of(struct parts *parts, int *idx_out)
+{
+	struct parts *box;
+	PARTS_LIST_FOREACH(box) {
+		if (!box->is_radio_box)
+			continue;
+		for (int i = 0; i < box->nr_radio_children; i++) {
+			if (box->radio_children[i] != parts->no)
+				continue;
+			if (idx_out)
+				*idx_out = i;
+			return box;
+		}
+	}
+	return NULL;
+}
+
 // Пометить часть как ПОЛЕ ВВОДА. Зовёт загрузчик раскладки (パーツタイプ=4): само
 // состояние поля живёт в таблице src/hll/PartsEngine.c, а вид компонента отдаёт парт.
 void parts_mark_textbox(int parts_no)
@@ -3434,6 +3496,11 @@ static int pe_get_component_type(int parts_no, int state)
 	// состояние)`) отдаёт игре null. Подробности — у флага в parts_internal.h.
 	if (parts->is_textbox)
 		return 4;
+
+	// Группа радиокнопок (パーツタイプ=9) — то же самое ради
+	// `CActivityWrap@GetRadioButtonBox` (`CompParts(имя, 9, состояние)`).
+	if (parts->is_radio_box)
+		return 9;
 
 	// Полосы прокрутки (縦=2, 横=3) — тот же случай: рисуются CG-ползунком, а
 	// тип обязаны отдавать свой, иначе `CActivityWrap@GetVScrollBar` (@0x202f0,
@@ -3748,7 +3815,10 @@ void PE_SetPartsCheckBoxChecked(int parts_no, bool checked)
 bool PE_GetPartsCheckBoxChecked(int parts_no)
 {
 	struct parts *parts = parts_try_get(parts_no);
-	return parts ? parts->checkbox_checked : false;
+	bool r = parts ? parts->checkbox_checked : false;
+	if (getenv("XSYS4_CB_TRACE"))
+		NOTICE("CB get part %d -> %d%s", parts_no, r, parts ? "" : " (части нет)");
+	return r;
 }
 
 // Load the checkbox box CG for the current checked state into all three display
@@ -3859,8 +3929,59 @@ void parts_checkbox_toggle(struct parts *parts)
 {
 	if (!parts->is_checkbox)
 		return;
+
+	/*
+	 * РАДИОКНОПКА (кнопка внутри `ラジオボタンボックス`) ведёт себя иначе, чем чекбокс:
+	 * клик по ней ВЫБИРАЕТ её и гасит остальные кнопки группы, а повторный клик по уже
+	 * выбранной ничего не меняет. Исключительность — на движке: замером проверено, что
+	 * игра её НЕ наводит (после `SetScalingType` обе кнопки оставались зажжёнными, пока
+	 * гашение не делал движок).
+	 *
+	 * Порядок важен: сначала гасим соседей, потом объявляем событие. Обработчик игры
+	 * (`Config::WindowPage@Create()(67, 79)`) читает `Checked` у ВСЕХ кнопок группы и
+	 * берёт последнюю зажжённую — при непогашенном соседе он получил бы чужое значение.
+	 */
+	int my_idx = -1;
+	struct parts *box = parts_radio_box_of(parts, &my_idx);
+	if (box) {
+		for (int i = 0; i < box->nr_radio_children; i++) {
+			if (box->radio_children[i] == parts->no)
+				continue;
+			struct parts *other = parts_try_get(box->radio_children[i]);
+			if (other && other->checkbox_checked) {
+				other->checkbox_checked = false;
+				parts_checkbox_reload_cg(other);
+			}
+		}
+		if (!parts->checkbox_checked) {
+			parts->checkbox_checked = true;
+			parts_checkbox_reload_cg(parts);
+		}
+		if (getenv("XSYS4_CB_TRACE"))
+			NOTICE("CB группа %d <- кнопка %d (индекс %d)", box->no, parts->no, my_idx);
+		/*
+		 * ★Объявляем ОБА события, и это не перестраховка, а замер: страницы конфига
+		 * подписаны ПО-РАЗНОМУ. `ウィンドウ` вешает обработчик на ГРУППУ
+		 * (`GetRadioButtonBox(...).ChangedEvent`) и читает состояния кнопок сам;
+		 * `入力` вешает его на САМИ КНОПКИ, как на обычные чекбоксы
+		 * (`SetMoveMouseCursorSpeed`, `SetWheelForward` приходят только оттуда).
+		 * Погашенным соседям НЕ шлём ничего: их обработчик-«если включили» иначе
+		 * получил бы ноль после нашей единицы и обнулил только что выбранное.
+		 */
+		parts_msg_push(parts, PARTS_MSG_CHANGED_FLG, "i", 1);
+		// Событию группы аргумент — индекс выбранной кнопки (обработчик конфига его не
+		// использует: состояние он читает с самих частей).
+		parts_msg_push(box, PARTS_MSG_CHANGED, "i", my_idx < 0 ? 0 : my_idx);
+		return;
+	}
+
 	parts->checkbox_checked = !parts->checkbox_checked;
 	parts_checkbox_reload_cg(parts);
+	// ★Объявить игре. Без этого галочка меняется только на экране: конфиг вешает на
+	// чекбокс делегат `(номер, флаг)` и по нему зовёт `AFL_Config_Set…`.
+	if (getenv("XSYS4_CB_TRACE"))
+		NOTICE("CB toggle part %d -> checked=%d", parts->no, parts->checkbox_checked);
+	parts_msg_push(parts, PARTS_MSG_CHANGED_FLG, "i", parts->checkbox_checked ? 1 : 0);
 }
 
 // Checkbox label colour. Stored so the game can read it back; the checkbox is
