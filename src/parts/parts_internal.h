@@ -629,6 +629,18 @@ struct parts {
 	bool is_checkbox;
 	struct string *checkbox_cg_base;
 	/*
+	 * `テキストボックス` (パーツタイプ=4) — ПОЛЕ ВВОДА. Само состояние поля (текст,
+	 * шрифт, фокус) движок ведёт отдельной таблицей в src/hll/PartsEngine.c, но ВИД
+	 * компонента обязан отдавать сам парт: игра берёт поле обёрткой
+	 * `CActivityWrap@GetTextBox`, а та гейтится `CompParts(имя, 4, состояние)` и при
+	 * несовпадении возвращает null — молча, без единого предупреждения.
+	 * Так пропадала заметка к сейву: `SaveLoadConfirmScene` на «Yes» читает текст
+	 * поля `テキストボックス：コメント編集`, а при null подставляет ПУСТУЮ строку —
+	 * в сайдкаре `.vsf` поле `コメント` (индекс 8) оставалось пустым при заполненном
+	 * `ゲーム時間文字列`. Замер: вид части 90000183 был 26/19, а нужен 4.
+	 */
+	bool is_textbox;
+	/*
 	 * `ユーザコンポーネント` (тип компонента v14 = 17) — часть-место, куда игровой
 	 * фреймворк подставляет ОТДЕЛЬНУЮ активность (шапка, футер, полоса фазы…).
 	 * Своего рендера у неё нет: содержимое создаёт сама игра и вешает потомками.
@@ -971,6 +983,7 @@ bool parts_msg_api_new(void);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
 void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y);
 void PE_OnVScrollbarDragged(int parts_no, float rate);
+void PE_OnHScrollbarDragged(int parts_no, float rate);
 void parts_checkbox_toggle(struct parts *parts);
 
 // construction.c
