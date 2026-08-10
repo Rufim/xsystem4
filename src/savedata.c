@@ -368,10 +368,37 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 	}
 }
 
+/*
+ * ВЕРСИЯ 9 — та сборка движка, которая держит комментарий слота ВНУТРИ файла сейва
+ * (FINDINGS §5cp). По версии `.ain` её не отличить: и Dohna, и Haha Ranman — 14, а
+ * оригиналы пишут РАЗНОЕ (замер по их же файлам: `SaveData1000.asd` у Dohna — 9,
+ * `AFConfig.asd` у Haha Ranman — 7). Разделяет их состав библиотеки System: у Dohna
+ * объявлены `SerializeStruct`/`WriteSerializeStructComment`, у Haha Ranman этих
+ * функций нет вовсе. То есть комментарий внутри файла заводят ровно там, где игра
+ * умеет его писать, — по этому признаку и выбираем.
+ */
+static bool game_uses_gsave9(void)
+{
+	static int cached = -1;
+	if (cached >= 0)
+		return cached;
+	// ★Имя библиотеки в .ain — со СТРОЧНОЙ буквы (`system`), хотя реализация в
+	// движке зовётся `System`: по «System» поиск молча не находил ничего, и сейв
+	// продолжал писаться седьмой версией.
+	int libno = ain_get_library(ain, "system");
+	if (libno < 0)
+		libno = ain_get_library(ain, "System");
+	cached = libno >= 0
+		&& ain_get_library_function(ain, libno, "WriteSerializeStructComment") >= 0;
+	return cached;
+}
+
 static int get_gsave_version(void)
 {
 	if (AIN_VERSION_GTE(ain, 6, 0)) {
-		return config.vm_name ? 5 : 7;
+		if (config.vm_name)
+			return 5;
+		return game_uses_gsave9() ? 9 : 7;
 	}
 	return AIN_VERSION_GTE(ain, 5, 0) ? 5 : 4;
 }
@@ -411,6 +438,10 @@ int save_globals(const char *keyname, const char *filename, const char *group_na
 				continue;
 			global->name = strdup(ain->globals[i].name);
 			global->type = ain->globals[i].type.data;
+			// v9: параметр типа — тип содержимого у обёрток, иначе сам тип.
+			global->type_param = ain->globals[i].type.array_type
+				? ain->globals[i].type.array_type->data
+				: ain->globals[i].type.data;
 			global->value = add_value_to_gsave(global->type, global_get(i), save);
 			global++;
 		}
@@ -644,6 +675,20 @@ static int struct_member_index(struct ain_struct *st, const char *name)
  */
 static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value, struct page *container, int varno);
 
+/*
+ * ПЕРЕЧИСЛЕНИЕ РАВНО ЦЕЛОМУ при сверке типов. В сейве Windows-версии Dohna элемент
+ * массива и поле структуры могут нести тип 92/91 (`AIN_ENUM`/`AIN_ENUM2`), тогда как
+ * страница в игре объявлена как обычный int (перечисление в System4 хранится целым, и
+ * generic-массив из них мы и создаём как `array<int>`). Без нормализации сверка
+ * `data_type != тип из сейва` роняла загрузку насмерть:
+ * `gsave_load_array: Bad save file: unexpected array element type` при загрузке
+ * `SaveObject@Load` ← `LocalSave@Load`.
+ */
+static enum ain_data_type save_type_norm(enum ain_data_type t)
+{
+	return (t == AIN_ENUM || t == AIN_ENUM2) ? AIN_INT : t;
+}
+
 static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page *page, struct gsave_flat_array *flat_array)
 {
 	assert(page->type == ARRAY_PAGE);
@@ -658,7 +703,7 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 	for (int i = 0; i < page->nr_vars; i++) {
 		int struct_type, array_rank;
 		enum ain_data_type data_type = variable_type(page, i, &struct_type, &array_rank);
-		if (data_type != flat_array->values[i].type)
+		if (save_type_norm(data_type) != save_type_norm(flat_array->values[i].type))
 			VM_ERROR("Bad save file: unexpected array element type");
 		union vm_value val = gsave_to_vm_value(save, data_type, struct_type, array_rank,
 		                                       flat_array->values[i].value, page, i);
@@ -701,7 +746,20 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
 		const char *field_name = sd ? sd->fields[i].name : kv->name;
 		enum ain_data_type field_type = sd ? sd->fields[i].type : kv->type;
-		int index = struct_member_index(st, field_name);
+		/*
+		 * ПОЛЕ БЕЗ ИМЕНИ — сопоставляем ПО ПОЗИЦИИ. Windows-сборка Dohna
+		 * (сейв версии 9) не пишет имя у полей-делегатов: у `GameContext`
+		 * восьмое поле имеет тип 63 (`AIN_DELEGATE`) и пустое имя, хотя в .ain
+		 * это `DG_EventP<int> <OnChangeMoneyEvent>`; у `WorkerHistory` таких
+		 * полей два. Порядок полей в struct-def совпадает с порядком членов
+		 * структуры (проверено на GameContext: девять полей подряд, тип в тип),
+		 * поэтому позиция — надёжный ключ. Без этого поля просто терялись.
+		 */
+		int index;
+		if ((!field_name || !*field_name) && sd && i < st->nr_members)
+			index = i;
+		else
+			index = struct_member_index(st, field_name);
 		if (index < 0) {
 			strict_or_warn("загрузка", "у структуры %s нет члена %s — поле сейва потеряно",
 			               display_sjis0(struct_name), display_sjis1(field_name));
@@ -709,7 +767,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		}
 		int f_struct_type, f_array_rank;
 		enum ain_data_type data_type = variable_type(page, index, &f_struct_type, &f_array_rank);
-		if (data_type != field_type)
+		if (save_type_norm(data_type) != save_type_norm(field_type))
 			VM_ERROR("Bad save file: structure member type mismatch");
 
 
@@ -869,7 +927,18 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 	case AIN_STRING:
 		{
 			int slot = heap_alloc_slot(VM_STRING);
-			heap[slot].s = string_ref(value == GSAVE7_EMPTY_STRING ? &EMPTY_STRING : save->strings[value]);
+			/*
+			 * ПУСТАЯ СТРОКА ЗАПИСЫВАЕТСЯ ДВУМЯ СПОСОБАМИ. xsystem4 пишет
+			 * `GSAVE7_EMPTY_STRING` (0x7fffffff), а Windows-сборка Dohna в сейве
+			 * версии 9 — обычное −1. Раньше −1 уходило индексом в `save->strings`,
+			 * и `string_ref` получал мусорный указатель: движок падал МОЛЧА
+			 * (стек по gdb: string_ref ← gsave_to_vm_value(AIN_STRING, value=-1)
+			 * ← gsave_fill_struct «WorkerHistory» ← … ← load_struct_list).
+			 * Любой отрицательный индекс — это «строки нет».
+			 */
+			bool empty = value == GSAVE7_EMPTY_STRING || value < 0
+				|| value >= save->nr_strings;
+			heap[slot].s = string_ref(empty ? &EMPTY_STRING : save->strings[value]);
 			return vm_int(slot);
 		}
 	case AIN_STRUCT:
@@ -1014,6 +1083,12 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			case AIN_STRING:    guessed = AIN_ARRAY_STRING; break;
 			case AIN_FUNC_TYPE: guessed = AIN_ARRAY_FUNC_TYPE; break;
 			case AIN_DELEGATE:  guessed = AIN_ARRAY_DELEGATE; break;
+			// Перечисление хранится целым, и массив из них — обычный array<int>.
+			// Живой случай: `GameContext.m_menuState` = `array<MenuState#92>` в
+			// сейве Windows-версии; без этой ветки массив приходил пустым
+			// (heap[slot].page = NULL) и сцена не строилась вовсе.
+			case AIN_ENUM:
+			case AIN_ENUM2:     guessed = AIN_ARRAY_INT; break;
 			case AIN_STRUCT:
 				guessed = AIN_ARRAY_STRUCT;
 				if (fa->nr_values) {
@@ -1144,6 +1219,7 @@ int save_struct_list(const char *filename, struct page *list)
 		struct gsave_global *g = &save->globals[i];
 		g->name = strdup(name);
 		g->type = AIN_STRUCT;
+		g->type_param = AIN_STRUCT;   // v9: параметр типа (у не-обёрток дублирует тип)
 		g->value = add_value_to_gsave(AIN_STRUCT, list->values[i], save);
 	}
 
@@ -1253,8 +1329,57 @@ static char *comment_path(const char *filename)
 	return path;
 }
 
+/*
+ * Записать комментарий ВНУТРЬ сейва (формат версии 9). Игра зовёт
+ * `WriteSerializeStructComment` сразу после `SerializeStruct`, поэтому файл уже
+ * лежит на диске: перечитываем его, подставляем строку и пишем обратно тем же
+ * `gsave_write`. Дороже сайдкара на одну перезапись файла, зато сейв получается
+ * такой же, как у Windows-сборки, и читается ею.
+ */
+static int save_struct_comment_inline(const char *filename, struct string *comment)
+{
+	char *path = savedir_path(filename);
+	enum savefile_error err;
+	struct gsave *gs = gsave_read(path, &err);
+	if (!gs) {
+		WARNING("WriteSerializeStructComment: не прочитать %s: %s",
+		        display_utf0(path), savefile_strerror(err));
+		free(path);
+		return 0;
+	}
+	for (int i = 0; i < gs->nr_comments; i++) {
+		if (gs->comments[i])
+			free_string(gs->comments[i]);
+	}
+	free(gs->comments);
+	gs->nr_comments = 1;
+	gs->comments = xcalloc(1, sizeof(struct string *));
+	gs->comments[0] = string_ref(comment ? comment : &EMPTY_STRING);
+
+	int ok = 0;
+	FILE *fp = file_open_utf8(path, "wb");
+	if (fp) {
+		bool encrypt = !AIN_VERSION_GTE(ain, 6, 0);
+		int compression_level = AIN_VERSION_GTE(ain, 6, 0) ? 1 : 9;
+		err = gsave_write(gs, fp, encrypt, compression_level);
+		fclose(fp);
+		ok = err == SAVEFILE_SUCCESS;
+		if (!ok)
+			WARNING("WriteSerializeStructComment: %s", savefile_strerror(err));
+	} else {
+		WARNING("WriteSerializeStructComment: не открыть %s: %s",
+		        display_utf0(path), strerror(errno));
+	}
+	free(path);
+	gsave_free(gs);
+	return ok;
+}
+
 int save_struct_comment(const char *filename, struct string *comment)
 {
+	if (get_gsave_version() >= 9)
+		return save_struct_comment_inline(filename, comment);
+
 	char *path = comment_path(filename);
 	FILE *fp = file_open_utf8(path, "wb");
 	if (!fp) {
@@ -1276,10 +1401,27 @@ struct string *load_struct_comment(const char *filename)
 	size_t len = 0;
 	char *buf = file_read(path, &len);
 	free(path);
-	if (!buf)
+	if (buf) {
+		struct string *s = make_string(buf, len);
+		free(buf);
+		return s;
+	}
+	/*
+	 * Сайдкара нет — значит сейв не наш, а от Windows-сборки: там комментарий
+	 * лежит ВНУТРИ файла, отдельной секцией версии 9 (FINDINGS §5cp). Без этой
+	 * ветки слот из папки оригинала показывался как «Day0 <None>», хотя сам сейв
+	 * уже читался и грузился.
+	 */
+	char *save_path = savedir_path(filename);
+	enum savefile_error err;
+	struct gsave *gs = gsave_read(save_path, &err);
+	free(save_path);
+	if (!gs)
 		return NULL;
-	struct string *s = make_string(buf, len);
-	free(buf);
+	struct string *s = NULL;
+	if (gs->nr_comments > 0 && gs->comments && gs->comments[0])
+		s = string_ref(gs->comments[0]);
+	gsave_free(gs);
 	return s;
 }
 
