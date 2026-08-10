@@ -128,6 +128,18 @@ static void test_queue_release(const SDL_Event *ev)
 	test_pending_n++;
 }
 
+// Последняя РЕАЛЬНАЯ позиция курсора (см. mouse_get_pos): по её ИЗМЕНЕНИЮ отличается
+// живая мышь от синтетической позиции тестового ввода.
+static int last_real_x, last_real_y;
+static bool real_seen;
+
+// Наш собственный warp курсора не должен считаться движением мыши.
+static void test_input_forget_real_pos(void)
+{
+	real_seen = false;
+}
+
+
 static void test_input_update(void)
 {
 	const char *path = getenv("XSYS4_TEST_INPUT");
@@ -213,6 +225,9 @@ static void test_input_update(void)
 			// «прыжок в точку» и настоящую протяжку не воспроизводит.
 			test_mouse_x = x; test_mouse_y = y;
 			mouse_set_pos(x, y);
+			// Наш собственный warp — не «живая мышь»: забываем прошлую реальную
+			// позицию, иначе следующий кадр примет прыжок курсора за ручной ввод.
+			test_input_forget_real_pos();
 			SDL_Event down = {0};
 			down.type = SDL_MOUSEBUTTONDOWN;
 			down.button.button = SDL_BUTTON_LEFT;
@@ -224,6 +239,9 @@ static void test_input_update(void)
 		} else if (sscanf(line, "mouseup %d %d", &x, &y) == 2) {
 			test_mouse_x = x; test_mouse_y = y;
 			mouse_set_pos(x, y);
+			// Наш собственный warp — не «живая мышь»: забываем прошлую реальную
+			// позицию, иначе следующий кадр примет прыжок курсора за ручной ввод.
+			test_input_forget_real_pos();
 			SDL_Event up = {0};
 			up.type = SDL_MOUSEBUTTONUP;
 			up.button.button = SDL_BUTTON_LEFT;
@@ -239,6 +257,9 @@ static void test_input_update(void)
 			// spot a real mouse would — e.g. the wheel/BACK LOG trigger, which
 			// behaves differently depending on where the cursor is.
 			mouse_set_pos(x, y);
+			// Наш собственный warp — не «живая мышь»: забываем прошлую реальную
+			// позицию, иначе следующий кадр примет прыжок курсора за ручной ввод.
+			test_input_forget_real_pos();
 			NOTICE("TEST_INPUT: move %d,%d", x, y);
 		} else if (sscanf(line, "wheel %d", &x) == 1) {
 			// Deterministic mouse-wheel for testing scrollable UIs (BACK LOG).
@@ -455,6 +476,8 @@ void key_clear_flag(bool no_ctrl)
 	}
 }
 
+
+
 void mouse_get_pos(int *x, int *y)
 {
 	int wx, wy;
@@ -468,23 +491,36 @@ void mouse_get_pos(int *x, int *y)
 		 * ★ЖИВАЯ МЫШЬ ОТМЕНЯЕТ ПОДМЕНУ. Раньше первая же команда `move` делала
 		 * позицию курсора НАВСЕГДА синтетической, и после скрипта прохождения
 		 * управлять игрой руками было нельзя: движок считал, что курсор стоит там,
-		 * где его оставил скрипт. Симптом у пользователя выглядел как баг игры —
-		 * «нажимается только правая нижняя кнопка» (скрипт `dohna-user.sh`
-		 * заканчивается на `move 1230 681`, это кнопка футера) и «словно кто-то сам
-		 * жмёт кнопки». Проверено дампом по SIGUSR1: сколько бы игрок ни водил
-		 * мышью, в дампе стояло всё то же `курсор 1230,681`.
-		 * После нашего же `mouse_set_pos` реальная позиция СОВПАДАЕТ с
-		 * синтетической, поэтому расхождение — верный признак живого ввода.
+		 * где его оставил скрипт. У пользователя это выглядело как баг игры —
+		 * «нажимается только правая нижняя кнопка» (`dohna-user.sh` заканчивается на
+		 * `move 1230 681`, это кнопка футера) и «словно кто-то сам жмёт кнопки»;
+		 * два дампа по SIGUSR1 подряд показывали одно и то же `курсор 1230,681`,
+		 * сколько бы игрок ни водил мышью (FINDINGS §5cu).
+		 *
+		 * ★Признак живого ввода — ИЗМЕНЕНИЕ реальной позиции между кадрами, а НЕ её
+		 * расхождение с синтетической. Первая редакция правки сравнивала с
+		 * синтетической и сломала сам тестовый ввод: `mouse_set_pos` (SDL warp) под
+		 * Wayland не двигает курсор вовсе, расхождение возникало сразу же, подмена
+		 * снималась на первой команде — и клик скрипта уходил туда, где физически
+		 * лежала мышь. В прогоне это попало по «Exit the game?», автоответчик
+		 * подтвердил, и игра закрылась.
 		 */
-		if (abs(rx - test_mouse_x) <= 2 && abs(ry - test_mouse_y) <= 2) {
+		if (real_seen && (rx != last_real_x || ry != last_real_y)) {
+			test_mouse_x = -1;
+			NOTICE("TEST_INPUT: курсор сдвинут живой мышью (%d,%d) — подмена позиции снята",
+			       rx, ry);
+		} else {
+			last_real_x = rx;
+			last_real_y = ry;
+			real_seen = true;
 			*x = test_mouse_x;
 			*y = test_mouse_y;
 			return;
 		}
-		test_mouse_x = -1;
-		NOTICE("TEST_INPUT: курсор сдвинут живой мышью (%d,%d) — подмена позиции снята",
-		       rx, ry);
 	}
+	last_real_x = rx;
+	last_real_y = ry;
+	real_seen = true;
 	*x = rx;
 	*y = ry;
 }
