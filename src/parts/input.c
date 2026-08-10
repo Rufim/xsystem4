@@ -448,6 +448,20 @@ void PE_UpdateInputState(int passed_time)
 	bool cur_clicking = key_is_down(VK_LBUTTON);
 	mouse_get_pos(&cur_pos.x, &cur_pos.y);
 
+	/*
+	 * ★ДИАГНОСТИКА — ДО ГЕЙТА. Разовый дамп по kill -USR1 нужен ровно тогда, когда
+	 * «ничего не нажимается», а это чаще всего и означает выключенный гейт: стоя
+	 * ниже, печать молчала именно в том случае, ради которого её завели. Заодно
+	 * печатаем само состояние гейта — по одной строке видно, ввод выключен или
+	 * перехвачен какой-то частью.
+	 */
+	if (parts_take_debug_dump_request()) {
+		NOTICE("--- PARTS DUMP (по сигналу) --- ввод %s, курсор %d,%d, кнопка %d",
+		       parts_input_enabled ? "ВКЛЮЧЁН" : "ВЫКЛЮЧЕН (SetEnableInput(false))",
+		       cur_pos.x, cur_pos.y, (int)cur_clicking);
+		parts_debug_dump();
+	}
+
 	// Ввод выключен игрой — не наводим, не кликаем и не рассылаем сообщения.
 	// Позицию курсора при этом всё равно прочли: игра её опрашивает отдельно.
 	if (!parts_input_enabled)
@@ -458,12 +472,6 @@ void PE_UpdateInputState(int passed_time)
 		if ((ncalls++ % 30) == 0 || cur_clicking || clicked_parts)
 			NOTICE("INPUT UpdateInputState #%d: clicking=%d pos=%d,%d clicked_parts=%d",
 			       ncalls, cur_clicking, cur_pos.x, cur_pos.y, clicked_parts);
-	}
-	// Разовый дамп по kill -USR1 (см. parts_request_debug_dump): печатаем здесь, в
-	// главном цикле, а не в обработчике сигнала.
-	if (parts_take_debug_dump_request()) {
-		NOTICE("--- PARTS DUMP (по сигналу) ---");
-		parts_debug_dump();
 	}
 	if (getenv("XSYS4_DUMP_PARTS")) {
 		static int dcnt = 0;
