@@ -322,6 +322,10 @@ struct parts_cp_fill_gradation {
 	int x, y, w, h;
 	int top_r, top_g, top_b;
 	int bot_r, bot_g, bot_b;
+	// Прямоугольник не задан — заливать ВЕСЬ холст (как full_size у
+	// parts_cp_color_filter). Так приходит из раскладки: там у команды 9
+	// `元矩形`/`先矩形` нулевые, а цвета заданы (см. act_construction_run).
+	bool full_size;
 };
 
 // Фильтр умножения: как gray_filter, но с цветом.

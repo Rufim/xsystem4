@@ -31,6 +31,8 @@
 #include "system4/utfsjis.h"
 
 #include "vm.h"
+#include "vm/heap.h"
+#include "vm/page.h"
 #include "xsystem4.h"
 #include "parts.h"
 #include "parts_internal.h"
@@ -46,8 +48,14 @@ static struct parts_message_window *mw_get(int parts_no)
  * окну, которого нет, — это НЕ «игра ошиблась», а «движок не опознал узел».
  * Молчать нельзя: тихий no-op превратился бы в пустое окно без единой жалобы.
  */
+void parts_adopt_to_active_layer(int parts_no);
+
 static struct parts_message_window *mw_require(int parts_no, const char *fn)
 {
+	// Игра переиспользует окно реплик между сценами: если его слой уже снесён,
+	// поднимаем окно на актуальный (иначе оно уходит под фон, см.
+	// parts_adopt_to_active_layer).
+	parts_adopt_to_active_layer(parts_no);
 	struct parts_message_window *mw = mw_get(parts_no);
 	if (!mw) {
 		static bool warned = false;
@@ -505,18 +513,64 @@ bool PE_StepMessageWindowFlatFinalFrame(int parts_no)
 
 // ----------------------------------------------------------------- HLL: текст
 
-// Конфиг-глобал игры g_既読メッセージ色変更: включена ли 既読-перекраска.
-// Индекс глобала ищется по имени один раз; в играх без него — режим выключен.
+static int mw_global_by_name(const char *u8)
+{
+	char *sjis = utf2sjis(u8, strlen(u8));
+	int no = ain_get_global(ain, sjis);
+	free(sjis);
+	return no;
+}
+
+/*
+ * Включена ли 既読-перекраска.
+ *
+ * Настройка живёт ПО-РАЗНОМУ. У части игр это отдельный глобал
+ * `g_既読メッセージ色変更`, а у Dohna — ПОЛЕ структуры конфига:
+ * `g_AFConfig` типа `CASConfigData`, поле `既読メッセージ色変更` (в байткоде
+ * видно только `.STRUCTASSIGN CASConfigData 既読メッセージ色変更 1` в
+ * конструкторе дефолтов, отдельного глобала с таким именем нет вовсе).
+ * Пока искали лишь глобал, режим был выключен ВСЕГДА: замер `XSYS4_MW_TRACE`
+ * на прологе давал `read=1 mode=0` — флаг «прочитано» стоял, а перекраска не
+ * включалась, и уже читанные реплики шли базовым белым.
+ *
+ * Оба места ищем по одному разу: имя глобала и слот поля кэшируются.
+ */
 static bool mw_read_color_mode(void)
 {
-	static int varno = -2;
-	if (varno == -2) {
-		const char *u8 = "g_既読メッセージ色変更";
-		char *sjis = utf2sjis(u8, strlen(u8));
-		varno = ain_get_global(ain, sjis);
-		free(sjis);
+	static int varno = -2;      // отдельный глобал, если он есть
+	static int cfg_varno = -2;  // g_AFConfig
+	static int cfg_slot = -1;   // слот поля внутри него
+
+	if (varno == -2)
+		varno = mw_global_by_name("g_既読メッセージ色変更");
+	if (varno >= 0)
+		return global_get(varno).i != 0;
+
+	if (cfg_varno == -2) {
+		cfg_varno = mw_global_by_name("g_AFConfig");
+		if (cfg_varno >= 0) {
+			struct page *page = heap_get_page(global_get(cfg_varno).i);
+			if (page && page->type == STRUCT_PAGE && page->index >= 0
+					&& page->index < ain->nr_structures) {
+				struct ain_struct *s = &ain->structures[page->index];
+				const char *u8 = "既読メッセージ色変更";
+				char *sjis = utf2sjis(u8, strlen(u8));
+				for (int i = 0; i < s->nr_members; i++) {
+					if (!strcmp(s->members[i].name, sjis)) {
+						cfg_slot = i;
+						break;
+					}
+				}
+				free(sjis);
+			}
+		}
 	}
-	return varno >= 0 && global_get(varno).i;
+	if (cfg_varno < 0 || cfg_slot < 0)
+		return false;
+	struct page *page = heap_get_page(global_get(cfg_varno).i);
+	if (!page || cfg_slot >= page->nr_vars)
+		return false;
+	return page->values[cfg_slot].i != 0;
 }
 
 /*
@@ -536,6 +590,14 @@ static void mw_apply_read_color(struct parts_message_window *mw)
 	if (tp < 0)
 		return;
 	int r = mw->text_color.r, g = mw->text_color.g, b = mw->text_color.b;
+	if (getenv("XSYS4_MW_TRACE")) {
+		// Три гейта перекраски по отдельности: без этого не отличить «реплика не
+		// числится прочитанной» от «режим выключен в конфиге».
+		NOTICE("READCOLOR part=%d msg=%d read=%d mode=%d базовый=%d,%d,%d",
+		       tp, mw->msg_num,
+		       mw->msg_num >= 0 ? (int)msgskip_message_is_read(mw->msg_num) : -1,
+		       (int)mw_read_color_mode(), r, g, b);
+	}
 	if (mw->msg_num >= 0 && msgskip_message_is_read(mw->msg_num)
 	    && mw_read_color_mode()) {
 		// Дефолты — как у config::detail::GetReadTextColor.
@@ -543,6 +605,13 @@ static void mw_apply_read_color(struct parts_message_window *mw)
 		mainex_list_int_get("Ｅ＿既読メッセージ色", 0, &r);
 		mainex_list_int_get("Ｅ＿既読メッセージ色", 1, &g);
 		mainex_list_int_get("Ｅ＿既読メッセージ色", 2, &b);
+		// XSYS4_READCOLOR=r,g,b — подменить цвет прочитанного (замер: виден ли
+		// вообще эффект перекраски на экране).
+		const char *e = getenv("XSYS4_READCOLOR");
+		if (e)
+			sscanf(e, "%d,%d,%d", &r, &g, &b);
+		if (getenv("XSYS4_MW_TRACE"))
+			NOTICE("READCOLOR применяю %d,%d,%d к части %d", r, g, b, tp);
 	}
 	PE_SetPartsFontColor(tp, r, g, b, 1);
 }

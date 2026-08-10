@@ -427,7 +427,8 @@ bool PE_AddFillGradationHorizonToPartsConstructionProcess(int parts_no, int x, i
 	op->gradation = (struct parts_cp_fill_gradation) {
 		.x = x, .y = y, .w = w, .h = h,
 		.top_r = top_r, .top_g = top_g, .top_b = top_b,
-		.bot_r = bot_r, .bot_g = bot_g, .bot_b = bot_b
+		.bot_r = bot_r, .bot_g = bot_g, .bot_b = bot_b,
+		.full_size = (w <= 0 || h <= 0)
 	};
 
 	parts_add_cp_op(cproc, op);
@@ -937,17 +938,24 @@ static bool build_fill_gradation_horizon(struct parts_construction_process *cpro
 {
 	if (!cproc->common.texture.handle)
 		return false;
-	if (op->w <= 0 || op->h <= 0)
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	if (op->full_size || w <= 0 || h <= 0) {
+		// Прямоугольник не задан — весь холст (см. full_size в структуре).
+		x = 0; y = 0;
+		w = cproc->common.texture.w;
+		h = cproc->common.texture.h;
+	}
+	if (w <= 0 || h <= 0)
 		return true;
 
-	for (int i = 0; i < op->h; i++) {
+	for (int i = 0; i < h; i++) {
 		// Делим на h-1, чтобы НИЖНЯЯ строка получила ровно нижний цвет
 		// (при делении на h последняя строка не дотягивала бы до него).
-		int d = op->h > 1 ? op->h - 1 : 1;
+		int d = h > 1 ? h - 1 : 1;
 		int r = op->top_r + (op->bot_r - op->top_r) * i / d;
 		int g = op->top_g + (op->bot_g - op->top_g) * i / d;
 		int b = op->top_b + (op->bot_b - op->top_b) * i / d;
-		gfx_fill(&cproc->common.texture, op->x, op->y + i, op->w, 1, r, g, b);
+		gfx_fill(&cproc->common.texture, x, y + i, w, 1, r, g, b);
 	}
 	return true;
 }
