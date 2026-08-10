@@ -245,6 +245,10 @@ static void mw_apply_text_area(int parts_no, struct parts_message_window *mw)
 void PE_CreateMessageWindow(int parts_no, int text_parts_no, int mark_parts_no)
 {
 	struct parts *parts = parts_get(parts_no);
+	// XSYS4_MW_TRACE: отличает «игра переиспользует окно» от «строит заново».
+	if (getenv("XSYS4_MW_TRACE"))
+		NOTICE("MWCREATE окно=%d текст=%d маркер=%d (было mw=%d)",
+		       parts_no, text_parts_no, mark_parts_no, parts->mw ? 1 : 0);
 	if (parts->mw)
 		parts_message_window_free(parts->mw);
 	parts->mw = parts_message_window_alloc();
