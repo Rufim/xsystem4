@@ -4496,6 +4496,20 @@ bool vm_called_from(const char *substr)
 	return false;
 }
 
+// Сколько ЖИВЫХ кадров игры с таким именем сейчас на стеке. Нужно приёму клика:
+// у игры сессии ввода не вложены по стеку (SceneStack@Join разматывает сцены не в
+// порядке вызова), поэтому «сколько ожиданий клика ещё живо» достоверно только здесь,
+// а не по счётчику Begin/EndInput.
+int vm_count_frames(const char *substr)
+{
+	int n = 0;
+	for (int i = call_stack_ptr - 1; i >= 0; i--) {
+		if (strstr(ain->functions[call_stack[i].fno].name, substr))
+			n++;
+	}
+	return n;
+}
+
 void vm_stack_trace(void)
 {
 	for (int i = call_stack_ptr - 1; i >= 0; i--) {
