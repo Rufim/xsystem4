@@ -724,8 +724,20 @@ void parts_render(struct parts *parts)
 		}
 		return;
 	}
-	if (parts->message_window && !parts_message_window_show)
-		return;
+	/*
+	 * ★ПРИВЯЗКА К ВИДИМОСТИ ОКОН СООБЩЕНИЙ НАСЛЕДУЕТСЯ ПОТОМКАМИ. Игра ставит
+	 * SetPartsMessageWindowShowLink только на КОРЕНЬ окна (у Dohna 90000074,
+	 * mw=1), а текст реплики и метка NEXT — его дети с mw=0. Пока флаг
+	 * проверялся только у самой части, Hide UI прятал рамку окна, но текст и
+	 * NEXT продолжали рисоваться (отчёт пользователя). Тот же класс бага, что
+	 * опт-аут снимка бэк-сцены (§5cy): признак поддерева, а не части.
+	 */
+	if (!parts_message_window_show) {
+		for (struct parts *p = parts; p; p = p->parent) {
+			if (p->message_window)
+				return;
+		}
+	}
 	if (parts->linked_to >= 0) {
 		struct parts *link_parts = parts_get(parts->linked_to);
 		if (!link_parts->is_hovered)
