@@ -867,12 +867,29 @@ void parts_set_alpha(struct parts *parts, int alpha)
 	parts_dirty(parts);
 }
 
+/*
+ * ★ДОБАВОЧНЫЙ ЦВЕТ СКЛАДЫВАЕТСЯ, А НЕ УМНОЖАЕТСЯ. Здесь была копия соседней
+ * `parts_update_global_multiply_color` (апстрим, `fc42c42` 2022) — `parent * (local/255)`.
+ * У умножения нейтральный элемент 255, у сложения — 0, поэтому прежняя формула гасила
+ * добавку ВСЕГДА: у части без своего цвета выходило `parent * 0 = 0`, а у части без
+ * родителя `parts_set_add_color` подставляет корню `{0,0,0}` — и `0 * local = 0`. То
+ * есть `SetAddColor`/`SetComponentAddColor` не делали ничего ни для одной игры.
+ *
+ * Живой случай: на карте Haha Ranman маркер события у панели `Shrine` должен МЕРЦАТЬ
+ * БЕЛЫМ. Игра считает это сама (`CBlink(0, 64.0, 1500, 500)` — добавка 0…64 за 1.5 с
+ * с паузой 0.5 с) и каждый кадр кладёт её на РОДИТЕЛЬСКИЙ контейнер маркера; замер
+ * (`XSYS4_MUL_TRACE=1`, лог `playtest/haharanman-blink-fresh.log`): у части `90000558`
+ * добавочный цвет честно ходит `0 → 63 → 0`, а на экране не менялось ни одного пикселя.
+ *
+ * Складываем с потолком 255: клампить обязательно, иначе на цепочке вложенных
+ * контейнеров сумма переполнит байт.
+ */
 static void parts_update_global_add_color(struct parts *parts, SDL_Color parent_color)
 {
 	parts->global.add_color = (SDL_Color) {
-		parent_color.r * (parts->local.add_color.r / 255.0f),
-		parent_color.g * (parts->local.add_color.g / 255.0f),
-		parent_color.b * (parts->local.add_color.b / 255.0f),
+		min(255, parent_color.r + parts->local.add_color.r),
+		min(255, parent_color.g + parts->local.add_color.g),
+		min(255, parent_color.b + parts->local.add_color.b),
 		0
 	};
 
@@ -1002,8 +1019,16 @@ static void parts_update_global_rotate_z(struct parts *parts, float parent_rot_z
 	}
 }
 
+// XSYS4_ROT_TRACE=1 — кто и на какой угол разворачивает части. Нужна не «для полноты»:
+// у наклонных фигур (метка времени на колесе знаков карты Haha Ranman) по кадру не
+// отличить «игра угол не отдала» от «угол пришёл, но не доехал до отрисовки».
 void parts_set_rotation_z(struct parts *parts, float rot)
 {
+	if (getenv("XSYS4_ROT_TRACE"))
+		NOTICE("ROT set z part %d: %.2f -> %.2f (родитель %d, глобальный %.2f)",
+		       parts->no, parts->local.rotation.z, rot,
+		       parts->parent ? parts->parent->no : -1,
+		       parts->parent ? parts->parent->global.rotation.z : 0.0f);
 	parts->local.rotation.z = rot;
 	parts_update_global_rotate_z(parts, parts->parent ? parts->parent->global.rotation.z : 0.0f);
 	parts_dirty(parts);
@@ -1544,12 +1569,14 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
 		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
+		       p->local.rotation.z, p->global.rotation.z,
+		       p->local.rotation.x, p->local.rotation.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
 		       p->global.alpha, parts_hidden_by_layer(p), p->message_window,
 		       p->linked_to, p->alpha_clipper_parts_no, p->is_alpha_clipper,
@@ -2743,6 +2770,10 @@ void PE_SetAddColor(int parts_no, int r, int g, int b)
 		min(255, max(0, b)),
 		255
 	};
+	// XSYS4_MUL_TRACE=1 печатает и добавочный цвет: мерцание белым делается именно им,
+	// и по кадру не отличить «игра не покрасила» от «покрасила, а не доехало».
+	if (getenv("XSYS4_MUL_TRACE"))
+		NOTICE("ADD part %d <- rgb %d,%d,%d", parts_no, r, g, b);
 	parts_set_add_color(parts_get(parts_no), add_color);
 }
 

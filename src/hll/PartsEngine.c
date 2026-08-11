@@ -984,6 +984,17 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		PE_AddBlurFilterToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
 				full_size, blur, command == 28, state);
 		break;
+	/*
+	 * `CASConstructionProcess::TileCGBlend` — замостить поверхность картинкой и
+	 * подмешать её по альфе. Разбор `title::CScreen@Bulid`: у титула Haha Ranman
+	 * так кладётся зерно плёнки `タイトル／フィルム／ノイズ` ДО гашения краёв,
+	 * поэтому крупа попадает и в кайму, где снимок растворяется в бумаге.
+	 * Раньше команда падала в ветку «неизвестная v14-команда» и отбрасывалась.
+	 */
+	case 128:  // CASConstructionProcess::TileCGBlend (v14)
+		PE_AddTileCGBlendToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				cg_name, state);
+		break;
 	case 88:  // CASConstructionProcess::SetFillRect (v14) — заливка ЦВЕТОМ
 		PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh, r, g, b, state);
 		break;
@@ -1364,7 +1375,8 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
 	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
-	static const int v14_ok[] = { 25, 26, 27, 28, 88, 90, 102, 122 };
+	// 128 — `TileCGBlend` (зерно плёнки на титуле Haha Ranman).
+	static const int v14_ok[] = { 25, 26, 27, 28, 88, 90, 102, 122, 128 };
 	bool known_v14 = false;
 	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
 		known_v14 |= (command == v14_ok[i]);
@@ -3454,6 +3466,42 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetPartsMagX(no, sx);
 	if (sy != 1.0f)
 		PE_SetPartsMagY(no, sy);
+	/*
+	 * 回転 (углы поворота x,y,z в градусах) — загрузчик его НЕ ЧИТАЛ, и всякая
+	 * наклонная фигура раскладки ложилась горизонтально.
+	 *
+	 * Живой случай — метка «сколько времени отнимет действие» на колесе времени
+	 * карты Haha Ranman (`行動選択／時刻`): двенадцать частей `ＣＧ：刻限：００…１１`
+	 * с одним и тем же CG `行動選択／刻／経過時間` (48x15) — это СТОРОНЫ
+	 * двенадцатиугольника вокруг центра колеса, и каждой задан свой угол
+	 * z = 0/30/60/…/330 при `原点座標モード = 1`. Без угла на экране выходила одна
+	 * горизонтальная полоса СПРАВА от колеса (замер: x 208..246, y 134..146)
+	 * вместо наклонной внутри сектора (у оригинала x 175..187, y 134..168).
+	 * Вызовов `SetComponentRotateZ` от игры при этом НЕТ ВООБЩЕ (проверено
+	 * `XSYS4_ROT_TRACE=1`, ноль строк за прогон) — угол приходит только раскладкой.
+	 *
+	 * Охват (замер: grep `回転` по всем .pactex каждой игры): Haharanman 19
+	 * ненулевых из 904 (`時刻` 11 и `残り日数／桜` 8), Dohna 31 из 2708,
+	 * Tsumamigui 3 (629) и Yorugakuru (4679) — по нулям, их правка не задевает.
+	 */
+	// Откат для замеров: XSYS4_NO_LAYOUT_ROT=1 — не применять угол из раскладки.
+	float rot_z = getenv("XSYS4_NO_LAYOUT_ROT") ? 0.0f : act_list_float(node, "回転", 2, 0.0f);
+	if (rot_z != 0.0f)
+		PE_SetPartsRotateZ(no, rot_z);
+	// Отрисовка умеет ТОЛЬКО z: повороты по x/y в `parts_render_cg` закомментированы,
+	// им нужна перспектива. Молча проглотить угол — ровно та ошибка, которую тут и
+	// починили, поэтому сообщаем. Ненулевой x/y во всех играх ровно один:
+	// `SceneBattleResult` Dohna с y=180.
+	float rot_x = act_list_float(node, "回転", 0, 0.0f);
+	float rot_y = act_list_float(node, "回転", 1, 0.0f);
+	if (rot_x != 0.0f || rot_y != 0.0f) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("act_build_part: part '%s' has 回転 x/y (%.1f,%.1f) — 3D rotation needs perspective, ignored",
+			        display_sjis0(node->name->text), rot_x, rot_y);
+		}
+	}
 	if (act_int(node, "クリック許可", 0))
 		PE_SetClickable(no, true);
 	/*
@@ -4212,6 +4260,24 @@ static int PE_GetComponentScrollPosYLinkNumber(int parts_no)
  */
 static void PE_SetButtonCGName(int parts_no, struct string *name) {
 	static const char *const sfx[4] = { NULL, "／通常", "／オン", "／ダウン" };
+	/*
+	 * ★БАЗУ ЗАПОМИНАЕМ ЗАНОВО. Раньше её брали только из раскладки
+	 * (`act_build_part`), а в раскладке лежит РЕДАКТОРСКАЯ ЗАГОТОВКА: у панелей
+	 * карты Haha Ranman (`行動選択／行動ボタン`) это `行動選択／移動先／たばこ／調`,
+	 * один шаблон на все места. Настоящее место игра задаёт этим вызовом.
+	 *
+	 * Живой случай: в покое у панели `Shrine` был нарисован не «крылатый» глиф
+	 * святилища, а тонкая диагональная палочка — кисэру ТАБАЧНОЙ ЛАВКИ. Порядок
+	 * событий по трассе `XSYS4_CG_WATCH=行動選択／移動先` (лог
+	 * `playtest/haharanman-build-cg.log`, часть `90000172`): заготовка
+	 * `たばこ／調／通常·オン·ダウン` → игра ставит `神社／参／通常·オン·ダウン` →
+	 * `SetButtonEnable` перезагружает ОБЫЧНОЕ состояние по устаревшей базе и
+	 * возвращает `たばこ／調／通常` (у недоступной панели — `／無効`). Состояния
+	 * `オン`/`ダウン` при этом никто не трогает, поэтому под курсором глиф был
+	 * правильный, а в покое — чужой: сверять такие вещи можно только в ОДНОМ
+	 * состоянии экрана.
+	 */
+	pe_button_remember_cg(parts_no, name);
 	for (int st = 1; st <= 3; st++) {  // default/hovered/clicked
 		bool ok = false;
 		if (name && name->size) {

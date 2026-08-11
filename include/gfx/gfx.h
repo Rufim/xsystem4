@@ -151,6 +151,10 @@ void gfx_fill_amap_over_border(Texture *dst, int x, int y, int w, int h, int alp
 void gfx_fill_amap_under_border(Texture *dst, int x, int y, int w, int h, int alpha, int border);
 void gfx_fill_amap_gradation_ud(Texture *dst, int x, int y, int w, int h, int up_a, int down_a);
 void gfx_fill_amap_gradation_lr(Texture *dst, int x, int y, int w, int h, int left_a, int right_a);
+// Те же градиенты, но альфа-карта УМНОЖАЕТСЯ на них, а не замещается: игра просит
+// именно это (`CASConstructionProcess::MulAMapGradation{Horizon,Vertical}`).
+void gfx_mul_amap_gradation_ud(Texture *dst, int x, int y, int w, int h, int up_a, int down_a);
+void gfx_mul_amap_gradation_lr(Texture *dst, int x, int y, int w, int h, int left_a, int right_a);
 void gfx_fill_screen(Texture *dst, int x, int y, int w, int h, int r, int g, int b);
 void gfx_fill_multiply(Texture *dst, int x, int y, int w, int h, int r, int g, int b);
 void gfx_fill_add(Texture *dst, int x, int y, int w, int h, int r, int g, int b);

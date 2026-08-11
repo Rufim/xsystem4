@@ -142,6 +142,7 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_MUL_FILTER:
 	case PARTS_CP_ADD_FILTER:
 	case PARTS_CP_FILL_GRADATION_AMAP:
+	case PARTS_CP_TILE_CG_BLEND:
 		break;
 	case PARTS_CP_DRAW_TEXT:
 	case PARTS_CP_COPY_TEXT:
@@ -467,6 +468,30 @@ bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w
 		.x = x, .y = y, .w = w, .h = h,
 		.r = r, .g = g, .b = b,
 		.full_size = full_size
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
+bool PE_AddTileCGBlendToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, struct string *cg_name, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+	int cg_no;
+	if (!cg_name || !cg_name->size ||
+			!asset_exists_by_name(ASSET_CG, cg_name->text, &cg_no)) {
+		WARNING("TileCGBlend: нет CG '%s'",
+		        cg_name ? display_sjis0(cg_name->text) : "(null)");
+		return false;
+	}
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_TILE_CG_BLEND;
+	op->tile_cg = (struct parts_cp_tile_cg) {
+		.cg_no = cg_no, .x = x, .y = y, .w = w, .h = h
 	};
 
 	parts_add_cp_op(cproc, op);
@@ -1043,10 +1068,53 @@ static bool build_fill_gradation_amap(struct parts_construction_process *cproc,
 	cp_fill_rect(cproc, &x, &y, &w, &h);
 	if (w <= 0 || h <= 0)
 		return true;
+	// ★УМНОЖАЕМ, а не замещаем: у игры это `MulAMapGradationHorizon`/`Vertical`
+	// (разбор байткода `title::CScreen@Bulid`). При замещении полосы каймы затирали
+	// друг друга на пересечениях, и в углах оставался спад только по одной оси.
 	if (op->vertical)
-		gfx_fill_amap_gradation_ud(&cproc->common.texture, x, y, w, h, op->a1, op->a2);
+		gfx_mul_amap_gradation_ud(&cproc->common.texture, x, y, w, h, op->a1, op->a2);
 	else
-		gfx_fill_amap_gradation_lr(&cproc->common.texture, x, y, w, h, op->a1, op->a2);
+		gfx_mul_amap_gradation_lr(&cproc->common.texture, x, y, w, h, op->a1, op->a2);
+	return true;
+}
+
+/*
+ * `TileCGBlend` (команда 128) — замостить поверхность картинкой и подмешать её по
+ * альфе. У титула Haha Ranman это зерно плёнки `タイトル／フィルム／ノイズ`: 32x32,
+ * RGB нулевые, альфа 0…22 — то есть лёгкая тёмная крупа поверх фотографии.
+ *
+ * ★Шаг идёт ДО гашения краёв (`Create → CutCGScaleBlend → HBlur → VBlur →
+ * GrayFilter → AddFilter → TileCGBlend → Mul…Gradation ×4`), поэтому зерно
+ * ложится и в кайму: у оригинала полоса, где снимок растворяется в бумаге,
+ * заполнена крупой, а у нас была стерильной.
+ */
+static bool build_tile_cg_blend(struct parts_construction_process *cproc,
+		struct parts_cp_tile_cg *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	struct cg *cg = asset_cg_load(op->cg_no);
+	if (!cg)
+		return false;
+
+	Texture src;
+	gfx_init_texture_with_cg(&src, cg);
+	cg_free(cg);
+
+	int x = op->x, y = op->y, w = op->w, h = op->h;
+	cp_fill_rect(cproc, &x, &y, &w, &h);
+	if (src.w > 0 && src.h > 0 && w > 0 && h > 0) {
+		for (int ty = y; ty < y + h; ty += src.h) {
+			for (int tx = x; tx < x + w; tx += src.w) {
+				// Хвостовые плитки обрезаем по краю области, иначе крупа
+				// вылезет за поверхность и ляжет на соседние шаги.
+				int tw = min(src.w, x + w - tx);
+				int th = min(src.h, y + h - ty);
+				gfx_blend_amap(&cproc->common.texture, tx, ty, &src, 0, 0, tw, th);
+			}
+		}
+	}
+	gfx_delete_texture(&src);
 	return true;
 }
 
@@ -1135,6 +1203,10 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_ADD_FILTER:
 			if (!build_add_filter(cproc, &op->color_filter))
+				return false;
+			break;
+		case PARTS_CP_TILE_CG_BLEND:
+			if (!build_tile_cg_blend(cproc, &op->tile_cg))
 				return false;
 			break;
 		case PARTS_CP_FILL_GRADATION_AMAP:
