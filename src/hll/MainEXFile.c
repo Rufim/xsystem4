@@ -589,13 +589,23 @@ static bool MainEXFile_A2String(struct string *path, int row, int col, struct st
 	return 1;
 }
 
+static bool ex_trace_hit(struct string *path);
+
 static int MainEXFile_GetRowAtIntKey(struct string *path, int key, int exidx)
 {
 	(void)exidx;
 	struct ex_table *t = handle_to_table(ex_key_handle(path));
-	if (!t)
+	if (!t) {
+		if (ex_trace_hit(path))
+			NOTICE("EX строка по ключу %d в '%s': ТАБЛИЦЫ НЕТ", key,
+			       display_sjis0(path->text));
 		return -1;
-	return ex_row_at_int_key(t, key);
+	}
+	int row = ex_row_at_int_key(t, key);
+	if (ex_trace_hit(path))
+		NOTICE("EX строка по ключу %d в '%s' -> %d (строк %d)", key,
+		       display_sjis0(path->text), row, t->nr_rows);
+	return row;
 }
 
 static int MainEXFile_GetRowAtStringKey(struct string *path, struct string *key, int exidx)
@@ -821,13 +831,46 @@ static bool MainEXFile_GetEXNameList(struct string *tree_path, struct page **out
 }
 
 // Healing Touch и др.: индекс колонки таблицы по её формат-имени (заголовку поля).
+/*
+ * `XSYS4_EX_TRACE=<подстрока имени таблицы>` (или `1` — всё) — печатать поиск
+ * СТРОКИ и СТОЛБЦА в таблице .ex. Нужен, когда данные «пустые»: игровая обёртка
+ * `EX_IA2String` берёт столбец по имени поля и строку по индексированному ключу,
+ * а при промахе любого из двух отдаёт значение по умолчанию — и наружу это
+ * выглядит как «в .ex ничего не лежит». Живой случай: узлы данжа Dohna, где
+ * `NodeProperty.Id` определяет, ПРОХОДНОЙ ли узел (`MapStructure@Shlink`
+ * склеивает рёбра через узлы с пустым `Id`).
+ * Имя таблицы — SJIS, поэтому и печать, и сверка идут через `display_sjis0`.
+ */
+static bool ex_trace_hit(struct string *path)
+{
+	static const char *pat = (const char *)1;
+	if (pat == (const char *)1)
+		pat = getenv("XSYS4_EX_TRACE");
+	if (!pat || !*pat || !path)
+		return false;
+	if (!strcmp(pat, "1"))
+		return true;
+	const char *u = display_sjis0(path->text);
+	return u && strstr(u, pat);
+}
+
 static int MainEXFile_GetColAtFormatName(struct string *path, struct string *format_name, int exidx)
 {
 	(void)exidx;
 	struct ex_table *t = handle_to_table(ex_key_handle(path));
-	if (!t)
+	if (!t) {
+		if (ex_trace_hit(path))
+			NOTICE("EX столбец '%s' в '%s': ТАБЛИЦЫ НЕТ",
+			       display_sjis0(format_name->text),
+			       display_sjis0(path->text));
 		return -1;
-	return ex_col_from_name(t, format_name->text);
+	}
+	int col = ex_col_from_name(t, format_name->text);
+	if (ex_trace_hit(path))
+		NOTICE("EX столбец '%s' в '%s' -> %d (полей %d, строк %d)",
+		       display_sjis0(format_name->text), display_sjis0(path->text),
+		       col, t->nr_fields, t->nr_rows);
+	return col;
 }
 
 // Вернуть имена всех колонок (полей) таблицы .ex в строковый массив.
@@ -912,7 +955,16 @@ static float MEX_d_AFloat(struct string *name, int index, float def, int id) { (
 static struct string *MEX_d_AString(struct string *name, int index, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(MainEXFile_AHandle(ex_key_handle(name), index), &v) ? v : string_ref(def); }
 static int MEX_d_A2Int(struct string *name, int row, int col, int def, int id) { (void)id; int v; return hv_int(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : def; }
 static float MEX_d_A2Float(struct string *name, int row, int col, float def, int id) { (void)id; float v; return hv_float(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : def; }
-static struct string *MEX_d_A2String(struct string *name, int row, int col, struct string *def, int id) { (void)id; struct string *v = NULL; return hv_string(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v) ? v : string_ref(def); }
+static struct string *MEX_d_A2String(struct string *name, int row, int col, struct string *def, int id)
+{
+	(void)id;
+	struct string *v = NULL;
+	bool ok = hv_string(MainEXFile_A2Handle(ex_key_handle(name), row, col), &v);
+	if (ex_trace_hit(name))
+		NOTICE("EX ячейка '%s'[строка %d, столбец %d] -> %s", display_sjis0(name->text),
+		       row, col, ok ? display_sjis0(v->text) : "ПРОМАХ (значение по умолчанию)");
+	return ok ? v : string_ref(def);
+}
 
 /*
  * Прямое чтение int-элемента list-значения главного .ex движковыми модулями

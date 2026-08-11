@@ -915,14 +915,108 @@ static int ix_extreme(struct page **self, union vm_value *fn, bool want_max)
 	return best;
 }
 
+/*
+ * ★`First`/`Last` С ПРЕДИКАТОМ, который НИЧЕГО не нашёл, — почти всегда дефект
+ * ДАННЫХ, а не нормальная ветка: сайт получает ссылку из индекса −1 и падает при
+ * первом же разыменовании, причём далеко от причины. Живой случай: клик по узлу
+ * данжа Dohna — `SceneMap@OnClickNode` берёт ребро как
+ * `Array.First(m_map.Edges, obj => obj.NodeFrom == idFrom && obj.NodeTo == nodeId)`
+ * и БЕЗ проверки зовёт `MapView@Move(edge)`, а тот сразу `edge.GetRoutePos()` —
+ * в логе это выглядело как «`Out of bounds heap index: -1/2` в `MapEdge@GetRoutePos`».
+ * Поэтому промах называем СРАЗУ и печатаем стек игры (один раз на прогон, чтобы
+ * не залить лог), а с `XSYS4_BSEARCH_FIELDS=<поля>` — ещё и содержимое элементов,
+ * по которым шёл поиск (для рёбер это члены 0/1 — `m_nodeFrom`/`m_nodeTo`).
+ */
+/*
+ * ★КЛЮЧИ поиска лежат в ЛОКАЛЬНОЙ странице ВЫЗЫВАЮЩЕЙ функции: предикат-лямбда
+ * читает их через `X_GETENV`, а сама HLL-функция кадра не заводит, поэтому
+ * `local_page()` здесь — это кадр сайта. Печатаем имя функции и её целочисленные
+ * локальные С ИМЕНАМИ из `.ain`: у `SceneMap@OnClickNode` это сразу даёт
+ * `nodeId` и `idFrom`, то есть ЧТО искали, а не только среди чего.
+ */
+static void ix_pred_site(char *buf, size_t sz)
+{
+	buf[0] = '\0';
+	struct page *lp = local_page();
+	if (!lp || lp->type != LOCAL_PAGE || lp->index < 0
+			|| lp->index >= ain->nr_functions)
+		return;
+	struct ain_function *f = &ain->functions[lp->index];
+	size_t o = snprintf(buf, sz, " сайт %s:", display_sjis0(f->name));
+	for (int i = 0; i < lp->nr_vars && i < f->nr_vars && o + 48 < sz; i++) {
+		enum ain_data_type t = f->vars[i].type.data;
+		if (t != AIN_INT && t != AIN_BOOL)
+			continue;
+		o += snprintf(buf + o, sz - o, " %s=%d",
+			      display_sjis0(f->vars[i].name), lp->values[i].i);
+	}
+}
+
+/*
+ * `XSYS4_FIRST_TRACE=<подстрока имени функции-сайта>` — печатать и УДАЧНЫЕ поиски
+ * с предикатом: найденный индекс, сайт с его локальными и содержимое элементов.
+ * Промах виден и без этого (см. `ix_pred_miss`), а вот «нашёл, но НЕ ТО» — только
+ * так: `MapStructure@FindNodeFromId(3)` отдавал узел с `Id = 2` (первый в списке),
+ * из-за чего клик по законному узлу данжа падал (§5ed).
+ */
+static void ix_pred_hit(const char *what, struct page **self, int idx)
+{
+	static const char *pat = (const char *)1;
+	if (pat == (const char *)1)
+		pat = getenv("XSYS4_FIRST_TRACE");
+	if (!pat || !*pat)
+		return;
+	char site[512];
+	ix_pred_site(site, sizeof(site));
+	if (!strstr(site, pat))
+		return;
+	char flds[1024];
+	ix_elem_fields(self ? *self : NULL, flds, sizeof(flds));
+	NOTICE("Array.%s -> индекс %d.%s%s%s", what, idx, site,
+	       *flds ? " Элементы:" : "", flds);
+}
+
+static void ix_pred_miss(const char *what, struct page **self)
+{
+	static bool warned = false;
+	struct page *p = self ? *self : NULL;
+	char flds[1024], site[512];
+	ix_elem_fields(p, flds, sizeof(flds));
+	ix_pred_site(site, sizeof(site));
+	if (!warned) {
+		warned = true;
+		WARNING("Array.%s(предикат) не нашёл НИ ОДНОГО элемента из %d: сайт "
+			"получит ссылку −1 и упадёт при разыменовании.%s%s%s", what,
+			p ? array_numof(p, 1) : 0, site,
+			*flds ? " Элементы:" : "", flds);
+		vm_stack_trace();
+	} else {
+		// Повторы — только под ручкой и только для интересующего сайта: у игры
+		// полно ШТАТНЫХ промахов (`Motion::EasingArgumentAnalyzer` и подобные),
+		// и без фильтра они заливают лог тысячами строк, пряча настоящий сбой.
+		static const char *pat = (const char *)1;
+		if (pat == (const char *)1)
+			pat = getenv("XSYS4_FIRST_TRACE");
+		if (pat && *pat && strstr(site, pat))
+			NOTICE("Array.%s(предикат) промах.%s%s%s", what, site,
+			       *flds ? " Элементы:" : "", flds);
+	}
+}
+
 // int First/Last(self[, предикат]) — индекс; ffi материализует из него ссылку
 // на элемент по типу элемента (см. AIN_REF_HLL_PARAM в ffi.c).
 static int Array_ix_First(struct page **self, union vm_value *fn)
 {
 	if (!self || !*self)
 		return -1;
-	if (hll_current_nr_args >= 2 && ix_arg_is_func(1))
-		return ix_find_pred(self, fn, false);
+	if (hll_current_nr_args >= 2 && ix_arg_is_func(1)) {
+		int i = ix_find_pred(self, fn, false);
+		if (i < 0)
+			ix_pred_miss("First", self);
+		else
+			ix_pred_hit("First", self, i);
+		return i;
+	}
 	return array_numof(*self, 1) > 0 ? 0 : -1;
 }
 
@@ -1352,7 +1446,14 @@ static int Array_ix_ShallowCopy(struct page **self)
 	// дальше: копия ЭТОЙ страницы (`A_REF` → `copy_page`) обязана ссылаться на
 	// те же объекты, иначе запись по элементу копии теряется (§5dy: `EndTime`
 	// кадров уходил в клоны, и анимации стояли).
-	dst->elems_shared = true;
+	// Откат для замеров A/B на одном бинаре: `XSYS4_NO_SHALLOW_ELEMS=1` — не
+	// помечать (копия страницы снова будет клонировать элементы).
+	{
+		static const char *off = (const char *)1;
+		if (off == (const char *)1)
+			off = getenv("XSYS4_NO_SHALLOW_ELEMS");
+		dst->elems_shared = !(off && *off);
+	}
 	int slots = array_elem_slots(src);
 	bool obj = ix_elem_is_object(src->a_type);
 	for (int i = 0; i < src->nr_vars; i++) {
@@ -1465,6 +1566,37 @@ static void Array_ix_Unique(struct page **self, union vm_value *fn)
 }
 
 /*
+ * `UniqueSorted(self)` / `UniqueSorted(self, равенство)` — убрать дубликаты в
+ * УЖЕ УПОРЯДОЧЕННОМ массиве, то есть классический `std::unique`: сравнивать
+ * только СОСЕДЕЙ. Отдельной от `Unique` эта функция и объявлена ровно потому,
+ * что там сравнение со всеми предыдущими, а здесь — с одним предыдущим; на
+ * отсортированных данных результат тот же, но за один проход.
+ * Без неё игра падала фаталом `Unimplemented HLL function: Array.UniqueSorted`
+ * в битве Dohna (§5ef).
+ * Идём с конца: удаление не сдвигает ещё не просмотренные индексы, и из пары
+ * совпавших остаётся ПЕРВЫЙ — как у `Unique`.
+ */
+static void Array_ix_UniqueSorted(struct page **self, union vm_value *fn)
+{
+	if (!self || !*self)
+		return;
+	bool use_pred = hll_current_nr_args >= 2 && ix_arg_is_func(1);
+	int slots = array_elem_slots(*self);
+	for (int i = array_numof(*self, 1) - 1; i >= 1; i--) {
+		bool dup;
+		if (use_pred) {
+			dup = ix_less(fn, *self, i - 1, i);
+		} else {
+			// Без предиката равенство — по ЗНАЧЕНИЮ элемента: ищем предыдущий
+			// в диапазоне [i-1, i), то есть сравниваем ровно с соседом.
+			dup = array_find(*self, i - 1, i, (*self)->values[i * slots], 0) >= 0;
+		}
+		if (dup)
+			ix_erase_at(self, i);
+	}
+}
+
+/*
  * array SYSTEMONLY_GetStructPageList(self) — «сырые» страницы объектов из
  * контейнера интерфейсных ссылок. Служебная функция сериализации: единственный
  * сайт — `AFL_GameSave_StructLoad` (@0x227e56), который собирает
@@ -1505,6 +1637,7 @@ HLL_LIBRARY(Array,
 	    HLL_EXPORT(Alloc, Array_Alloc),
 	    HLL_EXPORT(SYSTEMONLY_GetStructPageList, Array_SYSTEMONLY_GetStructPageList),
 	    HLL_EXPORT(Unique, Array_ix_Unique),
+	    HLL_EXPORT(UniqueSorted, Array_ix_UniqueSorted),
 	    HLL_EXPORT(EmplaceBack, Array_EmplaceBack),
 	    HLL_EXPORT(At, Array_At),
 	    HLL_EXPORT(First, Array_ix_First),

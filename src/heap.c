@@ -207,6 +207,27 @@ static void heap_free_slot(int32_t slot)
 		else
 			vm_stack_trace();
 	}
+	/*
+	 * ★★СЛОТ 0 ОСВОБОЖДАТЬ НЕЛЬЗЯ НИКОГДА: в нём живёт ГЛОБАЛЬНАЯ СТРАНИЦА
+	 * (`heap_free_ptr` стартует с 1, т.е. аллокатор его не выдаёт). Если он
+	 * попадёт в список свободных, следующее же выделение отдаст слот 0, и
+	 * глобальная страница будет ПОДМЕНЕНА чужой — а падёт игра сильно позже и
+	 * совсем в другом месте. Живой случай (§5ee): на старте панели действий битвы
+	 * Dohna в слоте 0 оказывалась локальная страница на одну переменную, «глобали»
+	 * читались как чужая память, и SIGSEGV прилетал в `heap_ref` из `CALLMETHOD` на
+	 * `g_DelayCG`. Поэтому: не освобождать, а назвать виновника со стеком игры.
+	 */
+	if (unlikely(slot == 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("попытка ОСВОБОДИТЬ heap-слот 0 (ГЛОБАЛЬНАЯ страница): "
+				"освобождение пропущено, иначе следующее выделение подменит "
+				"глобали — стек вызовов игры:");
+			vm_stack_trace();
+		}
+		return;
+	}
 	heap[slot].seq = 0;
 	heap_free_stack[--heap_free_ptr] = slot;
 }
@@ -255,6 +276,29 @@ void heap_ref(int32_t slot)
 
 void heap_unref(int slot)
 {
+	/*
+	 * ★★СЛОТ 0 — ГЛОБАЛЬНАЯ СТРАНИЦА, снимать с неё ссылку в обычной работе
+	 * НЕЛЬЗЯ: на нуле счётчика страница освобождается, и дальше игра читает
+	 * «глобали» из освобождённой памяти. Падает при этом что угодно и где угодно
+	 * (§5ee: SIGSEGV в `heap_ref` из `CALLMETHOD` на `g_DelayCG` при старте панели
+	 * действий битвы Dohna, а до того — «текст `SkillPanel/SkillPanel` поверх
+	 * глобалей»). Ноль в объектном слоте — это всегда ЧУЖОЕ ЧИСЛО, а не объект:
+	 * аллокатор кучи выдаёт слоты начиная с 1.
+	 * Штатное освобождение глобалей на выходе идёт отдельной `exit_unref`, так что
+	 * гейт здесь ничего не ломает. Виновников видно по стеку игры: у Dohna это
+	 * `ResetLoadManager::Run` (загрузка сейва) и `DELETE` в
+	 * `SkillButton@UpdateTargetWeakPoint`.
+	 */
+	if (unlikely(slot == 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("UNREF heap-слота 0 (ГЛОБАЛЬНАЯ страница) — пропущено, иначе "
+				"глобали освободятся посреди игры. Стек вызовов игры:");
+			vm_stack_trace();
+		}
+		return;
+	}
 	if (unlikely(heap_watched(slot)))
 		heap_watch_msg("HEAPWATCH %d UNREF (ref=%d) @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
 	if (unlikely(heap[slot].ref <= 0)) {

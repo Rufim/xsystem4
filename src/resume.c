@@ -840,6 +840,40 @@ static void load_rsave_delegate(int slot, struct rsave_heap_delegate *d)
 	heap[slot].page = page;
 }
 
+/*
+ * ★После загрузки образа heap-слот 0 ОБЯЗАН быть занят ГЛОБАЛЬНОЙ СТРАНИЦЕЙ.
+ * `delete_heap` возвращает В СПИСОК СВОБОДНЫХ ВСЕ слоты, включая нулевой, и
+ * корректность держится только на том, что в образе есть запись для слота 0
+ * (`RSAVE_GLOBALS`), которая занимает его через `alloc_heap_slot`. Если записи
+ * нет, слот 0 остаётся выдаваемым — и очередное выделение ПОДМЕНИТ глобальную
+ * страницу чужой, а падать игра будет много позже и в другом месте (§5ee).
+ * Поэтому проверяем прямо здесь: чиним слот и говорим об этом громко.
+ */
+static void check_global_slot_after_load(void)
+{
+	if (heap_size > 0 && heap[0].ref > 0 && heap[0].type == VM_PAGE
+			&& heap[0].page && heap[0].page->type == GLOBAL_PAGE)
+		return;
+	WARNING("после загрузки образа heap-слот 0 НЕ занят глобальной страницей "
+		"(ref=%d type=%d) — в образе не было записи глобалей; ставлю пустую "
+		"страницу и занимаю слот, иначе его выдаст аллокатор",
+		heap_size > 0 ? heap[0].ref : -1,
+		heap_size > 0 ? (int)heap[0].type : -1);
+	// Убрать 0 из списка свободных: он лежит где-то в хвосте [heap_free_ptr, …).
+	for (size_t i = heap_free_ptr; i < heap_size; i++) {
+		if (heap_free_stack[i] != 0)
+			continue;
+		heap_free_stack[i] = heap_free_stack[heap_free_ptr];
+		heap_free_stack[heap_free_ptr] = 0;
+		heap_free_ptr++;
+		break;
+	}
+	heap[0].ref = 1;
+	heap[0].seq = 0;
+	heap[0].type = VM_PAGE;
+	heap[0].page = alloc_page(GLOBAL_PAGE, 0, ain->nr_globals);
+}
+
 static void load_rsave_heap(struct rsave *save)
 {
 	delete_heap();
@@ -856,6 +890,7 @@ static void load_rsave_heap(struct rsave *save)
 		case RSAVE_NULL: break;
 		}
 	}
+	check_global_slot_after_load();
 	heap_next_seq = save->next_seq;
 }
 

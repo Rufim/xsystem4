@@ -342,6 +342,28 @@ static int hll_param_slots(int elem_class)
 	return 1;
 }
 
+/*
+ * Годен ли heap-слот под СТРОКОВЫЙ аргумент HLL. Слот 0 — глобальная страница
+ * (см. большой комментарий у AIN_STRING), запись в него подменяет её на строку;
+ * отрицательный/за границей — просто чужое число в строковом слоте. И то и другое
+ * называем ОДИН раз со стеком игры: молчаливая порча стоит часов поиска.
+ */
+static bool ffi_string_slot_ok(int slot, struct ain_hll_function *f, int argno)
+{
+	if (slot > 0 && heap_index_valid(slot))
+		return true;
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		WARNING("HLL %s: аргумент %d (строка) пришёл с heap-слотом %d — это не "
+			"строка, а чужое число%s; подставлена пустая строка, чтобы не "
+			"портить кучу. Стек вызовов игры:", f->name, argno, slot,
+			slot == 0 ? " (слот 0 — ГЛОБАЛЬНАЯ страница!)" : "");
+		vm_stack_trace();
+	}
+	return false;
+}
+
 void hll_call(int libno, int fno, int elem_class)
 {
 	struct ain_hll_function *f = &ain->libraries[libno].functions[fno];
@@ -378,6 +400,8 @@ void hll_call(int libno, int fno, int elem_class)
 	// reallocation during HLL calls.
 	void *heap_ptrs[HLL_MAX_ARGS];
 	int heap_slots[HLL_MAX_ARGS];
+	// Заглушки под строковые аргументы с испорченным слотом (см. AIN_STRING ниже).
+	void *str_dummies[HLL_MAX_ARGS];
 	// Ixseal-лямбда (AIN_HLL_FUNC) — пара (страница объекта, номер функции).
 	// Держим КОПИЮ, а не указатель в стек VM: реализация зовёт VM обратно, и
 	// та затирает слоты стека ниже stack_ptr.
@@ -439,14 +463,41 @@ void hll_call(int libno, int fno, int elem_class)
 			args[i] = &ptrs[i];
 			break;
 		}
+		/*
+		 * ★★СЛОТ 0 В СТРОКОВОМ АРГУМЕНТЕ — ЧУЖОЕ ЧИСЛО, А НЕ СТРОКА. Heap-слот 0
+		 * занят ГЛОБАЛЬНОЙ СТРАНИЦЕЙ (аллокатор кучи выдаёт слоты с 1), а
+		 * `heap[i].s` и `heap[i].page` — ОДНО И ТО ЖЕ поле объединения. Поэтому
+		 * `&heap[0].s` — это указатель на указатель глобальной страницы: стоит
+		 * реализации записать туда строку (а `ref string` пишет туда всегда), и
+		 * глобальная страница подменяется на `struct string *`. Дальше игра
+		 * читает «глобали» уже как байты этой строки, и падение приходит далеко
+		 * от причины: §5ee — на старте панели действий битвы Dohna в `g_DelayCG`
+		 * (глобал 26) оказывался текст `SkillPanel/SkillPanel`, а SIGSEGV
+		 * случался в `heap_ref` на следующем `CALLMETHOD`.
+		 * Поэтому: не писать в слот 0 (и в любой невалидный) НИКОГДА — вместо
+		 * этого одноразовое предупреждение со стеком игры и пустая строка-заглушка,
+		 * чтобы вызов отработал без порчи.
+		 */
 		case AIN_STRING:
 			stack_ptr--;
+			if (unlikely(!ffi_string_slot_ok(stack[stack_ptr].i, f, i))) {
+				str_dummies[i] = &EMPTY_STRING;
+				args[i] = &str_dummies[i];
+				break;
+			}
 			args[i] = &heap[stack[stack_ptr].i].s;
 			break;
 		case AIN_REF_STRING:
 			stack_ptr--;
 			heap_slots[i] = stack[stack_ptr].i;
-			heap_ptrs[i] = heap[stack[stack_ptr].i].s;
+			if (unlikely(!ffi_string_slot_ok(heap_slots[i], f, i))) {
+				heap_slots[i] = -1;   // write-back ниже пропустит
+				heap_ptrs[i] = &EMPTY_STRING;
+				ptrs[i] = &heap_ptrs[i];
+				args[i] = &ptrs[i];
+				break;
+			}
+			heap_ptrs[i] = heap[heap_slots[i]].s;
 			ptrs[i] = &heap_ptrs[i];
 			args[i] = &ptrs[i];
 			break;
@@ -546,6 +597,16 @@ void hll_call(int libno, int fno, int elem_class)
 
 	union vm_value r;
 	uint32_t image_generation = vm_image_generation;
+	// Снимок глобала-канарейки ДО вызова (сама сверка — ниже, после вызова).
+	int32_t canary_before = (heap_index_valid(0) && heap[0].page
+			&& heap[0].page->nr_vars > 0) ? heap[0].page->values[0].i : 0;
+	{
+		const char *cs = getenv("XSYS4_GLOBAL_CANARY");
+		int ci = cs && *cs ? (int)strtol(cs, NULL, 0) : -1;
+		if (ci >= 0 && heap_index_valid(0) && heap[0].page
+				&& ci < heap[0].page->nr_vars)
+			canary_before = heap[0].page->values[ci].i;
+	}
 	if (lenient_noop) {
 		r.i = 0;
 		if (f->return_type.data == AIN_STRING)
@@ -565,6 +626,44 @@ void hll_call(int libno, int fno, int elem_class)
 #endif
 		hll_current_nr_args = saved_nr_args;
 		hll_current_fn = saved_fn;
+	}
+
+	/*
+	 * `XSYS4_GLOBAL_CANARY=<индекс глобала>` — назвать HLL-функцию, которая
+	 * ПОРТИТ глобал. Нужна, когда порча приходит не через VM-запись (её ловит
+	 * `XSYS4_GLOBAL_WATCH`), а мимо неё: out-параметр `ref int/bool/float`
+	 * приходит в реализацию указателем ПРЯМО В СЛОТ страницы
+	 * (`&heap[pageno].page->values[varno]`), и если наша сигнатура расходится с
+	 * объявлением в `.ain` (например пишем строку туда, где игра ждёт число),
+	 * то текст ложится поверх глобалей. Живой случай (§5ee): на старте панели
+	 * действий битвы Dohna в глобалях 25/26/27 оказывался текст
+	 * `SkillPanel/SkillPanel`, а глобал 26 — это `g_DelayCG` (`CASMap`), после
+	 * чего `CALLMETHOD` на нём падал с SIGSEGV в `heap_ref`.
+	 */
+	{
+		static int canary = -2;
+		static int32_t last;
+		if (canary == -2) {
+			const char *spec = getenv("XSYS4_GLOBAL_CANARY");
+			canary = spec && *spec ? (int)strtol(spec, NULL, 0) : -1;
+			if (canary >= 0)
+				NOTICE("GLOBALCANARY включён: глобал %d", canary);
+		}
+		if (canary >= 0 && heap_index_valid(0) && heap[0].page
+				&& canary < heap[0].page->nr_vars) {
+			int32_t now = heap[0].page->values[canary].i;
+			if (now != last) {
+				// ★Различаем «испортил ЭТОТ вызов» и «испортил байткод МЕЖДУ
+				// вызовами»: без этого канарейка называет ближайшую HLL-функцию
+				// после порчи, а она может быть невиновна.
+				WARNING("GLOBALCANARY глобал %d изменился %d -> %d %s HLL %s.%s"
+					" — стек вызовов игры:", canary, last, now,
+					canary_before == last ? "ВНУТРИ" : "ДО (в байткоде, перед)",
+					ain->libraries[libno].name, f->name);
+				vm_stack_trace();
+				last = now;
+			}
+		}
 	}
 
 	/*
@@ -640,6 +739,46 @@ void hll_call(int libno, int fno, int elem_class)
 	}
 
 	int slot;
+	/*
+	 * ★★НОЛЬ (или NULL) В ХЭНДЛЕ-ВОЗВРАТЕ — ЭТО НАШ ДЕФЕКТ, а не «нет объекта».
+	 * Null-маркер у Ixseal −1, а heap-слот 0 занят ГЛОБАЛЬНОЙ страницей: получив
+	 * 0, игра рано или поздно сделает над этим «хэндлом» DELETE, `variable_fini`
+	 * позовёт `heap_unref(0)` — и глобали будут уничтожены посреди игры (§5ee).
+	 * Ровно этот дефект уже трижды правился поштучно (ветка AIN_WRAP ниже,
+	 * `hll/FileOperation.c`, `vm.c`), поэтому теперь называем виновника САМИ:
+	 * по одному предупреждению на функцию, со стеком игры.
+	 * `AIN_WRAP`/`AIN_REF_HLL_PARAM` сюда НЕ входят: там возвращается ИНДЕКС
+	 * элемента, и ноль — законное первое место.
+	 */
+	{
+		enum ain_data_type rt = f->return_type.data;
+		// ★`AIN_ARRAY_TYPE` — МАКРОС со списком case-меток, не значение;
+		// массивность проверяется предикатом.
+		// ★★`AIN_WRAP`(82) и `AIN_REF_HLL_PARAM`(75) исключены ЯВНО: там
+		// возвращается ИНДЕКС элемента (или сам контейнер), и ноль — законное
+		// первое место. Без этого исключения проверка врала на
+		// `Array.EmplaceBack/Sort/QuickSort` (замер: три ложных срабатывания).
+		bool handle_ret = rt != AIN_WRAP && rt != AIN_REF_HLL_PARAM
+			&& (rt == AIN_STRUCT || rt == AIN_ARRAY
+			    || ain_is_array_data_type(rt) || rt == AIN_DELEGATE);
+		if (unlikely((handle_ret && r.i == 0) || (rt == AIN_STRING && !r.ref))) {
+			static int seen[64], nr_seen;
+			int key = (libno << 16) | fno;
+			bool dup = false;
+			for (int k = 0; k < nr_seen; k++)
+				if (seen[k] == key) dup = true;
+			if (!dup && nr_seen < 64) {
+				seen[nr_seen++] = key;
+				WARNING("HLL %s.%s вернула %s там, где нужен ХЭНДЛ (тип возврата "
+					"%d): null-маркер здесь −1, а 0 — это heap-слот ГЛОБАЛЬНОЙ "
+					"страницы, и DELETE над ним уничтожит глобали. "
+					"Стек вызовов игры:", ain->libraries[libno].name, f->name,
+					rt == AIN_STRING ? "NULL-строку" : "0", (int)rt);
+				vm_stack_trace();
+			}
+		}
+	}
+
 	switch (f->return_type.data) {
 	case AIN_VOID:
 		break;

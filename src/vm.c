@@ -83,6 +83,8 @@ static int fn_trace_list[32];
 static int fn_trace_count = -1;
 // Diagnostic: XSYS4_SP_CHECK — проверять баланс стека на каждом RETURN.
 static bool sp_check = false;
+// XSYS4_GLOBAL_PAGE_CHECK: сверять целость глобальной страницы после каждой инструкции.
+static bool gp_check = false;
 static uint8_t sp_check_reported[65536];
 
 /*
@@ -338,6 +340,39 @@ static char *lambda_parent_name(const char *name)
 	if (*end != '>' || end == begin)
 		return NULL;
 	for (int i = 0; i < 2; i++) {
+		/*
+		 * ★МОДИФИКАТОР между списком аргументов родителя и позицией лямбды:
+		 * у const-метода имя выглядит как
+		 * `Класс@<lambda : Класс@Метод(int) readonly(43, 29)>`.
+		 * Пока это слово не снималось, разбор возвращал NULL, родитель НЕ
+		 * НАХОДИЛСЯ ВООБЩЕ, и `X_GETENV` оставлял лямбду без захваченного
+		 * окружения — у Dohna таких лямбд 86 из 4031. Живой случай (§5ed):
+		 * предикат `MapStructure@FindNodeFromId(int) readonly` сравнивал `Id`
+		 * узла не с искомым id, а с чем попало, поиск отдавал ПЕРВЫЙ узел, и
+		 * клик по законному узлу данжа падал в `MapEdge@GetRoutePos`
+		 * («Out of bounds heap index: -1/2»).
+		 */
+		if (i == 1 && end > begin && end[-1] != ')') {
+			// Пробелы справа от слова, само слово, пробелы слева от него:
+			// `…Метод(int) readonly(43, 29)` — между `)` и `(` стоит и слово,
+			// и пробел, поэтому снимать надо С ОБЕИХ сторон слова.
+			const char *p = end;
+			while (p > begin && (p[-1] == ' ' || p[-1] == '\t'))
+				p--;
+			const char *w = p;
+			while (w > begin && ((w[-1] >= 'a' && w[-1] <= 'z')
+					|| (w[-1] >= 'A' && w[-1] <= 'Z')
+					|| w[-1] == '_'))
+				w--;
+			const char *q = w;
+			while (q > begin && (q[-1] == ' ' || q[-1] == '\t'))
+				q--;
+			// Снимаем слово только если за ним действительно закрывающая
+			// скобка списка аргументов — иначе имя не той формы, и лучше
+			// вернуть NULL, чем отрезать половину имени.
+			if (w < p && q > begin && q[-1] == ')')
+				end = q;
+		}
 		if (end - begin < 2 || end[-1] != ')')
 			return NULL;
 		int depth = 0;
@@ -1019,6 +1054,26 @@ static void method_call(int fno, int return_address)
 {
 	function_call(fno, return_address);
 	int struct_page = stack_pop().i;
+	/*
+	 * ★`this == 0` — ВСЕГДА чужое число в объектном слоте, а не объект: heap-слот
+	 * 0 занят ГЛОБАЛЬНОЙ СТРАНИЦЕЙ (аллокатор кучи начинает с 1), поэтому им не
+	 * может владеть ни одна переменная. Молчать тут нельзя: запись члена такого
+	 * «объекта» ложится ПОВЕРХ ГЛОБАЛЕЙ и рушит игру далеко от причины.
+	 * Живой случай (§5ee): на старте панели действий битвы Dohna
+	 * `CCGParts@CGName::set` вызывался с `this = 0`, имя CG `SkillPanel/SkillPanel`
+	 * легло на глобали 25/26/27, а глобал 26 — это `g_DelayCG` (`CASMap`), и
+	 * следующий же `CALLMETHOD` на нём падал SIGSEGV в `heap_ref`.
+	 */
+	if (unlikely(struct_page == 0)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("CALLMETHOD с `this` = 0 (это heap-слот ГЛОБАЛЬНОЙ страницы, "
+				"а не объект): в объектный слот попало чужое число, запись "
+				"членов пойдёт поверх глобалей — стек вызовов игры:");
+			vm_stack_trace();
+		}
+	}
 	call_stack[call_stack_ptr-1].entry_sp = stack_ptr;
 	set_struct_page(struct_page);
 	heap[call_stack[call_stack_ptr-1].page_slot].page->local.struct_ptr = struct_page;
@@ -4102,6 +4157,7 @@ static void vm_execute(void)
 	if (optrace_on < 0) {
 		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
 		sp_check = getenv("XSYS4_SP_CHECK") != NULL;
+		gp_check = getenv("XSYS4_GLOBAL_PAGE_CHECK") != NULL;
 		// XSYS4_IP_TRACE=<lo>-<hi> (hex): построчный лог «опкод, sp до -> sp после»
 		// для диапазона адресов. Так ищется функция, которая возвращается с лишними
 		// слотами (SPCHECK показывает ФАКТ расхождения, а этот трейс — сайт).
@@ -4126,6 +4182,33 @@ static void vm_execute(void)
 			optrace_pos++;
 		}
 		opcode = execute_instruction(opcode);
+		/*
+		 * `XSYS4_GLOBAL_PAGE_CHECK=1` — сверять ЦЕЛОСТЬ ГЛОБАЛЬНОЙ СТРАНИЦЫ после
+		 * КАЖДОЙ инструкции и назвать ту, которая её испортила (опкод, адрес и стек
+		 * игры). Дорого, поэтому под ручкой; зато отвечает на вопрос, на который не
+		 * отвечают ни `XSYS4_GLOBAL_WATCH` (он видит только записи через VM), ни
+		 * `XSYS4_GLOBAL_CANARY` (называет ближайший HLL-вызов, а не инструкцию).
+		 * §5ee: `heap[0].page` подменялся указателем на СТРОКУ (`heap[i].s` и
+		 * `heap[i].page` — одно поле объединения, а слот 0 занят глобальной
+		 * страницей), после чего «глобали» читались как байты текста и игра падала
+		 * далеко от причины — SIGSEGV в `heap_ref` на `g_DelayCG`.
+		 */
+		if (unlikely(gp_check)) {
+			struct page *gp = heap_size > 0 ? heap[0].page : NULL;
+			if (!gp || gp->type != GLOBAL_PAGE || gp->nr_vars != ain->nr_globals) {
+				static bool gp_warned = false;
+				if (!gp_warned) {
+					gp_warned = true;
+					WARNING("ГЛОБАЛЬНАЯ СТРАНИЦА ИСПОРЧЕНА после %s @0x%06x "
+						"(page=%p type=%d nr_vars=%d, ждали %d) — "
+						"стек вызовов игры:",
+						instructions[rec_op].name ? instructions[rec_op].name : "?",
+						rec_ip, (void *)gp, gp ? (int)gp->type : -1,
+						gp ? gp->nr_vars : -1, ain->nr_globals);
+					vm_stack_trace();
+				}
+			}
+		}
 		if (unlikely(ip_trace_hi) && rec_ip >= ip_trace_lo && rec_ip <= ip_trace_hi)
 			sys_warning("IPTRACE 0x%06x %-14s sp %d->%d\n", rec_ip,
 				    instructions[rec_op].name ? instructions[rec_op].name : "?", rec_sp, stack_ptr);
@@ -4461,6 +4544,31 @@ int vm_execute_ain(struct ain *program)
 
 	heap_init();
 	init_libraries();
+
+	/*
+	 * `XSYS4_LAMBDA_STATS=1` — сколько лямбд НЕ находят своего лексического
+	 * родителя по имени. Такая лямбда остаётся без захваченного окружения
+	 * (`X_GETENV`), и это молчаливый дефект: она не падает, а СРАВНИВАЕТ НЕ ТО.
+	 * Счётчик — способ проверить разбор имён БЕЗ прогона по игре: у Dohna до
+	 * правки `readonly`-модификатора не находили родителя 86 лямбд из 4031
+	 * (§5ed), после — ноль.
+	 */
+	if (getenv("XSYS4_LAMBDA_STATS")) {
+		int total = 0, bad = 0;
+		for (int i = 0; i < ain->nr_functions; i++) {
+			if (!ain->functions[i].name
+					|| !strstr(ain->functions[i].name, "<lambda : "))
+				continue;
+			total++;
+			if (lambda_parent_fno(i) < 0) {
+				if (bad < 5)
+					NOTICE("LAMBDA без родителя: %s",
+					       display_sjis0(ain->functions[i].name));
+				bad++;
+			}
+		}
+		NOTICE("LAMBDA всего %d, без родителя %d", total, bad);
+	}
 
 	/*
 	 * Ixseal (System 4 v11+) сам конструирует struct-глобалы: функция "0"

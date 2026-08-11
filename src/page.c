@@ -148,6 +148,19 @@ union vm_value variable_initval(enum ain_data_type type)
 	 * «слотом» 0x30303031). Замер: `XSYS4_DELETE_TRACE=MapView@GetNode` →
 	 * `DELTRACE @708744 slot=0`.
 	 */
+	/*
+	 * ★Ссылка на ПЕРЕЧИСЛЕНИЕ (тип 93) — такая же 2-слотовая ссылка, что и
+	 * `ref int`, но в макрос `AIN_REF_TYPE` она НЕ входит, поэтому попадала в
+	 * `default` и инициализировалась нулём. Дальше штатная идиома освобождения
+	 * старого значения («X_REF 1; DELETE») снимала ссылку с heap-слота 0, то есть
+	 * с ГЛОБАЛЬНОЙ СТРАНИЦЫ: глобали освобождались посреди игры, слот уходил в
+	 * пул, и падало потом в произвольном месте. Живой случай (§5ee):
+	 * `SkillButton@UpdateTargetWeakPoint`, локал `<dummy : Atの戻り値>` типа
+	 * `ref ElementResistantType` — панель действий битвы Dohna роняла игру
+	 * SIGSEGV'ом в `heap_ref` на `g_DelayCG`, а до того в «глобалях» появлялся
+	 * текст `SkillPanel/SkillPanel`.
+	 */
+	case AIN_REF_ENUM:
 	case AIN_UNKNOWN_TYPE_87:
 		return (union vm_value) { .i = -1 };
 	case AIN_ARRAY_TYPE:
