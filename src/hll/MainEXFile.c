@@ -162,11 +162,31 @@ static int ex_key_handle(struct string *key)
 	return v ? v->id : 0;
 }
 
-/* Internal handle-based value readers (shared by scalar and array accessors). */
+/*
+ * Internal handle-based value readers (shared by scalar and array accessors).
+ *
+ * ★ЧИСЛО В `.ex` ЧИТАЕТСЯ ЛЮБЫМ ЧИСЛОВЫМ ГЕТТЕРОМ: редактор кладёт значение без
+ * дробной части как `EX_INT`, а игра запрашивает его как float (и наоборот).
+ * Тип поля в файле — свойство ДАННЫХ, а не контракта геттера, поэтому целое↔
+ * дробное здесь ПРЕОБРАЗУЕТСЯ, и отказ остаётся только для действительно
+ * нечисловых значений (строка, таблица, список).
+ *
+ * Живой случай — 立ち絵 (спрайты персонажей) в ADV-сценах Haha Ranman: их место
+ * лежит в `Ｅ＿ＡＤＶ設定.立ち絵.定義.<ключ>.座標` списком ЦЕЛЫХ
+ * (`中立ち絵 = { 640, 770 }`), а `advscene::CStand@GetExPosX/Y` объявлены float.
+ * Прежний строгий `hv_float` отвечал «Value is not a float» (684 раза за живой
+ * прогон) и отдавал НОЛЬ: спрайт строился как надо (`立ち／大木久／着物／基本`,
+ * поверхность 1280×820 на части 1000001047), но с привязкой за низ-центр в (0,0)
+ * рисовался НАД экраном — персонажей на сценах не было видно вовсе.
+ */
 static bool hv_int(int handle, int *data)
 {
 	if (handle <= 0 || (unsigned)handle >= nr_handles)
 		return false;
+	if (handles[handle]->type == EX_FLOAT) {
+		*data = (int)handles[handle]->f;
+		return true;
+	}
 	if (handles[handle]->type != EX_INT) {
 		WARNING("Value is not an integer");
 		return false;
@@ -179,6 +199,10 @@ static bool hv_float(int handle, float *data)
 {
 	if (handle <= 0 || (unsigned)handle >= nr_handles)
 		return false;
+	if (handles[handle]->type == EX_INT) {
+		*data = (float)handles[handle]->i;
+		return true;
+	}
 	if (handles[handle]->type != EX_FLOAT) {
 		WARNING("Value is not a float");
 		return false;
