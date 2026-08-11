@@ -279,6 +279,7 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->gradation.bot_b);
 		break;
 	case PARTS_CP_MUL_FILTER:
+	case PARTS_CP_ADD_FILTER:
 		iarray_write(w, op->color_filter.x);
 		iarray_write(w, op->color_filter.y);
 		iarray_write(w, op->color_filter.w);
@@ -287,6 +288,24 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->color_filter.g);
 		iarray_write(w, op->color_filter.b);
 		iarray_write(w, op->color_filter.full_size);
+		break;
+	case PARTS_CP_FILL_PIE_AMAP:
+		iarray_write(w, op->pie.x);
+		iarray_write(w, op->pie.y);
+		iarray_write(w, op->pie.rx);
+		iarray_write(w, op->pie.ry);
+		iarray_write(w, op->pie.start_angle);
+		iarray_write(w, op->pie.sweep_angle);
+		iarray_write(w, op->pie.a);
+		break;
+	case PARTS_CP_FILL_GRADATION_AMAP:
+		iarray_write(w, op->gradation_amap.x);
+		iarray_write(w, op->gradation_amap.y);
+		iarray_write(w, op->gradation_amap.w);
+		iarray_write(w, op->gradation_amap.h);
+		iarray_write(w, op->gradation_amap.a1);
+		iarray_write(w, op->gradation_amap.a2);
+		iarray_write(w, op->gradation_amap.vertical);
 		break;
 	}
 }
@@ -366,8 +385,12 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->gradation.bot_r = iarray_read(r);
 		op->gradation.bot_g = iarray_read(r);
 		op->gradation.bot_b = iarray_read(r);
+		// full_size в сейв не пишется (формат менять нельзя) — выводим по тому же
+		// правилу, что при создании (см. PE_AddFillGradationHorizonToParts...).
+		op->gradation.full_size = (op->gradation.w <= 0 || op->gradation.h <= 0);
 		break;
 	case PARTS_CP_MUL_FILTER:
+	case PARTS_CP_ADD_FILTER:
 		op->color_filter.x = iarray_read(r);
 		op->color_filter.y = iarray_read(r);
 		op->color_filter.w = iarray_read(r);
@@ -376,6 +399,24 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->color_filter.g = iarray_read(r);
 		op->color_filter.b = iarray_read(r);
 		op->color_filter.full_size = !!iarray_read(r);
+		break;
+	case PARTS_CP_FILL_PIE_AMAP:
+		op->pie.x = iarray_read(r);
+		op->pie.y = iarray_read(r);
+		op->pie.rx = iarray_read(r);
+		op->pie.ry = iarray_read(r);
+		op->pie.start_angle = iarray_read(r);
+		op->pie.sweep_angle = iarray_read(r);
+		op->pie.a = iarray_read(r);
+		break;
+	case PARTS_CP_FILL_GRADATION_AMAP:
+		op->gradation_amap.x = iarray_read(r);
+		op->gradation_amap.y = iarray_read(r);
+		op->gradation_amap.w = iarray_read(r);
+		op->gradation_amap.h = iarray_read(r);
+		op->gradation_amap.a1 = iarray_read(r);
+		op->gradation_amap.a2 = iarray_read(r);
+		op->gradation_amap.vertical = !!iarray_read(r);
 		break;
 	}
 	return op;
