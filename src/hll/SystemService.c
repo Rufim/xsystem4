@@ -19,14 +19,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <unistd.h>
 
 #include <SDL.h>
 
 #include "system4/ain.h"
+#include "system4/file.h"
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
 #include "cJSON.h"
+#include "vm/page.h"
+#include "iarray.h"
 #include "input.h"
 #include "gfx/gfx.h"
 #include "mixer.h"
@@ -711,6 +715,104 @@ static void SystemService_ShowWaitMessage(bool show)
 }
 
 /*
+ * ★RESUME-СЕЙВ В БУФЕР (Ixseal v14): `bool Save(wrap<array<int>> SaveDataBuffer)` /
+ * `bool Load(wrap<array<int>> SaveDataBuffer)`. Та же механика, что у
+ * `system.ResumeSave/ResumeLoad`, только носитель — МАССИВ INT, который игра
+ * хранит сама (Dohna: снимок карты — `SceneMap@SaveMapSnapShot` →
+ * `SnapShotSave@Save` → `gamesave::detail::セーブ実行`; без реализации вход в
+ * hunting-фазу валил движок фатальным hll_call).
+ *
+ * Содержимое буфера для игры НЕПРОЗРАЧНО (она его только хранит и отдаёт
+ * обратно), поэтому носим готовый RSM-образ: vm_save_image пишет во временный
+ * файл в папке сейвов, байты упаковываются в int-массив (магия + длина +
+ * по 4 байта LE на int). Семантика возврата — как у ResumeSave с
+ * hll-конвенцией: 1 при сохранении; при ВОССТАНОВЛЕНИИ образа выполнение
+ * продолжается из точки Save со значением 0 на стеке (кладётся в снимок,
+ * см. save_stack_to_rsave) — по нему игра уходит в «ロード後復帰処理».
+ * Из Load при успехе управление не возвращается.
+ */
+#define SS_RESUME_MAGIC 0x53535253  // "SRSS"
+#define SS_RESUME_TMP "SystemServiceResume.rsm"
+
+static bool SystemService_Save(struct page **buffer)
+{
+	char *path = savedir_path(SS_RESUME_TMP);
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE SystemService.Save -> '%s'", path);
+	int vm_save_image(const char *key, const char *path, bool hll_convention);
+	int r = vm_save_image("SystemService", path, true);
+	if (!r) {
+		free(path);
+		return false;
+	}
+	size_t len = 0;
+	uint8_t *data = file_read(path, &len);
+	unlink(path);
+	free(path);
+	if (!data) {
+		WARNING("SystemService.Save: образ записался, но не прочитался");
+		return false;
+	}
+	struct iarray_writer w;
+	iarray_init_writer(&w, NULL);
+	iarray_write(&w, SS_RESUME_MAGIC);
+	iarray_write(&w, (int)len);
+	for (size_t i = 0; i < len; i += 4) {
+		int32_t v = 0;
+		memcpy(&v, data + i, len - i >= 4 ? 4 : len - i);
+		iarray_write(&w, v);
+	}
+	free(data);
+	if (*buffer) {
+		delete_page_vars(*buffer);
+		free_page(*buffer);
+	}
+	*buffer = iarray_to_page(&w);
+	iarray_free_writer(&w);
+	return true;
+}
+
+static bool SystemService_Load(struct page **buffer)
+{
+	if (!*buffer || (*buffer)->nr_vars < 2) {
+		WARNING("SystemService.Load: пустой буфер");
+		return false;
+	}
+	struct iarray_reader r;
+	iarray_init_reader(&r, *buffer, NULL);
+	if (iarray_read(&r) != SS_RESUME_MAGIC) {
+		WARNING("SystemService.Load: буфер не похож на наш образ");
+		return false;
+	}
+	int len = iarray_read(&r);
+	if (len <= 0 || (unsigned)(*buffer)->nr_vars < 2 + ((unsigned)len + 3) / 4) {
+		WARNING("SystemService.Load: битая длина %d при %d int", len, (*buffer)->nr_vars);
+		return false;
+	}
+	uint8_t *data = xmalloc(len);
+	for (int i = 0; i < len; i += 4) {
+		int32_t v = iarray_read(&r);
+		memcpy(data + i, &v, len - i >= 4 ? 4 : len - i);
+	}
+	char *path = savedir_path(SS_RESUME_TMP);
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE SystemService.Load <- '%s' (%d байт)", path, len);
+	bool ok = file_write(path, data, len);
+	free(data);
+	if (!ok) {
+		free(path);
+		WARNING("SystemService.Load: не записался временный образ");
+		return false;
+	}
+	void vm_load_image(const char *key, const char *path);
+	vm_load_image("SystemService", path);
+	// При успехе сюда не возвращаемся: выполнение ушло в точку Save.
+	unlink(path);
+	free(path);
+	return false;
+}
+
+/*
  * Резервные копии сейвов (Ixseal). Игра лишь РЕГИСТРИРУЕТ имена файлов
  * (`AddBackupSaveFileName`) и просит скопировать их (`BackupSaveFile`) — ни
  * геттера, ни возвращаемого значения у этой пары нет, так что имена копий и
@@ -1036,6 +1138,8 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
 	    HLL_EXPORT(RestrainScreensaver, SystemService_RestrainScreensaver),
 	    HLL_EXPORT(ShowWaitMessage, SystemService_ShowWaitMessage),
+	    HLL_EXPORT(Save, SystemService_Save),
+	    HLL_EXPORT(Load, SystemService_Load),
 	    HLL_EXPORT(AddBackupSaveFileName, SystemService_AddBackupSaveFileName),
 	    HLL_EXPORT(BackupSaveFile, SystemService_BackupSaveFile),
 	    HLL_EXPORT(Debug_GetUseVideoMemorySize, SystemService_Debug_GetUseVideoMemorySize),
