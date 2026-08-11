@@ -867,12 +867,29 @@ void parts_set_alpha(struct parts *parts, int alpha)
 	parts_dirty(parts);
 }
 
+/*
+ * ★ДОБАВОЧНЫЙ ЦВЕТ СКЛАДЫВАЕТСЯ, А НЕ УМНОЖАЕТСЯ. Здесь была копия соседней
+ * `parts_update_global_multiply_color` (апстрим, `fc42c42` 2022) — `parent * (local/255)`.
+ * У умножения нейтральный элемент 255, у сложения — 0, поэтому прежняя формула гасила
+ * добавку ВСЕГДА: у части без своего цвета выходило `parent * 0 = 0`, а у части без
+ * родителя `parts_set_add_color` подставляет корню `{0,0,0}` — и `0 * local = 0`. То
+ * есть `SetAddColor`/`SetComponentAddColor` не делали ничего ни для одной игры.
+ *
+ * Живой случай: на карте Haha Ranman маркер события у панели `Shrine` должен МЕРЦАТЬ
+ * БЕЛЫМ. Игра считает это сама (`CBlink(0, 64.0, 1500, 500)` — добавка 0…64 за 1.5 с
+ * с паузой 0.5 с) и каждый кадр кладёт её на РОДИТЕЛЬСКИЙ контейнер маркера; замер
+ * (`XSYS4_MUL_TRACE=1`, лог `playtest/haharanman-blink-fresh.log`): у части `90000558`
+ * добавочный цвет честно ходит `0 → 63 → 0`, а на экране не менялось ни одного пикселя.
+ *
+ * Складываем с потолком 255: клампить обязательно, иначе на цепочке вложенных
+ * контейнеров сумма переполнит байт.
+ */
 static void parts_update_global_add_color(struct parts *parts, SDL_Color parent_color)
 {
 	parts->global.add_color = (SDL_Color) {
-		parent_color.r * (parts->local.add_color.r / 255.0f),
-		parent_color.g * (parts->local.add_color.g / 255.0f),
-		parent_color.b * (parts->local.add_color.b / 255.0f),
+		min(255, parent_color.r + parts->local.add_color.r),
+		min(255, parent_color.g + parts->local.add_color.g),
+		min(255, parent_color.b + parts->local.add_color.b),
 		0
 	};
 
@@ -2753,6 +2770,10 @@ void PE_SetAddColor(int parts_no, int r, int g, int b)
 		min(255, max(0, b)),
 		255
 	};
+	// XSYS4_MUL_TRACE=1 печатает и добавочный цвет: мерцание белым делается именно им,
+	// и по кадру не отличить «игра не покрасила» от «покрасила, а не доехало».
+	if (getenv("XSYS4_MUL_TRACE"))
+		NOTICE("ADD part %d <- rgb %d,%d,%d", parts_no, r, g, b);
 	parts_set_add_color(parts_get(parts_no), add_color);
 }
 
