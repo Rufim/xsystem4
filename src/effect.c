@@ -145,6 +145,7 @@ static void render_effect_shader(struct effect_shader *shader, Texture *dst, Tex
 static struct effect_shader crossfade_shader = EFFECT_SHADER("shaders/effects/crossfade.f.glsl");
 static struct effect_shader crossfade_lr_shader = EFFECT_SHADER("shaders/effects/crossfade_lr.f.glsl");
 static struct effect_shader crossfade_up_down_shader = EFFECT_SHADER("shaders/effects/crossfade_up_down.f.glsl");
+static struct effect_shader crossfade_down_up_shader = EFFECT_SHADER("shaders/effects/crossfade_down_up.f.glsl");
 static struct effect_shader mosaic_shader = EFFECT_SHADER("shaders/effects/mosaic.f.glsl");
 static struct effect_shader blind_down_shader = EFFECT_SHADER("shaders/effects/blind_down.f.glsl");
 static struct effect_shader blind_lr_shader = EFFECT_SHADER("shaders/effects/blind_lr.f.glsl");
@@ -161,6 +162,7 @@ static struct effect_shader *effect_shaders[NR_EFFECTS] = {
 	[EFFECT_CROSSFADE] = &crossfade_shader,
 	[EFFECT_CROSSFADE_LR] = &crossfade_lr_shader,
 	[EFFECT_UP_DOWN_CROSSFADE] = &crossfade_up_down_shader,
+	[EFFECT_DOWN_UP_CROSSFADE] = &crossfade_down_up_shader,
 	[EFFECT_CROSSFADE_MOSAIC] = &mosaic_shader,
 	[EFFECT_BLIND_DOWN] = &blind_down_shader,
 	[EFFECT_BLIND_LR] = &blind_lr_shader,
@@ -323,6 +325,11 @@ int effect_init(enum effect type)
 		}
 	}
 
+	// XSYS4_EFFECT_TRACE=1 — какой переход и когда начался: нужно, чтобы поймать его
+	// фазу в серии кадров при сверке с оригиналом (по одному снимку переход не сверить).
+	if (getenv("XSYS4_EFFECT_TRACE"))
+		NOTICE("EFFECT start %d (%s)", type,
+		       effect_names[type] ? effect_names[type] : "?");
 	effect.on = true;
 	effect.type = type;
 	gfx_delete_texture(&effect.old);
