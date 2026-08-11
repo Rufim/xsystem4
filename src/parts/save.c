@@ -1213,6 +1213,13 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 		return false;
 	}
 
+	// ★СКОЛЬКО ЧАСТЕЙ ПРИШЛО СНИМКОМ, а не из раскладки. Отвечает на ловушку, которая
+	// стоит полсессии: интерфейс загруженного экрана берётся ОТСЮДА (у карты Haha Ranman
+	// 779 частей из сейва против 124 построенных), поэтому правки загрузчика раскладки
+	// на старом сейве не видны вовсе — проверять их надо на заново построенном экране.
+	if (getenv("XSYS4_DUMP_PARTS") || getenv("XSYS4_PARTS_TRACE"))
+		NOTICE("parts-сейв отдаёт %d частей (globals=%d, back_scene=%d)",
+		       nr_parts, restore_globals, back_scene);
 	for (int i = 0; i < nr_parts; i++) {
 		load_parts(&r, version, back_scene);
 	}
