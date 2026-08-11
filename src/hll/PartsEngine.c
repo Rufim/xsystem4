@@ -827,7 +827,7 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		int font_r, int font_g, int font_b, int edge_r, int edge_g, int edge_b,
 		int full_size, float bold_weight, float edge_weight,
 		struct string *text, struct string *cg_name,
-		int radius_x, int radius_y, int start_angle, int sweep_angle, int blur)
+		int radius_x, int radius_y, int start_angle, int sweep_angle, int blur, int a2)
 {
 	(void)interp_type; (void)sw; (void)sh;
 	switch (command) {
@@ -917,7 +917,11 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 				dx, dy, dw, dh, full_size, state);
 		break;
 	case 16:  // CASConstructionProcess::SetAddFilter
-		WARNING("AddConstructProcess: AddFilter unimplemented");
+		// Тёплая подкраска обесцвеченного кадра: слайд-шоу титула Haha Ranman
+		// делает GrayFilter, а следом AddFilter(17,5,0) — без него фотографии
+		// за логотипом выходят холодно-серыми (замер R−B: +12.8 против +28.1).
+		PE_AddAddFilterToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				r, g, b, full_size, state);
 		break;
 	case 17:  // CASConstructionProcess::SetMulFilter
 		WARNING("AddConstructProcess: MulFilter unimplemented");
@@ -962,6 +966,17 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 				font_r, font_g, font_b, bold_weight,
 				edge_r, edge_g, edge_b, edge_weight,
 				char_space, line_space, state);
+		break;
+	/*
+	 * Градиент В АЛЬФА-КАРТУ: 25 — вдоль Y, 26 — вдоль X. Альфа идёт от `色１`.A
+	 * к A2 (у A2 нет классического слота, см. разбор массива v14). Ими обводят
+	 * поверхность мягкой каймой — слайд-шоу титула Haha Ranman кладёт четыре
+	 * полосы по 15 px, и фотография растворяется в бумаге вместо резкой рамки.
+	 */
+	case 25:  // CASConstructionProcess::SetFillGradationAMapUD (v14)
+	case 26:  // CASConstructionProcess::SetFillGradationAMapLR (v14)
+		PE_AddFillGradationAMapToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				a, a2, command == 25, state);
 		break;
 	case 27:  // CASConstructionProcess::SetHBlurFilter (v14)
 	case 28:  // CASConstructionProcess::SetVBlurFilter (v14)
@@ -1038,6 +1053,7 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 	int start_angle = nr_ints > 36 ? ints[36].i : 0;
 	int sweep_angle = nr_ints > 37 ? ints[37].i : 0;
 	int blur = nr_ints > 38 ? ints[38].i : 0;  // поле `ブラー` (команды 27/28)
+	int a2   = nr_ints > 39 ? ints[39].i : 0;  // второй альфы (команды 25/26)
 
 	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
 		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
@@ -1049,7 +1065,7 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 			dx, dy, dw, dh, r, g, b, a, r2, g2, b2, char_space, line_space,
 			font_type, font_size, font_r, font_g, font_b,
 			edge_r, edge_g, edge_b, full_size, bold_weight, edge_weight,
-			text, cg_name, radius_x, radius_y, start_angle, sweep_angle, blur);
+			text, cg_name, radius_x, radius_y, start_angle, sweep_angle, blur, a2);
 }
 
 // Generic dispatch function for PartsEngine operations.
@@ -1348,18 +1364,23 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
 	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
-	static const int v14_ok[] = { 27, 28, 88, 90, 102, 122 };
+	static const int v14_ok[] = { 25, 26, 27, 28, 88, 90, 102, 122 };
 	bool known_v14 = false;
 	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
 		known_v14 |= (command == v14_ok[i]);
 	if (command < 0 || (command >= NR_CLASSIC_CONSTRUCTION_COMMANDS && !known_v14)) {
-		if (trace)
-			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d)",
-			       command, parts_no);
+		if (trace) {
+			char buf[512]; int p = 0;
+			for (int i = 0; i < IX_NR_CONSTRUCTION_INTS; i++)
+				p += snprintf(buf + p, sizeof(buf) - p, "%d:%d ", i, src[i].i);
+			struct string *cgn = heap_get_string((*as)->values[1].i);
+			NOTICE("AddPartsConstructionProcess(ix): v14-only command %d (part=%d) cg='%s' сырьё: %s",
+			       command, parts_no, cgn ? display_sjis0(cgn->text) : "", buf);
+		}
 		return;
 	}
 
-	union vm_value ints[38] = {0};
+	union vm_value ints[40] = {0};
 	ints[0].i = parts_no;
 	ints[1].i = state;
 	ints[2].i = command;
@@ -1367,20 +1388,36 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 		ints[i] = src[i - 2];
 	for (int i = 21; i <= 31; i++)  // CharSpace .. FullSize (A2 has no classic slot)
 		ints[i] = src[i - 1];
+	/*
+	 * ★Два поля v14 оставались ЗА БОРТОМ, и оба молча: массив собирался на 38
+	 * слотов и уходил с `nr_ints = 38`, а сила размытия читается из слота 38 —
+	 * условие `nr_ints > 38` не выполнялось НИКОГДА, поэтому HBlur/VBlur у всех
+	 * v14-игр были no-op (`radius = 0` → выход без работы). Второй альфы (`A2`)
+	 * в классической раскладке нет вовсе — кладём её в свой слот 39, иначе
+	 * градиент в альфа-карту (команды 25/26) не знает, чем заканчивается.
+	 */
+	ints[38] = src[31];  // ブラー
+	ints[39] = src[19];  // A2
 
-	if (trace)
-		NOTICE("AddPartsConstructionProcess(ix) part=%d state=%d cmd=%d src=(%d,%d %dx%d) dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d",
+	if (trace) {
+		// Имя CG — из строковых аргументов: без него по трассе не понять, ЧТО
+		// именно рисует шаг, а «посмотреть ассет» в этом проекте первично.
+		struct string *cgn = heap_get_string((*as)->values[1].i);
+		NOTICE("AddPartsConstructionProcess(ix) part=%d state=%d cmd=%d src=(%d,%d %dx%d) dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d blur=%d full=%d cg='%s'",
 		       parts_no, state, command,
 		       ints[4].i, ints[5].i, ints[6].i, ints[7].i,
 		       ints[8].i, ints[9].i, ints[12].i, ints[13].i,
-		       ints[14].i, ints[15].i, ints[16].i, ints[17].i);
+		       ints[14].i, ints[15].i, ints[16].i, ints[17].i,
+		       ints[38].i, ints[31].i,
+		       cgn ? display_sjis0(cgn->text) : "");
+	}
 	// Слоты 34..37 — наши, для полей фигур v14 (радиусы и углы дуги): классическая
 	// раскладка их не знает, а команде 122 они необходимы.
 	ints[34] = src[32];  // RadiusX
 	ints[35] = src[33];  // RadiusY
 	ints[36] = src[38];  // StartAngle
 	ints[37] = src[39];  // SweepAngle
-	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values, 38);
+	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values, 40);
 }
 
 // --- Подсистема Activity (именованные наборы parts) ---
@@ -2070,7 +2107,7 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			act_float(op, "フォント縁取り", 0.0f), text, cg,
 			act_list_int(op, "半径", 0, 0), act_list_int(op, "半径", 1, 0),
 			act_list_int(op, "円弧角度", 0, 0), act_list_int(op, "円弧角度", 1, 0),
-			act_int(op, "ブラー", 0));
+			act_int(op, "ブラー", 0), act_list_int(op, "色２", 3, 255));
 		done++;
 	}
 	return done;
@@ -2547,6 +2584,18 @@ static int act_hover_nr;
 struct act_radio_pending { int box_no; struct string *child_name; };
 static struct act_radio_pending *act_radio_pending;
 static int act_radio_nr;
+/*
+ * `アルファクリッパー` — ИМЯ части, чьей альфой обрезается эта. Загрузчик поле не читал,
+ * и «эффект воспроизведения» на экране MUSIC у Haha Ranman светил целиком: `再生効果／光`
+ * (белая полоса-стрелка с осью в центре полукруга, `原点座標モード=6`) объявляет
+ * клиппером своего же родителя `再生効果／ベース` — золотую дугу 192×79. Без маски
+ * рисуются ОБЕ части целиком: дуга горит по всему кольцу, а полоса ложится поверх
+ * кнопок 停止/再生. Поле непустое ровно у этой части (`音楽モード.pactex:3212`).
+ * Отложенно и по именам ЭТОЙ постройки — по тем же причинам, что у hover-связей.
+ */
+struct act_clipper_pending { int parts_no; struct string *clipper_name; };
+static struct act_clipper_pending *act_clipper_pending;
+static int act_clipper_nr;
 struct act_built_name { struct string *name; int no; };
 static struct act_built_name *act_built;
 static int act_built_nr;
@@ -2597,6 +2646,29 @@ static void act_apply_pending_hover_links(void)
 			NOTICE("RB группа %d <- кнопка '%s' (часть %d)", act_radio_pending[i].box_no,
 			       display_sjis0(act_radio_pending[i].child_name->text), child_no);
 	}
+	for (int i = 0; i < act_clipper_nr; i++) {
+		int clipper_no = -1;
+		for (int j = 0; j < act_built_nr; j++) {
+			if (act_name_eq(act_built[j].name, act_clipper_pending[i].clipper_name)) {
+				clipper_no = act_built[j].no;
+				break;
+			}
+		}
+		if (clipper_no < 0) {
+			WARNING("act_build_part: アルファクリッパー '%s' не найден в этой активности",
+			        display_sjis0(act_clipper_pending[i].clipper_name->text));
+			continue;
+		}
+		PE_SetPartsAlphaClipperPartsNumber(act_clipper_pending[i].parts_no, clipper_no);
+		if (getenv("XSYS4_PARTS_TRACE") || getenv("XSYS4_ACT_TRACE"))
+			NOTICE("ACT alpha-clipper: часть %d обрезается по '%s' (часть %d)",
+			       act_clipper_pending[i].parts_no,
+			       display_sjis0(act_clipper_pending[i].clipper_name->text), clipper_no);
+	}
+	free(act_clipper_pending);
+	act_clipper_pending = NULL;
+	act_clipper_nr = 0;
+
 	free(act_radio_pending);
 	act_radio_pending = NULL;
 	act_radio_nr = 0;
@@ -2627,6 +2699,14 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		act_hover_pending[act_hover_nr].parts_no = no;
 		act_hover_pending[act_hover_nr].target_name = hover_target;
 		act_hover_nr++;
+	}
+	struct string *clipper_name = act_str(node, "アルファクリッパー");
+	if (clipper_name && clipper_name->size > 0) {
+		act_clipper_pending = xrealloc_array(act_clipper_pending, act_clipper_nr,
+		                                     act_clipper_nr + 1, sizeof(*act_clipper_pending));
+		act_clipper_pending[act_clipper_nr].parts_no = no;
+		act_clipper_pending[act_clipper_nr].clipper_name = clipper_name;
+		act_clipper_nr++;
 	}
 
 	// register name -> number so the game can resolve it (GetActivityPartsNumber)
@@ -3567,6 +3647,9 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 		struct act_radio_pending *saved_radio = act_radio_pending;
 		int saved_radio_nr = act_radio_nr;
 		act_radio_pending = NULL; act_radio_nr = 0;
+		struct act_clipper_pending *saved_clipper = act_clipper_pending;
+		int saved_clipper_nr = act_clipper_nr;
+		act_clipper_pending = NULL; act_clipper_nr = 0;
 		struct act_hover_pending *saved_pending = act_hover_pending;
 		int saved_pending_nr = act_hover_nr;
 		struct act_built_name *saved_built = act_built;
@@ -3579,6 +3662,7 @@ static bool PE_ReadActivityFile(struct string *activity_name, struct string *fil
 
 		act_hover_pending = saved_pending; act_hover_nr = saved_pending_nr;
 		act_radio_pending = saved_radio; act_radio_nr = saved_radio_nr;
+		act_clipper_pending = saved_clipper; act_clipper_nr = saved_clipper_nr;
 		act_built = saved_built; act_built_nr = saved_built_nr;
 		if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_DUMP_PARTS")) {
 			NOTICE("=== parts right after ReadActivityFile build ===");
