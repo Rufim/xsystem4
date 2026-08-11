@@ -119,6 +119,11 @@ int vm_hll_func_nr_args(int fno);
 union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *argv, int argc);
 int vm_time(void);
 void vm_sleep(int ms);
+// Имя функции на стеке вызовов игры: 0 — текущая, 1 — вызвавшая её, и т.д.
+// Нужна и сисколлу SYS_GET_FUNC_STACK_NAME, и HLL system.GetFuncStackName
+// (новые игры зовут ЕЁ: на пустом имени у них разваливается регистрация
+// прочитанных сцен — ключи 既読 склеиваются в "" и "＠読了").
+struct string *vm_func_stack_name(int index);
 
 // elem_class: Ixseal's third CALLHLL operand (0 when the .ain doesn't have it).
 // It describes the element type of a generic container and, with it, how many
