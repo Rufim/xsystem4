@@ -79,8 +79,12 @@ static GLchar *read_shader_file(const char *path)
 		char full_path[PATH_MAX];
 		snprintf(full_path, PATH_MAX, XSYS4_DATA_DIR "/%s", path);
 		source = SDL_LoadFile(full_path, NULL);
+		// ★В формате не хватало второго `%s`, и путь в сообщении ТЕРЯЛСЯ: в логе
+		// печаталось «Failed to load shader file &» с мусорным errno, а фатал этот
+		// приходит на ПЕРВОМ использовании эффекта (шейдеры грузятся лениво) — то
+		// есть посреди игры, и понять, какого файла не хватает, было нельзя.
 		if (!source)
-			ERROR("Failed to load shader file %s", full_path, strerror(errno));
+			ERROR("Failed to load shader file %s: %s", full_path, strerror(errno));
 	}
 	return source;
 }

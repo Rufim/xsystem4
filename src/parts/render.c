@@ -195,8 +195,9 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 	 * вовсе — подписи узлов данжа Dohna (`Parking Ent.`, каптион `M11`) выходили
 	 * горизонтальными там, где оригинал наклоняет их на −36.25° (§5dx).
 	 * Общий трансформ собираем матрицей: сдвиг в позицию → поворот → масштаб →
-	 * сдвиг на привязку; шаг между символами и межстрочный интервал после этого
-	 * уже НЕ надо умножать на масштаб руками — их масштабирует сама матрица.
+	 * сдвиг на привязку. Дальше ВСЁ (шаг между символами, межстрочный интервал,
+	 * размеры глифов, положение руби) считается в ЛОКАЛЬНЫХ единицах части и на
+	 * масштаб руками НЕ умножается — его применяет сама матрица.
 	 */
 	mat4 base = GLM_MAT4_IDENTITY_INIT;
 	glm_translate(base, (vec3){ parts->global.pos.x, parts->global.pos.y, 0 });
@@ -205,17 +206,63 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 	glm_translate(base, (vec3){ t->common.origin_offset.x, t->common.origin_offset.y, 0 });
 
 	float x = 0.0f, y = 0.0f;
+	// Индекс РИСУЕМОГО символа сквозь все строки — по нему обрезается посимвольное
+	// проявление реплики (см. reveal_* в parts_text). Переводы строки в счёт не
+	// входят: своего глифа у них нет.
+	int idx = 0;
+	int ri = 0;             // курсор по прогонам руби (они идут по возрастанию базы)
+	float ruby_start_x = 0; // левый край базы текущего прогона
 	for (int i = 0; i < t->nr_lines; i++) {
 		struct parts_text_line *line = &t->lines[i];
-		for (int j = 0; j < line->nr_chars; j++) {
+		for (int j = 0; j < line->nr_chars; j++, idx++) {
 			struct parts_text_char *ch = &line->chars[j];
+			float alpha = blend_rate;
+			if (t->reveal_active) {
+				if (idx > t->reveal_shown)
+					continue;
+				if (idx == t->reveal_shown) {
+					if (t->reveal_head_alpha <= 0.0f)
+						continue;
+					alpha *= t->reveal_head_alpha;
+				}
+			}
+			while (ri < t->nr_ruby && t->ruby[ri].first_char + t->ruby[ri].nr_chars <= idx)
+				ri++;
+			if (ri < t->nr_ruby && t->ruby[ri].first_char == idx)
+				ruby_start_x = x;
 			mat4 mw_transform;
 			glm_mat4_copy(base, mw_transform);
 			glm_translate(mw_transform, (vec3){ x, y, 0 });
 			glm_scale(mw_transform, (vec3){ ch->t.w, ch->t.h, 1.0f });
 			Rectangle r = { 0, 0, ch->t.w, ch->t.h };
-			parts_render_texture(&ch->t, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts_effective_clipper(parts));
+			parts_render_texture(&ch->t, mw_transform, &r, alpha, add_color, multiply_color, 0, parts_effective_clipper(parts));
 			x += ch->advance;
+			/*
+			 * Чтение рисуем, когда дорисован ПОСЛЕДНИЙ символ его базы: только тогда
+			 * известна ширина прогона, по которой оно центрируется (замер по кадру
+			 * оригинала — `まみ` стоит ровно над серединой `塗`).
+			 * По вертикали чтение — ОТДЕЛЬНАЯ строка НАД базовой, с межстрочным
+			 * интервалом самого руби (узел `ルビ`, у Haha Ranman 行間隔 = −15):
+			 * y = верх базовой строки − высота руби − интервал.
+			 */
+			struct parts_text_ruby *rb = ri < t->nr_ruby ? &t->ruby[ri] : NULL;
+			if (rb && rb->first_char + rb->nr_chars - 1 == idx && rb->nr_glyphs) {
+				float span = x - ruby_start_x;
+				float rh = text_style_height(&t->ruby_ts);
+				float rx = ruby_start_x + (span - rb->width) / 2.0f;
+				float ry = y - rh - t->ruby_line_space;
+				for (int k = 0; k < rb->nr_glyphs; k++) {
+					struct parts_text_char *g = &rb->glyphs[k];
+					mat4 rt;
+					glm_mat4_copy(base, rt);
+					glm_translate(rt, (vec3){ rx, ry, 0 });
+					glm_scale(rt, (vec3){ g->t.w, g->t.h, 1.0f });
+					Rectangle rr = { 0, 0, g->t.w, g->t.h };
+					parts_render_texture(&g->t, rt, &rr, alpha, add_color,
+							multiply_color, 0, parts_effective_clipper(parts));
+					rx += g->advance;
+				}
+			}
 		}
 		x = 0.0f;
 		y += line->height + t->line_space;

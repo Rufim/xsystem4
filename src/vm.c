@@ -113,9 +113,9 @@ static int type_slots(struct ain_type *t)
 // Env-gated, harmless.
 static const char *fn_trace_ns = (const char *)1; // 1 = not-yet-resolved
 static int32_t struct_page_slot(void);
-static bool fn_trace_ns_match(const char *n)
+static bool fn_trace_list_match(const char *patterns, const char *n)
 {
-	const char *p = fn_trace_ns;
+	const char *p = patterns;
 	while (*p) {
 		const char *comma = strchr(p, ',');
 		size_t len = comma ? (size_t)(comma - p) : strlen(p);
@@ -141,16 +141,22 @@ static void vm_fn_trace_ns(int fno)
 	if (fno < 0 || fno >= ain->nr_functions)
 		return;
 	const char *n = ain->functions[fno].name;
-	if (n && fn_trace_ns_match(n)) {
+	if (n && fn_trace_list_match(fn_trace_ns, n)) {
 		// this вызываемого метода в момент трейса ещё в стеке VM ПОД аргументами
 		// (method_call снимает его ПОСЛЕ function_call, который снимет nr_args) —
 		// печатаем его, а не только struct_page_slot() вызывающего.
 		int na = ain->functions[fno].nr_args;
 		// a0 — первый аргумент вызываемого (для сеттеров это значение): он ещё
-		// на стеке НАД this.
-		WARNING("NSTRACE fn %d this=%d callee_this=%d a0=%d %s", fno, struct_page_slot(),
-			stack_ptr > na ? stack[stack_ptr - 1 - na].i : -1,
-			na >= 1 && stack_ptr >= 1 ? stack[stack_ptr - na].i : 0, n);
+		// на стеке НАД this. Строковый a0 печатаем текстом: слот кучи сам по
+		// себе ничего не говорит, а видеть надо именно строковые ключи.
+		int32_t a0 = na >= 1 && stack_ptr >= 1 ? stack[stack_ptr - na].i : 0;
+		char a0s[300] = "";
+		if (na >= 1 && ain->functions[fno].vars[0].type.data == AIN_STRING
+		    && a0 > 0 && heap_index_valid(a0) && heap[a0].type == VM_STRING)
+			snprintf(a0s, sizeof(a0s), " a0s=\"%s\"",
+				 display_sjis0(heap_get_string(a0)->text));
+		WARNING("NSTRACE fn %d this=%d callee_this=%d a0=%d%s %s", fno, struct_page_slot(),
+			stack_ptr > na ? stack[stack_ptr - 1 - na].i : -1, a0, a0s, n);
 		// XSYS4_FN_TRACE_NS_STACK=1 — к каждому совпадению печатать стек
 		// вызовов игры: отвечает «кто зовёт», а не только «что зовётся».
 		if (getenv("XSYS4_FN_TRACE_NS_STACK"))
@@ -1346,7 +1352,7 @@ static const SDL_MessageBoxButtonData stop_continue_buttons[] = {
 	{ 0, 0, "Continue" },
 };
 
-static struct string *get_func_stack_name(int index)
+struct string *vm_func_stack_name(int index)
 {
 	int i = call_stack_ptr - (1 + index);
 	if (i < 0 || i >= call_stack_ptr) {
@@ -1518,7 +1524,7 @@ static void system_call(enum syscall_code code)
 		break;
 	}
 	case SYS_GET_FUNC_STACK_NAME: { // system.GetFuncStackName(int nIndex)
-		stack_push_string(get_func_stack_name(stack_pop().i));
+		stack_push_string(vm_func_stack_name(stack_pop().i));
 		break;
 	}
 	case SYS_PEEK: {// system.Peek(void)
@@ -2427,9 +2433,18 @@ static enum opcode execute_instruction(enum opcode opcode)
 				int fno = call_stack[call_stack_ptr - 1].fno;
 				const char *n = fno >= 0 && fno < ain->nr_functions
 					? ain->functions[fno].name : NULL;
-				if (n && strstr(n, ret_ns))
-					WARNING("RETTRACE %s -> %d", n,
-						stack_ptr > 0 ? stack[stack_ptr - 1].i : 0);
+				// Список подстрок через запятую — как у XSYS4_FN_TRACE_NS.
+				if (n && fn_trace_list_match(ret_ns, n)) {
+					// Строковый возврат — текстом (см. NSTRACE): слот кучи
+					// без текста на вопрос «что игра решила» не отвечает.
+					int32_t rv = stack_ptr > 0 ? stack[stack_ptr - 1].i : 0;
+					char rvs[300] = "";
+					if (ain->functions[fno].return_type.data == AIN_STRING
+					    && rv > 0 && heap_index_valid(rv) && heap[rv].type == VM_STRING)
+						snprintf(rvs, sizeof(rvs), " rvs=\"%s\"",
+							 display_sjis0(heap_get_string(rv)->text));
+					WARNING("RETTRACE %s -> %d%s", n, rv, rvs);
+				}
 			}
 		}
 		function_return();
@@ -3697,7 +3712,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case SH_S_ASSIGN_CALLSYS19: {
-		struct string *name = get_func_stack_name(stack_pop().i);
+		struct string *name = vm_func_stack_name(stack_pop().i);
 		heap_string_assign(stack_pop().i, name);
 		free_string(name);
 		break;

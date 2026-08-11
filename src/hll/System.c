@@ -165,10 +165,13 @@ static struct string *System_GetSaveFolderName(void)
 	return s;
 }
 
+// Имя функции из стека вызовов игры (0 — вызвавшая, 1 — её вызвавшая, ...).
+// Новые игры регистрируют этим именем прочитанные сцены (■既読登録/■読了登録
+// в Haha Ranman): на пустой заглушке все ключи 既読 склеивались в "" и
+// "＠読了", и события с пререквизитом «сцена X прочитана» не запускались.
 static struct string *System_GetFuncStackName(int index)
 {
-	(void)index;
-	return string_ref(&EMPTY_STRING);
+	return vm_func_stack_name(index);
 }
 
 static bool System_ExistFunc(struct string *name)

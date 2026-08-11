@@ -2138,6 +2138,72 @@ static float act_float(struct ex_tree *t, const char *utf8, float dflt);
  * `blurred` — сколько шагов размытия встретилось: по нему вызывающий узнаёт, что
  * процедура строит РАЗМЫТЫЙ ЗАДНИК экрана, а не элемент интерфейса.
  */
+/*
+ * Запомнить шаг раскладки как СЫРЬЁ процедуры построения — то, что игра получит,
+ * если прочитает процедуру обратно (`Parts_GetPartsConstructionProcess`).
+ *
+ * Зачем: круговая шкала автомода Haha Ranman (`構築：ゲージ` в активности
+ * `ＭＳＧ枠/ＭＳＧ／オートモード待機時間.x`) строится игровым классом `CWaitPie`,
+ * а тот НАЧИНАЕТ с чтения уже загруженной процедуры: `GetProcessList()` →
+ * `Array.FindLast(команда ∈ {0,1,2})` → если это `SetCreateCG` (2), берёт оттуда
+ * имя CG (зелёное кольцо) и по нему размер, иначе берёт размер из `SetCreate`.
+ * Мы отдавали пустую операцию, игра читала её как `SetCreate(0,0)` и каждый кадр
+ * подавала `Create(0,0)` + `FillPie` с НУЛЕВЫМ радиусом: поверхность выходила 1×1,
+ * зелёного слоя на экране не было вовсе (FINDINGS §5dm).
+ *
+ * Порядок полей — раскладка `CASConstructionProcess::ArrayIntIndex` формы v14
+ * (см. большой комментарий у `PE_AddPartsConstructionProcess_ix`). Классическую
+ * форму (v6/v7) НЕ пишем: там у структуры другой набор полей, а неверное сырьё
+ * хуже отсутствующего — те игры этого чтения и не делают.
+ *
+ * Сырьё пишется для КАЖДОГО шага, включая команды, которых мы не умеем строить:
+ * индексы обязаны совпадать с тем, что видит игра, иначе `FindLast` найдёт чужой шаг.
+ */
+static bool construction_raw_ix = false;
+
+static void act_save_construction_raw(int no, int state, struct ex_tree *op, int command,
+		struct string *text, struct string *cg)
+{
+	if (!construction_raw_ix)
+		return;
+	int v[40] = {0};
+	v[0] = command;
+	v[1] = act_int(op, "補間タイプ", 0);
+	for (int i = 0; i < 4; i++)                       // 元矩形 → Src{X,Y,Width,Height}
+		v[2 + i] = act_list_int(op, "元矩形", i, 0);
+	for (int i = 0; i < 4; i++)                       // 先矩形[0..3] → Dest{X,Y,X2,Y2}
+		v[6 + i] = act_list_int(op, "先矩形", i, 0);
+	v[10] = act_list_int(op, "先矩形", 4, 0);          // Dest{Width,Height}
+	v[11] = act_list_int(op, "先矩形", 5, 0);
+	for (int i = 0; i < 3; i++)
+		v[12 + i] = act_list_int(op, "色１", i, 0);
+	v[15] = act_list_int(op, "色１", 3, 255);
+	for (int i = 0; i < 3; i++)
+		v[16 + i] = act_list_int(op, "色２", i, 0);
+	v[19] = act_list_int(op, "色２", 3, 255);
+	v[20] = act_int(op, "文字間隔", 0);
+	v[21] = act_int(op, "行間隔", 0);
+	v[22] = act_int(op, "フォントタイプ", 0);
+	v[23] = act_int(op, "フォントサイズ", 16);
+	for (int i = 0; i < 3; i++)
+		v[24 + i] = act_list_int(op, "フォント色", i, 255);
+	for (int i = 0; i < 3; i++)
+		v[27 + i] = act_list_int(op, "フォント縁取り色", i, 0);
+	v[30] = act_int(op, "全体", 0);
+	v[31] = act_int(op, "ブラー", 0);
+	v[32] = act_list_int(op, "半径", 0, 0);
+	v[33] = act_list_int(op, "半径", 1, 0);
+	v[34] = act_int(op, "線の幅", 0);
+	v[35] = act_list_int(op, "丸め", 0, 0);            // RoundEdge / RoundCorner
+	v[36] = act_list_int(op, "丸め", 1, 0);
+	v[37] = act_int(op, "回転角度", 0);
+	v[38] = act_list_int(op, "円弧角度", 0, 0);
+	v[39] = act_list_int(op, "円弧角度", 1, 0);
+	float f[2] = { act_float(op, "フォント太さ", 0.0f), act_float(op, "フォント縁取り", 0.0f) };
+	struct string *s[2] = { text, cg };
+	PE_SaveConstructionRawValues(no, state, v, 40, f, 2, s, 2);
+}
+
 static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped, int *blurred)
 {
 	int done = 0;
@@ -2152,6 +2218,8 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 		int command = act_int(op, "コマンド", -1);
 		if (command < 0)
 			continue;
+		act_save_construction_raw(no, state, op, command,
+				act_str(op, "テキスト"), act_str(op, "ＣＧ名"));
 		// Команды за пределами реализованного набора пропускаем ЯВНО: пусть их
 		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
 		// Список тот же, что у ix-пути (v14_ok): 29 — CGBlend (фон данжа),
@@ -5697,6 +5765,10 @@ static void PartsEngine_PreLink(void)
 	if (fun && fun->nr_arguments == 6) {
 		static_library_replace(&lib_PartsEngine, "AddPartsConstructionProcess",
 				PE_AddPartsConstructionProcess_ix);
+		// Та же форма — у структуры, которую игра читает ОБРАТНО: значит и сырьё
+		// раскладочных процедур надо писать по v14-раскладке полей
+		// (см. act_save_construction_raw).
+		construction_raw_ix = true;
 	}
 	fun = get_fun(libno, "Update");
 	if (fun && fun->nr_arguments == 5) {

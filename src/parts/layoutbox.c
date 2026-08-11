@@ -167,6 +167,23 @@ static void parts_get_layout_size(struct parts *parts, int *w, int *h);
  * занимают потомки. Каждый потомок стоит на своей локальной позиции (внутри
  * такого узла их расставляет не раскладка, а сама игра), поэтому берём
  * объединение `позиция + размер`.
+ *
+ * ★Позиция потомка — это его ТОЧКА ПРИВЯЗКИ, а не левый-верхний угол: при
+ * `原点座標モード` ≠ 1 нарисованный прямоугольник сдвинут от неё на
+ * `origin_offset`. Без этого сдвига потомок, привязанный, скажем, за низ-центр,
+ * считался так, будто привязан за левый-верх, и содержимое «распухало» ровно на
+ * пол-ширины и высоту картинки.
+ *
+ * Живой случай — сакуры на карте Haha Ranman (`行動選択／残り日数`): четыре слота
+ * `ユーザコンポーネント` стоят у нижней кромки экрана (360·560·760·960, 720) с
+ * `原点座標モード = 8`, а внутри каждого активность `行動選択／桜` с деревом
+ * 127×138 в (20,5), тоже привязанным за низ-центр. По прежней формуле
+ * содержимое выходило 147×143 → сдвиг привязки (−73,−143), и дерево вставало
+ * в (244,444) — висело НАД полосой улицы, накрывая карточки локаций.
+ * С учётом привязки содержимое 84×5 → сдвиг (−42,−5), дерево в (275,582).
+ * ЗАМЕР: у оригинала картинка ствола лежит в (275,582) — 1280 пикселей из 2008
+ * видимых совпадают БИТ-В-БИТ (соседние позиции дают 300–500), и неповёрнутый
+ * лепесток независимо подтверждает позицию дерева (338,720).
  */
 void parts_get_content_size(struct parts *parts, int *w, int *h)
 {
@@ -175,8 +192,11 @@ void parts_get_content_size(struct parts *parts, int *w, int *h)
 	PARTS_FOREACH_CHILD(child, parts) {
 		int child_w, child_h;
 		parts_get_layout_size(child, &child_w, &child_h);
-		int x = child->local.pos.x + child->margin_left + child_w + child->margin_right;
-		int y = child->local.pos.y + child->margin_top + child_h + child->margin_bottom;
+		Point off = child->states[child->state].common.origin_offset;
+		int x = child->local.pos.x + off.x
+			+ child->margin_left + child_w + child->margin_right;
+		int y = child->local.pos.y + off.y
+			+ child->margin_top + child_h + child->margin_bottom;
 		if (x > max_x)
 			max_x = x;
 		if (y > max_y)

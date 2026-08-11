@@ -304,6 +304,10 @@ int PE_GetPartsConstructionProcessCount(int parts_no, int state);
 void PE_SaveConstructionRaw(int parts_no, int state, union vm_value *ints,
 		int nr_ints, union vm_value *floats, int nr_floats,
 		union vm_value *strings, int nr_strings, union vm_value *pos, int nr_pos);
+// То же, но из обычных массивов — для процедур, собранных ЗАГРУЗЧИКОМ РАСКЛАДОК
+// (там нет ни страниц VM, ни строк в куче).
+void PE_SaveConstructionRawValues(int parts_no, int state, const int *ints, int nr_ints,
+		const float *floats, int nr_floats, struct string **strings, int nr_strings);
 void PE_GetPartsConstructionProcess(int parts_no, int index, struct page **a_int,
 		struct page **a_float, struct page **a_string, struct page **a_pos, int state);
 float PE_GetHSliderBarScrollRate(int parts_no);
