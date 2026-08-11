@@ -1002,8 +1002,16 @@ static void parts_update_global_rotate_z(struct parts *parts, float parent_rot_z
 	}
 }
 
+// XSYS4_ROT_TRACE=1 — кто и на какой угол разворачивает части. Нужна не «для полноты»:
+// у наклонных фигур (метка времени на колесе знаков карты Haha Ranman) по кадру не
+// отличить «игра угол не отдала» от «угол пришёл, но не доехал до отрисовки».
 void parts_set_rotation_z(struct parts *parts, float rot)
 {
+	if (getenv("XSYS4_ROT_TRACE"))
+		NOTICE("ROT set z part %d: %.2f -> %.2f (родитель %d, глобальный %.2f)",
+		       parts->no, parts->local.rotation.z, rot,
+		       parts->parent ? parts->parent->no : -1,
+		       parts->parent ? parts->parent->global.rotation.z : 0.0f);
 	parts->local.rotation.z = rot;
 	parts_update_global_rotate_z(parts, parts->parent ? parts->parent->global.rotation.z : 0.0f);
 	parts_dirty(parts);
@@ -1544,12 +1552,14 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
 		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
+		       p->local.rotation.z, p->global.rotation.z,
+		       p->local.rotation.x, p->local.rotation.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
 		       p->global.alpha, parts_hidden_by_layer(p), p->message_window,
 		       p->linked_to, p->alpha_clipper_parts_no, p->is_alpha_clipper,

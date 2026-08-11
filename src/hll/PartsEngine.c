@@ -3454,6 +3454,42 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetPartsMagX(no, sx);
 	if (sy != 1.0f)
 		PE_SetPartsMagY(no, sy);
+	/*
+	 * 回転 (углы поворота x,y,z в градусах) — загрузчик его НЕ ЧИТАЛ, и всякая
+	 * наклонная фигура раскладки ложилась горизонтально.
+	 *
+	 * Живой случай — метка «сколько времени отнимет действие» на колесе времени
+	 * карты Haha Ranman (`行動選択／時刻`): двенадцать частей `ＣＧ：刻限：００…１１`
+	 * с одним и тем же CG `行動選択／刻／経過時間` (48x15) — это СТОРОНЫ
+	 * двенадцатиугольника вокруг центра колеса, и каждой задан свой угол
+	 * z = 0/30/60/…/330 при `原点座標モード = 1`. Без угла на экране выходила одна
+	 * горизонтальная полоса СПРАВА от колеса (замер: x 208..246, y 134..146)
+	 * вместо наклонной внутри сектора (у оригинала x 175..187, y 134..168).
+	 * Вызовов `SetComponentRotateZ` от игры при этом НЕТ ВООБЩЕ (проверено
+	 * `XSYS4_ROT_TRACE=1`, ноль строк за прогон) — угол приходит только раскладкой.
+	 *
+	 * Охват (замер: grep `回転` по всем .pactex каждой игры): Haharanman 19
+	 * ненулевых из 904 (`時刻` 11 и `残り日数／桜` 8), Dohna 31 из 2708,
+	 * Tsumamigui 3 (629) и Yorugakuru (4679) — по нулям, их правка не задевает.
+	 */
+	// Откат для замеров: XSYS4_NO_LAYOUT_ROT=1 — не применять угол из раскладки.
+	float rot_z = getenv("XSYS4_NO_LAYOUT_ROT") ? 0.0f : act_list_float(node, "回転", 2, 0.0f);
+	if (rot_z != 0.0f)
+		PE_SetPartsRotateZ(no, rot_z);
+	// Отрисовка умеет ТОЛЬКО z: повороты по x/y в `parts_render_cg` закомментированы,
+	// им нужна перспектива. Молча проглотить угол — ровно та ошибка, которую тут и
+	// починили, поэтому сообщаем. Ненулевой x/y во всех играх ровно один:
+	// `SceneBattleResult` Dohna с y=180.
+	float rot_x = act_list_float(node, "回転", 0, 0.0f);
+	float rot_y = act_list_float(node, "回転", 1, 0.0f);
+	if (rot_x != 0.0f || rot_y != 0.0f) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("act_build_part: part '%s' has 回転 x/y (%.1f,%.1f) — 3D rotation needs perspective, ignored",
+			        display_sjis0(node->name->text), rot_x, rot_y);
+		}
+	}
 	if (act_int(node, "クリック許可", 0))
 		PE_SetClickable(no, true);
 	/*
