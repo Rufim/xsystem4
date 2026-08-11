@@ -93,6 +93,34 @@ struct parts_text_line {
 	float width;
 };
 
+/*
+ * РУБИ (фуригана) — чтение мелким кеглем над прогоном базовых символов. В репликах
+ * Haha Ranman это ЕДИНСТВЕННАЯ живая разметка: во всех 34406 сообщениях .ain
+ * встречается только `${ruby text=<чтение>}<база>${/ruby}` (482 раза), а формы
+ * `${font …}`/`${time …}` лежат лишь ШАБЛОНАМИ в строковой секции — их собирает
+ * `CMessageTextModel@AddMessageText` из глобалов `_Ｍフォント`, `_Ｍサイズ`, …,
+ * которым игра ни разу не присваивает значение.
+ *
+ * Чтение хранится СВОИМИ текстурами глифов, а не строкой: у него свой кегль,
+ * интервал и обводка (узел `ルビ` раскладки), то есть в общий поток символов строки
+ * оно не встаёт. Индекс базы — СКВОЗНОЙ по рисуемым символам части, как у счётчика
+ * посимвольного проявления.
+ */
+struct parts_text_ruby {
+	int first_char;
+	int nr_chars;
+	int nr_glyphs;
+	struct parts_text_char *glyphs;
+	float width;
+};
+
+// То, что подаёт разборщик разметки: чтение над прогоном базовых символов.
+struct parts_ruby_spec {
+	int first_char;
+	int nr_chars;
+	struct string *text;
+};
+
 enum parts_type {
 	PARTS_UNINITIALIZED,
 	PARTS_CG,
@@ -152,6 +180,25 @@ struct parts_text {
 	// ставит флаг и читает обратно (`Parts_IsTextEnableTag`), поэтому хранить его
 	// обязательно. Сам разбор тегов движком пока не делается — см. PE_SetTextEnableTag.
 	bool enable_tag;
+	/*
+	 * ПОСИМВОЛЬНОЕ ПРОЯВЛЕНИЕ (`字速度` окна реплик, см. message_window.c).
+	 * Отрисовка обрезается по счётчику, а не перекладывается текст: у части и так
+	 * каждый символ — своя текстура, поэтому «показать первые N» ничего не
+	 * перерисовывает. Счёт идёт по РИСУЕМЫМ символам в порядке отрисовки
+	 * (переводы строки в него не входят — они не глифы).
+	 *
+	 * `reveal_active` отдельным флагом, а не «-1 = всё видно» в счётчике: часть
+	 * приходит из xcalloc нулями, и любое значение-в-счётчике по умолчанию
+	 * означало бы «спрятать текст» у ВСЕХ обычных текстовых частей.
+	 */
+	bool reveal_active;
+	int reveal_shown;         // сколько символов нарисовано целиком
+	float reveal_head_alpha;  // альфа символа под номером reveal_shown (0…1)
+	// Руби: свой стиль (узел `ルビ` раскладки) и прогоны чтения.
+	struct text_style ruby_ts;
+	int ruby_line_space;
+	struct parts_text_ruby *ruby;
+	int nr_ruby;
 };
 
 struct parts_animation {
@@ -852,6 +899,27 @@ struct parts_message_window {
 	int text_speed;                     // 字速度
 	bool text_wrapping;                 // 折り返し
 	bool text_fixed;                    // текст проявлен целиком
+	/*
+	 * ПОСИМВОЛЬНОЕ ПРОЯВЛЕНИЕ реплики. `char_ms` — время на каждый РИСУЕМЫЙ символ
+	 * (уже с множителем настройки メッセージ表示速度), нулевое значение = мгновенно
+	 * (`${time 0}`). `plain_text` нужен для сверки ПРЕФИКСА: игра пересобирает
+	 * строку окна с нуля (Clear -> мгновенный повтор старого -> Fix -> новый хвост),
+	 * и уже проявленные символы обязаны остаться проявленными.
+	 */
+	struct string *plain_text;
+	/*
+	 * Текст окна КАК ЕГО ПОДАЛА ИГРА, вместе с разметкой. Именно его обязан
+	 * возвращать GetMessageWindowText: игра накапливает страницу, дописывая новый
+	 * кусок к прочитанному обратно (`CMessageTextView@CreateDrawChar`), и если
+	 * отдавать очищенный текст, то с каждым куском теряются И обёртки `${time 0}`
+	 * уже показанного, И чтения `${ruby …}` — руби гасло на следующей же реплике
+	 * страницы (замер XSYS4_RUBY_TRACE: чтение строилось и тут же пропадало).
+	 */
+	struct string *raw_text;
+	int *char_ms;
+	int nr_reveal_chars;
+	int reveal_shown;
+	int reveal_timer;                   // ms, накопленные для символа reveal_shown
 	// Идентичность реплики из SetMessageWindowText(…, MsgNum, FuncName, Ver, Step) —
 	// ею игра метит сообщение для 既読判定 (флага «прочитано»).
 	int msg_num;
@@ -989,6 +1057,8 @@ void parts_vgauge_set_rate(struct parts *parts, struct parts_gauge *g, float rat
 // text.c
 void parts_text_free(struct parts_text *t);
 struct string *parts_text_line_get(struct parts_text_line *line);
+void parts_text_set_ruby(struct parts *parts, int state, const struct text_style *ts,
+		int line_space, const struct parts_ruby_spec *specs, int nr_specs);
 struct string *parts_text_get(struct parts_text *t);
 
 // render.c
@@ -1167,6 +1237,8 @@ void parts_get_content_size(struct parts *parts, int *w, int *h);
 struct parts_message_window *parts_message_window_alloc(void);
 void parts_message_window_free(struct parts_message_window *mw);
 void parts_message_window_relayout(struct parts *parts);
+// Тик посимвольного проявления реплики; true — картинка изменилась.
+bool parts_message_window_update(struct parts *parts, int passed_time);
 
 // debug.c
 struct sprite;

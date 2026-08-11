@@ -144,6 +144,89 @@ void parts_text_append(struct parts *parts, struct parts_text *t, struct string 
 	parts_set_dims(parts, &t->common, width, height);
 }
 
+static void parts_text_free_ruby(struct parts_text *t)
+{
+	for (int i = 0; i < t->nr_ruby; i++) {
+		for (int j = 0; j < t->ruby[i].nr_glyphs; j++)
+			gfx_delete_texture(&t->ruby[i].glyphs[j].t);
+		free(t->ruby[i].glyphs);
+	}
+	free(t->ruby);
+	t->ruby = NULL;
+	t->nr_ruby = 0;
+}
+
+/*
+ * Заменить прогоны РУБИ. Зовётся ПОСЛЕ SetText: чтение привязано к индексам
+ * рисуемых символов, а их создаёт parts_text_append.
+ *
+ * Глифы чтения рисуются здесь же, своим стилем: складывать их в общий поток строки
+ * нельзя — у руби свой кегль (в раскладке Haha Ranman 14 против 40 у реплики), свой
+ * интервал и своя обводка, и в ширину строки они не входят (замер по кадру
+ * оригинала: чтение `まみ` УЖЕ базового `塗` и висит над ним, соседние символы не
+ * раздвинуты).
+ */
+void parts_text_set_ruby(struct parts *parts, int state, const struct text_style *ts,
+		int line_space, const struct parts_ruby_spec *specs, int nr_specs)
+{
+	struct parts_text *t = parts_get_text(parts, state);
+	parts_text_free_ruby(t);
+	t->ruby_ts = *ts;
+	t->ruby_line_space = line_space;
+	if (nr_specs <= 0)
+		return;
+	// Без кегля глиф чтения вышел бы текстурой 0x0 — значит узел `ルビ` раскладки не
+	// прочитан, и молчать нельзя: чтения просто исчезли бы с экрана.
+	if (t->ruby_ts.size <= 0.0f) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("руби: у части %d нет кегля чтения (узел `ルビ` не задан) — "
+				"%d чтений не нарисовано", parts->no, nr_specs);
+		}
+		return;
+	}
+
+	t->ruby = xcalloc(nr_specs, sizeof(struct parts_text_ruby));
+	t->nr_ruby = nr_specs;
+	for (int i = 0; i < nr_specs; i++) {
+		struct parts_text_ruby *r = &t->ruby[i];
+		r->first_char = specs[i].first_char;
+		r->nr_chars = specs[i].nr_chars;
+		const char *p = specs[i].text ? specs[i].text->text : "";
+		int cap = 0;
+		while (*p) {
+			if (r->nr_glyphs == cap) {
+				int ncap = cap ? cap * 2 : 8;
+				r->glyphs = xrealloc_array(r->glyphs, cap, ncap,
+						sizeof(struct parts_text_char));
+				cap = ncap;
+			}
+			struct parts_text_char *ch = &r->glyphs[r->nr_glyphs++];
+			int len = extract_sjis_char(p, ch->ch);
+			int w = ceilf(text_style_width(&t->ruby_ts, ch->ch));
+			int h = text_style_height(&t->ruby_ts);
+			gfx_init_texture_rgba(&ch->t, w, h, (SDL_Color){0,0,0,0});
+			ch->advance = gfx_render_textf(&ch->t, 0, 0, ch->ch, &t->ruby_ts, false);
+			r->width += ch->advance;
+			p += len;
+		}
+		// Интервал идёт МЕЖДУ символами — после последнего его быть не должно
+		// (тот же счёт, что у ширины строки в parts_text_append).
+		if (r->nr_glyphs > 0)
+			r->width -= t->ruby_ts.font_spacing;
+		// XSYS4_RUBY_TRACE=1 — что вышло из чтения: глифы, их текстуры и ширина.
+		// Отделяет «тег не разобран» от «глиф пустой» и от «нарисован не там».
+		if (getenv("XSYS4_RUBY_TRACE"))
+			NOTICE("RUBY part=%d база=[%d,+%d] глифов=%d ширина=%.1f face=%u кегль=%.1f "
+			       "текстура=%dx%d", parts->no, r->first_char, r->nr_chars,
+			       r->nr_glyphs, r->width, t->ruby_ts.face, t->ruby_ts.size,
+			       r->nr_glyphs ? r->glyphs[0].t.w : -1,
+			       r->nr_glyphs ? r->glyphs[0].t.h : -1);
+	}
+	parts_dirty(parts);
+}
+
 void parts_text_free(struct parts_text *t)
 {
 	gfx_delete_texture(&t->common.texture);
@@ -155,6 +238,7 @@ void parts_text_free(struct parts_text *t)
 		free(line->chars);
 	}
 	free(t->lines);
+	parts_text_free_ruby(t);
 }
 
 static void parts_text_rerender(struct parts *parts, struct parts_text *t)
@@ -162,9 +246,18 @@ static void parts_text_rerender(struct parts *parts, struct parts_text *t)
 	if (!t->nr_lines)
 		return;
 	struct string *text = parts_text_get(t);
+	// Руби ПЕРЕЖИВАЕТ пересборку: она привязана к индексам символов, а те от смены
+	// кегля/цвета базового текста не меняются. Иначе смена стиля (её игра делает
+	// перед каждой репликой — 既読-перекраска) молча стирала бы чтения.
+	struct parts_text_ruby *ruby = t->ruby;
+	int nr_ruby = t->nr_ruby;
+	t->ruby = NULL;
+	t->nr_ruby = 0;
 	parts_text_free(t);
 	t->lines = NULL;
 	t->nr_lines = 0;
+	t->ruby = ruby;
+	t->nr_ruby = nr_ruby;
 	parts_text_append(parts, t, text);
 	free_string(text);
 	parts_dirty(parts);
@@ -211,7 +304,19 @@ bool PE_SetText(int parts_no, struct string *text, int state)
 
 	struct parts *parts = parts_get(parts_no);
 	parts_text_clear(parts, state);
-	parts_text_append(parts, parts_get_text(parts, state), text);
+	struct parts_text *t = parts_get_text(parts, state);
+	// Разметка в тексте ЧАСТИ (не окна реплик): разбора нет, теги нарисуются
+	// буквально. Жалуемся по факту прихода данных — см. PE_SetTextEnableTag.
+	if (t->enable_tag && text && text->size
+			&& memmem(text->text, text->size, "${", 2)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("Parts_SetTextEnableTag: в часть %d легла разметка, а разбора "
+				"тегов в тексте части нет — она отрисуется буквально", parts_no);
+		}
+	}
+	parts_text_append(parts, t, text);
 	return true;
 }
 
@@ -245,10 +350,13 @@ bool PE_AddPartsText(int parts_no, struct string *text, int state)
  * («Unimplemented HLL function: PartsEngine.Parts_SetTextEnableTag»), и запустить
  * её можно было только костылём `XSYS4_LENIENT_HLL=1`.
  *
- * ★Сам разбор тегов НЕ реализован: движок кладёт строку как есть. Если игра
- * включит теги и подаст разметку, она отрисуется буквально — тогда и надо будет
- * реализовать разбор, но сперва увидеть такой текст живьём (одноразовый WARNING
- * ниже это покажет).
+ * ★Сам разбор тегов НЕ реализован: движок кладёт строку как есть. Предупреждать по
+ * ФЛАГУ бессмысленно и вводит в заблуждение — флаг стоит, а разметка не приходит:
+ * в Haha Ranman `タグ処理有効 = 1` всего у ЧЕТЫРЁХ узлов раскладок (`通知枠`,
+ * `確認枠`, `サーバ接続待機`, `アンケート`), а во всей строковой секции .ain нет ни
+ * одной строки с `${…}`, кроме ШАБЛОНОВ самого SDK (их собирает окно реплик, а не
+ * текстовая часть). Поэтому жалуемся на РЕАЛЬНЫЕ ДАННЫЕ — когда в часть с
+ * разрешёнными тегами действительно легла разметка (см. PE_SetText).
  */
 void PE_SetTextEnableTag(int parts_no, bool enable, int state)
 {
@@ -258,14 +366,6 @@ void PE_SetTextEnableTag(int parts_no, bool enable, int state)
 	struct parts *parts = parts_get(parts_no);
 	struct parts_text *text = parts_get_text(parts, state);
 	text->enable_tag = enable;
-	if (enable) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			WARNING("Parts_SetTextEnableTag: разбор тегов в тексте части не "
-				"реализован — разметка отрисуется как обычный текст");
-		}
-	}
 }
 
 bool PE_IsTextEnableTag(int parts_no, int state)

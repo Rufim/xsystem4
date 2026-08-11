@@ -77,6 +77,16 @@ struct parts_message_window *parts_message_window_alloc(void)
 	mw->mark_parts_no = -1;
 	mw->text_fixed = true;
 	mw->msg_num = -1;
+	// Стиль руби: масштабы ОБЯЗАНЫ быть единичными. От xcalloc они нули, а на нулевом
+	// scale_x у text_style_width выходит нулевая ширина — глиф чтения стал бы пустой
+	// текстурой 0x0. Остальное перезапишет SetMessageWindowRubyFont из узла `ルビ`.
+	mw->ruby_ts.face = FONT_GOTHIC;
+	mw->ruby_ts.size = 10.0f;
+	mw->ruby_ts.weight = FW_NORMAL;
+	mw->ruby_ts.scale_x = 1.0f;
+	mw->ruby_ts.space_scale_x = 1.0f;
+	mw->ruby_ts.color = (SDL_Color) { 255, 255, 255, 255 };
+	mw->ruby_ts.edge_color = (SDL_Color) { 0, 0, 0, 255 };
 	return mw;
 }
 
@@ -94,6 +104,11 @@ void parts_message_window_free(struct parts_message_window *mw)
 		free_string(mw->mark_cg_name);
 	if (mw->mark_flat_name)
 		free_string(mw->mark_flat_name);
+	if (mw->plain_text)
+		free_string(mw->plain_text);
+	if (mw->raw_text)
+		free_string(mw->raw_text);
+	free(mw->char_ms);
 	free(mw);
 }
 
@@ -131,28 +146,177 @@ static void mw_apply_background(int parts_no, struct parts_message_window *mw)
 
 // ---------------------------------------------------------------------- текст
 
-/*
- * РАЗМЕТКА В ТЕКСТЕ РЕПЛИКИ. Игра передаёт в SetMessageWindowText строку с
- * тегами `${…}`; полный их набор снят со строковой секции .ain (16 шаблонов,
- * тул `alice ain dump -s`):
- *   ${font type=%d|size=%d|r=%d|g=%d|b=%d|bold=%f|edge=%f|er=%d|eg=%d|eb=%d
- *          |tracking=%d|leading=%d} … ${/font}
- *   ${time %d} … ${/time}        (${time 0} — мгновенный вывод, режим скипа)
- * Других форм в .ain нет.
- *
- * Сейчас теги ВЫРЕЗАЮТСЯ, а не исполняются: у части текста один стиль на всю
- * строку, а `${font …}` меняет его посередине — для этого нужны стилевые
- * прогоны внутри parts_text. Оставлять теги в тексте нельзя (они нарисовались бы
- * буквально), поэтому вырезаем и один раз предупреждаем.
- */
-static struct string *mw_strip_markup(struct string *src)
+// Номер игрового глобала по UTF-8 имени (имена в .ain — SJIS). Через него движок
+// читает НАСТРОЙКИ, которых игра ему не передаёт (см. mw_speed_rate и
+// mw_read_color_mode): у обеих нет ни одного HLL-канала, это конвенция SDK.
+static int mw_global_by_name(const char *u8)
 {
-	struct string *dst = string_ref(&EMPTY_STRING);
+	char *sjis = utf2sjis(u8, strlen(u8));
+	int no = ain_get_global(ain, sjis);
+	free(sjis);
+	return no;
+}
+
+/*
+ * НАСТРОЙКА, КОТОРУЮ ИГРА ДВИЖКУ НЕ ПЕРЕДАЁТ. Такие есть, и их приходится читать
+ * из игровой памяти по имени — это конвенция SDK, а не обход: ни у скорости
+ * текста, ни у 既読-перекраски нет ни одного HLL-канала (проверено счётом сайтов
+ * CALLHLL по .ain обеих игр).
+ *
+ * Лежат они ПО-РАЗНОМУ, и оба варианта живые:
+ *   Haha Ranman — отдельными глобалами `g_fMessageSpeedRate`, `g_既読メッセージ色変更`;
+ *   Dohna       — ПОЛЯМИ структуры конфига `g_AFConfig` (`CASConfigData`):
+ *                 `MessageSpeedRate`, `既読メッセージ色変更`.
+ * Поэтому ищем оба места по одному разу и кэшируем результат в самом описателе.
+ */
+struct mw_setting {
+	const char *global_name;  // имя отдельного глобала (UTF-8)
+	const char *field_name;   // имя поля g_AFConfig (UTF-8)
+	int varno;                // -2 — ещё не искали
+	int cfg_varno;
+	int cfg_slot;
+};
+
+static bool mw_setting_get(struct mw_setting *s, union vm_value *out)
+{
+	if (s->varno == -2)
+		s->varno = mw_global_by_name(s->global_name);
+	if (s->varno >= 0) {
+		*out = global_get(s->varno);
+		return true;
+	}
+
+	if (s->cfg_varno == -2) {
+		s->cfg_varno = mw_global_by_name("g_AFConfig");
+		if (s->cfg_varno >= 0) {
+			struct page *page = heap_get_page(global_get(s->cfg_varno).i);
+			if (page && page->type == STRUCT_PAGE && page->index >= 0
+					&& page->index < ain->nr_structures) {
+				struct ain_struct *st = &ain->structures[page->index];
+				char *sjis = utf2sjis(s->field_name, strlen(s->field_name));
+				for (int i = 0; i < st->nr_members; i++) {
+					if (!strcmp(st->members[i].name, sjis)) {
+						s->cfg_slot = i;
+						break;
+					}
+				}
+				free(sjis);
+			}
+		}
+	}
+	if (s->cfg_varno < 0 || s->cfg_slot < 0)
+		return false;
+	// Страницу берём каждый раз заново: куча переезжает.
+	struct page *page = heap_get_page(global_get(s->cfg_varno).i);
+	if (!page || s->cfg_slot >= page->nr_vars)
+		return false;
+	*out = page->values[s->cfg_slot];
+	return true;
+}
+
+struct mw_markup {
+	struct string *plain;  // текст без тегов
+	int *char_ms;          // время на РИСУЕМЫЙ символ, ms (0 — мгновенно)
+	int nr_chars;          // сколько их
+	struct parts_ruby_spec *ruby;  // чтения над прогонами базовых символов
+	int nr_ruby;
+};
+
+static void mw_markup_free(struct mw_markup *mk)
+{
+	for (int i = 0; i < mk->nr_ruby; i++)
+		free_string(mk->ruby[i].text);
+	free(mk->ruby);
+	free(mk->char_ms);
+	if (mk->plain)
+		free_string(mk->plain);
+}
+
+/*
+ * Множитель настройки `メッセージ表示速度` (первый ползунок экрана CONFIG).
+ *
+ * Игра НЕ передаёт его движку: `SetMessageWindowTextSpeed` вызывается ровно из
+ * одного места — обёртки-свойства `CMessageWindowParts@TextSpeed::set`, а её саму
+ * не зовёт никто (единственное упоминание номера 12302 — регистрация свойства в
+ * конструкторе класса). То есть `字速度` приходит ТОЛЬКО из раскладки (23), а
+ * ползунок живёт в игровой памяти (см. mw_setting_get).
+ *
+ * Кривая — ровно из `message::detail::GetMessageSpeedRate` (FUNC 1 и там и там),
+ * потому что ею же пользуется живое превью на экране CONFIG
+ * (`config::detail::GetSampleMessageTextByElapsedTime`, и у Haha Ranman, и у
+ * Dohna — с тем же литералом 23): превью обязано показывать ту скорость, с
+ * которой пойдёт реплика, значит формула у движка та же.
+ * rate 0 -> ×2 (медленно), 0.5 -> ×1, ≥2/3 -> ≤0, то есть МГНОВЕННО.
+ */
+static float mw_speed_rate(void)
+{
+	static struct mw_setting setting = {
+		.global_name = "g_fMessageSpeedRate",
+		.field_name = "MessageSpeedRate",
+		.varno = -2, .cfg_varno = -2, .cfg_slot = -1,
+	};
+	// XSYS4_MSGSPEED_RATE=<0…1> — подменить положение ползунка (A/B без CONFIG).
+	const char *e = getenv("XSYS4_MSGSPEED_RATE");
+	float rate = 0.5f;
+	if (e) {
+		rate = strtof(e, NULL);
+	} else {
+		union vm_value v;
+		if (mw_setting_get(&setting, &v))
+			rate = v.f;
+	}
+	if (rate < 0.0f)
+		rate = 0.0f;
+	if (rate > 1.0f)
+		rate = 1.0f;
+	if (0.5f >= rate)
+		return (1.0f - rate) * 2.0f;
+	return 1.0f + (0.5f - rate) * 6.0f;
+}
+
+/*
+ * РАЗМЕТКА В ТЕКСТЕ РЕПЛИКИ. Три формы, и ЖИВЫЕ из них — не те, что казались:
+ *
+ *   ${ruby text=<чтение>}<база>${/ruby}   482 раза в САМИХ СООБЩЕНИЯХ .ain
+ *   ${time %d} … ${/time}                 только ШАБЛОН в строковой секции
+ *   ${font type=…|size=…|r=…|…} … ${/font} только ШАБЛОНЫ в строковой секции
+ *
+ * Счёт по `alice ain dump -m` (34406 сообщений): руби — единственная разметка,
+ * которая приходит в реплике из данных. `${font …}` и `${time %d}` собирает
+ * `CMessageTextModel@AddMessageText` из глобалов `_Ｍフォント`, `_Ｍサイズ`, `_ＭＲ`,
+ * … , `_Ｍ速度`, и каждый гейтится `!= -1` — а присваивания этим глобалам в
+ * байткоде нет ни одного, то есть в обычной игре тегов шрифта не появляется вовсе.
+ * (`${font …}` всё же встречается — в ОБРАЗЦОВОМ тексте раскладок, который игра
+ * тут же перезаписывает своим.)
+ *
+ * `${time N}` — время на ОДИН символ внутри прогона, в тех же единицах, что и
+ * `字速度`; `${time 0}` значит «мгновенно». Эту форму игра собирает уже без данных:
+ * `CMessageTextView@CreateDrawCharList` заворачивает в `${time 0}…${/time}` всё,
+ * что на странице уже показано, а новый хвост подаёт без обёртки — он и должен
+ * набираться посимвольно.
+ *
+ * `${font …}` ВЫРЕЗАЕТСЯ (а не исполняется): у части текста один стиль на всю
+ * строку, а тег меняет его посередине. Живого случая нет, поэтому стилевые прогоны
+ * не написаны; одноразовый WARNING покажет, если такой текст всё-таки придёт.
+ */
+static struct mw_markup mw_parse_markup(struct string *src, int text_speed)
+{
+	struct mw_markup mk = { .plain = string_ref(&EMPTY_STRING) };
 	const char *p = src->text;
 	const char *end = src->text + src->size;
 	const char *run = p;   // начало неразмеченного куска
-	bool seen_tag = false;
+	bool seen_font_tag = false;
+	float rate = mw_speed_rate();
 
+	// Стек `${time}`: теги вкладываются, и по `${/time}` надо вернуться к
+	// предыдущему времени, а не к дефолту.
+	int speed_stack[16];
+	int speed_sp = 0;
+	int cur_speed = text_speed;
+
+	int cap = 0;
+	int ruby_cap = 0;
+	int ruby_open = -1;   // индекс незакрытого прогона руби
 	// ★Копируем КУСКАМИ, а не побайтно: `string_push_back` принимает СИМВОЛ, и на
 	// ведущем байте двухбайтового SJIS (SJIS_2BYTE) дописывает второй байт из
 	// старших разрядов — то есть НОЛЬ. Побайтная сборка превращала каждую
@@ -163,26 +327,156 @@ static struct string *mw_strip_markup(struct string *src)
 			const char *close = memchr(p, '}', end - p);
 			if (close) {
 				if (p > run)
-					string_append_cstr(&dst, run, p - run);
-				seen_tag = true;
+					string_append_cstr(&mk.plain, run, p - run);
+				const char *tag = p + 2;
+				size_t len = close - tag;
+				if (len >= 4 && !strncmp(tag, "time", 4)) {
+					if (speed_sp < (int)(sizeof(speed_stack) / sizeof(*speed_stack)))
+						speed_stack[speed_sp++] = cur_speed;
+					cur_speed = (int)strtol(tag + 4, NULL, 10);
+				} else if (len >= 5 && !strncmp(tag, "/time", 5)) {
+					cur_speed = speed_sp > 0 ? speed_stack[--speed_sp] : text_speed;
+				} else if (len >= 10 && !strncmp(tag, "ruby text=", 10)) {
+					// Открылось чтение: база пойдёт следующими символами, её длину
+					// узнаем на `${/ruby}`. Хвостовые пробелы в чтении — часть тега
+					// (`${ruby text=いちる }`), их отрезаем.
+					const char *rt = tag + 10;
+					size_t rl = close - rt;
+					while (rl > 0 && (rt[rl - 1] == ' ' || rt[rl - 1] == '\t'))
+						rl--;
+					if (ruby_cap == mk.nr_ruby) {
+						int ncap = ruby_cap ? ruby_cap * 2 : 8;
+						mk.ruby = xrealloc_array(mk.ruby, ruby_cap, ncap,
+								sizeof(struct parts_ruby_spec));
+						ruby_cap = ncap;
+					}
+					ruby_open = mk.nr_ruby;
+					mk.ruby[mk.nr_ruby].first_char = mk.nr_chars;
+					mk.ruby[mk.nr_ruby].nr_chars = 0;
+					mk.ruby[mk.nr_ruby].text = make_string(rt, rl);
+					mk.nr_ruby++;
+				} else if (len >= 5 && !strncmp(tag, "/ruby", 5)) {
+					if (ruby_open >= 0) {
+						mk.ruby[ruby_open].nr_chars =
+							mk.nr_chars - mk.ruby[ruby_open].first_char;
+						ruby_open = -1;
+					}
+				} else {
+					seen_font_tag = true;
+				}
 				p = run = close + 1;
 				continue;
 			}
 		}
-		p++;
+		// Шаг по СИМВОЛУ: время назначается символу, а не байту.
+		int step = SJIS_2BYTE(*p) && p + 1 < end ? 2 : 1;
+		if (*p != '\n') {
+			if (mk.nr_chars == cap) {
+				int ncap = cap ? cap * 2 : 64;
+				mk.char_ms = xrealloc_array(mk.char_ms, cap, ncap, sizeof(int));
+				cap = ncap;
+			}
+			int ms = (int)(cur_speed * rate);
+			mk.char_ms[mk.nr_chars++] = ms > 0 ? ms : 0;
+		}
+		p += step;
 	}
 	if (p > run)
-		string_append_cstr(&dst, run, p - run);
+		string_append_cstr(&mk.plain, run, p - run);
+	// Незакрытый `${ruby}` тянется до конца строки.
+	if (ruby_open >= 0)
+		mk.ruby[ruby_open].nr_chars = mk.nr_chars - mk.ruby[ruby_open].first_char;
+	// Пустая база чтению не нужна — рисовать его было бы не над чем.
+	int keep = 0;
+	for (int i = 0; i < mk.nr_ruby; i++) {
+		if (mk.ruby[i].nr_chars > 0 && mk.ruby[i].text->size)
+			mk.ruby[keep++] = mk.ruby[i];
+		else
+			free_string(mk.ruby[i].text);
+	}
+	mk.nr_ruby = keep;
 
-	if (seen_tag) {
+	if (seen_font_tag) {
 		static bool warned = false;
 		if (!warned) {
 			warned = true;
-			WARNING("メッセージウィンドウ: разметка ${…} в реплике вырезана, "
+			WARNING("メッセージウィンドウ: разметка ${font …} в реплике вырезана, "
 			        "а не исполнена (стилевые прогоны внутри строки не реализованы)");
 		}
 	}
-	return dst;
+	return mk;
+}
+
+// Сколько РИСУЕМЫХ символов совпадает в начале двух plain-строк. Нужно, чтобы
+// пересборка строки окна не сбрасывала уже проявленное (см. plain_text в mw).
+static int mw_common_prefix_chars(struct string *a, struct string *b)
+{
+	if (!a || !b)
+		return 0;
+	const char *pa = a->text, *ea = a->text + a->size;
+	const char *pb = b->text, *eb = b->text + b->size;
+	int n = 0;
+	while (pa < ea && pb < eb) {
+		int sa = SJIS_2BYTE(*pa) && pa + 1 < ea ? 2 : 1;
+		int sb = SJIS_2BYTE(*pb) && pb + 1 < eb ? 2 : 1;
+		if (sa != sb || memcmp(pa, pb, sa))
+			break;
+		if (*pa != '\n')
+			n++;
+		pa += sa;
+		pb += sb;
+	}
+	return n;
+}
+
+// Передать состояние проявления служебной части текста.
+static void mw_apply_reveal(struct parts_message_window *mw)
+{
+	if (mw->text_parts_no < 0)
+		return;
+	struct parts *tp = parts_try_get(mw->text_parts_no);
+	if (!tp)
+		return;
+	struct parts_text *t = parts_get_text(tp, PARTS_STATE_DEFAULT);
+	bool all = mw->reveal_shown >= mw->nr_reveal_chars;
+	t->reveal_active = !all;
+	t->reveal_shown = mw->reveal_shown;
+	int ms = all ? 0 : mw->char_ms[mw->reveal_shown];
+	/*
+	 * Проявляющийся символ идёт НЕ рывком, а по альфе за своё время: игра называет
+	 * форсирование конца `CMessageTextView@FixAllDrawCharListAlphaRate`, то есть у
+	 * каждого символа списка есть «alpha rate», а не просто флаг «нарисован».
+	 * Ручка XSYS4_MW_NOFADE=1 возвращает рывок — для A/B по кадрам оригинала.
+	 */
+	if (ms > 0 && !getenv("XSYS4_MW_NOFADE")) {
+		float a = (float)mw->reveal_timer / ms;
+		t->reveal_head_alpha = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+	} else {
+		t->reveal_head_alpha = 0.0f;
+	}
+}
+
+bool parts_message_window_update(struct parts *parts, int passed_time)
+{
+	struct parts_message_window *mw = parts->mw;
+	if (!mw || mw->text_fixed)
+		return false;
+	if (passed_time < 0)
+		passed_time = 0;
+	mw->reveal_timer += passed_time;
+	while (mw->reveal_shown < mw->nr_reveal_chars) {
+		int ms = mw->char_ms[mw->reveal_shown];
+		if (ms > 0 && mw->reveal_timer < ms)
+			break;
+		mw->reveal_timer -= ms;
+		mw->reveal_shown++;
+	}
+	if (mw->reveal_shown >= mw->nr_reveal_chars) {
+		mw->text_fixed = true;
+		mw->reveal_timer = 0;
+	}
+	mw_apply_reveal(mw);
+	return true;
 }
 
 static int mw_text_parts(struct parts_message_window *mw)
@@ -342,6 +636,9 @@ void PE_SetKeyWaitFlatName(int parts_no, struct string *name)
 	if (mw->mark_flat_name)
 		free_string(mw->mark_flat_name);
 	mw->mark_flat_name = string_ref(name);
+	if (getenv("XSYS4_MW_TRACE"))
+		NOTICE("MWMARK окно=%d метка=%d flat='%s'", parts_no, mw->mark_parts_no,
+		       name ? display_sjis0(name->text) : "(nil)");
 	if (name && name->size) {
 		PE_SetPartsFlat(mw_mark_parts(parts_no, mw), name, 1);
 		parts_message_window_relayout(parts_get(parts_no));
@@ -391,6 +688,9 @@ void PE_SetKeyWaitShow(int parts_no, bool show)
 	if (!mw)
 		return;
 	mw->mark_show = show;
+	if (getenv("XSYS4_MW_TRACE"))
+		NOTICE("MWMARKSHOW окно=%d метка=%d show=%d", parts_no,
+		       mw->mark_parts_no, (int)show);
 	PE_SetShow(mw_mark_parts(parts_no, mw), show);
 }
 
@@ -528,64 +828,26 @@ bool PE_StepMessageWindowFlatFinalFrame(int parts_no)
 
 // ----------------------------------------------------------------- HLL: текст
 
-static int mw_global_by_name(const char *u8)
-{
-	char *sjis = utf2sjis(u8, strlen(u8));
-	int no = ain_get_global(ain, sjis);
-	free(sjis);
-	return no;
-}
-
 /*
  * Включена ли 既読-перекраска.
  *
- * Настройка живёт ПО-РАЗНОМУ. У части игр это отдельный глобал
- * `g_既読メッセージ色変更`, а у Dohna — ПОЛЕ структуры конфига:
- * `g_AFConfig` типа `CASConfigData`, поле `既読メッセージ色変更` (в байткоде
- * видно только `.STRUCTASSIGN CASConfigData 既読メッセージ色変更 1` в
- * конструкторе дефолтов, отдельного глобала с таким именем нет вовсе).
- * Пока искали лишь глобал, режим был выключен ВСЕГДА: замер `XSYS4_MW_TRACE`
- * на прологе давал `read=1 mode=0` — флаг «прочитано» стоял, а перекраска не
- * включалась, и уже читанные реплики шли базовым белым.
- *
- * Оба места ищем по одному разу: имя глобала и слот поля кэшируются.
+ * Настройка живёт ПО-РАЗНОМУ (см. mw_setting_get): у Haha Ranman это отдельный
+ * глобал `g_既読メッセージ色変更`, у Dohna — ПОЛЕ `g_AFConfig` (в байткоде видно
+ * только `.STRUCTASSIGN CASConfigData 既読メッセージ色変更 1` в конструкторе
+ * дефолтов, отдельного глобала с таким именем нет вовсе). Пока искали лишь
+ * глобал, режим был выключен ВСЕГДА: замер `XSYS4_MW_TRACE` на прологе давал
+ * `read=1 mode=0` — флаг «прочитано» стоял, а перекраска не включалась, и уже
+ * читанные реплики шли базовым белым.
  */
 static bool mw_read_color_mode(void)
 {
-	static int varno = -2;      // отдельный глобал, если он есть
-	static int cfg_varno = -2;  // g_AFConfig
-	static int cfg_slot = -1;   // слот поля внутри него
-
-	if (varno == -2)
-		varno = mw_global_by_name("g_既読メッセージ色変更");
-	if (varno >= 0)
-		return global_get(varno).i != 0;
-
-	if (cfg_varno == -2) {
-		cfg_varno = mw_global_by_name("g_AFConfig");
-		if (cfg_varno >= 0) {
-			struct page *page = heap_get_page(global_get(cfg_varno).i);
-			if (page && page->type == STRUCT_PAGE && page->index >= 0
-					&& page->index < ain->nr_structures) {
-				struct ain_struct *s = &ain->structures[page->index];
-				const char *u8 = "既読メッセージ色変更";
-				char *sjis = utf2sjis(u8, strlen(u8));
-				for (int i = 0; i < s->nr_members; i++) {
-					if (!strcmp(s->members[i].name, sjis)) {
-						cfg_slot = i;
-						break;
-					}
-				}
-				free(sjis);
-			}
-		}
-	}
-	if (cfg_varno < 0 || cfg_slot < 0)
-		return false;
-	struct page *page = heap_get_page(global_get(cfg_varno).i);
-	if (!page || cfg_slot >= page->nr_vars)
-		return false;
-	return page->values[cfg_slot].i != 0;
+	static struct mw_setting setting = {
+		.global_name = "g_既読メッセージ色変更",
+		.field_name = "既読メッセージ色変更",
+		.varno = -2, .cfg_varno = -2, .cfg_slot = -1,
+	};
+	union vm_value v;
+	return mw_setting_get(&setting, &v) && v.i != 0;
 }
 
 /*
@@ -649,43 +911,103 @@ void PE_SetMessageWindowText(int parts_no, struct string *text, int msg_num,
 		       ver, step, text ? display_sjis0(text->text) : "(nil)");
 
 	mw_apply_read_color(mw);
-	struct string *plain = mw_strip_markup(text);
-	PE_SetText(mw_text_parts(mw), plain, 1);
-	free_string(plain);
+	struct mw_markup mk = mw_parse_markup(text, mw->text_speed);
 
 	/*
-	 * `字速度` (скорость посимвольного проявления) пока не исполняется: текст
-	 * появляется целиком. Это НЕ тихий дефолт — режим мгновенного вывода у игры
-	 * законный (тег `${time 0}` и скип), но раскладки задают 23, поэтому
-	 * предупреждаем, что видимое поведение отличается от оригинального.
+	 * ПРОЯВЛЕННОЕ ОСТАЁТСЯ ПРОЯВЛЕННЫМ. Игра не досылает хвост реплики, а
+	 * ПЕРЕСОБИРАЕТ строку окна целиком (`CMessageTextView@CreateDrawCharList`):
+	 * Clear() -> SetMessageWindowText(""), затем повтор уже показанного (в обёртке
+	 * `${time 0}`) с накоплением через GetMessageWindowText, затем Fix, затем
+	 * анимируемый хвост. Обёртка `${time 0}` в повторе доживает только до первого
+	 * чтения обратно — GetMessageWindowText отдаёт ЧИСТЫЙ текст, — поэтому одного
+	 * разбора тегов не хватает: длину общего префикса надо мерить самим.
 	 */
-	if (mw->text_speed > 0) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			WARNING("メッセージウィンドウ: 字速度 %d не исполняется, реплика "
-			        "показывается целиком", mw->text_speed);
-		}
+	int prefix = mw_common_prefix_chars(mw->plain_text, mk.plain);
+	if (mw->reveal_shown > prefix)
+		mw->reveal_shown = prefix;
+	if (mw->reveal_shown > mk.nr_chars)
+		mw->reveal_shown = mk.nr_chars;
+	free(mw->char_ms);
+	mw->char_ms = mk.char_ms;
+	mw->nr_reveal_chars = mk.nr_chars;
+	if (mw->plain_text)
+		free_string(mw->plain_text);
+	mw->plain_text = string_ref(mk.plain);
+	if (mw->raw_text)
+		free_string(mw->raw_text);
+	mw->raw_text = text ? string_ref(text) : NULL;
+	mw->reveal_timer = 0;
+	// Мгновенные символы (`${time 0}` и выкрученный вправо ползунок скорости)
+	// проявляются в том же кадре, а не «в первый тик»: тика может и не быть —
+	// DrawAll форсирует Fix сразу после пересборки списка.
+	while (mw->reveal_shown < mw->nr_reveal_chars && mw->char_ms[mw->reveal_shown] <= 0)
+		mw->reveal_shown++;
+	mw->text_fixed = mw->reveal_shown >= mw->nr_reveal_chars;
+
+	int tno = mw_text_parts(mw);
+	PE_SetText(tno, mk.plain, 1);
+	/*
+	 * Руби кладём ПОСЛЕ текста: чтение привязано к индексам рисуемых символов, а их
+	 * создаёт SetText. Стиль — узел `ルビ` раскладки; `字間隔` руби живёт в
+	 * `font_spacing` его собственного стиля, как у обычного текста.
+	 */
+	struct parts *tp = tno >= 0 ? parts_try_get(tno) : NULL;
+	if (tp) {
+		struct text_style rts = mw->ruby_ts;
+		rts.font_spacing = mw->ruby_char_space;
+		parts_text_set_ruby(tp, PARTS_STATE_DEFAULT, &rts, mw->ruby_line_space,
+				mk.ruby, mk.nr_ruby);
 	}
-	mw->text_fixed = true;
+	mw_apply_reveal(mw);
+	if (getenv("XSYS4_MW_TRACE"))
+		NOTICE("MWREVEAL part=%d символов=%d проявлено=%d ms/симв=%d руби=%d fixed=%d",
+		       parts_no, mw->nr_reveal_chars, mw->reveal_shown,
+		       mw->nr_reveal_chars ? mw->char_ms[0] : 0, mk.nr_ruby,
+		       (int)mw->text_fixed);
+	mk.char_ms = NULL;   // ушёл в mw
+	mw_markup_free(&mk);
 }
 
+/*
+ * ★Отдаём текст С РАЗМЕТКОЙ, а не то, что видно на экране. Единственный игровой
+ * потребитель — накопление страницы в `CMessageTextView@CreateDrawChar`:
+ *     text = GetMessageWindowText(окно);  text += новый кусок;  SetMessageWindowText(…)
+ * Возвращая очищенный текст, движок стирал разметку уже показанной части: обёртки
+ * `${time 0}` (и тогда страница перенабиралась бы заново) и чтения `${ruby …}`
+ * (руби пропадало на следующей реплике той же страницы).
+ */
 struct string *PE_GetMessageWindowText(int parts_no)
 {
 	struct parts_message_window *mw = mw_get(parts_no);
-	if (!mw || mw->text_parts_no < 0)
+	if (!mw || !mw->raw_text)
 		return string_ref(&EMPTY_STRING);
-	return PE_GetTextPartsText(mw->text_parts_no, 1);
+	return string_ref(mw->raw_text);
 }
 
+/*
+ * «Досюда показано целиком» — форсирование конца проявления. Игра зовёт это
+ * через `CMessageTextView@FixAllDrawCharListAlphaRate`: по клику/клавише, по
+ * скипу, и сразу после мгновенной пересборки уже прочитанной части страницы.
+ */
 void PE_FixMessageWindowText(int parts_no)
 {
 	struct parts_message_window *mw = mw_require(parts_no, "FixMessageWindowText");
 	if (!mw)
 		return;
+	mw->reveal_shown = mw->nr_reveal_chars;
+	mw->reveal_timer = 0;
 	mw->text_fixed = true;
+	mw_apply_reveal(mw);
 }
 
+/*
+ * ★Это НЕ «текст задан», а «текст ДОПРОЯВИЛСЯ». `CMessageTextView@Draw` крутит
+ * БЛОКИРУЮЩИЙ цикл кадров (`AFL_View_Update`), пока
+ * `IsFinishedDrawCharListFadeIn` — то есть IsFixedMessageWindowText по всем
+ * показанным окнам — не станет true (или пока игрок не прервёт клавишей/скипом).
+ * Пока мы отвечали true всегда, цикл выходил на ПЕРВОМ кадре, и реплика
+ * появлялась целиком.
+ */
 bool PE_IsFixedMessageWindowText(int parts_no)
 {
 	struct parts_message_window *mw = mw_get(parts_no);
@@ -711,11 +1033,26 @@ void PE_GetMessageWindowTextArea(int parts_no, int *x, int *y, int *w, int *h)
 }
 
 /*
- * `テキスト位置` — выравнивание текста внутри テキストエリア по той же сетке 1-9,
- * что и 原点座標モード частей (1 = верх-лево … 5 = центр … 9 = низ-право). Во всех
- * 195 раскладках Dohna значение равно 1, и игра переустанавливает его тем же 1
- * (message::detail::CMessageTextView@CreateDrawChar), поэтому реализовано только
- * оно; на любое другое — одноразовый WARNING вместо выдуманного выравнивания.
+ * `テキスト位置` — привязка текста внутри テキストエリア по той же сетке 1…9, что и
+ * 原点座標モード частей (1 = верх-лево, 5 = центр, 7 = низ-лево, …).
+ *
+ * ★НА ОКНЕ РЕПЛИК ВЕРТИКАЛЬНАЯ ПРИВЯЗКА НЕ ПРОЯВЛЯЕТСЯ — это ЗАМЕР, а не догадка.
+ * Живые значения у メッセージウィンドウ ровно два: 1 (`ＭＳＧ枠／プロット`,
+ * `全体枠`) и 7 (`名札`, `ト書き` и их варианты — ими и идёт ADV-сцена), плюс 0,
+ * которым игра переустанавливает режим на каждой реплике из глобала
+ * `message::detail::_Ｍ配置` (ему в байткоде не присваивается ничего). У окна `ト書き`
+ * область (120, 8, 992, 118) при кегле 40, то есть между «по верху» и «по низу»
+ * должно быть ~57 px на одной строке и ~18 px на двух. Сверка кадров с оригиналом на
+ * ОДНОЙ И ТОЙ ЖЕ реплике пролога (`hr-M1-ms*` против `orig-hr-ms*`):
+ *   одна строка: наши чернила y=580…605, оригинал y=581…607;
+ *   две строки:  наши 579…606 и 618…643, оригинал 581…608 и 620…645.
+ * То есть оригинал ставит текст ПО ВЕРХУ области при режиме 7, а расхождение — те же
+ * 2 px, что и на всех прочих строках (метрики глифов, §5ab). Поэтому ничего
+ * «реализовывать» тут не надо, и предупреждать не о чем.
+ *
+ * Предупреждаем только о НЕ ЗАМЕРЕННЫХ режимах: 4 и 5 в раскладках есть, но лишь у
+ * ТЕКСТОВЫХ частей (кнопки, диалоги), а не у окон реплик — на этом пути они
+ * действительно не реализованы.
  */
 void PE_SetMessageWindowTextOriginPosMode(int parts_no, int mode)
 {
@@ -723,12 +1060,13 @@ void PE_SetMessageWindowTextOriginPosMode(int parts_no, int mode)
 	if (!mw)
 		return;
 	mw->text_origin_pos_mode = mode;
-	if (mode != 1) {
+	if (mode != 0 && mode != 1 && mode != 7) {
 		static bool warned = false;
 		if (!warned) {
 			warned = true;
-			WARNING("メッセージウィンドウ: テキスト位置 %d не реализовано "
-			        "(текст выравнивается по верхнему левому углу области)", mode);
+			WARNING("メッセージウィンドウ: テキスト位置 %d не замерено "
+			        "(текст ставится по верху テキストエリア, как для режимов 1 и 7)",
+			        mode);
 		}
 	}
 }

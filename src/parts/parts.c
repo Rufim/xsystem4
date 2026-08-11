@@ -1467,6 +1467,10 @@ static void parts_update_loop(struct parts *parts, int passed_time)
 	default:
 		break;
 	}
+	// Посимвольное проявление реплики идёт по тому же тику: окно реплик держит фон
+	// обычным состоянием части, поэтому в switch выше его ветки нет.
+	if (parts->mw && parts_message_window_update(parts, passed_time))
+		dirty = true;
 	if (dirty)
 		parts_dirty(parts);
 }
