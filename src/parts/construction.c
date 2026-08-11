@@ -77,7 +77,22 @@ int PE_GetPartsConstructionProcessCount(int parts_no, int state)
  *
  * Процедуры, пришедшие из РАСКЛАДОК, сырья не имеют — для них массивы остаются
  * пустыми (одноразовое предупреждение, чтобы это было видно, а не молча).
+ *
+ * ★Массивы приходят УЖЕ ВЫДЕЛЕННЫМИ: конструктор `CASConstructionProcess@0` зовёт
+ * `Array.Alloc(ArrayIntIndex::Numof)` (40 int, 2 float, 2 string), и игра читает
+ * поля ПО ИНДЕКСАМ (`ArrayInt[0]` — команда). Значит писать надо В СУЩЕСТВУЮЩИЕ
+ * элементы, а `array_pushback` дописывал в хвост: игра видела свои нули, читала их
+ * как `SetCreate(0,0)` и строила поверхность 0×0. Так «умирала» круговая шкала
+ * автомода Haha Ranman (FINDINGS §5dm). Дописываем только то, что не влезло.
  */
+static void cp_raw_put_int(struct page **arr, int i, union vm_value v, enum ain_data_type type)
+{
+	if (*arr && i < (*arr)->nr_vars)
+		variable_set(*arr, i, type == AIN_ARRAY_STRING ? AIN_STRING : AIN_INT, v);
+	else
+		*arr = array_pushback(*arr, v, type, -1);
+}
+
 void PE_GetPartsConstructionProcess(int parts_no, int index, struct page **a_int,
 		struct page **a_float, struct page **a_string, struct page **a_pos, int state)
 {
@@ -100,25 +115,26 @@ void PE_GetPartsConstructionProcess(int parts_no, int index, struct page **a_int
 	struct parts_cp_raw *r = &cproc->raw[index];
 	if (a_int) {
 		for (int i = 0; i < r->nr_ints; i++)
-			*a_int = array_pushback(*a_int, (union vm_value){ .i = r->ints[i] },
-						AIN_ARRAY_INT, -1);
+			cp_raw_put_int(a_int, i, (union vm_value){ .i = r->ints[i] }, AIN_ARRAY_INT);
 	}
 	if (a_float) {
-		for (int i = 0; i < r->nr_floats; i++)
-			*a_float = array_pushback(*a_float, (union vm_value){ .f = r->floats[i] },
-						  AIN_ARRAY_FLOAT, -1);
+		for (int i = 0; i < r->nr_floats; i++) {
+			union vm_value v = { .f = r->floats[i] };
+			if (*a_float && i < (*a_float)->nr_vars)
+				variable_set(*a_float, i, AIN_FLOAT, v);
+			else
+				*a_float = array_pushback(*a_float, v, AIN_ARRAY_FLOAT, -1);
+		}
 	}
 	if (a_string) {
 		for (int i = 0; i < r->nr_strings; i++) {
 			int slot = vm_string_ref(r->strings[i] ? r->strings[i] : &EMPTY_STRING);
-			*a_string = array_pushback(*a_string, (union vm_value){ .i = slot },
-						   AIN_ARRAY_STRING, -1);
+			cp_raw_put_int(a_string, i, (union vm_value){ .i = slot }, AIN_ARRAY_STRING);
 		}
 	}
 	if (a_pos) {
 		for (int i = 0; i < r->nr_pos; i++)
-			*a_pos = array_pushback(*a_pos, (union vm_value){ .i = r->pos[i] },
-						AIN_ARRAY_INT, -1);
+			cp_raw_put_int(a_pos, i, (union vm_value){ .i = r->pos[i] }, AIN_ARRAY_INT);
 	}
 }
 
@@ -271,6 +287,9 @@ bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int
 	if (!parts_state_valid(--state))
 		return false;
 
+	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
+		NOTICE("CP AddFillPieAMap part=%d c=(%d,%d) r=(%d,%d) angle=%d+%d a=%d",
+		       parts_no, x, y, rx, ry, start_angle, sweep_angle, a);
 	struct parts_construction_process *cproc = get_cproc(parts_no, state);
 	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
 	op->type = PARTS_CP_FILL_PIE_AMAP;
@@ -728,13 +747,42 @@ static bool build_fill_pie_amap(struct parts_construction_process *cproc, struct
 				}
 			}
 			if (hits)
-				amap[py * w + px] = op->a * hits / (SS * SS);
+				amap[py * w + px] = 255 * hits / (SS * SS);
 		}
 	}
-	Texture tmp;
-	gfx_init_texture_amap(&tmp, w, h, amap, (SDL_Color){0, 0, 0, 0});
-	gfx_copy_amap_max(&cproc->common.texture, op->x - rx, op->y - ry, &tmp, 0, 0, w, h);
-	gfx_delete_texture(&tmp);
+	/*
+	 * ★Альфу в пределах сектора ЗАПИСЫВАЕМ, а не берём максимумом: игра шлёт этот
+	 * шаг и для СТИРАНИЯ (`a = 0`). Круговая шкала автомода Haha Ranman так и
+	 * устроена — поверхность = зелёное кольцо из CG, а непройденная доля круга
+	 * вырезается сектором с нулевой альфой (`CWaitPie@BuildCg`: sweep = 360 − угол).
+	 * При `gfx_copy_amap_max` стирание было no-op, и кольцо всегда стояло полным.
+	 *
+	 * `amap` здесь — ПОКРЫТИЕ пикселя сектором (суперсэмплинг 3×3), а не готовая
+	 * альфа: результат = old·(1 − cov) + a·cov. Для `a = 255` поверх нуля это
+	 * ровно прежнее поведение (скруглённые подложки Dohna не меняются), а края
+	 * остаются сглаженными в обе стороны.
+	 */
+	Texture *t = &cproc->common.texture;
+	int ox = op->x - rx, oy = op->y - ry;
+	uint8_t *px = gfx_get_pixels(t);
+	for (int py = 0; py < h; py++) {
+		int ty = oy + py;                  // экранная строка
+		if (ty < 0 || ty >= t->h)
+			continue;
+		int by = t->h - 1 - ty;            // буфер идёт снизу вверх (см. build_blur_filter)
+		for (int pxi = 0; pxi < w; pxi++) {
+			int tx = ox + pxi;
+			if (tx < 0 || tx >= t->w)
+				continue;
+			int cov = amap[py * w + pxi];
+			if (!cov)
+				continue;
+			uint8_t *dst = px + ((size_t)by * t->w + tx) * 4 + 3;
+			*dst = (*dst * (255 - cov) + op->a * cov) / 255;
+		}
+	}
+	gfx_update_texture_with_pixels(t, px);
+	free(px);
 	free(amap);
 	return true;
 }
@@ -1241,21 +1289,30 @@ bool PE_BuildPartsConstructionProcess(int parts_no, int state)
 	return r;
 }
 
+// Место под очередную запись сырья. Общее для рантайм-подачи (страницы VM) и для
+// загрузчика раскладок (обычные массивы).
+static struct parts_cp_raw *parts_cp_new_raw(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return NULL;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts)
+		return NULL;
+	struct parts_construction_process *cproc = &parts->states[state].cproc;
+	cproc->raw = xrealloc_array(cproc->raw, cproc->nr_raw, cproc->nr_raw + 1,
+				   sizeof(*cproc->raw));
+	return &cproc->raw[cproc->nr_raw++];
+}
+
 // Запомнить сырьё операции (см. struct parts_cp_raw): игра читает процедуру
 // обратно через GetPartsConstructionProcess, и отдавать надо ровно поданное.
 void PE_SaveConstructionRaw(int parts_no, int state, union vm_value *ints,
 		int nr_ints, union vm_value *floats, int nr_floats,
 		union vm_value *strings, int nr_strings, union vm_value *pos, int nr_pos)
 {
-	if (!parts_state_valid(--state))
+	struct parts_cp_raw *r = parts_cp_new_raw(parts_no, state);
+	if (!r)
 		return;
-	struct parts *parts = parts_try_get(parts_no);
-	if (!parts)
-		return;
-	struct parts_construction_process *cproc = &parts->states[state].cproc;
-	cproc->raw = xrealloc_array(cproc->raw, cproc->nr_raw, cproc->nr_raw + 1,
-				   sizeof(*cproc->raw));
-	struct parts_cp_raw *r = &cproc->raw[cproc->nr_raw++];
 	r->nr_ints = nr_ints < 40 ? nr_ints : 40;
 	for (int i = 0; i < r->nr_ints; i++)
 		r->ints[i] = ints[i].i;
@@ -1270,6 +1327,33 @@ void PE_SaveConstructionRaw(int parts_no, int state, union vm_value *ints,
 	r->pos = nr_pos ? xcalloc(nr_pos, sizeof(int)) : NULL;
 	for (int i = 0; i < nr_pos; i++)
 		r->pos[i] = pos[i].i;
+}
+
+/*
+ * То же для процедур ИЗ РАСКЛАДКИ: там значения — обычные int/float, а строки —
+ * готовые `struct string *` из EX-дерева, не слоты кучи.
+ *
+ * Нужно потому, что игра ЧИТАЕТ раскладочную процедуру обратно: `CWaitPie` у
+ * Haha Ranman ищет в ней создающий шаг (команды 0/1/2), чтобы взять оттуда имя CG
+ * и размер круговой шкалы автомода. Пустой ответ она понимала как «SetCreate(0,0)».
+ */
+void PE_SaveConstructionRawValues(int parts_no, int state, const int *ints, int nr_ints,
+		const float *floats, int nr_floats, struct string **strings, int nr_strings)
+{
+	struct parts_cp_raw *r = parts_cp_new_raw(parts_no, state);
+	if (!r)
+		return;
+	r->nr_ints = nr_ints < 40 ? nr_ints : 40;
+	for (int i = 0; i < r->nr_ints; i++)
+		r->ints[i] = ints[i];
+	r->nr_floats = nr_floats < 2 ? nr_floats : 2;
+	for (int i = 0; i < r->nr_floats; i++)
+		r->floats[i] = floats[i];
+	r->nr_strings = nr_strings < 2 ? nr_strings : 2;
+	for (int i = 0; i < r->nr_strings; i++)
+		r->strings[i] = strings[i] ? string_ref(strings[i]) : NULL;
+	r->nr_pos = 0;
+	r->pos = NULL;
 }
 
 static void parts_cp_free_raw(struct parts_construction_process *cproc)
