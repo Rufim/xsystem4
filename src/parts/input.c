@@ -677,6 +677,10 @@ void PE_UpdateInputState(int passed_time)
 				// XSYS4_SLIDER_TRACE на вкладке `メッセージウィンドウ` дал 11
 				// протяжек и НОЛЬ вызовов GetHSliderBarScrollRate. Ползунок
 				// ехал, а прозрачность окна не менялась.
+				// ★Поправка (§5ec): это про полосу CONFIG. У ползунка прозрачности
+				// в футере ADV (`横スライダーバー`) игра долю ЧИТАЕТ — тот же замер
+				// даёт `SLIDER get rate=0.286` сразу после протяжки, — так что
+				// объявление события и опрос доли живут ОБА, порознь по виджетам.
 				// Игра ждёт событие прокрутки: `CAlpha@Active::postset` вешает
 				// на часть DG_ScrollHandler(number, scrollPos, total), и уже
 				// обработчик читает долю и зовёт SetMessageWindowAlphaRate.

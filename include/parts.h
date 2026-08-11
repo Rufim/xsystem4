@@ -430,6 +430,8 @@ void PE_MakeTextState(int parts_no, int state);
 void parts_mark_textbox(int parts_no);
 // Пометить часть как группу радиокнопок (см. src/parts/parts.c).
 void parts_mark_radio_box(int parts_no);
+// Пометить полосу как слайдер (v14 12/13, см. src/parts/parts.c).
+void parts_mark_slider_bar(int parts_no, bool horizontal);
 // Записать кнопку в состав группы (см. src/parts/parts.c).
 void parts_radio_box_add_child(int box_no, int child_no);
 // Номер группы, которой принадлежит кнопка, и её индекс в ней (-1 = вне группы).
