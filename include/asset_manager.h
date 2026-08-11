@@ -42,6 +42,9 @@ bool asset_exists(enum asset_type type, int no);
 bool asset_exists_by_name(enum asset_type type, const char *name, int *id_out);
 struct archive_data *asset_get(enum asset_type type, int no);
 struct archive_data *asset_get_by_name(enum asset_type type, const char *name, int *id_out);
+// Перечисление имён записей типа (AFA); cb возвращает false — остановить обход.
+void asset_foreach_name(enum asset_type type,
+		bool (*cb)(const char *name, void *user), void *user);
 
 struct cg *asset_cg_load(int no);
 struct cg *asset_cg_load_by_name(const char *name, int *id_out);

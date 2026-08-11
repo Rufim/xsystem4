@@ -297,6 +297,41 @@ static struct archive_data *ald_get_by_id(struct asset_manager *_manager, int id
 	return archive_get(manager->archive, id - 1);
 }
 
+/*
+ * Перечисление ИМЁН записей типа (для AFAFactory: поиск заголовков по
+ * префиксу/суффиксу — так Dohna ищет музыку карты, `MusicRouter` →
+ * `CResourceSearcher` → `GetPrefixSearchTitleList`). Возврат cb false —
+ * остановить обход. Поддержано только для AFA-менеджеров: у ALD имён нет.
+ */
+static bool afa_load_archive(struct asset_manager *_manager, const char *name);
+
+// AFA-менеджер узнаётся по своему load_archive: отдельного поля типа нет.
+static bool asset_manager_is_afa(struct asset_manager *m)
+{
+	return m->load_archive == afa_load_archive;
+}
+
+void asset_foreach_name(enum asset_type type,
+		bool (*cb)(const char *name, void *user), void *user)
+{
+	if (!assets[type] || !asset_manager_is_afa(assets[type])) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("asset_foreach_name: тип %s без AFA-архива", asset_strtype(type));
+		}
+		return;
+	}
+	struct asset_manager_afa *m = (struct asset_manager_afa*)assets[type];
+	for (int a = 0; a < MAX_ARCHIVES && m->archives[a]; a++) {
+		struct afa_archive *ar = m->archives[a];
+		for (uint32_t i = 0; i < ar->nr_files; i++) {
+			if (ar->files[i].name && !cb(ar->files[i].name->text, user))
+				return;
+		}
+	}
+}
+
 static bool afa_load_archive(struct asset_manager *_manager, const char *name)
 {
 	struct asset_manager_afa *manager = (struct asset_manager_afa*)_manager;
