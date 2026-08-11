@@ -609,7 +609,24 @@ static void Array_ix_Duplicate(struct page **self, struct page **src)
 	Array_ix_AddRange(self, src);
 }
 
-static void Array_Reverse(struct page **self) { if (self) array_reverse(*self); }
+// XSYS4_BSEARCH_TRACE=miss печатает и переворот: по строке видно, ТУ ЛИ страницу
+// переворачивают, которую потом ищут (сверять по адресу страницы и первым элементам).
+static void Array_Reverse(struct page **self)
+{
+	if (!self)
+		return;
+	array_reverse(*self);
+	const char *tr = getenv("XSYS4_BSEARCH_TRACE");
+	if (tr && !strcmp(tr, "miss") && *self) {
+		struct page *p = *self;
+		int s = array_elem_slots(p);
+		NOTICE("REVERSE page=%p n=%d slots=%d элементы: %d %d … %d", (void *)p,
+		       p->nr_vars / (s ? s : 1), s,
+		       p->nr_vars > 0 ? p->values[0].i : -1,
+		       p->nr_vars > s ? p->values[s].i : -1,
+		       p->nr_vars > 0 ? p->values[p->nr_vars - s].i : -1);
+	}
+}
 static void Array_Shuffle(struct page **self, int seed) { if (self) array_shuffle(*self, seed); }
 
 static int Array_ix_Fill(struct page **self, union vm_value *value)
@@ -1168,14 +1185,28 @@ static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
 	// на отсортированном массиве ответ тот же, на неотсортированном корректнее.
 	if (!ix_arg_is_func(1))
 		return array_find(*self, 0, n, *key, 0);
-	bool trace = getenv("XSYS4_BSEARCH_TRACE");
+	/*
+	 * `XSYS4_BSEARCH_TRACE=miss` — печатать ТОЛЬКО промахи (результат −1), по
+	 * одной строке на вызов. Полный лог зондов на живом прогоне Dohna — десятки
+	 * мегабайт (поиск идёт каждый кадр по каждому юниту), а вопрос обычно один:
+	 * «почему именно этот поиск не нашёл». Именно так разбиралась замершая
+	 * покадровая анимация отряда в данже: `FrameInfoCollection@GetIndexFromTime`
+	 * зовёт BinarySearch с ТРЁХЗНАЧНЫМ компаратором и получает −1 (§5dy).
+	 */
+	const char *tr_env = getenv("XSYS4_BSEARCH_TRACE");
+	bool miss_only = tr_env && !strcmp(tr_env, "miss");
+	bool trace = tr_env && !miss_only;
 	int lo = 0, hi = n - 1;
+	char probes[128];
+	int np = 0;
 	while (lo <= hi) {
 		int mid = lo + (hi - lo) / 2;
 		// Лямбда может перевыделить страницу — сверяемся каждый шаг.
 		if (!*self || mid >= array_numof(*self, 1))
 			return -1;
 		int c = ix_cmp3(key, *self, mid);
+		if (miss_only && np < (int)sizeof(probes) - 12)
+			np += snprintf(probes + np, sizeof(probes) - np, " [%d]=%d", mid, c);
 		if (trace)
 			ix_probe_trace("BSEARCH", *self, n, lo, hi, mid, c);
 		if (c == 0)
@@ -1184,6 +1215,16 @@ static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
 			lo = mid + 1;   // элемент МЕНЬШЕ ключа → искать правее
 		else
 			hi = mid - 1;
+	}
+	if (miss_only) {
+		struct page *p = *self;
+		int s = array_elem_slots(p);
+		NOTICE("BSEARCH промах: page=%p n=%d elem_slots=%d nr_args=%d элементы: %d %d … %d зонды:%s",
+		       (void *)p, n, s, vm_hll_func_nr_args(key[1].i),
+		       p->nr_vars > 0 ? p->values[0].i : -1,
+		       p->nr_vars > s ? p->values[s].i : -1,
+		       p->nr_vars > 0 ? p->values[p->nr_vars - s].i : -1,
+		       np ? probes : " нет");
 	}
 	return -1;
 }

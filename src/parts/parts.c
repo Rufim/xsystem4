@@ -751,9 +751,29 @@ static Point parts_child_origin(struct parts *parts)
 static void parts_update_global_pos(struct parts *parts, Point parent_pos,
 		float parent_scale_x, float parent_scale_y)
 {
+	/*
+	 * ★Смещение ребёнка ПОВОРАЧИВАЕТСЯ вместе с родителем: наклон родителя — это
+	 * жёсткое преобразование всего поддерева, а не «каждый повернулся у себя».
+	 * Без этого подпись узла данжа Dohna наклонялась правильно, а её розовая
+	 * бирка (`M11`, ребёнок подписи со смещением ~15 px по x) оставалась на
+	 * прежнем месте и отрывалась от текста — на кадре бирки уезжали правее и ниже
+	 * подписей (§5dx). Угол берём накопленный (`global`), тот же, с которым
+	 * родитель рисуется.
+	 */
+	float rot = parts->parent ? parts->parent->global.rotation.z : 0.0f;
+	float lx = parts->local.pos.x * parent_scale_x;
+	float ly = parts->local.pos.y * parent_scale_y;
+	if (rot != 0.0f) {
+		float a = rot * (float)M_PI / 180.0f;
+		float c = cosf(a), s = sinf(a);
+		float rx = lx * c - ly * s;
+		float ry = lx * s + ly * c;
+		lx = rx;
+		ly = ry;
+	}
 	parts->global.pos = (Point) {
-		parent_pos.x + (int)roundf(parts->local.pos.x * parent_scale_x),
-		parent_pos.y + (int)roundf(parts->local.pos.y * parent_scale_y)
+		parent_pos.x + (int)roundf(lx),
+		parent_pos.y + (int)roundf(ly)
 	};
 
 	Point child_origin = parts_child_origin(parts);
@@ -1031,6 +1051,9 @@ void parts_set_rotation_z(struct parts *parts, float rot)
 		       parts->parent ? parts->parent->global.rotation.z : 0.0f);
 	parts->local.rotation.z = rot;
 	parts_update_global_rotate_z(parts, parts->parent ? parts->parent->global.rotation.z : 0.0f);
+	// Смещения потомков считаются в ПОВЁРНУТОЙ системе родителя
+	// (parts_update_global_pos), поэтому смена угла двигает поддерево.
+	parts_reposition_family(parts);
 	parts_dirty(parts);
 }
 
@@ -1577,12 +1600,18 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
-		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b, p->global.scale.x, p->global.scale.y,
+		       p->global.multiply_color.r, p->global.multiply_color.g, p->global.multiply_color.b,
+		       // Добавочный цвет — рядом с mul: цвет на экране получается ими ОБОИМИ
+		       // (`tex*mul + add`), и по одному mul объяснить кадр нельзя — «труба»
+		       // маршрута в данже из белой поверхности выходит светло-розовой именно
+		       // добавочным цветом (§5dw).
+		       p->global.add_color.r, p->global.add_color.g, p->global.add_color.b,
+		       p->sub_color_mode ? "(sub)" : "", p->global.scale.x, p->global.scale.y,
 		       p->local.rotation.z, p->global.rotation.z,
 		       p->local.rotation.x, p->local.rotation.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,

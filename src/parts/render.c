@@ -62,6 +62,22 @@ static void set_draw_filter_blend_func(int draw_filter)
 	}
 }
 
+/*
+ * Поворот, с которым часть РИСУЕТСЯ, — накопленный по дереву (`global`), а не
+ * свой собственный (`local`): наклон родителя достаётся детям, как достаются
+ * позиция, масштаб, альфа и видимость слоя.
+ *
+ * Замер, который это показал (Dohna, экран DUNGEON, подпись узла «Parking
+ * Basement»): часть-текст 90000966 имеет `rotz=0.00/323.75` — своего поворота у
+ * неё нет, весь наклон пришёл от родителя 90000965, а рисовалась она по `local`,
+ * то есть без наклона; рядом пиктограмма-панель 90000956 (`rotz=0.00/323.75`) —
+ * та же история. В оригинале и подпись, и её пиктограмма наклонены на −36.25°.
+ */
+static float parts_render_rotation_z(struct parts *parts)
+{
+	return parts->global.rotation.z;
+}
+
 static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rectangle *rect, float blend_rate, vec3 add_color, vec3 multiply_color, int draw_filter, int alpha_clipper)
 {
 	mat4 wv_transform = WV_TRANSFORM(config.view_width, config.view_height);
@@ -98,7 +114,7 @@ static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rec
 		// Calculate the inverse of the clipper's world matrix.
 		mat4 clip_mw = GLM_MAT4_IDENTITY_INIT;
 		glm_translate(clip_mw, (vec3) { clipper->global.pos.x, clipper->global.pos.y, 0 });
-		glm_rotate_z(clip_mw, glm_rad(clipper->local.rotation.z), clip_mw);
+		glm_rotate_z(clip_mw, glm_rad(parts_render_rotation_z(clipper)), clip_mw);
 		glm_scale(clip_mw, (vec3){ clipper->global.scale.x, clipper->global.scale.y, 1.0 });
 		glm_translate(clip_mw, (vec3){ c_common->origin_offset.x, c_common->origin_offset.y, 0 });
 		glm_scale(clip_mw, (vec3){ c_common->w, c_common->h, 1.0 });
@@ -154,7 +170,7 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 		parts->global.add_color.b / 255.0f
 	};
 	// `減算色モード` (SetComponentSubColorMode): тот же добавочный цвет, но ВЫЧИТАЕТСЯ.
-	// Шейдер считает `(tex + add_color) * multiply_color`, поэтому режим — это просто
+	// Шейдер считает `tex * multiply_color + add_color`, поэтому режим — это просто
 	// смена знака, отдельной ветки в шейдере не нужно.
 	if (parts->sub_color_mode)
 		glm_vec3_negate(add_color);
@@ -173,22 +189,36 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 	 * должно быть 31. Масштабируем и размер глифа, и шаг между символами, и
 	 * межстрочный интервал — иначе буквы разъезжались бы по своим местам.
 	 */
-	float sx = parts->global.scale.x;
-	float sy = parts->global.scale.y;
-	float ox = parts->global.pos.x + t->common.origin_offset.x * sx;
-	float oy = parts->global.pos.y + t->common.origin_offset.y * sy;
-	float x = ox, y = oy;
+	/*
+	 * ★Поворот (`回転`) у текста применяется ТАК ЖЕ, как у картинки: строка
+	 * поворачивается целиком, вокруг точки привязки части. Раньше его не было
+	 * вовсе — подписи узлов данжа Dohna (`Parking Ent.`, каптион `M11`) выходили
+	 * горизонтальными там, где оригинал наклоняет их на −36.25° (§5dx).
+	 * Общий трансформ собираем матрицей: сдвиг в позицию → поворот → масштаб →
+	 * сдвиг на привязку; шаг между символами и межстрочный интервал после этого
+	 * уже НЕ надо умножать на масштаб руками — их масштабирует сама матрица.
+	 */
+	mat4 base = GLM_MAT4_IDENTITY_INIT;
+	glm_translate(base, (vec3){ parts->global.pos.x, parts->global.pos.y, 0 });
+	glm_rotate_z(base, glm_rad(parts_render_rotation_z(parts)), base);
+	glm_scale(base, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0f });
+	glm_translate(base, (vec3){ t->common.origin_offset.x, t->common.origin_offset.y, 0 });
+
+	float x = 0.0f, y = 0.0f;
 	for (int i = 0; i < t->nr_lines; i++) {
 		struct parts_text_line *line = &t->lines[i];
 		for (int j = 0; j < line->nr_chars; j++) {
 			struct parts_text_char *ch = &line->chars[j];
-			mat4 mw_transform = WORLD_TRANSFORM(ch->t.w * sx, ch->t.h * sy, x, y);
+			mat4 mw_transform;
+			glm_mat4_copy(base, mw_transform);
+			glm_translate(mw_transform, (vec3){ x, y, 0 });
+			glm_scale(mw_transform, (vec3){ ch->t.w, ch->t.h, 1.0f });
 			Rectangle r = { 0, 0, ch->t.w, ch->t.h };
 			parts_render_texture(&ch->t, mw_transform, &r, blend_rate, add_color, multiply_color, 0, parts_effective_clipper(parts));
-			x += ch->advance * sx;
+			x += ch->advance;
 		}
-		x = ox;
-		y += (line->height + t->line_space) * sy;
+		x = 0.0f;
+		y += line->height + t->line_space;
 	}
 }
 
@@ -201,7 +231,7 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 	// FIXME: need perspective for 3D rotate
 	//glm_rotate_x(mw_transform, parts->rotation.x, mw_transform);
 	//glm_rotate_y(mw_transform, parts->rotation.y, mw_transform);
-	glm_rotate_z(mw_transform, glm_rad(parts->local.rotation.z), mw_transform);
+	glm_rotate_z(mw_transform, glm_rad(parts_render_rotation_z(parts)), mw_transform);
 	glm_scale(mw_transform, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0 });
 	glm_translate(mw_transform, (vec3){ common->origin_offset.x, common->origin_offset.y, 0 });
 
@@ -241,7 +271,7 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 		parts->global.add_color.b / 255.0f
 	};
 	// `減算色モード` (SetComponentSubColorMode): тот же добавочный цвет, но ВЫЧИТАЕТСЯ.
-	// Шейдер считает `(tex + add_color) * multiply_color`, поэтому режим — это просто
+	// Шейдер считает `tex * multiply_color + add_color`, поэтому режим — это просто
 	// смена знака, отдельной ветки в шейдере не нужно.
 	if (parts->sub_color_mode)
 		glm_vec3_negate(add_color);
@@ -526,7 +556,7 @@ static void parts_render_flat(struct parts *parts, struct parts_flat *f)
 	struct flat_draw_ctx ctx;
 	glm_mat4_identity(ctx.matrix);
 	glm_translate(ctx.matrix, (vec3){ parts->global.pos.x, parts->global.pos.y, 0 });
-	glm_rotate_z(ctx.matrix, glm_rad(parts->local.rotation.z), ctx.matrix);
+	glm_rotate_z(ctx.matrix, glm_rad(parts_render_rotation_z(parts)), ctx.matrix);
 	glm_scale(ctx.matrix, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0f });
 	ctx.alpha = parts->global.alpha / 255.0f;
 	glm_vec3_zero(ctx.add_color);

@@ -42,7 +42,17 @@ void main() {
 		discard;
 
 	vec4 tex_color = texture(tex, tex_coord);
-	vec3 mod_color = (tex_color.rgb + add_color) * multiply_color;
+	/*
+	 * ★Порядок именно такой: СНАЧАЛА умножение, ПОТОМ добавление. Замер, который
+	 * это доказал (Dohna, экран DUNGEON, «труба» маршрута между узлами):
+	 * поверхность построения белая (`FillPolygonAlphaBlend(pos, CASColor::WHITE)`
+	 * в `PartsConstructionHelper::CreateRoundedLine`), `MapEdgeView@SetReachState`
+	 * ставит парту mul = палитра−120 = (109,0,0) и add = (130,130,130).
+	 *   оригинал:  109 + 130          = (239,130,130) — светло-розовая труба;
+	 *   (tex+add)*mul: (255+130)/255*109 = (165,  0,  0) — тёмно-красная, как было у нас.
+	 * Оба числа совпали с кадрами до пикселя (§5dw).
+	 */
+	vec3 mod_color = tex_color.rgb * multiply_color + add_color;
 	float alpha = tex_color.a * blend_rate;
 
 	if (use_clipper != 0) {
