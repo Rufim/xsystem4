@@ -4344,23 +4344,34 @@ static int ctrl_stack_pos(int id)
 }
 
 // Восстановление стека после загрузки сейва: в сейве лежит только ГЛУБИНА (формат
-// менять нельзя), а нумерация там всегда была стековой — значит id = позиции.
+// менять нельзя), а нумерация там всегда была стековой — значит id = позиция + 1
+// (ID слоёв 1-based, см. ctrl_stack_init). `active` приходит уже сдвинутым:
+// пересчитать 0-based значение старого образа может только загрузчик, который
+// знает его версию.
 void parts_controller_stack_restore(int nr, int active)
 {
 	if (nr < 0) nr = 0;
 	if (nr > PARTS_CONTROLLER_STACK_MAX) nr = PARTS_CONTROLLER_STACK_MAX;
 	ctrl_stack.nr_controllers = nr;
 	for (int i = 0; i < nr; i++) {
-		ctrl_stack.stack[i] = i;
+		ctrl_stack.stack[i] = i + 1;
 		ctrl_stack.hidden[i] = false;
 	}
-	ctrl_stack.next_id = nr;
+	ctrl_stack.next_id = nr + 1;
 	ctrl_stack.active = active;
 }
 
 static void ctrl_stack_init(void)
 {
 	memset(&ctrl_stack, 0, sizeof(ctrl_stack));
+	/*
+	 * ID СЛОЁВ НАЧИНАЮТСЯ С 1. Игра оборачивает ID слоя как КОМПОНЕНТ
+	 * (`CBackSceneView@ShowAllFrontScene` → `parts::detail::Wrap`), а валидность
+	 * компонента у неё — `<Number> != 0`: обёртка слоя с ID 0 рождается мёртвой,
+	 * игра её сохраняет и ассертит `parts.IsValid` на первой же операции
+	 * (маршрут scrollback → Back, 38 нулевых обёрток за прогон; FINDINGS §5df).
+	 */
+	ctrl_stack.next_id = 1;
 	// Add initial default controller
 	PE_AddController(-1);
 }
@@ -4502,12 +4513,22 @@ void PE_RemoveController(struct page **erase_number_list, int index)
 	while (p) {
 		struct parts *next = TAILQ_NEXT(p, parts_list_entry);
 		if (p->controller_no == ctrl_no && keep_act && pe_parts_in_activity(p->no)) {
+			// Под XSYS4_CTRL_TRACE_AR видно и УЦЕЛЕВШИХ: часть активности со слоем
+			// не сносится, но её delegate-индекс и не отдаётся игре.
+			if (getenv("XSYS4_CTRL_TRACE_AR"))
+				NOTICE("   ctrl %d: ОСТАВЛЕН активити-парт %d (delegate=%d)",
+				       ctrl_no, p->no, p->delegate_index);
 			p = next;
 			continue;
 		}
 		if (p->controller_no == ctrl_no) {
 			if (getenv("XSYS4_CTRL_TRACE") || getenv("XSYS4_CTRL_TRACE_AR")) {
 				released++;
+				NOTICE("   ctrl %d: снят парт %d (delegate=%d, activity=%d, cg=\"%s\")",
+				       ctrl_no, p->no, p->delegate_index,
+				       pe_parts_in_activity(p->no),
+				       p->states[0].type == PARTS_CG && p->states[0].cg.name
+				               ? display_sjis0(p->states[0].cg.name->text) : "");
 				if (!*sample && p->states[0].type == PARTS_CG
 						&& p->states[0].cg.name)
 					sample = display_sjis0(p->states[0].cg.name->text);
@@ -4594,11 +4615,19 @@ void PE_set_active_controller(int controller_no)
 	if (getenv("XSYS4_CTRL_TRACE_ACTIVE") && controller_no != ctrl_stack.active)
 		NOTICE("ACTIVE %d -> %d [%s]", ctrl_stack.active, controller_no,
 		       display_sjis0(vm_current_function_name()));
-	if (controller_no == PARTS_CONTROLLER_SYSTEM_OVERLAY ||
-			ctrl_stack_pos(controller_no) >= 0)
-		ctrl_stack.active = controller_no;
-	else
-		VM_ERROR("Invalid controller number: %d", controller_no);
+	/*
+	 * ★НЕСУЩЕСТВУЮЩИЙ ID — НЕ ОШИБКА. Игры зовут это со слоями, которых нет,
+	 * ШТАТНО: `parts::detail::CallPartsUpdateEvent` (fno 9181) выставляет слой
+	 * КАЖДОЙ подписки перед её обработчиком, даже если `IsExistLayer` = 0, а у
+	 * подписок без слоя там ноль — Haha Ranman дёргает 3↔0 по три раза за кадр.
+	 * Пока ID слоёв начинались с 0, ноль совпадал с базовым слоем и вызов
+	 * проходил; с 1-based нумерацией (§5df) прежний `VM_ERROR` ронял HR на
+	 * первом же кадре ADV («Invalid controller number: 0» → REPL). Оригинал
+	 * с той же нумерацией обязан это терпеть — храним ID как есть: снятие с
+	 * несуществующего слоя парты и так уводит под всё (parts_get_sprite_z = 0),
+	 * а следующий SetActiveLayer игры возвращает живой слой.
+	 */
+	ctrl_stack.active = controller_no;
 }
 
 int PE_get_active_controller(void)

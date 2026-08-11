@@ -23,7 +23,23 @@
 #include "parts_internal.h"
 #include "../hll/iarray.h"
 
-#define CURRENT_SAVE_VERSION 8
+/*
+ * v9: ID слоёв стали 1-based (обёртка слоя с ID 0 у игры мертворождённая —
+ * `IsValid` = `Number != 0`, FINDINGS §5df). В образах прежних версий ID слоёв
+ * и `controller_no` частей 0-based — при чтении сдвигаются на +1
+ * (кроме PARTS_CONTROLLER_SYSTEM_OVERLAY). Без сдвига загруженные парты
+ * осиротели бы: слоя с их номером нет, и они уходят под всё
+ * (parts_get_sprite_z = 0) — экран после загрузки пустой/чёрный.
+ */
+#define CURRENT_SAVE_VERSION 9
+
+// Пересчёт номера слоя из образа версии < 9 (0-based) в текущий 1-based.
+static int migrate_controller_no(int no, int version)
+{
+	if (version >= 9 || no == PARTS_CONTROLLER_SYSTEM_OVERLAY)
+		return no;
+	return no + 1;
+}
 
 // Насколько глубоко уводится снимок бэк-сцены под UI вьювера (см. load_parts).
 #define BACK_SCENE_Z_SHIFT 1000000
@@ -837,8 +853,23 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 	if (back_scene && parts->pending_parent >= 0)
 		parts->pending_parent += BACK_SCENE_PARTS_OFFSET;
 	parts->delegate_index = iarray_read(r);
-	if (version >= 7)
-		parts->event_unique_id = iarray_read(r);
+	parts->event_unique_id = version >= 7 ? iarray_read(r) : -1;
+	/*
+	 * ★КОПИЯ БЭК-СЦЕНЫ НЕ НАСЛЕДУЕТ ОБРАБОТЧИКИ ОРИГИНАЛА. delegate_index /
+	 * event_unique_id адресуют function-set ЖИВОЙ части в
+	 * CPartsMessageManager игры, а копия — витрина: своего набора у неё нет.
+	 * Копии кладутся на слой вьювера, и его закрытие возвращает игре
+	 * (`EraseLayer` → `RemoveController(delegateIndexList)`) delegate-индексы
+	 * всего слоя — с унаследованными индексами туда попадали наборы ЖИВОГО
+	 * интерфейса ADV, игра их освобождала и обнуляла хэндлы своих объектов
+	 * (`CallFunctionDeleted` → `<Number> = 0`). Через несколько реплик
+	 * анимация таблички имени била игровой ассерт `parts.IsValid`
+	 * (`Executer.jaf:55`), окно закрывалось. FINDINGS §5dg.
+	 */
+	if (back_scene) {
+		parts->delegate_index = -1;
+		parts->event_unique_id = -1;
+	}
 	parts->sprite_deform = iarray_read(r);
 	parts->clickable = iarray_read(r);
 	parts->on_cursor_sound = iarray_read(r);
@@ -923,7 +954,8 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
 	if (parts_multi_controller) {
-		int saved_controller = iarray_read(r);
+		// v9: в старых образах номер слоя 0-based — сдвиг при чтении.
+		int saved_controller = migrate_controller_no(iarray_read(r), version);
 		// Копия бэк-сцены живёт в слое ВЬЮВЕРА: слои игры на это время погашены
 		// (`HideAllFrontScene`), а закрытие вьювера снесёт копию вместе со слоем.
 		parts->controller_no = back_scene ? ctrl_stack.active : saved_controller;
@@ -1183,16 +1215,21 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
 	if (parts_multi_controller) {
-		int active = iarray_read(&r);
+		// v9: в образах прежних версий ID слоёв 0-based — сдвиг при чтении
+		// (migrate_controller_no); next_id — не номер слоя, но сдвигается на ту же
+		// единицу, чтобы новые слои не столкнулись с восстановленными.
+		int active = migrate_controller_no(iarray_read(&r), version);
 		int nr_controllers = iarray_read(&r);
 		if (version >= 5) {
 			// v5: настоящие id слоёв (см. writer выше).
 			int next_id = iarray_read(&r);
+			if (version < 9)
+				next_id++;
 			int nr = nr_controllers;
 			if (nr < 0) nr = 0;
 			if (nr > PARTS_CONTROLLER_STACK_MAX) nr = PARTS_CONTROLLER_STACK_MAX;
 			for (int i = 0; i < nr_controllers; i++) {
-				int id = iarray_read(&r);
+				int id = migrate_controller_no(iarray_read(&r), version);
 				bool hid = iarray_read(&r);
 				if (restore_globals && i < nr) {
 					ctrl_stack.stack[i] = id;
@@ -1205,7 +1242,8 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 				ctrl_stack.active = active;
 			}
 		} else if (restore_globals) {
-			// Стек id восстанавливаем целиком: в сейве лежит только глубина.
+			// Стек id восстанавливаем целиком: в сейве лежит только глубина;
+			// `active` уже сдвинут выше.
 			parts_controller_stack_restore(nr_controllers, active);
 		}
 	}
