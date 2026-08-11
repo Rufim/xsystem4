@@ -2554,6 +2554,9 @@ struct pe_button_state {
 	 */
 	int text_no;
 	int text_x, text_y, box_w, box_h, font_size;
+	// Была ли часть кликабельной (クリック許可/SetClickable) ДО SetButtonEnable(false):
+	// включение восстанавливает это значение, а не дарит кликабельность всем подряд.
+	bool was_clickable;
 };
 
 static struct pe_button_state *pe_button_get(int parts_no, bool create);
@@ -2788,10 +2791,21 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			// Fallback hit-area from the declared size ONLY when no CG/flat loaded.
 			// (SetPartsRectangleDetectionSize resets the state to RECT_DETECTION,
 			// which would erase a CG; a loaded CG provides its own hitbox.)
-			if (!have_visual && bw > 0 && bh > 0)
+		if (!have_visual && bw > 0 && bh > 0)
 				PE_SetPartsRectangleDetectionSize(no, bw, bh, s);
 		}
-		PE_SetClickable(no, true);
+		/*
+		 * ★КЛИКАБЕЛЬНОСТЬ (SetClickable) КНОПКЕ НЕ СТАВИТЬ. `clickable > 0` — это
+		 * «клик по части виден опросу GetClickNumber», т.е. условие выхода КАЖДОГО
+		 * `parts::detail::WaitForClick` (ожидание реплики, Motion::Join, таймеры).
+		 * В раскладках оригинала за это отвечает ОТДЕЛЬНЫЙ флаг `クリック許可`, и у
+		 * ADV-кнопок (AdvSystemButton.x) он 0, а 1 — только у опрашиваемых областей
+		 * (строки BackLog с озвучкой, Detector футера, узлы карты). Раздача
+		 * кликабельности каждому лэйаут-баттону заставляла клик по любой кнопке ADV
+		 * дополнительно листать реплику. Интерактивность кнопки (hover, захват
+		 * клика, MOUSE_CLICK) держится на is_button — см. parts_can_take_cursor и
+		 * click_eligible в src/parts/input.c.
+		 */
 		PE_SetPartsIsButton(no, true);  // report component type 0 (button) to the game
 		/*
 		 * Подпись НА кнопке. У типа `ボタン` она лежит в самой кнопке
@@ -2899,7 +2913,8 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			act_int(ti, "長さ", 0), act_int(ti, "幅", 0),
 			act_int(ti, "全体スクロール量", 0), act_int(ti, "表示量", 1),
 			act_float(ti, "スクロールレート", 0.0f));
-		PE_SetClickable(no, true);
+		// Кликабельность не раздаём (см. комментарий у кнопки): интерактивность
+		// полосы держится на is_hscrollbar.
 	} else if (ptype == 4 && ti) {
 		/*
 		 * Текстовое поле ввода (パーツタイプ=4). Всё описание лежит прямо здесь,
@@ -2949,7 +2964,8 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			t->caret = textbox_nr_chars(t);
 			textbox_render(t);
 		}
-		PE_SetClickable(no, true);
+		// Кликабельность не раздаём (см. комментарий у кнопки): курсор и фокус по
+		// клику держатся на is_textbox (parts_can_take_cursor).
 	} else if (ptype == 2 && ti) {
 		// vertical scrollbar (パーツタイプ=2). Geometry from 種類別情報: 長さ=track
 		// length (Y), 幅=track width (X), 前/次サイズ=∧/∨ arrow-button heights,
@@ -3046,7 +3062,8 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		if (getenv("XSYS4_PT_TRACE"))
 			NOTICE("PT vscrollbar no=%d base=(%d,%d) len=%d w=%d up=%d down=%d total=%d view=%d rate=%.3f",
 			       no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
-		PE_SetClickable(no, true);
+		// Кликабельность не раздаём (см. комментарий у кнопки): интерактивность
+		// полосы держится на is_vscrollbar.
 	} else if (ptype == 9) {
 		/*
 		 * Группа радиокнопок: своего вида у неё нет, вся роль — отдавать игре свой ВИД
@@ -3121,7 +3138,8 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 			if (sw > 0 && sh > 0)
 				PE_SetPartsColorFill(no, sw, sh);
 		}
-		PE_SetClickable(no, true);
+		// Кликабельность не раздаём (см. комментарий у кнопки): интерактивность
+		// чекбокса держится на is_checkbox.
 		struct string *txt = act_str(ti, "テキスト");
 		if (txt && txt->size) {
 			int box_w = PE_GetPartsWidth(no, 1);
@@ -4047,7 +4065,24 @@ static void PartsEngine_SetButtonEnable(int parts_no, bool enable)
 	if (b->enabled == en)
 		return;
 	b->enabled = en;
-	PE_SetClickable(parts_no, enable);
+	/*
+	 * Погашенная кнопка не принимает ввод — это по-прежнему `clickable = -1`
+	 * (тот же явный запрет, что у SetClickable(false); слой ввода на него
+	 * смотрит). А вот ВКЛЮЧЕНИЕ кликабельность НЕ ДАРИТ: `clickable > 0` — это
+	 * `クリック許可` (клик виден опросу GetClickNumber и завершает WaitForClick),
+	 * у обычных кнопок его нет — их действие идёт сообщением MOUSE_CLICK. Прежний
+	 * `SetClickable(parts_no, true)` делал каждую включённую кнопку «опрашиваемой»
+	 * — клик по ней листал реплику. Возвращаем то значение, что было до запрета.
+	 */
+	if (enable) {
+		if (b->was_clickable)
+			PE_SetClickable(parts_no, true);
+		else
+			PE_ClearClickableBan(parts_no);
+	} else {
+		b->was_clickable = PE_GetPartsClickable(parts_no);
+		PE_SetClickable(parts_no, false);
+	}
 	if (!b->cg_base)
 		return;
 	// Серый вид — отдельный файл `／無効`; включённой кнопке возвращаем `／通常`.
@@ -4204,14 +4239,12 @@ static void PE_SetFocusPartsNumber(int parts_no)
 static int PE_GetFocusPartsNumber(void) { return focus_parts_no; }
 static bool PE_IsFocus(int parts_no) { return focus_parts_no == parts_no; }
 
-// `GetActiveParts` — «номер активной части», 0 = нет такой. У Tsumamigui 3 её зовёт
-// РОВНО одно место: `activityeditor::detail::CAESelectOriginDialog@MouseLClickEvent`
-// (встроенный редактор активностей AliceSoft), где `== 0` закрывает диалог. Редактор
-// в обычной игре не открывается, а понятия «активной» части у нас нет вовсе (фокус —
-// заглушка выше), поэтому честнее вернуть 0, чем выдумать семантику: 0 означает «нет
-// активной части», и это согласовано с нашей нумерацией (номера начинаются от 9e7).
-// Экспорт нужен потому, что ОТСУТСТВИЕ функции уводит движок в REPL (FINDINGS §5x).
-static int PE_GetActiveParts(void) { return 0; }
+// `GetActiveParts` — «номер активной части» (передняя часть под курсором), 0 = нет
+// такой. Реализация — в src/parts/input.c при потребителе курсора hover-прохода:
+// у Dohna по ней ходят гейт листания реплики (`CMessageKeyControl@CheckKeyClick`,
+// вето `!IsClickableParts(GetActiveParts())`) и выбор пункта меню
+// (`CMenuView@_Update`); заглушка «всегда 0» ломала оба (реплика листалась кликом
+// по любой кнопке ADV). У Tsumamigui 3 её зовёт только редактор активностей.
 
 // IME (переключение на полноширинный ввод в текстовом поле) — у нас ввод идёт через
 // SDL без IME, переключать нечего. Настоящий no-op, а не заглушка-недоделка.

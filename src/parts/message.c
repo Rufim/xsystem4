@@ -35,10 +35,61 @@ struct parts_message {
 	int type;
 	int variables[PARTS_MSG_MAX_VARS];
 	int nr_variables;
+	// Кадр постановки в очередь (см. msg_cur_frame ниже).
+	unsigned frame;
 };
 
 static STAILQ_HEAD(, parts_message) msg_queue =
 		STAILQ_HEAD_INITIALIZER(msg_queue);
+
+/*
+ * ★СООБЩЕНИЯ ЭТОГО КАДРА ИГРЕ НЕ ВИДНЫ — очередь читается С ЗАДЕРЖКОЙ КАДРА,
+ * как в оригинале (давно наблюдавшиеся «грабли», оказавшиеся ЗАЩИТОЙ).
+ *
+ * Внутри одного View_Update порядок такой: parts::detail::Update (наш
+ * PE_UpdateInputState кладёт MOUSE_CLICK) → parts::detail::UpdateMessage
+ * (CPartsMessageManager читает очередь и диспатчит). Если сообщение видно сразу,
+ * обработчик кнопки выполняется В ТОМ ЖЕ кадре, что и отпускание, — РАНЬШЕ, чем
+ * ожидание реплики успевает потребить фронт этого же клика своим CASClick-опросом
+ * (callback цикла WaitForClick идёт ДО View_Update). Живой случай — кнопка Auto:
+ * диспатч включает режим, а на следующем кадре CheckKeyClickStepMessage видит
+ * «клик» (залипший keyDown), попадает в ветку CheckReleaseModeByClick — она стоит
+ * ДО вето IsClickableParts(GetActiveParts()) — и ГАСИТ только что включённый Auto
+ * (лог: g_オートモード <- 1 из Ｓ＿オート и тут же <- 0 из ReleaseModeByClickCancel).
+ * С задержкой кадра фронт потребляется на кадр РАНЬШЕ диспатча: Auto ещё выключен,
+ * CheckReleaseModeByClick молчит, вето по «активной части» съедает клик, и только
+ * потом обработчик включает режим.
+ *
+ * msg_cur_frame двигает PE_UpdateInputState (раз в кадр, parts_msg_new_frame);
+ * сообщение видно, когда его кадр УЖЕ НЕ текущий.
+ *
+ * ★ЗАДЕРЖИВАЮТСЯ ТОЛЬКО КЛИКОВЫЕ СООБЩЕНИЯ (MOUSE_CLICK и парный ему KEY_UP).
+ * Первая редакция откладывала ВСЮ очередь — и загрузка игры расползлась на
+ * десятки секунд: шаги построения экранов, связанные через сообщения
+ * («обработчик → пуш → обработчик»), стали стоить по кадру каждый, и титул к
+ * штатному времени стенда ещё летел в фоне (клик по Start Game ловил кнопку
+ * アリスの館 на пролёте через её координаты). Гонка же живёт только на клике —
+ * шире откладывать и не нужно.
+ */
+static unsigned msg_cur_frame;
+
+void parts_msg_new_frame(void)
+{
+	msg_cur_frame++;
+}
+
+static bool msg_click_kind(int type)
+{
+	return type == PARTS_MSG_MOUSE_CLICK || type == PARTS_MSG_KEY_UP;
+}
+
+static struct parts_message *msg_visible_head(void)
+{
+	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	if (!msg || (msg->frame == msg_cur_frame && msg_click_kind(msg->type)))
+		return NULL;
+	return msg;
+}
 
 // Значение GetMessageType на ПУСТОЙ очереди — «сообщений больше нет». Игра крутит
 // drain-луп именно по этому сентинелу, и он СМЕНИЛСЯ между версиями библиотеки:
@@ -178,6 +229,7 @@ static void msg_push_v(int parts_no, int delegate_index, int unique_id, int type
 	msg->unique_id = unique_id;
 	msg->type = type;
 	msg->nr_variables = 0;
+	msg->frame = msg_cur_frame;
 
 	for (const char *p = fmt; *p; p++) {
 		if (msg->nr_variables >= PARTS_MSG_MAX_VARS) {
@@ -237,18 +289,28 @@ void parts_msg_push_global(int type, const char *fmt, ...)
 
 void PE_ReleaseMessage(void)
 {
-	while (!STAILQ_EMPTY(&msg_queue)) {
-		struct parts_message *msg = STAILQ_FIRST(&msg_queue);
-		STAILQ_REMOVE_HEAD(&msg_queue, entry);
-		free(msg);
+	/*
+	 * `CPartsMessageManager@Update` зовёт это В КОНЦЕ КАЖДОГО кадра, выкинув всё
+	 * недочитанное. ОТЛОЖЕННЫЙ КЛИК этого кадра (см. msg_visible_head) обязан
+	 * пережить очистку — иначе он умирает не доставленным, и кнопки-делегаты
+	 * глохнут вовсе (первый же замер: Start Game на титуле перестал нажиматься).
+	 */
+	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	while (msg) {
+		struct parts_message *next = STAILQ_NEXT(msg, entry);
+		if (!(msg->frame == msg_cur_frame && msg_click_kind(msg->type))) {
+			STAILQ_REMOVE(&msg_queue, msg, parts_message, entry);
+			free(msg);
+		}
+		msg = next;
 	}
 }
 
 void PE_PopMessage(void)
 {
-	if (STAILQ_EMPTY(&msg_queue))
+	struct parts_message *msg = msg_visible_head();
+	if (!msg)
 		return;
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
 	if (getenv("XSYS4_MSG_TRACE") && msg->type != 6)
 		NOTICE("MSG POP  type=%d parts=%d delegate=%d nvars=%d",
 		       msg->type, msg->parts_no, msg->delegate_index, msg->nr_variables);
@@ -271,19 +333,19 @@ void PE_PopMessage(void)
 
 int PE_GetMessageType(void)
 {
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	struct parts_message *msg = msg_visible_head();
 	return msg ? msg_type_out(msg->type) : msg_empty_type;
 }
 
 int PE_GetMessagePartsNumber(void)
 {
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	struct parts_message *msg = msg_visible_head();
 	return msg ? msg->parts_no : 0;
 }
 
 int PE_GetMessageDelegateIndex(void)
 {
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	struct parts_message *msg = msg_visible_head();
 	if (!msg)
 		return -1;
 	// Prefer the part's *current* delegate index: some messages (e.g. a Scroll
@@ -305,7 +367,7 @@ int PE_GetMessageDelegateIndex(void)
 // как игра зарегистрировала обработчик.
 int PE_GetMessageUniqueID(void)
 {
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	struct parts_message *msg = msg_visible_head();
 	if (!msg)
 		return -1;
 	struct parts *p = parts_try_get(msg->parts_no);
@@ -317,7 +379,7 @@ int PE_GetMessageUniqueID(void)
 
 int PE_GetMessageVariableCount(void)
 {
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	struct parts_message *msg = msg_visible_head();
 	return msg ? msg->nr_variables : 0;
 }
 
@@ -329,7 +391,7 @@ int PE_GetMessageVariableType(possibly_unused int index)
 
 int PE_GetMessageVariableInt(int index)
 {
-	struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+	struct parts_message *msg = msg_visible_head();
 	if (!msg)
 		return 0;
 	if (index < 0 || index >= msg->nr_variables)
@@ -357,7 +419,7 @@ bool PE_GetMessageVariableBool(int index)
 {
 	bool r = PE_GetMessageVariableInt(index) != 0;
 	if (getenv("XSYS4_MSG_TRACE")) {
-		struct parts_message *msg = STAILQ_FIRST(&msg_queue);
+		struct parts_message *msg = msg_visible_head();
 		NOTICE("MSG VAR bool[%d] -> %d (type=%d parts=%d nvars=%d)", index, (int)r,
 		       msg ? msg->type : -1, msg ? msg->parts_no : -1,
 		       msg ? msg->nr_variables : -1);

@@ -45,6 +45,20 @@ static bool prev_clicking = false;
 static int clicked_parts = 0;
 // the current (partially) clicked parts number
 static int click_down_parts = 0;
+/*
+ * «Активная часть» (`PartsEngine.GetActiveParts`) — передняя часть под курсором,
+ * потребившая его в hover-проходе этого кадра; 0 = никто. По ней игра сама решает,
+ * листать ли реплику кликом: гейт левой кнопки в ожидании реплики
+ * (`CMessageKeyControl@CheckKeyClick`, лямбда 24389) — это
+ * `!IsClickableParts(GetActiveParts())`, и выбор пункта меню
+ * (`CMenuView@_Update`) охраняется тем же вызовом. Пока функция была заглушкой
+ * «всегда 0», вето не срабатывало НИКОГДА, и любой клик по кнопке ADV вдобавок
+ * к своему действию листал реплику (Dohna: микрофон, ярлыки, строки System
+ * Menu; особенно после возврата из кнопочной сцены — путь
+ * `AdvSystemButton@Execute` штатно НЕ чистит CASClick-флаги, и залипший фронт
+ * гасится в оригинале именно этим вето).
+ */
+static int active_parts = 0;
 
 // drag state
 static struct parts *drag_parts = NULL;
@@ -162,9 +176,12 @@ static bool parts_can_take_cursor(struct parts *parts)
 {
 	// ★`wheelable` СЮДА НЕ ГОДИТСЯ: его дефолт — true у КАЖДОЙ части (parts_init),
 	// то есть признаком способности к вводу он не является и обнулял весь гейт.
+	// is_textbox здесь с тех пор, как загрузчик раскладок перестал раздавать
+	// кликабельность (clickable > 0 теперь ТОЛЬКО от クリック許可/SetClickable):
+	// поле ввода берёт фокус кликом (PE_textbox_click), и курсор ему нужен.
 	bool own_input = parts->clickable > 0 || parts->is_button || parts->pixel_hittest
 			|| parts->is_checkbox || parts->is_hscrollbar || parts->is_vscrollbar
-			|| parts->draggable;
+			|| parts->is_textbox || parts->draggable;
 	enum parts_type t = parts->states[parts->state].type;
 	bool detector = (t == PARTS_CG_DETECTION || t == PARTS_RECT_DETECTION);
 	bool r = own_input || detector || !parts_msg_api_new() || parts->delegate_index >= 0;
@@ -279,8 +296,12 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		       parts->global.z, parts->controller_no);
 
 	// !pass_cursor parts consume the cursor for parts behind them
-	if (is_hovered && !parts->pass_cursor)
+	if (is_hovered && !parts->pass_cursor) {
 		*hover_consumed = true;
+		// Потребитель курсора этого кадра и есть «активная часть» (обход идёт
+		// front-to-back, потребитель один — первый непрозрачный для курсора).
+		active_parts = parts->no;
+	}
 
 	if (parts->linked_from >= 0 && is_hovered != was_hovered) {
 		parts_dirty(parts_get(parts->linked_from));
@@ -396,10 +417,26 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 			struct parts_state *st = &parts->states[parts->state];
 			const char *cg = (st->type == PARTS_CG && st->cg.name)
 			                 ? display_sjis0(st->cg.name->text) : "";
-			NOTICE("CLICKNO часть %d кликнута (глубина ввода %d) cg=\"%s\"",
-			       parts->no, parts_input_depth, cg);
+			NOTICE("CLICKNO часть %d кликнута (глубина ввода %d, clickable=%d) cg=\"%s\"",
+			       parts->no, parts_input_depth, parts->clickable, cg);
 		}
-		clicked_parts = parts->no;
+		/*
+		 * «Номер кликнутой части» (GetClickNumber) — ТОЛЬКО для частей, которые игра
+		 * ЯВНО объявила кликабельными (SetClickable / Parts_SetClickable /
+		 * `CParts@Clickable::set`). `0 < GetClickNumber()` — условие выхода КАЖДОГО
+		 * `parts::detail::WaitForClick`, а на нём у новых игр висят не только меню, но
+		 * и ожидание реплики (`CMessageTextView@ExecuteKeyWait`), `Motion::Join`,
+		 * таймеры и `SceneContext@Join` (все через `Ｐ＿クリック実行`). Если номер
+		 * ставит ЛЮБАЯ непрозрачная часть (прежнее condition = click_eligible), клик по
+		 * кнопке ADV или по окну сообщений завершает ожидание реплики — реплика
+		 * листается ВДОБАВОК к действию кнопки (Dohna: микрофон, ярлыки scrollback/Hide
+		 * UI, клик в режиме Auto). Кликабельность кнопок-делегатов оригиналу и не
+		 * нужна: их действие приходит сообщением MOUSE_CLICK (отправка ниже осталась
+		 * широкой — click_eligible), а фон листает реплику через CASClick-опрос с вето
+		 * IsClickableParts(GetActiveParts()) — см. PE_GetActiveParts.
+		 */
+		if (parts->clickable > 0)
+			clicked_parts = parts->no;
 
 		// Checkbox: flip state on click; the game reads it via IsCheckBoxChecked.
 		// ★И СРАЗУ СООБЩАЕМ ИГРЕ: одного локального переключения мало — вся логика
@@ -469,6 +506,10 @@ void PE_UpdateInputState(int passed_time)
 	bool cur_clicking = key_is_down(VK_LBUTTON);
 	mouse_get_pos(&cur_pos.x, &cur_pos.y);
 
+	// Новый кадр очереди сообщений: всё, что наложим ниже (MOUSE_CLICK и пр.),
+	// игра прочитает только СЛЕДУЮЩИМ кадром — как в оригинале (см. message.c).
+	parts_msg_new_frame();
+
 	/*
 	 * ★ДИАГНОСТИКА — ДО ГЕЙТА. Разовый дамп по kill -USR1 нужен ровно тогда, когда
 	 * «ничего не нажимается», а это чаще всего и означает выключенный гейт: стоя
@@ -485,8 +526,11 @@ void PE_UpdateInputState(int passed_time)
 
 	// Ввод выключен игрой — не наводим, не кликаем и не рассылаем сообщения.
 	// Позицию курсора при этом всё равно прочли: игра её опрашивает отдельно.
-	if (!parts_input_enabled)
+	// Активной части при выключенном вводе тоже нет.
+	if (!parts_input_enabled) {
+		active_parts = 0;
 		return;
+	}
 
 	if (getenv("XSYS4_INPUT_TRACE")) {
 		static int ncalls = 0;
@@ -526,6 +570,8 @@ void PE_UpdateInputState(int passed_time)
 
 	bool hover_consumed = false;
 	bool click_consumed = false;
+	// Активная часть считается заново каждый кадр: курсор мог уйти в пустоту.
+	active_parts = 0;
 	struct parts *parts;
 	// Iterate front-to-back (highest z first) for proper cursor consumption
 	PARTS_LIST_FOREACH_REVERSE(parts) {
@@ -772,6 +818,16 @@ void PE_SetClickable(int parts_no, bool clickable)
 	parts_get(parts_no)->clickable = clickable ? 1 : -1;
 }
 
+// Снять явный запрет клика, НЕ делая часть кликабельной (обратно в «не задано»).
+// Нужен SetButtonEnable(true): включение кнопки снимает запрет ввода, но клик по
+// ней не должен становиться видимым опросу GetClickNumber (см. PartsEngine.c).
+void PE_ClearClickableBan(int parts_no)
+{
+	struct parts *parts = parts_get(parts_no);
+	if (parts->clickable < 0)
+		parts->clickable = 0;
+}
+
 void PE_SetPartsIsButton(int parts_no, bool is_button)
 {
 	parts_get(parts_no)->is_button = !!is_button;
@@ -959,6 +1015,7 @@ void parts_input_reset(void)
 	parts_began_click = false;
 	clicked_parts = 0;
 	click_down_parts = 0;
+	active_parts = 0;
 	drag_state_reset();
 }
 
@@ -985,8 +1042,19 @@ int PE_GetSwipeType(int parts_no)
 	return parts ? parts->swipe_type : 0;
 }
 
+int PE_GetActiveParts(void)
+{
+	return active_parts;
+}
+
 int PE_GetClickPartsNumber(void)
 {
+	// Вторая половина XSYS4_CLICKNO_TRACE: не только жизнь номера, но и его ЧТЕНИЕ
+	// игрой. Ненулевой ответ — это выход какого-то WaitForClick; по паре
+	// «кликнута → ЧТЕНИЕ» видно, КАКОЕ ожидание съело клик (нулевые чтения идут
+	// каждый кадр и в лог не годятся).
+	if (clicked_parts && getenv("XSYS4_CLICKNO_TRACE"))
+		NOTICE("CLICKNO ЧТЕНИЕ номера %d (глубина %d)", clicked_parts, parts_input_depth);
 	return clicked_parts;
 }
 

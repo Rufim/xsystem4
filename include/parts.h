@@ -284,6 +284,7 @@ void PE_UpdateInputState(int passed_time);
 void PE_SetPassCursor(int parts_no, bool pass);
 bool PE_GetPartsPassCursor(int parts_no);
 void PE_SetClickable(int parts_no, bool clickable);
+void PE_ClearClickableBan(int parts_no);
 void PE_SetPartsIsButton(int parts_no, bool is_button);
 void PE_SetPartsPixelHitTest(int parts_no, bool enable);
 void PE_SetEnableInputProcess(int parts_no, bool enable);
@@ -348,6 +349,7 @@ int PE_Parts_GetSoundNumber(int parts_no, int state);
 void PE_BeginInput(void);
 void PE_EndInput(void);
 int PE_GetClickPartsNumber(void);
+int PE_GetActiveParts(void);
 bool PE_IsCursorIn(int parts_no, int mouse_x, int mouse_y, int state);
 
 // message.c

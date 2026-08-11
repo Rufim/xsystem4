@@ -1079,6 +1079,9 @@ enum parts_message_type {
 void parts_msg_push(struct parts* parts, int type, const char *fmt, ...);
 void parts_msg_push_global(int type, const char *fmt, ...);
 bool parts_msg_api_new(void);
+// Кадровая граница видимости очереди сообщений (см. msg_cur_frame в message.c):
+// зовёт PE_UpdateInputState раз в кадр, ДО постановки событий этого кадра.
+void parts_msg_new_frame(void);
 void parts_hscrollbar_drag_to(struct parts *parts, int cursor_abs_x);
 void parts_vscrollbar_drag_to(struct parts *parts, int cursor_abs_y);
 void PE_OnVScrollbarDragged(int parts_no, float rate);
