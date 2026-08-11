@@ -323,6 +323,13 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->gradation_amap.a2);
 		iarray_write(w, op->gradation_amap.vertical);
 		break;
+	case PARTS_CP_TILE_CG_BLEND:
+		iarray_write(w, op->tile_cg.cg_no);
+		iarray_write(w, op->tile_cg.x);
+		iarray_write(w, op->tile_cg.y);
+		iarray_write(w, op->tile_cg.w);
+		iarray_write(w, op->tile_cg.h);
+		break;
 	}
 }
 
@@ -433,6 +440,13 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->gradation_amap.a1 = iarray_read(r);
 		op->gradation_amap.a2 = iarray_read(r);
 		op->gradation_amap.vertical = !!iarray_read(r);
+		break;
+	case PARTS_CP_TILE_CG_BLEND:
+		op->tile_cg.cg_no = iarray_read(r);
+		op->tile_cg.x = iarray_read(r);
+		op->tile_cg.y = iarray_read(r);
+		op->tile_cg.w = iarray_read(r);
+		op->tile_cg.h = iarray_read(r);
 		break;
 	}
 	return op;
