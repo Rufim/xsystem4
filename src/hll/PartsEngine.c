@@ -984,6 +984,17 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		PE_AddBlurFilterToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
 				full_size, blur, command == 28, state);
 		break;
+	/*
+	 * `CASConstructionProcess::TileCGBlend` — замостить поверхность картинкой и
+	 * подмешать её по альфе. Разбор `title::CScreen@Bulid`: у титула Haha Ranman
+	 * так кладётся зерно плёнки `タイトル／フィルム／ノイズ` ДО гашения краёв,
+	 * поэтому крупа попадает и в кайму, где снимок растворяется в бумаге.
+	 * Раньше команда падала в ветку «неизвестная v14-команда» и отбрасывалась.
+	 */
+	case 128:  // CASConstructionProcess::TileCGBlend (v14)
+		PE_AddTileCGBlendToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				cg_name, state);
+		break;
 	case 88:  // CASConstructionProcess::SetFillRect (v14) — заливка ЦВЕТОМ
 		PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh, r, g, b, state);
 		break;
@@ -1364,7 +1375,8 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
 	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
-	static const int v14_ok[] = { 25, 26, 27, 28, 88, 90, 102, 122 };
+	// 128 — `TileCGBlend` (зерно плёнки на титуле Haha Ranman).
+	static const int v14_ok[] = { 25, 26, 27, 28, 88, 90, 102, 122, 128 };
 	bool known_v14 = false;
 	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
 		known_v14 |= (command == v14_ok[i]);

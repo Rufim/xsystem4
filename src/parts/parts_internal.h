@@ -262,7 +262,15 @@ enum parts_cp_op_type {
 	// Ими обводят поверхность мягкой каймой: слайд-шоу титула Haha Ranman кладёт
 	// четыре полосы по 15 px и получает фотографию, растворяющуюся в бумаге.
 	PARTS_CP_FILL_GRADATION_AMAP,
-#define PARTS_NR_CP_TYPES (PARTS_CP_FILL_GRADATION_AMAP+1)
+	/*
+	 * v14: ЗАМОЩЕНИЕ CG (команда 128, у игры `CASConstructionProcess::TileCGBlend`).
+	 * Картинку повторяют по всей поверхности и подмешивают по её альфе. У титула
+	 * Haha Ranman так кладётся зерно плёнки `タイトル／フィルム／ノイズ` (32x32,
+	 * чёрное, альфа 0…22) — ШАГ ИДЁТ ДО гашения краёв, поэтому зерно попадает и в
+	 * кайму. Без него плёнка выходит стерильной.
+	 */
+	PARTS_CP_TILE_CG_BLEND,
+#define PARTS_NR_CP_TYPES (PARTS_CP_TILE_CG_BLEND+1)
 };
 
 struct parts_cp_create {
@@ -347,6 +355,11 @@ struct parts_cp_gradation_amap {
 	bool vertical;   // true — вдоль Y (команда 25), false — вдоль X (команда 26)
 };
 
+struct parts_cp_tile_cg {
+	int cg_no;
+	int x, y, w, h;  // область замощения; нули = вся поверхность (см. cp_fill_rect)
+};
+
 struct parts_cp_op {
 	TAILQ_ENTRY(parts_cp_op) entry;
 	enum parts_cp_op_type type;
@@ -362,6 +375,7 @@ struct parts_cp_op {
 		struct parts_cp_fill_gradation gradation;
 		struct parts_cp_color_filter color_filter;
 		struct parts_cp_gradation_amap gradation_amap;
+		struct parts_cp_tile_cg tile_cg;
 	};
 };
 

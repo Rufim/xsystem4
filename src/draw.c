@@ -600,6 +600,42 @@ void gfx_fill_amap_gradation_lr(Texture *dst, int x, int y, int w, int h, int le
 }
 
 /*
+ * УМНОЖЕНИЕ альфа-карты на градиент — то, что просит игра
+ * (`CASConstructionProcess::MulAMapGradationHorizon`/`Vertical`, команды 25/26).
+ * Шейдер тот же, что у заливки, отличается только режим смешивания: приёмник
+ * умножается на альфу источника (`GL_ZERO, GL_SRC_ALPHA` для альфа-канала), тогда
+ * как заливка его замещала (`GL_ONE, GL_ZERO`).
+ *
+ * Разница видна там, где альфа уже НЕ 255: полосы каймы пересекаются в углах, и
+ * при замещении последняя просто затирала предыдущую — вместо произведения двух
+ * спадов в углу оставался один. У титула Haha Ranman четыре полосы по 15 px, то
+ * есть четыре угла 15x15 на каждом слайде.
+ */
+void gfx_mul_amap_gradation_ud(Texture *dst, int x, int y, int w, int h, int up_a, int down_a)
+{
+	glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ZERO, GL_SRC_ALPHA);
+
+	struct copy_data data = COPY_DATA(x, y, 0, 0, w, h);
+	data.threshold = up_a / 255.0;
+	data.threshold2 = down_a / 255.0;
+	run_fill_shader(&fill_amap_gradation_ud_shader.s, dst, &data);
+
+	restore_blend_mode();
+}
+
+void gfx_mul_amap_gradation_lr(Texture *dst, int x, int y, int w, int h, int left_a, int right_a)
+{
+	glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ZERO, GL_SRC_ALPHA);
+
+	struct copy_data data = COPY_DATA(x, y, 0, 0, w, h);
+	data.threshold = left_a / 255.0;
+	data.threshold2 = right_a / 255.0;
+	run_fill_shader(&fill_amap_gradation_lr_shader.s, dst, &data);
+
+	restore_blend_mode();
+}
+
+/*
  * Аддитивная подкраска (`CASConstructionProcess@SetAddFilter`, команда 16). Альфу
  * не трогаем — фильтр красит только цвет. Так титул Haha Ranman возвращает тёплый
  * тон обесцвеченной фотографии: GrayFilter, затем AddFilter(17,5,0).
