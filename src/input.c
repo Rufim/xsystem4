@@ -128,16 +128,18 @@ static void test_queue_release(const SDL_Event *ev)
 	test_pending_n++;
 }
 
-// Последняя РЕАЛЬНАЯ позиция курсора (см. mouse_get_pos): по её ИЗМЕНЕНИЮ отличается
-// живая мышь от синтетической позиции тестового ввода.
-static int last_real_x, last_real_y;
-static bool real_seen;
-
-// Наш собственный warp курсора не должен считаться движением мыши.
-static void test_input_forget_real_pos(void)
-{
-	real_seen = false;
-}
+/*
+ * Цель ПОСЛЕДНЕГО warp'а курсора в ОКОННЫХ координатах (-1 — warp не ждём).
+ * По ней живая мышь отличается от нашего же warp'а: warp рождает
+ * SDL_MOUSEMOTION ровно в цель, живая рука — куда угодно ещё.
+ * ★Детекция ТОЛЬКО по событиям SDL_MOUSEMOTION (см. handle_events), НЕ по
+ * поллингу GetMouseState: warp асинхронный, и выборка между запросом и
+ * посадкой видела «скачок» (база до warp'а, позиция после) — подмена
+ * снималась от нашего же движения, стенды теряли ввод (Haha Ranman, Dohna
+ * save/load). Вдобавок поллинг пересчитывает координаты через viewport, и
+ * смена viewport (fullscreen, resize) «двигала» курсор без движения мыши.
+ */
+static int warp_target_wx = -1, warp_target_wy = -1;
 
 
 static void test_input_update(void)
@@ -225,9 +227,6 @@ static void test_input_update(void)
 			// «прыжок в точку» и настоящую протяжку не воспроизводит.
 			test_mouse_x = x; test_mouse_y = y;
 			mouse_set_pos(x, y);
-			// Наш собственный warp — не «живая мышь»: забываем прошлую реальную
-			// позицию, иначе следующий кадр примет прыжок курсора за ручной ввод.
-			test_input_forget_real_pos();
 			SDL_Event down = {0};
 			down.type = SDL_MOUSEBUTTONDOWN;
 			down.button.button = SDL_BUTTON_LEFT;
@@ -239,9 +238,6 @@ static void test_input_update(void)
 		} else if (sscanf(line, "mouseup %d %d", &x, &y) == 2) {
 			test_mouse_x = x; test_mouse_y = y;
 			mouse_set_pos(x, y);
-			// Наш собственный warp — не «живая мышь»: забываем прошлую реальную
-			// позицию, иначе следующий кадр примет прыжок курсора за ручной ввод.
-			test_input_forget_real_pos();
 			SDL_Event up = {0};
 			up.type = SDL_MOUSEBUTTONUP;
 			up.button.button = SDL_BUTTON_LEFT;
@@ -257,9 +253,6 @@ static void test_input_update(void)
 			// spot a real mouse would — e.g. the wheel/BACK LOG trigger, which
 			// behaves differently depending on where the cursor is.
 			mouse_set_pos(x, y);
-			// Наш собственный warp — не «живая мышь»: забываем прошлую реальную
-			// позицию, иначе следующий кадр примет прыжок курсора за ручной ввод.
-			test_input_forget_real_pos();
 			NOTICE("TEST_INPUT: move %d,%d", x, y);
 		} else if (sscanf(line, "wheel %d", &x) == 1) {
 			// Deterministic mouse-wheel for testing scrollable UIs (BACK LOG).
@@ -488,45 +481,18 @@ void mouse_get_pos(int *x, int *y)
 
 	if (test_input_enabled && test_mouse_x >= 0) {
 		/*
-		 * ★ЖИВАЯ МЫШЬ ОТМЕНЯЕТ ПОДМЕНУ. Раньше первая же команда `move` делала
-		 * позицию курсора НАВСЕГДА синтетической, и после скрипта прохождения
-		 * управлять игрой руками было нельзя: движок считал, что курсор стоит там,
-		 * где его оставил скрипт. У пользователя это выглядело как баг игры —
-		 * «нажимается только правая нижняя кнопка» (`dohna-user.sh` заканчивается на
-		 * `move 1230 681`, это кнопка футера) и «словно кто-то сам жмёт кнопки»;
-		 * два дампа по SIGUSR1 подряд показывали одно и то же `курсор 1230,681`,
-		 * сколько бы игрок ни водил мышью (FINDINGS §5cu).
-		 *
-		 * ★Признак живого ввода — ИЗМЕНЕНИЕ реальной позиции между кадрами, а НЕ её
-		 * расхождение с синтетической. Первая редакция правки сравнивала с
-		 * синтетической и сломала сам тестовый ввод: `mouse_set_pos` (SDL warp) под
-		 * Wayland не двигает курсор вовсе, расхождение возникало сразу же, подмена
-		 * снималась на первой команде — и клик скрипта уходил туда, где физически
-		 * лежала мышь. В прогоне это попало по «Exit the game?», автоответчик
-		 * подтвердил, и игра закрылась.
+		 * ★ЖИВАЯ МЫШЬ ОТМЕНЯЕТ ПОДМЕНУ (см. SDL_MOUSEMOTION в handle_events).
+		 * Раньше первая же команда `move` делала позицию курсора НАВСЕГДА
+		 * синтетической, и после скрипта прохождения управлять игрой руками было
+		 * нельзя (FINDINGS §5cu: «нажимается только правая нижняя кнопка»).
+		 * Здесь подмену НЕ проверяем: поллинг GetMouseState ловил наш же
+		 * асинхронный warp и смену viewport как «движение мыши» и снимал
+		 * подмену посреди прогона (стенды Haha Ranman и dohna-saveload).
 		 */
-		/*
-		 * ★ПОРОГ, А НЕ РАВЕНСТВО. Пересчёт оконных координат в игровые идёт с
-		 * округлением (viewport), поэтому «та же» точка легко отличается на пиксель:
-		 * в прогоне подмена снималась от разницы (1231,680) против (1230,681) сразу
-		 * после нашего же warp — и тестовый ввод ломался на первой команде.
-		 */
-		if (real_seen && (abs(rx - last_real_x) > 4 || abs(ry - last_real_y) > 4)) {
-			test_mouse_x = -1;
-			NOTICE("TEST_INPUT: курсор сдвинут живой мышью (%d,%d) — подмена позиции снята",
-			       rx, ry);
-		} else {
-			last_real_x = rx;
-			last_real_y = ry;
-			real_seen = true;
-			*x = test_mouse_x;
-			*y = test_mouse_y;
-			return;
-		}
+		*x = test_mouse_x;
+		*y = test_mouse_y;
+		return;
 	}
-	last_real_x = rx;
-	last_real_y = ry;
-	real_seen = true;
 	*x = rx;
 	*y = ry;
 }
@@ -535,6 +501,9 @@ void mouse_set_pos(int x, int y)
 {
 	int wx = x * sdl.viewport.w / sdl.w + sdl.viewport.x;
 	int wy = y * sdl.viewport.h / sdl.h + sdl.viewport.y;
+	// Запоминаем цель: SDL_MOUSEMOTION ровно в неё — наш warp, не живая рука.
+	warp_target_wx = wx;
+	warp_target_wy = wy;
 	SDL_WarpMouseInWindow(sdl.window, wx, wy);
 }
 
@@ -962,6 +931,30 @@ void handle_events(void)
 			break;
 		case SDL_APP_DIDENTERFOREGROUND:
 			gfx_swap();
+			break;
+		case SDL_MOUSEMOTION:
+			/*
+			 * ЖИВАЯ МЫШЬ ОТМЕНЯЕТ ПОДМЕНУ ТЕСТОВОГО ВВОДА (FINDINGS §5cu).
+			 * Детекция по СОБЫТИЮ, а не поллингом: warp асинхронный, и сравнение
+			 * позиций между кадрами принимало его посадку за ручной ввод.
+			 * Наш warp отличается целью: его событие приходит ровно в неё
+			 * (допуск на округление); всё остальное — рука на мыши.
+			 */
+			if (test_input_enabled && test_mouse_x >= 0) {
+				if (warp_target_wx >= 0 &&
+				    abs(e.motion.x - warp_target_wx) <= 2 &&
+				    abs(e.motion.y - warp_target_wy) <= 2) {
+					warp_target_wx = warp_target_wy = -1;
+				} else {
+					// Не в цель warp'а — живая рука. «Ждать посадку warp'а»
+					// здесь нельзя: под Wayland warp не двигает курсор вовсе,
+					// события в цель не будет, и вечное ожидание глушило бы
+					// детекцию (мышь пользователя перестала бы сниматься).
+					test_mouse_x = -1;
+					NOTICE("TEST_INPUT: курсор сдвинут живой мышью (%d,%d) — подмена позиции снята",
+					       e.motion.x, e.motion.y);
+				}
+			}
 			break;
 		case SDL_KEYDOWN:
 			if (e.key.keysym.scancode == SDL_SCANCODE_F9) {
