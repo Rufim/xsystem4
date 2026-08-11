@@ -256,8 +256,11 @@ union vm_value global_get(int varno)
 	return heap[0].page->values[varno];
 }
 
+static void global_watch(int varno, union vm_value val);
+
 void global_set(int varno, union vm_value val, bool call_dtors)
 {
+	global_watch(varno, val);
 	switch (ain->globals[varno].type.data) {
 	case AIN_STRING:
 	case AIN_STRUCT:
@@ -546,6 +549,44 @@ static union vm_value *stack_pop_var(void)
  *   XSYS4_FIELD_WATCH=parts::detail::CParts:1:0
  * (поле 1 — `<Number>` в `struct CParts { array<int> <vtable>; int <Number>; bool <AutoRelease>; }`).
  */
+/*
+ * `XSYS4_GLOBAL_WATCH=<индекс>[:<значение>]` — печатать СТЕК ВЫЗОВОВ ИГРЫ в момент
+ * записи в ГЛОБАЛ игры (номер брать из `alice ain dump -g`; при желании — только
+ * когда пишут указанное значение). Родной брат XSYS4_FIELD_WATCH: тот ловит поля
+ * объектов, этот — глобальную страницу. Появился для g_オートモード (слот 0x77):
+ * «Auto включается со второго-третьего нажатия» — надо видеть, КТО и в каком
+ * порядке пишет включение/выключение режима.
+ */
+static void global_watch(int varno, union vm_value val)
+{
+	static int watch_index = -2;
+	static bool value_only;
+	static int watch_value;
+	if (watch_index == -2) {
+		watch_index = -1;
+		const char *spec = getenv("XSYS4_GLOBAL_WATCH");
+		if (spec && *spec) {
+			watch_index = (int)strtol(spec, NULL, 0);
+			const char *colon = strchr(spec, ':');
+			if (colon) {
+				value_only = true;
+				watch_value = atoi(colon + 1);
+			}
+			NOTICE("GLOBALWATCH включён: глобал %d%s", watch_index,
+			       value_only ? ", только значение" : "");
+		}
+	}
+	if (watch_index < 0 || varno != watch_index)
+		return;
+	if (value_only && val.i != watch_value)
+		return;
+	const char *name = (varno >= 0 && varno < ain->nr_globals)
+		? ain->globals[varno].name : "?";
+	NOTICE("GLOBALWATCH %s (глобал %d) <- %d — стек вызовов игры:",
+	       display_sjis0(name), varno, val.i);
+	vm_stack_trace();
+}
+
 static void field_watch(union vm_value val)
 {
 	static int watch_index = -2;   // -2 = переменную ещё не разбирали
@@ -586,6 +627,10 @@ static void field_watch(union vm_value val)
 			}
 		}
 	}
+	// Запись в ГЛОБАЛ через PUSHGLOBALPAGE + X_ASSIGN идёт этим же путём — отдаём
+	// её глобальному вотчеру (GLOBALASSIGN ловится отдельно, в global_set).
+	if (last_var_page && last_var_page->type == GLOBAL_PAGE)
+		global_watch(last_var_index, val);
 	if (watch_index < 0 || !last_var_page || last_var_index != watch_index)
 		return;
 	if (last_var_page->type != STRUCT_PAGE)
