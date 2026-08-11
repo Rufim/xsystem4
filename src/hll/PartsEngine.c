@@ -2902,10 +2902,25 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 
 	struct ex_tree *ti = act_child(node, "種類別情報");
 	int ptype = ti ? act_parts_type(ti) : -1;
+	/*
+	 * СЛАЙДЕРЫ (`横スライダーバー` = 13, `縦スライダーバー` = 12 в нумерации v14)
+	 * классического аналога не имеют, поэтому act_parts_type честно отдаёт -1 и
+	 * они уходили в общую CG-ветку: ни картинки бегунка по суффиксам, ни геометрии.
+	 * Так ползунок прозрачности подложки реплик (ADV-футер Haha Ranman) оставался
+	 * без бегунка — жёлоб и заливка от соседних частей были, а он один невидим.
+	 * Полоса и слайдер устроены одинаково (жёлоб, бегунок, доля), различаются
+	 * ИМЕНА ПОЛЕЙ раскладки и вид компонента, поэтому ведём их одной ветвью, но
+	 * с разными именами полей (`is_slider`) и своей пометкой части.
+	 */
+	int ptype14 = ti ? act_parts_type_v14(ti) : -1;
+	bool is_slider = (ptype14 == 12 || ptype14 == 13);
+	if (is_slider)
+		ptype = (ptype14 == 13) ? 3 : 2;
 	if (getenv("XSYS4_PT_TRACE")) {
 		struct string *dcg = ti ? act_str(ti, "ＣＧ名") : NULL;
-		NOTICE("PT part '%s' no=%d ptype=%d cg='%s'", display_sjis0(node->name->text),
-		       no, ptype, dcg ? display_sjis1(dcg->text) : "(nil)");
+		NOTICE("PT part '%s' no=%d ptype=%d%s cg='%s'", display_sjis0(node->name->text),
+		       no, ptype, is_slider ? " (слайдер)" : "",
+		       dcg ? display_sjis1(dcg->text) : "(nil)");
 	}
 
 	if (ptype == 0 && ti) {
@@ -3055,10 +3070,23 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		}
 		int base_x = act_list_int(node, "座標", 0, 0);
 		int base_y = act_list_int(node, "座標", 1, 0);
-		PE_InitPartsHScrollbar(no, base_x, base_y,
-			act_int(ti, "長さ", 0), act_int(ti, "幅", 0),
-			act_int(ti, "全体スクロール量", 0), act_int(ti, "表示量", 1),
-			act_float(ti, "スクロールレート", 0.0f));
+		// У слайдера поля названы своими именами: `全体スライダー量` вместо
+		// `全体スクロール量` и `スライダーレート` вместо `スクロールレート`
+		// (`表示量` совпадает). ★`スクロール位置` у слайдера тоже есть, но во ВСЕХ
+		// шести раскладках Haha Ranman он 0 при доле 0 — то есть выводить долю из
+		// позиции пока не на чем, и мы этого не делаем; поле видно в трассе.
+		int total = act_int(ti, is_slider ? "全体スライダー量" : "全体スクロール量", 0);
+		int view = act_int(ti, "表示量", 1);
+		float rate = act_float(ti, is_slider ? "スライダーレート" : "スクロールレート", 0.0f);
+		int length = act_int(ti, "長さ", 0);
+		int width = act_int(ti, "幅", 0);
+		PE_InitPartsHScrollbar(no, base_x, base_y, length, width, total, view, rate);
+		if (is_slider)
+			parts_mark_slider_bar(no, true);
+		if (getenv("XSYS4_PT_TRACE"))
+			NOTICE("PT h%s no=%d base=(%d,%d) len=%d w=%d total=%d view=%d rate=%.3f pos=%d",
+			       is_slider ? "sliderbar" : "scrollbar", no, base_x, base_y,
+			       length, width, total, view, rate, act_int(ti, "スクロール位置", 0));
 		// Кликабельность не раздаём (см. комментарий у кнопки): интерактивность
 		// полосы держится на is_hscrollbar.
 	} else if (ptype == 4 && ti) {
@@ -3154,15 +3182,20 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		} else if (flat && flat->size) {
 			PE_SetPartsFlat(no, flat, 1);
 		}
-		int total = act_int(ti, "全体スクロール量", 0);
+		// Имена полей у слайдера свои — см. горизонтальную ветвь. `縦スライダーバー`
+		// в раскладках Haha Ranman не встречается ни разу (счёт: 0 из 13 полос), так
+		// что этот путь пока держится только на симметрии с горизонтальным.
+		int total = act_int(ti, is_slider ? "全体スライダー量" : "全体スクロール量", 0);
 		int view  = act_int(ti, "表示量", 1);
-		float rate = act_float(ti, "スクロールレート", 0.0f);
+		float rate = act_float(ti, is_slider ? "スライダーレート" : "スクロールレート", 0.0f);
 		// Шаг кнопок-стрелок: без него 前へ/次へ не листают (см. sb_move_by_button).
 		PE_SetVScrollbarMoveSizeByButton(no, act_int(ti, "ボタンクリック移動量", 1));
 		PartsEngine_SetVScrollbarTotalSize(no, total);
 		PartsEngine_SetVScrollbarViewSize(no, view);
 		PartsEngine_SetVScrollbarScrollRate(no, rate);
 		PE_InitPartsVScrollbar(no, base_x, base_y, length, width, up_sz, down_sz, total, view, rate);
+		if (is_slider)
+			parts_mark_slider_bar(no, false);
 		// Cut 2 — static sibling parts for the rail background and ∧/∨ arrow buttons.
 		// The knob (part `no`) renders above the rail; the arrow buttons sit at the
 		// top/bottom ends of the track (前サイズ/次サイズ tall). They are decorative

@@ -3500,6 +3500,23 @@ void PE_SetComponentType(int parts_no, int type, int state)
 			parts->is_hscrollbar = true;
 		return;
 	}
+	/*
+	 * Слайдеры (`縦スライダーバー` = 12, `横スライダーバー` = 13 в нумерации v14) —
+	 * тот же случай, что полосы прокрутки: ФЛАГ на CG-части, геометрию кладёт
+	 * загрузчик раскладок. Игра выставляет тип сама (`CHSliderBarParts@0` →
+	 * SetComponentType(no, 13, 1)); раньше это уходило в общую ветку виджетов и
+	 * печатало «виджет 13 без своего вида отрисовки», а ползунок прозрачности
+	 * оставался без бегунка. Гейт по нумерации обязателен: классические 12/13 —
+	 * это `ループＣＧパーツ` и `テキストパーツ`.
+	 */
+	if (shifted_component_types() && (type == 12 || type == 13)) {
+		if (type == 12)
+			parts->is_vscrollbar = true;
+		else
+			parts->is_hscrollbar = true;
+		parts->is_slider_bar = true;
+		return;
+	}
 	switch (component_type_to_classic(type)) {
 	case 8:  pt = PARTS_LAYOUT_BOX; break;
 	case 11: pt = PARTS_CG; break;
@@ -3637,6 +3654,26 @@ void parts_mark_textbox(int parts_no)
 	pending_ctype_set(parts_no, 4, 1);
 }
 
+/*
+ * Пометить полосу как СЛАЙДЕР (`横スライダーバー` = 13, `縦スライダーバー` = 12 в
+ * нумерации v14). Зовёт загрузчик раскладки: механику (жёлоб, бегунок, доля) ведут
+ * те же поля, что у полосы прокрутки, а этот признак меняет только вид компонента,
+ * который часть отдаёт игре, — иначе обёртка `GetHSliderBar` у игры пустая.
+ */
+void parts_mark_slider_bar(int parts_no, bool horizontal)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts) {
+		pending_ctype_set(parts_no, horizontal ? 13 : 12, 1);
+		return;
+	}
+	if (horizontal)
+		parts->is_hscrollbar = true;
+	else
+		parts->is_vscrollbar = true;
+	parts->is_slider_bar = true;
+}
+
 int PE_GetComponentType(int parts_no, int state)
 {
 	int r = pe_get_component_type(parts_no, state);
@@ -3690,10 +3727,13 @@ static int pe_get_component_type(int parts_no, int state)
 	// `CompParts(имя, 2, 1)`) и `GetHScrollBar` (@0x20500, тип 3) возвращают
 	// null. На этом падал ассерт игры `ScrollBarUnit.jaf:26:
 	// (nonnull) m_act.GetVScrollBar("Scroll")` при входе на экран «Items».
+	// У СЛАЙДЕРА (`縦/横スライダーバー`) механика полосы, но свой вид: 12/13 в
+	// нумерации v14. `CActivityWrap@GetHSliderBar` (FUNC 552) сверяет его через
+	// `CompParts(имя, 13, 1)`, поэтому ответ «3» отдал бы игре пустую обёртку.
 	if (parts->is_vscrollbar)
-		return 2;
+		return parts->is_slider_bar ? 12 : 2;
 	if (parts->is_hscrollbar)
-		return 3;
+		return parts->is_slider_bar ? 13 : 3;
 
 	// Activity "button" parts (パーツタイプ=0) render as CG but report type 0 so
 	// the game recognizes them as buttons (e.g. C_TITLE@Enable registers click

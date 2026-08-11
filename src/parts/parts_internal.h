@@ -542,6 +542,18 @@ struct flat_stop_motion_frames {
 	int count;
 };
 
+/*
+ * ВИРТУАЛЬНАЯ CG-библиотека из секции TALT: у части флэтов LIBL пуст, а слои
+ * таймлайна просят картинки по имени (`AUTO.png`, `緑丸.png`) — они лежат
+ * ПОДКАРТИНКАМИ в одном атласе записи TALT. Такую библиотеку описывает пара
+ * «текстура атласа + прямоугольник в ней».
+ */
+struct flat_atlas_lib {
+	const char *name;   // из struct talt_metadata (владелец — struct flat)
+	int tex;            // индекс в parts_flat.talt_textures
+	Rectangle rect;     // подпрямоугольник в атласе
+};
+
 struct parts_flat {
 	struct parts_common common;
 	struct string *name;
@@ -556,6 +568,11 @@ struct parts_flat {
 	Texture *textures;  // indexed by library index (only CG libs have valid textures)
 	// Indexed by library index. Only entries for STOP_MOTION libraries have lib_indices populated.
 	struct flat_stop_motion_frames *stop_motion_frames;
+	// Атласы секции TALT (по записи) и собранные из них библиотеки-подкартинки.
+	Texture *talt_textures;
+	size_t nr_talt_textures;
+	struct flat_atlas_lib *atlas_libs;
+	size_t nr_atlas_libs;
 };
 
 struct parts_movie {
@@ -708,6 +725,16 @@ struct parts {
 	// Track runs top->bottom; up/down arrow buttons (前サイズ/次サイズ) reserve space
 	// at the ends. rate is driven by the game via SetVScrollbarScrollPos (pos/total/view).
 	bool is_vscrollbar;
+	/*
+	 * Полоса — СЛАЙДЕР (`横スライダーバー` = 13, `縦スライダーバー` = 12 в нумерации
+	 * v14), а не полоса прокрутки (3/2). Механика та же (жёлоб, бегунок, доля), а
+	 * различается ВИД КОМПОНЕНТА, который часть обязана отдавать игре: обёртку
+	 * слайдера `CActivityWrap@GetHSliderBar` игра берёт через `CompParts(имя, 13, 1)`
+	 * и при несовпадении получает null. Поэтому это отдельный признак, а не «алиас
+	 * 13 → 3»: у слайдера и поля раскладки названы своими именами
+	 * (`全体スライダー量`, `スライダーレート`).
+	 */
+	bool is_slider_bar;
 	int sb_up_size, sb_down_size;  // heights of the ∧/∨ arrow buttons (前サイズ/次サイズ)
 	// На сколько сдвигается позиция за одно нажатие кнопки-стрелки (.pactex
 	// `ボタンクリック移動量`, у бэк-сцены = 1). Именно этим листаются сцены: обработчики
@@ -1195,10 +1222,13 @@ void parts_flat_free(struct parts_flat *f);
 bool parts_flat_load(struct parts *parts, struct parts_flat *f, struct string *filename);
 bool parts_flat_update(struct parts_flat *f, int passed_time);
 int parts_flat_find_library(struct flat *fl, const char *name);
+// Библиотека-подкартинка из атласа TALT (когда в LIBL такого имени нет).
+const struct flat_atlas_lib *parts_flat_find_atlas_lib(struct parts_flat *f, const char *name);
 int parts_flat_stop_motion_get_cg_lib(struct parts_flat *f, int sm_lib_idx, int local);
 
 struct flat_emitter;
 struct flat_key_data_graphic;
+struct flat_timeline;
 
 struct flat_emitter_particle {
 	vec2 pos;          // emitter-space position (pixels)
@@ -1231,7 +1261,7 @@ typedef void (*flat_emitter_particle_fn)(const struct flat_emitter_particle *p,
 		void *ud);
 bool parts_flat_emitter_get_align_offset(struct parts_flat *f, int emitter_lib_idx, vec2 out);
 void parts_flat_foreach_emitter_particle(struct parts_flat *f, int emitter_lib_idx,
-		const struct flat_key_data_graphic *keys,
+		const struct flat_timeline *tl,
 		int birth_frame, int age, int frame_count,
 		flat_emitter_particle_fn fn, void *ud);
 void parts_flat_build_layer_matrix(const struct flat_key_data_graphic *key,

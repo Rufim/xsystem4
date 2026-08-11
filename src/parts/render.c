@@ -384,7 +384,7 @@ static void render_emitter_particle_cb(const struct flat_emitter_particle *p,
 
 static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 		int emitter_lib_idx, int local, int frame_count,
-		struct flat_key_data_graphic *keys,
+		const struct flat_timeline *tl,
 		mat4 root, float parent_alpha,
 		struct flat_key_stack *key_stack)
 {
@@ -412,7 +412,10 @@ static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 
 		// Use the birth frame's key transform so particles stay at their
 		// birth position while the emitter moves.
-		struct flat_key_data_graphic *birth_key = &keys[birth_frame];
+		const struct flat_key_data_graphic *birth_key =
+				flat_timeline_key(tl, birth_frame);
+		if (!birth_key)
+			continue;
 		float layer_alpha = parent_alpha * birth_key->alpha / 255.0f;
 
 		struct flat_emitter_layer_effective eff;
@@ -438,7 +441,7 @@ static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 		glm_vec3_copy(eff.mul_color, ud.mul_color);
 		glm_mat4_mul(base, layer_m, ud.transform);
 		glm_mat4_mul(root, ud.transform, ud.transform);
-		parts_flat_foreach_emitter_particle(f, emitter_lib_idx, keys,
+		parts_flat_foreach_emitter_particle(f, emitter_lib_idx, tl,
 				birth_frame, age, frame_count,
 				render_emitter_particle_cb, &ud);
 	}
@@ -458,11 +461,31 @@ static void render_flat_layer(struct parts *parts, struct parts_flat *f,
 		struct flat_draw_ctx *ctx, mat4 root,
 		struct flat_key_stack *key_stack);
 
+/*
+ * `atlas` — прямоугольник библиотеки-подкартинки из секции TALT (NULL, если
+ * библиотека своя, из LIBL). Это ВТОРОЙ, независимый источник смещения в
+ * текстуре: у ключа таймлайна есть своё `area_*`, и складывать их надо, а не
+ * подменять одно другим, иначе слой уедет на смещение атласа.
+ */
 static void render_flat_cg(struct parts *parts, Texture *tex,
-		struct flat_key_data_graphic *key, struct flat_draw_ctx *ctx)
+		const struct flat_key_data_graphic *key, struct flat_draw_ctx *ctx,
+		const Rectangle *atlas)
 {
 	if (!tex->handle)
 		return;
+
+	// Смещение подкартинки в текстуре: слагаемые независимы (атлас + область ключа).
+	int off_x = (atlas ? atlas->x : 0) + key->area_x;
+	int off_y = (atlas ? atlas->y : 0) + key->area_y;
+	// Сам прямоугольник: область ключа, если она задана; иначе подкартинка
+	// атласа; иначе (обычная библиотека LIBL) вся текстура — как было.
+	Rectangle rect;
+	if (key->area_width && key->area_height)
+		rect = (Rectangle){ off_x, off_y, key->area_width, key->area_height };
+	else if (atlas)
+		rect = *atlas;
+	else
+		rect = (Rectangle){ 0, 0, tex->w, tex->h };
 
 	set_draw_filter_blend_func(ctx->draw_filter);
 
@@ -474,15 +497,19 @@ static void render_flat_cg(struct parts *parts, Texture *tex,
 	// area_x/area_y select a sub-rectangle of the texture atlas, but
 	// should not shift the on-screen position. This translation cancels
 	// the offset that the sub-rect's top-left would otherwise introduce.
-	glm_translate(render_m, (vec3){ -(float)key->area_x, -(float)key->area_y, 0.0f });
+	glm_translate(render_m, (vec3){ -(float)off_x, -(float)off_y, 0.0f });
 	// key->origin_mode (formerly "uk2") is the layer's anchor/registration point
 	// on the standard 1-9 grid (1=top-left, 5=center, ...). origin_x/origin_y are
 	// usually 0, so the anchor is expressed via this mode; apply it against the
 	// content size so e.g. a full-screen zoom layer (mode 5) is centered instead
 	// of pinned top-left. Mode 1 (top-left) is a no-op, preserving old behavior.
 	{
-		int cw = key->area_width ? key->area_width : tex->w;
-		int ch = key->area_height ? key->area_height : tex->h;
+		// Размер СОДЕРЖИМОГО: своя область ключа, иначе размер подкартинки
+		// (у атласа — его прямоугольник, у обычной библиотеки — вся текстура).
+		// Без второго слагаемого кружок метки `AUTO` (origin_mode = 5) центровался
+		// бы по атласу 128×32 вместо своих 20×20.
+		int cw = key->area_width ? key->area_width : rect.w;
+		int ch = key->area_height ? key->area_height : rect.h;
 		int m = key->origin_mode;
 		float ax = (m == 2 || m == 5 || m == 8) ? cw / 2.0f
 			 : (m == 3 || m == 6 || m == 9) ? (float)cw : 0.0f;
@@ -492,13 +519,6 @@ static void render_flat_cg(struct parts *parts, Texture *tex,
 			glm_translate(render_m, (vec3){ -ax, -ay, 0.0f });
 	}
 	glm_scale(render_m, (vec3){ tex->w, tex->h, 1.0f });
-
-	Rectangle rect;
-	if (key->area_width && key->area_height) {
-		rect = (Rectangle){ key->area_x, key->area_y, key->area_width, key->area_height };
-	} else {
-		rect = (Rectangle){ 0, 0, tex->w, tex->h };
-	}
 
 	parts_render_texture(tex, render_m, &rect, ctx->alpha, ctx->add_color, ctx->mul_color,
 			ctx->draw_filter, parts_effective_clipper(parts));
@@ -510,22 +530,27 @@ static void render_flat_cg(struct parts *parts, Texture *tex,
 static void render_flat_item(struct parts *parts, struct parts_flat *f,
 		struct flat_layer_state *state, size_t tl_idx,
 		struct flat_timeline *tl, int local,
+		const struct flat_key_data_graphic *key,
 		struct flat_draw_ctx *parent, mat4 root,
 		struct flat_key_stack *key_stack)
 {
 	int lib_idx = parts_flat_find_library(f->flat, tl->library_name->text);
-	if (lib_idx < 0 || (size_t)lib_idx >= f->flat->nr_libraries)
-		return;
+	// Библиотеки в LIBL нет — картинка может лежать подкартинкой в атласе TALT
+	// (§5ea: у флэтов `ＡＤＶ／オートモード`/`スキップモード` LIBL пуст вовсе).
+	const struct flat_atlas_lib *atlas = NULL;
+	if (lib_idx < 0 || (size_t)lib_idx >= f->flat->nr_libraries) {
+		atlas = parts_flat_find_atlas_lib(f, tl->library_name->text);
+		if (!atlas)
+			return;
+	}
 
-	struct flat_library *lib = &f->flat->libraries[lib_idx];
-	if (lib->type == FLAT_LIB_EMITTER) {
+	struct flat_library *lib = atlas ? NULL : &f->flat->libraries[lib_idx];
+	if (lib && lib->type == FLAT_LIB_EMITTER) {
 		render_flat_emitter(parts, f, lib_idx, local, tl->frame_count,
-				tl->graphic.keys,
-				root, parent->alpha, key_stack);
+				tl, root, parent->alpha, key_stack);
 		return;
 	}
 
-	struct flat_key_data_graphic *key = &tl->graphic.keys[local];
 	mat4 layer_m;
 	vec2 pos = { key->pos_x, key->pos_y };
 	parts_flat_build_layer_matrix(key, pos,
@@ -543,9 +568,14 @@ static void render_flat_item(struct parts *parts, struct parts_flat *f,
 	ctx.draw_filter = key->draw_filter != PARTS_DRAW_FILTER_NORMAL
 			? key->draw_filter : parent->draw_filter;
 
+	if (atlas) {
+		render_flat_cg(parts, &f->talt_textures[atlas->tex], key, &ctx, &atlas->rect);
+		return;
+	}
+
 	switch (lib->type) {
 	case FLAT_LIB_CG:
-		render_flat_cg(parts, &f->textures[lib_idx], key, &ctx);
+		render_flat_cg(parts, &f->textures[lib_idx], key, &ctx, NULL);
 		break;
 	case FLAT_LIB_TIMELINE: {
 		struct flat_layer_state *child = state->children[tl_idx];
@@ -561,7 +591,7 @@ static void render_flat_item(struct parts *parts, struct parts_flat *f,
 	case FLAT_LIB_STOP_MOTION: {
 		int cg_idx = parts_flat_stop_motion_get_cg_lib(f, lib_idx, local);
 		if (cg_idx >= 0 && (size_t)cg_idx < f->nr_libraries)
-			render_flat_cg(parts, &f->textures[cg_idx], key, &ctx);
+			render_flat_cg(parts, &f->textures[cg_idx], key, &ctx, NULL);
 		break;
 	}
 	case FLAT_LIB_EMITTER:
@@ -585,13 +615,19 @@ static void render_flat_layer(struct parts *parts, struct parts_flat *f,
 		if (tl->type != FLAT_TIMELINE_GRAPHIC)
 			continue;
 		int local = state->current_frame - tl->begin_frame;
-		if (local < 0 || local >= tl->frame_count)
+		// Ключ кадра берём через flat_timeline_key: до версии 14 он лежит в
+		// `graphic.keys`, с версии 15 — в `graphic.frames`.
+		const struct flat_key_data_graphic *key = flat_timeline_key(tl, local);
+		if (getenv("XSYS4_FLAT_TRACE"))
+			NOTICE("FLAT draw tl=%zu '%s' lib='%s' frame=%d local=%d/%d ключ=%s",
+			       i, display_sjis0(tl->name->text),
+			       display_sjis1(tl->library_name->text),
+			       state->current_frame, local, tl->frame_count,
+			       key ? "есть" : "нет");
+		if (!key)
 			continue;
 
-		if (local >= (int)tl->graphic.count)
-			continue;
-
-		render_flat_item(parts, f, state, i, tl, local, ctx, root, key_stack);
+		render_flat_item(parts, f, state, i, tl, local, key, ctx, root, key_stack);
 	}
 }
 

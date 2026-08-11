@@ -115,6 +115,12 @@ void parts_flat_free(struct parts_flat *f)
 			free(f->stop_motion_frames[i].lib_indices);
 		free(f->stop_motion_frames);
 	}
+	if (f->talt_textures) {
+		for (size_t i = 0; i < f->nr_talt_textures; i++)
+			gfx_delete_texture(&f->talt_textures[i]);
+		free(f->talt_textures);
+	}
+	free(f->atlas_libs);
 }
 
 int parts_flat_find_library(struct flat *fl, const char *name)
@@ -124,6 +130,94 @@ int parts_flat_find_library(struct flat *fl, const char *name)
 			return (int)i;
 	}
 	return -1;
+}
+
+const struct flat_atlas_lib *parts_flat_find_atlas_lib(struct parts_flat *f, const char *name)
+{
+	for (size_t i = 0; i < f->nr_atlas_libs; i++) {
+		if (!strcmp(f->atlas_libs[i].name, name))
+			return &f->atlas_libs[i];
+	}
+	return NULL;
+}
+
+/*
+ * Собрать библиотеки-подкартинки из секции TALT: одна текстура на запись
+ * (атлас) плюс по одной «библиотеке» на её метаданные. Так флэт с ПУСТЫМ LIBL
+ * получает то, что просят слои таймлайна (§5ea: `ＡＤＶ／オートモード` —
+ * атлас 128×32, `AUTO.png` (0,0, 70×20) и `緑丸.png` (96,0, 20×20)).
+ *
+ * Текстуры грузим здесь же, на загрузке флэта: данные архива освобождаются
+ * сразу после parts_flat_load, а `struct flat` держит указатели в них.
+ */
+static void build_atlas_libs(struct parts_flat *f)
+{
+	struct flat *fl = f->flat;
+	if (!fl->nr_talt_entries)
+		return;
+
+	f->nr_talt_textures = fl->nr_talt_entries;
+	f->talt_textures = xcalloc(f->nr_talt_textures, sizeof(Texture));
+	for (size_t i = 0; i < fl->nr_talt_entries; i++) {
+		struct talt_entry *e = &fl->talt_entries[i];
+		struct cg *cg = cg_load_buffer(fl->data + e->off, e->size);
+		if (!cg) {
+			WARNING("flat: не удалось загрузить атлас TALT %zu", i);
+			continue;
+		}
+		gfx_init_texture_with_cg(&f->talt_textures[i], cg);
+		cg_free(cg);
+		for (unsigned j = 0; j < e->nr_meta; j++) {
+			struct talt_metadata *md = &e->metadata[j];
+			if (!md->name || !md->name->size || !md->unknown4 || !md->unknown5)
+				continue;
+			f->atlas_libs = xrealloc_array(f->atlas_libs, f->nr_atlas_libs,
+					f->nr_atlas_libs + 1, sizeof(struct flat_atlas_lib));
+			f->atlas_libs[f->nr_atlas_libs++] = (struct flat_atlas_lib) {
+				.name = md->name->text,
+				.tex = (int)i,
+				.rect = { md->unknown2, md->unknown3, md->unknown4, md->unknown5 },
+			};
+			if (getenv("XSYS4_FLAT_TRACE"))
+				NOTICE("FLAT atlas lib '%s' атлас=%zu rect=%u,%u %ux%u",
+				       display_sjis0(md->name->text), i,
+				       md->unknown2, md->unknown3, md->unknown4, md->unknown5);
+		}
+	}
+}
+
+/*
+ * Пожаловаться на слой, картинку которого негде взять. Жалоба ставится на
+ * ФАКТ ПРИХОДА ДАННЫХ (загрузка флэта, где слой есть), а не на флаг, и печатается
+ * один раз на флэт с именем библиотеки: без неё «флэт молча не рисуется» не
+ * видно в логе вовсе — ровно так §5ea и жил незамеченным.
+ */
+static void warn_missing_libraries(struct parts_flat *f,
+		struct flat_timeline *timelines, size_t nr_timelines, int depth)
+{
+	if (depth > FLAT_MAX_ANCESTOR_DEPTH)
+		return;
+	for (size_t i = 0; i < nr_timelines; i++) {
+		if (timelines[i].type != FLAT_TIMELINE_GRAPHIC)
+			continue;
+		const char *name = timelines[i].library_name->text;
+		if (!*name)
+			continue;
+		int lib_idx = parts_flat_find_library(f->flat, name);
+		if (lib_idx < 0) {
+			if (!parts_flat_find_atlas_lib(f, name))
+				WARNING("flat '%s': слою '%s' нужна библиотека '%s', а её нет "
+					"ни в LIBL, ни в атласах TALT",
+					display_sjis0(f->name->text),
+					display_sjis1(timelines[i].name->text),
+					display_sjis2(name));
+			continue;
+		}
+		struct flat_library *lib = &f->flat->libraries[lib_idx];
+		if (lib->type == FLAT_LIB_TIMELINE)
+			warn_missing_libraries(f, lib->timeline.timelines,
+					lib->timeline.nr_timelines, depth + 1);
+	}
 }
 
 static int flat_compute_max_frame(struct flat_timeline *timelines, size_t nr_timelines)
@@ -370,6 +464,8 @@ bool parts_flat_load(struct parts *parts, struct parts_flat *f, struct string *f
 		gfx_init_texture_with_cg(&f->textures[i], cg);
 		cg_free(cg);
 	}
+	build_atlas_libs(f);
+	warn_missing_libraries(f, f->flat->timelines, f->flat->nr_timelines, 0);
 	for (size_t i = 0; i < f->flat->nr_libraries; i++) {
 		if (f->flat->libraries[i].type == FLAT_LIB_STOP_MOTION)
 			build_stop_motion_frames(f, (int)i);
@@ -399,6 +495,14 @@ bool parts_flat_load(struct parts *parts, struct parts_flat *f, struct string *f
 				w = f->textures[i].w;
 			if (f->textures[i].h > h)
 				h = f->textures[i].h;
+		}
+		// У флэта с пустым LIBL картинки только в атласах TALT, и без них
+		// оценка вышла бы 0×0 (`ＡＤＶ／オートモード`: hdr size = 0×0).
+		for (size_t i = 0; i < f->nr_atlas_libs; i++) {
+			if (f->atlas_libs[i].rect.w > w)
+				w = f->atlas_libs[i].rect.w;
+			if (f->atlas_libs[i].rect.h > h)
+				h = f->atlas_libs[i].rect.h;
 		}
 	}
 	if (w > 0 && h > 0)
@@ -807,7 +911,7 @@ bool parts_flat_emitter_get_align_offset(struct parts_flat *f, int emitter_lib_i
 // rand_seed and birth_frame, so the same birth_frame always yields the same
 // particles regardless of `age`.
 void parts_flat_foreach_emitter_particle(struct parts_flat *f, int emitter_lib_idx,
-		const struct flat_key_data_graphic *keys,
+		const struct flat_timeline *tl,
 		int birth_frame, int age, int frame_count,
 		flat_emitter_particle_fn fn, void *ud)
 {
@@ -839,13 +943,15 @@ void parts_flat_foreach_emitter_particle(struct parts_flat *f, int emitter_lib_i
 	vec2 parent_vel = { 0, 0 };
 	if (em->direction_type == EMITTER_DIRECTION_PARENT
 			|| em->direction_type == EMITTER_DIRECTION_PARENT_REVERSE) {
-		const struct flat_key_data_graphic *cur = &keys[birth_frame];
-		if (birth_frame > 0) {
-			const struct flat_key_data_graphic *prev = &keys[birth_frame - 1];
+		const struct flat_key_data_graphic *cur = flat_timeline_key(tl, birth_frame);
+		const struct flat_key_data_graphic *prev = flat_timeline_key(tl, birth_frame - 1);
+		const struct flat_key_data_graphic *next =
+				birth_frame + 1 < frame_count
+				? flat_timeline_key(tl, birth_frame + 1) : NULL;
+		if (cur && prev) {
 			parent_vel[0] = cur->pos_x - prev->pos_x;
 			parent_vel[1] = cur->pos_y - prev->pos_y;
-		} else if (birth_frame + 1 < frame_count) {
-			const struct flat_key_data_graphic *next = &keys[birth_frame + 1];
+		} else if (cur && next) {
 			parent_vel[0] = next->pos_x - cur->pos_x;
 			parent_vel[1] = next->pos_y - cur->pos_y;
 		}
