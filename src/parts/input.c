@@ -891,22 +891,62 @@ bool PE_SetClickMissSoundNumber(possibly_unused int sound_no)
 	return true;
 }
 
+// XSYS4_INPUT_DEPTH_STACK=1 — стек игры на КАЖДОМ Begin/EndInput. По одному лишь
+// счётчику не понять, чей это вызов: `EndWaitForClick` только взводит глобальный флаг,
+// а `EndInput` зовёт та копия `WaitForClick`, которая первой заметит флаг в своём цикле,
+// и по логу эти вызовы не сопоставить с кадрами сцен.
+static void input_depth_stack(const char *what)
+{
+	if (!getenv("XSYS4_INPUT_DEPTH_STACK"))
+		return;
+	NOTICE("=== стек игры на %s (глубина %d) ===", what, parts_input_depth);
+	vm_stack_trace();
+}
+
 void PE_BeginInput(void)
 {
 	parts_input_depth++;
 	parts_began_click = true;
 	if (getenv("XSYS4_CLICKNO_TRACE"))
 		NOTICE("CLICKNO BeginInput -> глубина %d", parts_input_depth);
+	input_depth_stack("BeginInput");
 }
 
 void PE_EndInput(void)
 {
 	if (parts_input_depth > 0)
 		parts_input_depth--;
+	/*
+	 * ★СЧЁТЧИК ВЛОЖЕННОСТИ — НЕ ВСЯ ПРАВДА: сессии ввода у игры НЕ вложены по стеку.
+	 * Сцены сменяются через `SceneStack@Join`, и `EndInput` ВНЕШНЕЙ сцены приходит
+	 * уже после того, как ВНУТРЕННЯЯ завела своё ожидание клика. Тогда счётчик
+	 * уезжает в ноль под живым ожиданием, `parts_began_click` гаснет — и экран
+	 * показывает наведение, но не принимает ни одного клика.
+	 *
+	 * Живой случай — Haha Ranman, титул → LOAD LATEST: карта строится и уходит в своё
+	 * `WaitForClick`, а следом два `EndInput` от подтверждения и титула роняют глубину
+	 * до нуля. Через меню LOAD того же сейва экран жив только потому, что там на один
+	 * уровень больше (SaveLoad) и остатка случайно хватает.
+	 *
+	 * Достоверный признак «сколько ожиданий клика ещё живо» — не счётчик, а СТЕК ИГРЫ:
+	 * `parts::detail::WaitForClick` (подстрока не задевает ни `EndWaitForClick`, ни
+	 * `FTPARTS_WaitForClickCallback`). Текущее ожидание ещё на стеке, поэтому живых
+	 * после возврата — на одно меньше. Глубину только ПОДНИМАЕМ до этого числа: там,
+	 * где счётчик и так прав (Tsumamigui 3, FINDINGS §5m), поведение не меняется, а у
+	 * игр без такой функции счёт равен нулю и правило не срабатывает вовсе.
+	 */
+	int live_waits = vm_count_frames("parts::detail::WaitForClick") - 1;
+	if (live_waits > parts_input_depth) {
+		if (getenv("XSYS4_CLICKNO_TRACE"))
+			NOTICE("CLICKNO глубина %d < живых ожиданий клика %d — поднимаю",
+			       parts_input_depth, live_waits);
+		parts_input_depth = live_waits;
+	}
 	parts_began_click = parts_input_depth > 0;
 	if (getenv("XSYS4_CLICKNO_TRACE"))
 		NOTICE("CLICKNO EndInput -> глубина %d, номер %d обнулён",
 		       parts_input_depth, clicked_parts);
+	input_depth_stack("EndInput");
 	clicked_parts = 0;
 	drag_state_reset();
 }

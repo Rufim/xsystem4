@@ -147,6 +147,7 @@ void vm_stack_trace_file(FILE *out);
 // трейс лишь для интересных путей вызова, когда сам HLL-обработчик дёргается
 // каждый кадр.
 bool vm_called_from(const char *substr);
+int vm_count_frames(const char *substr);
 // Имя игровой функции на верху стека вызовов (для диагностики: HEAPWATCH
 // группирует ref/unref по функциям, по одному адресу инструкции путь не понять).
 const char *vm_current_function_name(void);
