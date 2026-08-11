@@ -120,23 +120,148 @@ struct archive_data *asset_get_by_name(enum asset_type type, const char *name, i
 	return assets[type]->get_by_name(assets[type], name, id_out);
 }
 
+/*
+ * ★LRU-КЭШ ДЕКОДИРОВАННЫХ CG. Листание scrollback перезагружает образ бэк-сцены
+ * на КАЖДУЮ страницу, и почти вся цена — повторное декодирование одних и тех же
+ * CG (замер XSYS4_XPE_TRACE: 114–118 мс из 124–131 на страницу в 25 частей —
+ * это «cg», ~4.6 мс на картинку; страницы жирнее — 300+ мс, и листание ощущалось
+ * задержками). Страницы делят большинство картинок (рамка окна, кнопки, лица),
+ * поэтому кэш по имени/номеру бьёт точно. Наружу отдаётся ГЛУБОКАЯ КОПИЯ
+ * (memcpy RGBA много дешевле декода QNT) — владение у вызывающего, как и было.
+ * Бюджет — по байтам, вытеснение — LRU. Откат для A/B: XSYS4_NO_CG_CACHE=1.
+ */
+#define CG_CACHE_MAX_BYTES (48u * 1024u * 1024u)
+
+struct cg_cache_entry {
+	char *key;
+	struct cg *cg;
+	int id;        // разрешённый номер (для id_out на попадании по имени)
+	size_t bytes;
+	uint64_t stamp;
+	struct cg_cache_entry *next;
+};
+static struct cg_cache_entry *cg_cache;
+static size_t cg_cache_bytes;
+static uint64_t cg_cache_stamp;
+static unsigned cg_cache_hits, cg_cache_misses;
+
+// Статистика с обнулением — для печати в XSYS4_XPE_TRACE (замер листания).
+void asset_cg_cache_stats(unsigned *hits, unsigned *misses)
+{
+	*hits = cg_cache_hits;
+	*misses = cg_cache_misses;
+	cg_cache_hits = cg_cache_misses = 0;
+}
+
+static size_t cg_cache_size_of(struct cg *cg)
+{
+	if (!cg || !cg->pixels || cg->metrics.w <= 0 || cg->metrics.h <= 0)
+		return 0;
+	return (size_t)cg->metrics.w * cg->metrics.h * 4;
+}
+
+static struct cg *cg_cache_clone(struct cg *src, size_t bytes)
+{
+	struct cg *cg = xmalloc(sizeof(struct cg));
+	*cg = *src;
+	cg->pixels = xmalloc(bytes);
+	memcpy(cg->pixels, src->pixels, bytes);
+	return cg;
+}
+
+static struct cg *cg_cache_get(const char *key, int *id_out)
+{
+	for (struct cg_cache_entry *e = cg_cache; e; e = e->next) {
+		if (!strcmp(e->key, key)) {
+			e->stamp = ++cg_cache_stamp;
+			if (id_out)
+				*id_out = e->id;
+			cg_cache_hits++;
+			return cg_cache_clone(e->cg, e->bytes);
+		}
+	}
+	cg_cache_misses++;
+	return NULL;
+}
+
+static void cg_cache_put(const char *key, struct cg *cg, int id)
+{
+	size_t bytes = cg_cache_size_of(cg);
+	if (!bytes || bytes > CG_CACHE_MAX_BYTES / 4)
+		return;   // гигантские (и пустые) не кэшируем — вымоют всё остальное
+	while (cg_cache_bytes + bytes > CG_CACHE_MAX_BYTES && cg_cache) {
+		struct cg_cache_entry **oldest = &cg_cache;
+		for (struct cg_cache_entry **e = &cg_cache; *e; e = &(*e)->next) {
+			if ((*e)->stamp < (*oldest)->stamp)
+				oldest = e;
+		}
+		struct cg_cache_entry *victim = *oldest;
+		*oldest = victim->next;
+		cg_cache_bytes -= victim->bytes;
+		cg_free(victim->cg);
+		free(victim->key);
+		free(victim);
+	}
+	struct cg_cache_entry *e = xmalloc(sizeof(*e));
+	e->key = strdup(key);
+	e->cg = cg_cache_clone(cg, bytes);
+	e->id = id;
+	e->bytes = bytes;
+	e->stamp = ++cg_cache_stamp;
+	e->next = cg_cache;
+	cg_cache = e;
+	cg_cache_bytes += bytes;
+}
+
+static bool cg_cache_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0)
+		enabled = !getenv("XSYS4_NO_CG_CACHE");
+	return enabled;
+}
+
 struct cg *asset_cg_load(int id)
 {
+	char key[32];
+	if (cg_cache_enabled()) {
+		snprintf(key, sizeof(key), "#%d", id);
+		struct cg *cached = cg_cache_get(key, NULL);
+		if (cached)
+			return cached;
+	}
 	struct archive_data *data = asset_get(ASSET_CG, id);
 	if (!data)
 		return NULL;
 	struct cg *cg = cg_load_data(data);
 	archive_free_data(data);
+	if (cg && cg_cache_enabled())
+		cg_cache_put(key, cg, id);
 	return cg;
 }
 
 struct cg *asset_cg_load_by_name(const char *name, int *id_out)
 {
-	struct archive_data *data = asset_get_by_name(ASSET_CG, name, id_out);
+	// Ключи по имени и по номеру — РАЗНЫЕ пространства («n:…» и «#…»):
+	// пересчёт имени в номер здесь не делается, чтобы не гадать о смещении
+	// нумерации у разных типов архивов; id для id_out хранится в записи.
+	char key[512];
+	if (cg_cache_enabled()) {
+		snprintf(key, sizeof(key), "n:%s", name);
+		struct cg *cached = cg_cache_get(key, id_out);
+		if (cached)
+			return cached;
+	}
+	int id = -1;
+	struct archive_data *data = asset_get_by_name(ASSET_CG, name, &id);
+	if (id_out)
+		*id_out = id;
 	if (!data)
 		return NULL;
 	struct cg *cg = cg_load_data(data);
 	archive_free_data(data);
+	if (cg && cg_cache_enabled())
+		cg_cache_put(key, cg, id);
 	return cg;
 }
 

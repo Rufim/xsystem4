@@ -33,6 +33,11 @@
  */
 #define CURRENT_SAVE_VERSION 9
 
+// Тайминг загрузки образа по типам состояний (печать под XSYS4_XPE_TRACE):
+// «задержки листания scrollback» — это перезагрузка образа на каждую страницу,
+// и без разбивки не видно, платим мы за CG (декодирование+текстуры) или за текст.
+static uint32_t xpe_load_cg_ms, xpe_load_text_ms;
+
 // Пересчёт номера слоя из образа версии < 9 (0-based) в текущий 1-based.
 static int migrate_controller_no(int no, int version)
 {
@@ -631,18 +636,27 @@ static void load_parts_state(struct iarray_reader *r, struct parts *parts,
 		state->panel.grad_right = iarray_read(r);
 		break;
 	}
-	case PARTS_CG:
+	case PARTS_CG: {
+		uint32_t t0 = SDL_GetTicks();
 		load_parts_cg(r, parts, &state->cg);
+		xpe_load_cg_ms += SDL_GetTicks() - t0;
 		break;
-	case PARTS_CG_DETECTION:
+	}
+	case PARTS_CG_DETECTION: {
 		// load_parts_cg грузит картинку общим путём и по дороге переводит
 		// состояние в PARTS_CG — возвращаем тип обратно.
+		uint32_t t0 = SDL_GetTicks();
 		load_parts_cg(r, parts, &state->cg);
+		xpe_load_cg_ms += SDL_GetTicks() - t0;
 		state->type = PARTS_CG_DETECTION;
 		break;
-	case PARTS_TEXT:
+	}
+	case PARTS_TEXT: {
+		uint32_t t0 = SDL_GetTicks();
 		load_parts_text(r, parts, &state->text);
+		xpe_load_text_ms += SDL_GetTicks() - t0;
 		break;
+	}
 	case PARTS_ANIMATION:
 		load_parts_animation(r, parts, &state->anim);
 		break;
@@ -1200,6 +1214,11 @@ bool PE_SaveBackScene(struct page **buffer)
 // to keep the stream in sync — just not applied.
 static bool parts_engine_load(struct page **buffer, bool restore_globals, bool back_scene)
 {
+	// XSYS4_XPE_TRACE=1 печатает и ДЛИТЕЛЬНОСТЬ загрузки (строка «XPE load ... ms»):
+	// листание scrollback перезагружает образ бэк-сцены на каждую страницу, и
+	// «задержки листания» иначе не отличить от задержек самой игры.
+	uint32_t t_start = SDL_GetTicks();
+	xpe_load_cg_ms = xpe_load_text_ms = 0;
 	if (!(*buffer)) {
 		WARNING("savedata array is empty");
 		return false;
@@ -1321,8 +1340,12 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 	// разложены по слоям. Отвечает на «этот оверлей восстановлен из сейва или
 	// остался от живого экрана», которое иначе приходится гадать по дампу.
 	if (getenv("XSYS4_XPE_TRACE")) {
-		NOTICE("XPE load: version=%d parts=%d (restore_globals=%d back_scene=%d)",
-		       version, nr_parts, restore_globals, back_scene);
+		void asset_cg_cache_stats(unsigned *hits, unsigned *misses);
+		unsigned ch, cm;
+		asset_cg_cache_stats(&ch, &cm);
+		NOTICE("XPE load: version=%d parts=%d (restore_globals=%d back_scene=%d) %u ms (cg %u [hit %u miss %u], text %u)",
+		       version, nr_parts, restore_globals, back_scene,
+		       SDL_GetTicks() - t_start, xpe_load_cg_ms, ch, cm, xpe_load_text_ms);
 		static int per_ctrl[PARTS_CONTROLLER_STACK_MAX + 2];
 		memset(per_ctrl, 0, sizeof(per_ctrl));
 		struct parts *p;

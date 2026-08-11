@@ -1123,7 +1123,15 @@ bool parts_cg_set(struct parts *parts, struct parts_cg *parts_cg, struct string 
 	struct cg *cg;
 	if (!memcmp(cg_name->text, "<save>", 6)) {
 		char *path = savedir_path(cg_name->text + 6);
+		uint32_t t0 = SDL_GetTicks();
 		cg = cg_load_file(path);
+		// Под XSYS4_XPE_TRACE видно цену <save>-картинок: они идут МИМО кэша CG
+		// (файл в папке сейвов, не ассет) и на листании scrollback декодируются
+		// с диска каждый раз.
+		if (getenv("XSYS4_XPE_TRACE"))
+			NOTICE("CG <save> '%s' %dx%d за %u ms", cg_name->text + 6,
+			       cg ? cg->metrics.w : -1, cg ? cg->metrics.h : -1,
+			       SDL_GetTicks() - t0);
 		no = 0;
 		free(path);
 	} else {
