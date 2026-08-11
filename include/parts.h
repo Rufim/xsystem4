@@ -126,6 +126,9 @@ int PE_GetPartsDrawFilter(int parts_no);
 void PE_SetAddColor(int parts_no, int r, int g, int b);
 void PE_GetAddColor(int parts_no, int *r, int *g, int *b);
 void PE_SetMultiplyColor(int parts_no, int r, int g, int b);
+// `減算色モード`: добавочный цвет вычитается вместо прибавления.
+void PE_SetSubColorMode(int parts_no, bool enable);
+bool PE_IsSubColorMode(int parts_no);
 void PE_GetMultiplyColor(int parts_no, int *r, int *g, int *b);
 int PE_GetPartsWidth(int parts_no, int state);
 int PE_GetPartsHeight(int parts_no, int state);
@@ -217,6 +220,8 @@ void parts_controller_stack_restore(int nr, int active);
 int PE_get_controller_index(int id);
 // XSYS4_PART_WATCH=<номер>[,…] — следить за конкретными партами.
 bool parts_watched(int parts_no);
+// Взять часть под наблюдение НА ХОДУ (XSYS4_WATCH_ACT — по имени активности).
+void parts_watch_add(int parts_no);
 int parts_cg_watch_part(void);
 bool parts_controller_get_show(int id);
 int PE_get_system_controller(void);
@@ -496,6 +501,9 @@ int PE_get_layoutbox_padding_right(int parts_no);
 
 // message_window.c — окно реплик ADV (`メッセージウィンドウ`, тип компонента v14 = 10).
 void PE_CreateMessageWindow(int parts_no, int text_parts_no, int mark_parts_no);
+// Номер текстовой части окна реплик или -1: стиль шрифта у нас живёт в текстовом
+// состоянии, поэтому вызовы, адресующие ОКНО, обязаны переадресоваться на неё.
+int PE_GetMessageWindowTextParts(int parts_no);
 void PE_SetKeyWaitCGName(int parts_no, struct string *name, int start_no, int nr_cg, int time_per_cg);
 void PE_GetKeyWaitCGName(int parts_no, struct string **name, int *start_no, int *nr_cg, int *time_per_cg);
 void PE_SetKeyWaitFlatName(int parts_no, struct string *name);

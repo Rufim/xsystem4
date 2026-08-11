@@ -24,6 +24,8 @@
 #include <limits.h>
 #include <assert.h>
 
+#include <unistd.h>
+
 #include "system4.h"
 #include "system4/file.h"
 #include "system4/little_endian.h"
@@ -443,7 +445,12 @@ static char *cmd_gets(void)
 	handle_window_events();
 	printf("dbg(cmd)> ");
 	fflush(stdout);
-	fgets(line, 1024, stdin);
+	// ★NULL ОТ fgets — ЭТО КОНЕЦ ВВОДА, А НЕ ПУСТАЯ СТРОКА. Возвращая статический
+	// буфер безусловно, мы отдавали вызывающему «строку» на каждом витке, и цикл REPL
+	// крутился вечно: за одно падение в фоне лог вырос до 24,5 млн строк `dbg(cmd)>`
+	// и съел место в tmpfs, а настоящая ошибка осталась в самом его начале.
+	if (!fgets(line, 1024, stdin))
+		return NULL;
 	return line;
 }
 #endif
@@ -535,10 +542,24 @@ void dbg_cmd_repl(void)
 	} else {
 		puts("Entering the debugger REPL. Type 'help' for a list of commands.");
 	}
+	/*
+	 * БЕЗ ТЕРМИНАЛА REPL БЕСПОЛЕЗЕН — и вреден: команд ждать не от кого, а приглашение
+	 * печатается в лог без конца. Прогоны на стенде идут в фоне с перенаправлением, и
+	 * именно так одно падение забило tmpfs. Выходим с ненулевым кодом, чтобы скрипт
+	 * увидел неудачу; причина уже напечатана выше (`*ERROR*`/`Assertion failed`).
+	 */
+	if (!isatty(STDIN_FILENO)) {
+		puts("Ввод не терминал — REPL пропущен, выходим (причина выше в логе).");
+		fflush(stdout);
+		sys_exit(1);
+	}
 	while (1) {
 		char *line = cmd_gets();
-		if (line)
-			execute_line(line);
+		if (!line) {
+			puts("Конец ввода — выходим из REPL.");
+			sys_exit(1);
+		}
+		execute_line(line);
 	}
 }
 

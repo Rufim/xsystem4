@@ -19,6 +19,7 @@
 
 #include "audio.h"
 #include "xsystem4.h"
+#include "parts.h"
 #include "parts_internal.h"
 
 #ifndef M_PI
@@ -89,8 +90,21 @@ void parts_clear_motion(struct parts *parts)
 	parts_motion_list_clear(&parts->motion);
 }
 
+/*
+ * ЕДИНАЯ ТОЧКА, ЧЕРЕЗ КОТОРУЮ ПРОХОДЯТ ВСЕ `PE_AddMotion*`.
+ *
+ * `XSYS4_MOTION_TRACE=1` — печать номера части и вида анимации. Нужна для ассерта
+ * `Executer.jaf:55 assert(parts.IsValid)`: игра ассертит В СВОЁМ `Motion::Create`, то
+ * есть ДО обращения к движку, поэтому виновную часть в логе видно не напрямую — её
+ * выдаёт СЛЕДУЮЩИЙ элемент в порядке, которым `AdvNamePlate@Hide` обходит табличку:
+ * последняя напечатанная анимация показывает, до какой части дошли, а упало на той,
+ * что идёт за ней.
+ */
 void parts_add_motion(struct parts *parts, struct parts_motion *motion)
 {
+	if (getenv("XSYS4_MOTION_TRACE") || parts_watched(parts->no))
+		NOTICE("MOTION часть %d <- вид %d, время %d..%d", parts->no,
+		       (int)motion->type, motion->begin_time, motion->end_time);
 	parts_motion_list_add(&parts->motion, motion);
 }
 

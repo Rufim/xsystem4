@@ -153,6 +153,11 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 		parts->global.add_color.g / 255.0f,
 		parts->global.add_color.b / 255.0f
 	};
+	// `減算色モード` (SetComponentSubColorMode): тот же добавочный цвет, но ВЫЧИТАЕТСЯ.
+	// Шейдер считает `(tex + add_color) * multiply_color`, поэтому режим — это просто
+	// смена знака, отдельной ветки в шейдере не нужно.
+	if (parts->sub_color_mode)
+		glm_vec3_negate(add_color);
 	vec3 multiply_color = {
 		parts->global.multiply_color.r / 255.0f,
 		parts->global.multiply_color.g / 255.0f,
@@ -235,6 +240,11 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 		parts->global.add_color.g / 255.0f,
 		parts->global.add_color.b / 255.0f
 	};
+	// `減算色モード` (SetComponentSubColorMode): тот же добавочный цвет, но ВЫЧИТАЕТСЯ.
+	// Шейдер считает `(tex + add_color) * multiply_color`, поэтому режим — это просто
+	// смена знака, отдельной ветки в шейдере не нужно.
+	if (parts->sub_color_mode)
+		glm_vec3_negate(add_color);
 	vec3 multiply_color = {
 		parts->global.multiply_color.r / 255.0f,
 		parts->global.multiply_color.g / 255.0f,

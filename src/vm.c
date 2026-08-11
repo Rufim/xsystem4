@@ -505,6 +505,17 @@ static const char *describe_heap_slot(int32_t slot)
 	return buf;
 }
 
+/*
+ * ПОСЛЕДНЯЯ РАЗЫМЕНОВАННАЯ ССЫЛКА — для `XSYS4_FIELD_WATCH` (см. field_watch ниже).
+ * Присваивание страницу не знает: `stack_pop_var` отдаёт голый указатель внутрь массива
+ * значений, поэтому «кто и какому полю пишет» иначе не восстановить.
+ */
+static struct page *last_var_page = NULL;
+static int last_var_index = -1;
+// ★И СЛОТ КУЧИ: без него события ловушки не сопоставить с дампом ассерта, где
+// вложенные объекты печатаются именно слотами (`f1=41281`).
+static int last_var_slot = -1;
+
 // Pop a reference off the stack, returning the address of the referenced object.
 static union vm_value *stack_pop_var(void)
 {
@@ -516,7 +527,79 @@ static union vm_value *stack_pop_var(void)
 		VM_ERROR("Out of bounds page index: %d/%d (в слоте: %s; последнее fini: %s)",
 			 heap_index, page_index, describe_heap_slot(heap_index),
 			 vm_last_fini_str());
+	last_var_page = heap[heap_index].page;
+	last_var_index = page_index;
+	last_var_slot = heap_index;
 	return &heap[heap_index].page->values[page_index];
+}
+
+/*
+ * `XSYS4_FIELD_WATCH=<Структура>:<поле>[:<значение>]` — печатать СТЕК ВЫЗОВОВ ИГРЫ в
+ * момент записи в поле объекта указанного типа (при желании — только когда пишут
+ * указанное значение). Порядок полей брать из `alice ain dump -S`.
+ *
+ * Зачем такой инструмент вообще: бывают дефекты, где движок отвечает правильно на всё, а
+ * ломается СОСТОЯНИЕ ВНУТРИ игры, и обычными трейсами движка момент порчи не виден.
+ * Живой случай — `assert(parts.IsValid)` в `Motion::Create` (§5dc–§5de): `IsValid` это
+ * `<Number> != 0`, часть при этом ЖИВА и никто её не снимал, то есть игра обнулила свой
+ * хэндл сама. Ловится так:
+ *   XSYS4_FIELD_WATCH=parts::detail::CParts:1:0
+ * (поле 1 — `<Number>` в `struct CParts { array<int> <vtable>; int <Number>; bool <AutoRelease>; }`).
+ */
+static void field_watch(union vm_value val)
+{
+	static int watch_index = -2;   // -2 = переменную ещё не разбирали
+	static char watch_struct[128];
+	static bool watch_value_only;
+	static int watch_value;
+	if (watch_index == -2) {
+		watch_index = -1;
+		const char *spec = getenv("XSYS4_FIELD_WATCH");
+		if (spec && *spec) {
+			// Имя структуры содержит «::», поэтому разбираем С КОНЦА.
+			const char *last = strrchr(spec, ':');
+			const char *prev = NULL;
+			for (const char *p = spec; last && p < last; p++)
+				if (*p == ':' && p + 1 < last && p[1] != ':'
+						&& (p == spec || p[-1] != ':'))
+					prev = p;
+			const char *idx_at = NULL;
+			size_t name_len = 0;
+			if (last && prev) {           // <Структура>:<поле>:<значение>
+				idx_at = prev + 1;
+				watch_value_only = true;
+				watch_value = atoi(last + 1);
+				name_len = prev - spec;
+			} else if (last) {            // <Структура>:<поле>
+				idx_at = last + 1;
+				name_len = last - spec;
+			}
+			if (idx_at) {
+				watch_index = atoi(idx_at);
+				if (name_len >= sizeof(watch_struct))
+					name_len = sizeof(watch_struct) - 1;
+				memcpy(watch_struct, spec, name_len);
+				watch_struct[name_len] = 0;
+				NOTICE("FIELDWATCH включён: структура '%s', поле %d%s",
+				       watch_struct, watch_index,
+				       watch_value_only ? ", только значение" : "");
+			}
+		}
+	}
+	if (watch_index < 0 || !last_var_page || last_var_index != watch_index)
+		return;
+	if (last_var_page->type != STRUCT_PAGE)
+		return;
+	if (watch_value_only && val.i != watch_value)
+		return;
+	if (last_var_page->index < 0 || last_var_page->index >= ain->nr_structures)
+		return;
+	const char *sname = ain->structures[last_var_page->index].name;
+	if (!sname || strcmp(sname, watch_struct))
+		return;
+	NOTICE("FIELDWATCH %s (слот %d) поле %d <- %d — стек вызовов игры:",
+	       display_sjis0(sname), last_var_slot, watch_index, val.i);
+	vm_stack_trace();
 }
 
 union vm_value *stack_peek_var(void)
@@ -1675,8 +1758,14 @@ static enum opcode execute_instruction(enum opcode opcode)
 		for (int i = n - 1; i >= 0; i--)
 			vals[i] = stack_pop();
 		union vm_value *ref = stack_pop_var();
+		int base_index = last_var_index;
 		for (int i = 0; i < n; i++)
 			ref[i] = vals[i];
+		for (int i = 0; i < n; i++) {
+			last_var_index = base_index + i;
+			field_watch(vals[i]);
+		}
+		last_var_index = base_index;
 		for (int i = 0; i < n; i++)
 			stack[stack_ptr++] = vals[i];
 		break;
@@ -1980,6 +2069,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 	case F_ASSIGN: {
 		union vm_value val = stack_pop();
 		stack_pop_var()[0] = val;
+		field_watch(val);
 		stack_push(val);
 		break;
 	}
@@ -2370,6 +2460,34 @@ static enum opcode execute_instruction(enum opcode opcode)
 						sys_warning("\tlocal[%d]=%d (page type=%d %s%s)\n", i, v,
 							p ? (int)p->type : -1,
 							sname ? display_sjis0(sname) : "", fields);
+						/*
+						 * ★НА ОДИН УРОВЕНЬ ГЛУБЖЕ. У Dohna объект части — КОМПОЗИЦИЯ
+						 * (`CLayoutBoxParts.m_parts` → `CSpriteParts` → `CParts`), и
+						 * САМ НОМЕР части лежит не здесь, а в вложенной странице.
+						 * Именно он решает `assert(parts.IsValid)` (это `Number != 0`),
+						 * поэтому без разворота вложенных полей виновника не назвать:
+						 * снаружи видно только «страница CLayoutBoxParts».
+						 */
+						for (int f = 0; p && f < p->nr_vars && f < 6; f++) {
+							int nv = p->values[f].i;
+							if (nv <= 0 || !heap_slot_is_page(nv))
+								continue;
+							struct page *np = heap_get_page(nv);
+							if (!np)
+								continue;
+							const char *nname = (np->type == STRUCT_PAGE
+								&& np->index >= 0 && np->index < ain->nr_structures)
+								? ain->structures[np->index].name : NULL;
+							char nf[192] = "";
+							int noff = 0;
+							for (int g = 0; g < np->nr_vars && g < 10
+								&& noff < (int)sizeof(nf) - 16; g++)
+								noff += snprintf(nf + noff, sizeof(nf) - noff,
+									" f%d=%d", g, np->values[g].i);
+							sys_warning("\t  \\_ f%d=%d (page type=%d %s%s)\n",
+								f, nv, (int)np->type,
+								nname ? display_sjis0(nname) : "", nf);
+						}
 					} else {
 						sys_warning("\tlocal[%d]=%d\n", i, v);
 					}

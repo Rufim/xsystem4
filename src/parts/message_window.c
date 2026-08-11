@@ -191,6 +191,17 @@ static int mw_text_parts(struct parts_message_window *mw)
 }
 
 /*
+ * Номер ТЕКСТОВОЙ части окна реплик (или −1, если часть не окно). Нужен вызовам,
+ * которые адресуют ОКНО, тогда как стиль шрифта у нас живёт в текстовом состоянии:
+ * поставить цвет прямо окну значит снести его картинку (см. PE_SetFontColorForBackScene).
+ */
+int PE_GetMessageWindowTextParts(int parts_no)
+{
+	struct parts_message_window *mw = mw_get(parts_no);
+	return mw ? mw_text_parts(mw) : -1;
+}
+
+/*
  * ★`テキストエリア` (и `キー待ちマーク／座標`) заданы от ВЕРХНЕГО ЛЕВОГО УГЛА части, а
  * НЕ от её точки привязки 座標. Позиция потомка же складывается с ГЛОБАЛЬНОЙ
  * позицией родителя (parts_update_global_pos), то есть с точкой привязки, —

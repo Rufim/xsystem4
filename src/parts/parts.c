@@ -174,12 +174,36 @@ static void parts_init(struct parts *parts)
  * на ADV-сцене остаются чужие парты, а сцена создаёт их тысячами (один только дождь —
  * сотня 1x32), так что «печатать всё» бесполезно.
  */
+/*
+ * ДОБАВЛЯЕМЫЙ НА ХОДУ СПИСОК НАБЛЮДЕНИЯ. `XSYS4_PART_WATCH` задаёт номера заранее, но
+ * номера частей МЕНЯЮТСЯ между прогонами, поэтому для «поймать вот эту часть по имени»
+ * он бесполезен. Реестр активностей знает имена (`GetActivityPartsNumber`), и по
+ * `XSYS4_WATCH_ACT=<подстрока имени активности>` найденные там части попадают сюда.
+ */
+#define PARTS_WATCH_DYN_MAX 64
+static int parts_watch_dyn[PARTS_WATCH_DYN_MAX];
+static int parts_watch_dyn_nr = 0;
+
+void parts_watch_add(int parts_no)
+{
+	for (int i = 0; i < parts_watch_dyn_nr; i++)
+		if (parts_watch_dyn[i] == parts_no)
+			return;
+	if (parts_watch_dyn_nr >= PARTS_WATCH_DYN_MAX)
+		return;
+	parts_watch_dyn[parts_watch_dyn_nr++] = parts_no;
+	NOTICE("PARTWATCH часть %d взята под наблюдение", parts_no);
+}
+
 bool parts_watched(int parts_no)
 {
 	// Парт, пойманный по КАРТИНКЕ (XSYS4_CG_WATCH), тоже считается наблюдаемым —
 	// иначе на каждом месте пришлось бы проверять два условия подряд.
 	if (parts_no >= 0 && parts_no == parts_cg_watch_part())
 		return true;
+	for (int i = 0; i < parts_watch_dyn_nr; i++)
+		if (parts_watch_dyn[i] == parts_no)
+			return true;
 	static const char *watch = (const char *)1;
 	if (watch == (const char *)1)
 		watch = getenv("XSYS4_PART_WATCH");
@@ -405,6 +429,18 @@ static struct text_style default_text_style = {
 
 void parts_state_reset(struct parts_state *state, enum parts_type type)
 {
+	/*
+	 * XSYS4_STATE_TRACE=1 — КТО ПЕРЕБИВАЕТ УЖЕ ЗАПОЛНЕННОЕ СОСТОЯНИЕ. Смена типа
+	 * рушит содержимое (`parts_state_free`), а происходит она НЕЯВНО: любой
+	 * `parts_get_text`/`parts_get_cg` на части «не того» типа молча сбрасывает её.
+	 * Ловушка на этот случай: печатаем со стеком вызовов игры только переход
+	 * ИЗ инициализированного состояния В другой тип.
+	 */
+	if (state->type != PARTS_UNINITIALIZED && state->type != type
+			&& getenv("XSYS4_STATE_TRACE")) {
+		NOTICE("STATE перебив: тип %d -> %d", state->type, type);
+		vm_stack_trace();
+	}
 	parts_state_free(state);
 	state->type = type;
 	switch (type) {
@@ -2593,10 +2629,27 @@ bool PE_SetNumeralSurfaceArea(int parts_no, int x, int y, int w, int h, int stat
 	return true;
 }
 
+/*
+ * `XSYS4_RELEASE_TRACE=1` — КАЖДЫЙ игровой `ReleaseParts` со стеком, а не только по
+ * наблюдаемым частям. Это ЕДИНСТВЕННЫЙ момент обнуления, видимый движку: игровой
+ * `CParts@Release` зовёт нас и СРАЗУ ПОСЛЕ обнуляет своё поле `<Number>`
+ * (`struct parts::detail::CParts { array<int> <vtable>; int <Number>; bool <AutoRelease>; }`),
+ * а именно нулевой номер роняет `assert(parts.IsValid)` в `Motion::Create` (§5dc/§5dd).
+ * Наблюдение по номеру тут не годится: номера меняются между прогонами, а виновная
+ * часть заранее неизвестна — нужен весь поток.
+ *
+ * ★Печатаем и номер, и ЖИВА ЛИ часть: снятие уже снесённой части — отдельный случай,
+ * который по одному номеру не отличить.
+ */
 void PE_ReleaseParts(int parts_no)
 {
 	if (parts_no == cg_watch_part) {
 		NOTICE("CGWATCH part=%d ReleaseParts — стек вызовов игры:", parts_no);
+		vm_stack_trace();
+	}
+	if (getenv("XSYS4_RELEASE_TRACE")) {
+		NOTICE("RELEASE игра просит снять часть %d (жива=%d) — стек:",
+		       parts_no, parts_try_get(parts_no) ? 1 : 0);
 		vm_stack_trace();
 	}
 	parts_release(parts_no);
@@ -2691,6 +2744,30 @@ void PE_SetAddColor(int parts_no, int r, int g, int b)
 		255
 	};
 	parts_set_add_color(parts_get(parts_no), add_color);
+}
+
+/*
+ * `減算色モード` — добавочный цвет ВЫЧИТАЕТСЯ вместо прибавления (см. sub_color_mode в
+ * parts_internal.h). Пара была НАСТОЯЩЕЙ ДЫРОЙ: `SetComponentSubColorMode` не
+ * экспортировалась, а незнакомая HLL-функция фатальна (`hll_call` → VM_ERROR) — экран
+ * просмотра CG уходил в отладочный REPL прямо при построении миниатюр
+ * (`CgThumbnailButton@RegisterStateEvent` → `CLayoutBoxParts@SubColorMode::set`), и
+ * снаружи это выглядело как «экран открылся, ничего не нажимается».
+ *
+ * У сеттера ЕСТЬ геттер (`IsComponentSubColorMode`), поэтому значение обязано
+ * храниться по-настоящему: no-op был бы отличим.
+ */
+void PE_SetSubColorMode(int parts_no, bool enable)
+{
+	if (getenv("XSYS4_MUL_TRACE"))
+		NOTICE("SUBCOLOR part %d <- %d", parts_no, (int)enable);
+	parts_get(parts_no)->sub_color_mode = enable;
+}
+
+bool PE_IsSubColorMode(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	return parts ? parts->sub_color_mode : false;
 }
 
 void PE_SetMultiplyColor(int parts_no, int r, int g, int b)

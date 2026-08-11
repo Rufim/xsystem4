@@ -750,6 +750,20 @@ struct parts {
 	bool is_hovered;
 	int hover_time;
 	int draw_filter;
+	/*
+	 * `減算色モード` / `SetComponentSubColorMode` — добавочный цвет ВЫЧИТАЕТСЯ вместо
+	 * прибавления (см. parts_render_cg/parts_render_text: шейдер считает
+	 * `(tex + add_color) * multiply_color`, режим — смена знака).
+	 *
+	 * Функция была ДЫРОЙ: `SetComponentSubColorMode` не экспортировалась вовсе, а
+	 * незнакомая HLL-функция фатальна — экран просмотра CG уходил в отладочный REPL,
+	 * и «ничего не нажималось». Ставит её `CgThumbnailButton@RegisterStateEvent`
+	 * (через `CLayoutBoxParts@SubColorMode::set`) при построении миниатюр.
+	 *
+	 * ★В образ (сейв) поле НЕ пишется — формат менять нельзя, а игра ставит режим
+	 * заново при построении своих вьюх.
+	 */
+	bool sub_color_mode;
 	bool message_window;
 	int alpha_clipper_parts_no;
 	/*

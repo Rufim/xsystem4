@@ -16,6 +16,7 @@
 
 #include "system4.h"
 #include "system4/string.h"
+#include "xsystem4.h"
 
 #include "vm/page.h"
 #include "parts.h"
@@ -99,9 +100,28 @@ static void load_parts_text(struct iarray_reader *r, struct parts *parts,
 	text->cursor.x = 0;
 	text->cursor.y = 0;
 
+	/*
+	 * СТРОКИ ВОССТАНАВЛИВАЮТСЯ ЧЕРЕЗ РАЗДЕЛИТЕЛЬ. В образ каждая строка пишется
+	 * ОТДЕЛЬНО и БЕЗ `\n` (см. save_parts_text), а `parts_text_append` начинает
+	 * новую строку только по этому символу — без разделителя все строки склеивались
+	 * в одну.
+	 *
+	 * Симптом (отчёт пользователя, кадр оригинала той же реплики): в scrollback
+	 * реплика уходила одной строкой за правый край, причём переносы не просто не
+	 * срабатывали, а СЪЕДАЛИСЬ — «продолжает,как», «символомпроцветания». У
+	 * оригинала на этом месте три строки. Замер: у копии окна текст
+	 * `1190000075 wh=533x35` (одна строка), у живой части `90000075 wh=740x103`
+	 * (три). Касается не только бэк-сцены: тот же путь восстанавливает текстовые
+	 * части из ИГРОВОГО сейва.
+	 */
 	int nr_lines = iarray_read(r);
-	for (unsigned i = 0; i < nr_lines; i++) {
+	for (int i = 0; i < nr_lines; i++) {
 		struct string *line = iarray_read_string(r);
+		if (i > 0) {
+			struct string *nl = make_string("\n", 1);
+			parts_text_append(parts, text, nl);
+			free_string(nl);
+		}
 		parts_text_append(parts, text, line);
 	}
 }
@@ -1004,11 +1024,49 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 			continue;
 		if (!save_hidden && !parts->global.show)
 			continue;
-		if (back_scene ? !parts->want_save_back_scene : !parts->want_save)
+		/*
+		 * ОПТ-АУТ ИЗ СНИМКА БЭК-СЦЕНЫ НАСЛЕДУЕТСЯ ПОТОМКАМИ. Игра помечает
+		 * `SetWantSaveBackScene(no, 0)` только КОРЕНЬ служебного оверлея, а не
+		 * каждую его часть: у Dohna это `90000054` — корень дерева системных
+		 * кнопок ADV (дети `90000055`/`58`/`59`/`60`/`67`/`72`, внуки — сами
+		 * ярлыки `システム／ボタン／バックシーン` и т.д.). Всего таких вызовов за
+		 * прогон 21, и все с нулём: парты 1/2/3/5, `90000046`, `90000054` и
+		 * отладочные `1000001000…1000001014`.
+		 *
+		 * Проверялось только на самой части — и снимок уносил ЯРЛЫКИ ADV вместе
+		 * со сценой. Симптом: в scrollback интерфейс ADV «не убирался». Живые
+		 * части при этом гасились правильно (`SetComponentShow(0,0)`/`(4,0)`
+		 * доходили как СЛОЙ, в дампе у них `lhid=1`) — на экране оставались
+		 * КОПИИ: `1190000056` (バックシーン, 26,653), `1190000057` (コンフィグ),
+		 * `1190000061` (マニュアル, поверх кнопки `Back`) и `1190000059`
+		 * (кнопка меню, 1200,558).
+		 *
+		 * ★Только для бэк-сцены. У игрового сейва (`want_save`) наследования
+		 * нет намеренно: исключив оверлеи оттуда, мы потеряли бы их после
+		 * resume-загрузки — пересоздавать парты некому (см. PE_SetWantSaveBackScene).
+		 */
+		if (back_scene) {
+			bool skip = false;
+			// Откат для замеров A/B на одном бинаре: XSYS4_NO_BS_OPTOUT_INHERIT=1 —
+			// поведение до правки (флаг проверяется только у самой части).
+			bool inherit = !getenv("XSYS4_NO_BS_OPTOUT_INHERIT");
+			for (struct parts *p = parts; p; p = inherit ? p->parent : NULL) {
+				if (!p->want_save_back_scene) {
+					skip = true;
+					break;
+				}
+			}
+			if (skip)
+				continue;
+		} else if (!parts->want_save) {
 			continue;
+		}
 		if (getenv("XSYS4_BS_TRACE"))
-			NOTICE("BS save[%s] part=%d show=%d", back_scene ? "back" : "game",
-			       parts->no, parts->global.show);
+			NOTICE("BS save[%s] part=%d show=%d st0type=%d cg=\"%s\"",
+			       back_scene ? "back" : "game", parts->no, parts->global.show,
+			       parts->states[0].type,
+			       parts->states[0].type == PARTS_CG && parts->states[0].cg.name
+			               ? display_sjis0(parts->states[0].cg.name->text) : "");
 		save_parts(&w, parts);
 		count++;
 	}

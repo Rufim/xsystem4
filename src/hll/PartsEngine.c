@@ -1189,7 +1189,14 @@ static void PE_Parts_GetSoundName(int parts_no, struct string **out, int state) 
 // возвращает ровно эти слои.
 static void PE_SetComponentShow(int no, bool show)
 {
-	if (parts_controller_is_layer(no))
+	bool is_layer = parts_controller_is_layer(no);
+	// XSYS4_BS_TRACE=1 — печать РЕШЕНИЯ, а не только вызова: «слой или часть» здесь
+	// разводится по существованию парта с тем же номером, и когда номера сталкиваются,
+	// гашение экрана уходит не туда (симптом — интерфейс ADV остаётся в scrollback).
+	if (getenv("XSYS4_BS_TRACE"))
+		NOTICE("BS SetComponentShow(%d, %d) -> %s", no, (int)show,
+		       is_layer ? "СЛОЙ" : "часть");
+	if (is_layer)
 		parts_controller_set_show(no, show);
 	else
 		PE_SetShow(no, show);
@@ -1229,9 +1236,27 @@ static void PE_SetMulColorForBackScene(int parts_no, int r, int g, int b)
 {
 	PE_SetMultiplyColor(parts_no + BACK_SCENE_PARTS_OFFSET, r, g, b);
 }
+/*
+ * ★ЦВЕТ ШРИФТА ОКНА РЕПЛИК АДРЕСУЕТ ЕГО ТЕКСТОВУЮ ЧАСТЬ, А НЕ САМО ОКНО.
+ *
+ * `CBackSceneView@UpdateBackSceneMessageWindow` зовёт это с номером САМОГО ОКНА, а у
+ * нас стиль шрифта живёт в состоянии типа «текст»: `PE_SetPartsFontColor` идёт через
+ * `parts_get_text`, который на части другого типа молча делает `parts_state_reset` —
+ * то есть СНОСИТ картинку окна. Состояние 0 копии окна становилось текстовым
+ * (`1190000074 st0type=2 tex=0`) при том, что снимок писал его правильно
+ * (`BS save[back] part=90000074 st0type=1 cg="メッセージウィンドウ／イベント"`).
+ * Поймано ловушкой `XSYS4_STATE_TRACE=1`: «STATE перебив: тип 1 -> 2» со стеком
+ * `SetFontColorForBackScene → UpdateBackSceneMessageWindow → SetSceneIndex`.
+ *
+ * Номер текстовой части берём у ЖИВОГО окна: у копии структуры окна нет вовсе
+ * (`parts->mw` создаёт только загрузчик раскладки), а её текстовая часть — это копия
+ * той же части, то есть тот же номер плюс смещение.
+ */
 static void PE_SetFontColorForBackScene(int parts_no, int r, int g, int b, int state)
 {
-	PE_SetPartsFontColor(parts_no + BACK_SCENE_PARTS_OFFSET, r, g, b, state);
+	int tp = PE_GetMessageWindowTextParts(parts_no);
+	PE_SetPartsFontColor((tp >= 0 ? tp : parts_no) + BACK_SCENE_PARTS_OFFSET,
+	                     r, g, b, state);
 }
 // PE_ClearBackScene — в src/parts/save.c: он сносит пространство номеров бэк-сцены.
 // Direct SaveThumbnail(filename, width) export. Newer games (Tsumamigui 3) call this via
@@ -3312,6 +3337,36 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		act_list_int(node, "マージン", 2, 0),
 		act_list_int(node, "マージン", 3, 0));
 	PE_SetAlpha(no, act_int(node, "アルファ", 255));
+	/*
+	 * `乗算色` — МНОЖИТЕЛЬ цвета части. Поле не читалось вовсе, а рисование его
+	 * поддерживает давно (`parts_render_texture` → uniform `multiply_color`,
+	 * наследование — `parts_combine_params`). По раскладкам Dohna ненулевой
+	 * (не белый) множитель у 52 частей из 2708, у 12 из них он ЧИСТО ЧЁРНЫЙ.
+	 *
+	 * Симптом, с которого начали: в System Menu ADV у восьми пунктов не было
+	 * иконок — белые плашки без рисунка. Иконки на экране БЫЛИ, но белым по
+	 * белому: части `ＣＧパーツ_001:N` в `SceneAdvButtonMenu.x` объявляют
+	 * `乗算色 = (0,0,0)`, то есть белый силуэт CG
+	 * (`システム／システムメニューアイコン／…`) должен становиться чёрным.
+	 * Замер дампом до правки: `90000086 … tex=328 lshow=1 gshow=1 wh=40x40
+	 * mul=255,255,255` — текстура на месте, множитель потерян.
+	 *
+	 * ★`加算色` (у 6 частей ненулевой) СПЕЦИАЛЬНО НЕ ЧИТАЕТСЯ: `parts_combine_params`
+	 * складывает добавочный цвет УМНОЖЕНИЕМ (`parent * child/255`), а по умолчанию
+	 * он нулевой — значит у любой части с родителем результат обнулился бы, и
+	 * проверить поле кадром нельзя. Сперва надо разобрать сам способ наследования.
+	 */
+	PE_SetMultiplyColor(no,
+		act_list_int(node, "乗算色", 0, 255),
+		act_list_int(node, "乗算色", 1, 255),
+		act_list_int(node, "乗算色", 2, 255));
+	/*
+	 * `減算色モード` — добавочный цвет ВЫЧИТАЕТСЯ вместо прибавления. У Dohna стоит у
+	 * трёх частей из 2708. Тот же режим игра ставит и во время работы —
+	 * `SetComponentSubColorMode` (миниатюры экрана CG), см. PE_SetSubColorMode.
+	 */
+	if (act_int(node, "減算色モード", 0))
+		PE_SetSubColorMode(no, true);
 	// 拡大縮小 (scale x,y): e.g. the config sample-window system icons are 0.5.
 	float sx = act_list_float(node, "拡大縮小", 0, 1.0f);
 	float sy = act_list_float(node, "拡大縮小", 1, 1.0f);
@@ -3321,6 +3376,47 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 		PE_SetPartsMagY(no, sy);
 	if (act_int(node, "クリック許可", 0))
 		PE_SetClickable(no, true);
+	/*
+	 * `オンカーソル効果音` / `クリック効果音` — звук наведения и звук клика ЧАСТИ,
+	 * заданные ИМЕНЕМ файла из звукового архива. Загрузчик их не читал, и весь
+	 * слой звука интерфейса молчал: у Dohna номер звука части не ставит НИКТО
+	 * другой — обёртки `Ｐ＿オンカーソル効果音設定`/`Ｐ＿クリック効果音設定`
+	 * (→ `Parts_SetSoundName`) в байткоде объявлены, но не вызываются ни разу, а
+	 * `Parts_PlaySound` у нас вообще не экспортирована, то есть её вызов был бы
+	 * фатальным (`hll_call` → `VM_ERROR`) — значит и `CSpriteParts@PlayClickSE`
+	 * игра не зовёт. Играть звук части обязан САМ ДВИЖОК, по имени из раскладки.
+	 *
+	 * Симптом, с которого начали: в System Menu ADV переключение галочки молчит.
+	 * Разбор показал, что молчали ВСЕ части: у кнопки, которая открывает экран,
+	 * звук на клике слышен только потому, что его играет сама открываемая сцена.
+	 *
+	 * Номер ассета 1-based (`afa_exists_by_name` отдаёт `no + 1`), поэтому он
+	 * никогда не равен нулю и не путается с границей «нет звука» (`<= 0` → −1) в
+	 * `PE_Parts_SetSoundNumber`. Состояния 2 и 3 — «под курсором» и «клик»
+	 * (мэппинг из байткода, см. §5as).
+	 */
+	static const struct { const char *field; int state; } act_sound_fields[] = {
+		{ "オンカーソル効果音", 2 },
+		{ "クリック効果音",     3 },
+	};
+	for (unsigned i = 0; i < sizeof(act_sound_fields) / sizeof(*act_sound_fields); i++) {
+		struct string *sname = act_str(node, act_sound_fields[i].field);
+		if (!sname || !sname->text[0])
+			continue;
+		int sound_no = 0;
+		if (asset_exists_by_name(ASSET_SOUND, sname->text, &sound_no)) {
+			PE_Parts_SetSoundNumber(no, sound_no, act_sound_fields[i].state);
+		} else {
+			// Не молчаливый пропуск: несовпадение имени — это либо кодировка, либо
+			// звук в другом архиве, и то и другое надо видеть.
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("act_build_part: звук '%s' (%s) не найден в архиве звуков",
+				        display_sjis0(sname->text), act_sound_fields[i].field);
+			}
+		}
+	}
 	/*
 	 * `オンカーソル透過` — «пропускать курсор сквозь себя». Загрузчик его НЕ ЧИТАЛ,
 	 * поэтому каждая часть перехватывала hover и клик у всего, что под ней, хотя
@@ -3647,9 +3743,21 @@ static bool PE_GetActivityParts(int index, struct string *act, struct string **n
 	return true;
 }
 
+/*
+ * ★НА ЭТОМ ОТВЕТЕ СТОИТ ВЕСЬ ПОИСК ЧАСТИ ПО ИМЕНИ. `CActivityWrap@GetParts` сперва
+ * спрашивает существование и при «нет» отдаёт ПУСТОЙ wrap, а дальше игра ассертит
+ * `parts.IsValid` (= `Number != 0`) в первом же `Motion::Create`. Поэтому печатаем и
+ * отрицательный ответ тоже — молчаливое «нет» тут неотличимо от «не спрашивали».
+ */
 static bool PE_IsExistActivityPartsByName(struct string *act, struct string *pn)
 {
-	return pe_act_find_by_name(pe_act_find(act), pn) >= 0;
+	struct pe_activity *a = pe_act_find(act);
+	bool r = pe_act_find_by_name(a, pn) >= 0;
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT IsExistActivityParts(act='%s', name='%s') -> %d (активность %s, частей %d)",
+		       display_sjis0(act->text), display_sjis1(pn->text), (int)r,
+		       a ? "найдена" : "НЕ НАЙДЕНА", a ? a->nr_parts : -1);
+	return r;
 }
 
 static bool PE_IsExistActivityPartsByNumber(struct string *act, int number)
@@ -3669,6 +3777,16 @@ static int PE_GetActivityPartsNumber(struct string *act, struct string *pn)
 	if (getenv("XSYS4_ACT_TRACE"))
 		NOTICE("ACT GetActivityPartsNumber(act='%s', name='%s') -> %d",
 		       display_sjis0(act->text), display_sjis1(pn->text), r);
+	/*
+	 * `XSYS4_WATCH_ACT=<подстрока имени активности>` — взять части этой активности под
+	 * наблюдение ПО ИМЕНИ. Номера меняются между прогонами, поэтому заранее их в
+	 * `XSYS4_PART_WATCH` не запишешь; а поймать надо именно «эту» часть — например
+	 * корень `AdvNamePlate`, на котором игра ассертит `parts.IsValid` (= номер в её
+	 * объекте обнулён, то есть часть освободили) при переключении события.
+	 */
+	const char *wa = getenv("XSYS4_WATCH_ACT");
+	if (wa && *wa && r >= 0 && strstr(act->text, wa))
+		parts_watch_add(r);
 	return r;
 }
 
@@ -4954,6 +5072,10 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(GetComponentAddColorG, PE_GetComponentAddColorG),
 	    HLL_EXPORT(GetComponentAddColorB, PE_GetComponentAddColorB),
 	    HLL_EXPORT(SetComponentMulColor, PE_SetMultiplyColor),
+	    // `減算色モード`: void SetComponentSubColorMode(int, bool) / bool IsComponentSubColorMode(int).
+	    // Были ДЫРОЙ — экран просмотра CG уходил в REPL на построении миниатюр.
+	    HLL_EXPORT(SetComponentSubColorMode, PE_SetSubColorMode),
+	    HLL_EXPORT(IsComponentSubColorMode, PE_IsSubColorMode),
 	    HLL_EXPORT(GetComponentMulColorR, PE_GetComponentMulColorR),
 	    HLL_EXPORT(GetComponentMulColorG, PE_GetComponentMulColorG),
 	    HLL_EXPORT(GetComponentMulColorB, PE_GetComponentMulColorB),

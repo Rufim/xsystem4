@@ -15,6 +15,7 @@
  */
 
 #include "system4.h"
+#include "system4/string.h"
 
 #include "asset_manager.h"
 #include "audio.h"
@@ -188,8 +189,14 @@ static bool parts_can_take_cursor(struct parts *parts)
  */
 static void parts_play_sound(int sound_no)
 {
-	if (sound_no >= 0)
-		audio_play_sound(sound_no);
+	if (sound_no < 0)
+		return;
+	// XSYS4_SND_TRACE=1 — единственный способ увидеть звук части замером: слышимость
+	// на стенде не проверить (SDL_AUDIODRIVER=dummy), а `audio_play_sound` возвращает
+	// false и при неудачной загрузке, и при нехватке каналов.
+	bool ok = audio_play_sound(sound_no);
+	if (getenv("XSYS4_SND_TRACE"))
+		NOTICE("PARTSND играем звук %d -> %s", sound_no, ok ? "ок" : "НЕ ВЫШЛО");
 }
 
 static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clicking,
@@ -378,6 +385,20 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	if (click_eligible && prev_clicking && !cur_clicking
 			&& click_down_parts == parts->no) {
 		parts_play_sound(parts->on_click_sound);
+		// XSYS4_CLICKNO_TRACE=1 — ЖИЗНЬ «номера кликнутой части». На нём стоит выход
+		// из ожидания клика у игры (`parts::detail::WaitForClick` крутится, пока
+		// `GetClickNumber() <= 0`), поэтому лишний ненулевой номер = лишний
+		// пролистанная реплика. Печатаем и установку, и обнуление, и глубину ввода.
+		// ★С ИМЕНЕМ КАРТИНКИ: по одному номеру части не понять, какую кнопку нажали, а
+		// по логу нужно уметь восстановить действия ЗАДНИМ ЧИСЛОМ — падение уносит
+		// процесс, и разового дампа по сигналу уже не снять.
+		if (getenv("XSYS4_CLICKNO_TRACE")) {
+			struct parts_state *st = &parts->states[parts->state];
+			const char *cg = (st->type == PARTS_CG && st->cg.name)
+			                 ? display_sjis0(st->cg.name->text) : "";
+			NOTICE("CLICKNO часть %d кликнута (глубина ввода %d) cg=\"%s\"",
+			       parts->no, parts_input_depth, cg);
+		}
 		clicked_parts = parts->no;
 
 		// Checkbox: flip state on click; the game reads it via IsCheckBoxChecked.
@@ -874,6 +895,8 @@ void PE_BeginInput(void)
 {
 	parts_input_depth++;
 	parts_began_click = true;
+	if (getenv("XSYS4_CLICKNO_TRACE"))
+		NOTICE("CLICKNO BeginInput -> глубина %d", parts_input_depth);
 }
 
 void PE_EndInput(void)
@@ -881,6 +904,9 @@ void PE_EndInput(void)
 	if (parts_input_depth > 0)
 		parts_input_depth--;
 	parts_began_click = parts_input_depth > 0;
+	if (getenv("XSYS4_CLICKNO_TRACE"))
+		NOTICE("CLICKNO EndInput -> глубина %d, номер %d обнулён",
+		       parts_input_depth, clicked_parts);
 	clicked_parts = 0;
 	drag_state_reset();
 }
