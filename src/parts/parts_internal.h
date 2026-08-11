@@ -1199,6 +1199,7 @@ int parts_flat_stop_motion_get_cg_lib(struct parts_flat *f, int sm_lib_idx, int 
 
 struct flat_emitter;
 struct flat_key_data_graphic;
+struct flat_timeline;
 
 struct flat_emitter_particle {
 	vec2 pos;          // emitter-space position (pixels)
@@ -1231,7 +1232,7 @@ typedef void (*flat_emitter_particle_fn)(const struct flat_emitter_particle *p,
 		void *ud);
 bool parts_flat_emitter_get_align_offset(struct parts_flat *f, int emitter_lib_idx, vec2 out);
 void parts_flat_foreach_emitter_particle(struct parts_flat *f, int emitter_lib_idx,
-		const struct flat_key_data_graphic *keys,
+		const struct flat_timeline *tl,
 		int birth_frame, int age, int frame_count,
 		flat_emitter_particle_fn fn, void *ud);
 void parts_flat_build_layer_matrix(const struct flat_key_data_graphic *key,

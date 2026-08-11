@@ -384,7 +384,7 @@ static void render_emitter_particle_cb(const struct flat_emitter_particle *p,
 
 static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 		int emitter_lib_idx, int local, int frame_count,
-		struct flat_key_data_graphic *keys,
+		const struct flat_timeline *tl,
 		mat4 root, float parent_alpha,
 		struct flat_key_stack *key_stack)
 {
@@ -412,7 +412,10 @@ static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 
 		// Use the birth frame's key transform so particles stay at their
 		// birth position while the emitter moves.
-		struct flat_key_data_graphic *birth_key = &keys[birth_frame];
+		const struct flat_key_data_graphic *birth_key =
+				flat_timeline_key(tl, birth_frame);
+		if (!birth_key)
+			continue;
 		float layer_alpha = parent_alpha * birth_key->alpha / 255.0f;
 
 		struct flat_emitter_layer_effective eff;
@@ -438,7 +441,7 @@ static void render_flat_emitter(struct parts *parts, struct parts_flat *f,
 		glm_vec3_copy(eff.mul_color, ud.mul_color);
 		glm_mat4_mul(base, layer_m, ud.transform);
 		glm_mat4_mul(root, ud.transform, ud.transform);
-		parts_flat_foreach_emitter_particle(f, emitter_lib_idx, keys,
+		parts_flat_foreach_emitter_particle(f, emitter_lib_idx, tl,
 				birth_frame, age, frame_count,
 				render_emitter_particle_cb, &ud);
 	}
@@ -459,7 +462,7 @@ static void render_flat_layer(struct parts *parts, struct parts_flat *f,
 		struct flat_key_stack *key_stack);
 
 static void render_flat_cg(struct parts *parts, Texture *tex,
-		struct flat_key_data_graphic *key, struct flat_draw_ctx *ctx)
+		const struct flat_key_data_graphic *key, struct flat_draw_ctx *ctx)
 {
 	if (!tex->handle)
 		return;
@@ -510,6 +513,7 @@ static void render_flat_cg(struct parts *parts, Texture *tex,
 static void render_flat_item(struct parts *parts, struct parts_flat *f,
 		struct flat_layer_state *state, size_t tl_idx,
 		struct flat_timeline *tl, int local,
+		const struct flat_key_data_graphic *key,
 		struct flat_draw_ctx *parent, mat4 root,
 		struct flat_key_stack *key_stack)
 {
@@ -520,12 +524,10 @@ static void render_flat_item(struct parts *parts, struct parts_flat *f,
 	struct flat_library *lib = &f->flat->libraries[lib_idx];
 	if (lib->type == FLAT_LIB_EMITTER) {
 		render_flat_emitter(parts, f, lib_idx, local, tl->frame_count,
-				tl->graphic.keys,
-				root, parent->alpha, key_stack);
+				tl, root, parent->alpha, key_stack);
 		return;
 	}
 
-	struct flat_key_data_graphic *key = &tl->graphic.keys[local];
 	mat4 layer_m;
 	vec2 pos = { key->pos_x, key->pos_y };
 	parts_flat_build_layer_matrix(key, pos,
@@ -585,13 +587,19 @@ static void render_flat_layer(struct parts *parts, struct parts_flat *f,
 		if (tl->type != FLAT_TIMELINE_GRAPHIC)
 			continue;
 		int local = state->current_frame - tl->begin_frame;
-		if (local < 0 || local >= tl->frame_count)
+		// Ключ кадра берём через flat_timeline_key: до версии 14 он лежит в
+		// `graphic.keys`, с версии 15 — в `graphic.frames`.
+		const struct flat_key_data_graphic *key = flat_timeline_key(tl, local);
+		if (getenv("XSYS4_FLAT_TRACE"))
+			NOTICE("FLAT draw tl=%zu '%s' lib='%s' frame=%d local=%d/%d ключ=%s",
+			       i, display_sjis0(tl->name->text),
+			       display_sjis1(tl->library_name->text),
+			       state->current_frame, local, tl->frame_count,
+			       key ? "есть" : "нет");
+		if (!key)
 			continue;
 
-		if (local >= (int)tl->graphic.count)
-			continue;
-
-		render_flat_item(parts, f, state, i, tl, local, ctx, root, key_stack);
+		render_flat_item(parts, f, state, i, tl, local, key, ctx, root, key_stack);
 	}
 }
 

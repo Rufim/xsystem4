@@ -807,7 +807,7 @@ bool parts_flat_emitter_get_align_offset(struct parts_flat *f, int emitter_lib_i
 // rand_seed and birth_frame, so the same birth_frame always yields the same
 // particles regardless of `age`.
 void parts_flat_foreach_emitter_particle(struct parts_flat *f, int emitter_lib_idx,
-		const struct flat_key_data_graphic *keys,
+		const struct flat_timeline *tl,
 		int birth_frame, int age, int frame_count,
 		flat_emitter_particle_fn fn, void *ud)
 {
@@ -839,13 +839,15 @@ void parts_flat_foreach_emitter_particle(struct parts_flat *f, int emitter_lib_i
 	vec2 parent_vel = { 0, 0 };
 	if (em->direction_type == EMITTER_DIRECTION_PARENT
 			|| em->direction_type == EMITTER_DIRECTION_PARENT_REVERSE) {
-		const struct flat_key_data_graphic *cur = &keys[birth_frame];
-		if (birth_frame > 0) {
-			const struct flat_key_data_graphic *prev = &keys[birth_frame - 1];
+		const struct flat_key_data_graphic *cur = flat_timeline_key(tl, birth_frame);
+		const struct flat_key_data_graphic *prev = flat_timeline_key(tl, birth_frame - 1);
+		const struct flat_key_data_graphic *next =
+				birth_frame + 1 < frame_count
+				? flat_timeline_key(tl, birth_frame + 1) : NULL;
+		if (cur && prev) {
 			parent_vel[0] = cur->pos_x - prev->pos_x;
 			parent_vel[1] = cur->pos_y - prev->pos_y;
-		} else if (birth_frame + 1 < frame_count) {
-			const struct flat_key_data_graphic *next = &keys[birth_frame + 1];
+		} else if (cur && next) {
 			parent_vel[0] = next->pos_x - cur->pos_x;
 			parent_vel[1] = next->pos_y - cur->pos_y;
 		}
