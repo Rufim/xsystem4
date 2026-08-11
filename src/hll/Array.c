@@ -610,7 +610,10 @@ static void Array_ix_Duplicate(struct page **self, struct page **src)
 }
 
 // XSYS4_BSEARCH_TRACE=miss печатает и переворот: по строке видно, ТУ ЛИ страницу
-// переворачивают, которую потом ищут (сверять по адресу страницы и первым элементам).
+// переворачивают, которую потом ищут (сверять по адресу страницы и первым элементам),
+// а с XSYS4_BSEARCH_FIELDS — и сами величины в элементах (объявление ниже).
+static void ix_elem_fields(struct page *a, char *buf, size_t sz);
+
 static void Array_Reverse(struct page **self)
 {
 	if (!self)
@@ -620,11 +623,14 @@ static void Array_Reverse(struct page **self)
 	if (tr && !strcmp(tr, "miss") && *self) {
 		struct page *p = *self;
 		int s = array_elem_slots(p);
-		NOTICE("REVERSE page=%p n=%d slots=%d элементы: %d %d … %d", (void *)p,
+		char flds[1024];
+		ix_elem_fields(p, flds, sizeof(flds));
+		NOTICE("REVERSE page=%p n=%d slots=%d элементы: %d %d … %d%s%s", (void *)p,
 		       p->nr_vars / (s ? s : 1), s,
 		       p->nr_vars > 0 ? p->values[0].i : -1,
 		       p->nr_vars > s ? p->values[s].i : -1,
-		       p->nr_vars > 0 ? p->values[p->nr_vars - s].i : -1);
+		       p->nr_vars > 0 ? p->values[p->nr_vars - s].i : -1,
+		       *flds ? " поля:" : "", flds);
 	}
 }
 static void Array_Shuffle(struct page **self, int seed) { if (self) array_shuffle(*self, seed); }
@@ -1166,6 +1172,60 @@ static const char *ix_elem_id(struct page *a, int index)
 	return display_sjis0(heap_get_string(s0)->text);
 }
 
+/*
+ * `XSYS4_BSEARCH_FIELDS=<n>[,<m>…]` — печатать у элементов массива значения
+ * указанных ПОЛЕЙ структуры (номер члена), а не только heap-id объекта. Без
+ * этого промах виден лишь как «объекты не те», а вопрос «что в них лежит»
+ * остаётся открытым: в §5dy у кадров `FrameInfo` нужны члены 24/25
+ * (`StartTime`/`EndTime`) — по ним и видно, стыкуются ли интервалы кадров и
+ * доходит ли до этих объектов запись из `FrameInfoCollection@SetFrameEndTime`.
+ * Формат: ` <heap-id>:<поле>/<поле>…`, `?` — поля у элемента нет.
+ */
+static void ix_elem_fields(struct page *a, char *buf, size_t sz)
+{
+	buf[0] = '\0';
+	const char *f = getenv("XSYS4_BSEARCH_FIELDS");
+	if (!f || !*f || !a || sz < 32)
+		return;
+	int fields[8], nf = 0;
+	for (const char *p = f; *p && nf < 8; ) {
+		fields[nf++] = atoi(p);
+		while (*p && *p != ',')
+			p++;
+		if (*p == ',')
+			p++;
+	}
+	int slots = array_elem_slots(a);
+	if (slots < 1)
+		return;
+	int n = a->nr_vars / slots;
+	size_t o = 0;
+	// Тип элемента — по номеру структуры первой страницы: без него по одним
+	// heap-id не понять, ТОТ ли это контейнер, за которым идёт охота.
+	{
+		int p0 = n > 0 ? a->values[0].i : -1;
+		struct page *e0 = (p0 > 0 && (size_t)p0 < heap_size
+				   && heap[p0].type == VM_PAGE) ? heap[p0].page : NULL;
+		if (e0 && e0->type == STRUCT_PAGE && e0->index >= 0
+		    && e0->index < ain->nr_structures)
+			o += snprintf(buf + o, sz - o, " <%s,членов=%d>",
+				      ain->structures[e0->index].name, e0->nr_vars);
+	}
+	for (int i = 0; i < n && o + 32 < sz; i++) {
+		int pgi = a->values[i * slots].i;
+		struct page *e = (pgi > 0 && (size_t)pgi < heap_size
+				  && heap[pgi].type == VM_PAGE) ? heap[pgi].page : NULL;
+		o += snprintf(buf + o, sz - o, " %d:", pgi);
+		for (int k = 0; k < nf && o + 12 < sz; k++) {
+			if (e && fields[k] < e->nr_vars)
+				o += snprintf(buf + o, sz - o, "%s%d", k ? "/" : "",
+					      e->values[fields[k]].i);
+			else
+				o += snprintf(buf + o, sz - o, "%s?", k ? "/" : "");
+		}
+	}
+}
+
 static void ix_probe_trace(const char *what, struct page *a, int n, int lo, int hi,
 			   int mid, int c)
 {
@@ -1219,12 +1279,15 @@ static int Array_ix_BinarySearch(struct page **self, union vm_value *key)
 	if (miss_only) {
 		struct page *p = *self;
 		int s = array_elem_slots(p);
-		NOTICE("BSEARCH промах: page=%p n=%d elem_slots=%d nr_args=%d элементы: %d %d … %d зонды:%s",
+		char flds[1024];
+		ix_elem_fields(p, flds, sizeof(flds));
+		NOTICE("BSEARCH промах: page=%p n=%d elem_slots=%d nr_args=%d элементы: %d %d … %d зонды:%s%s%s",
 		       (void *)p, n, s, vm_hll_func_nr_args(key[1].i),
 		       p->nr_vars > 0 ? p->values[0].i : -1,
 		       p->nr_vars > s ? p->values[s].i : -1,
 		       p->nr_vars > 0 ? p->values[p->nr_vars - s].i : -1,
-		       np ? probes : " нет");
+		       np ? probes : " нет",
+		       *flds ? " поля:" : "", flds);
 	}
 	return -1;
 }
@@ -1285,6 +1348,11 @@ static int Array_ix_ShallowCopy(struct page **self)
 	struct page *src = *self;
 	struct page *dst = alloc_page(ARRAY_PAGE, src->a_type, src->nr_vars);
 	dst->array = src->array;
+	// ★Элементы ОБЩИЕ с источником — это и есть смысл функции. Признак нужен
+	// дальше: копия ЭТОЙ страницы (`A_REF` → `copy_page`) обязана ссылаться на
+	// те же объекты, иначе запись по элементу копии теряется (§5dy: `EndTime`
+	// кадров уходил в клоны, и анимации стояли).
+	dst->elems_shared = true;
 	int slots = array_elem_slots(src);
 	bool obj = ix_elem_is_object(src->a_type);
 	for (int i = 0; i < src->nr_vars; i++) {

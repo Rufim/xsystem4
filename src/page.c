@@ -99,6 +99,10 @@ struct page *alloc_page(enum page_type type, int type_index, int nr_vars)
 	page->type = type;
 	page->index = type_index;
 	page->nr_vars = nr_vars;
+	// Страницы приходят из кэша `_alloc_page` (там обнуляются только `values`),
+	// поэтому признак общих элементов надо гасить явно — иначе он достался бы
+	// новому массиву от переиспользованной страницы.
+	page->elems_shared = false;
 	return page;
 }
 
@@ -918,12 +922,39 @@ struct page *copy_page(struct page *src)
 		return dst;
 	}
 
-	if (src->type == ARRAY_PAGE && array_handle_elem_type(src->a_type)) {
+	/*
+	 * ★ЗДЕСЬ НЕЛЬЗЯ трогать простой `array<структура>` (§5dy, замер отверг).
+	 * Соблазн такой: у Ixseal `SelectableIndexArray<FrameInfo>@m_list` объявлен
+	 * `array<FrameInfo>`, а `GetAllInstances` (`Array.ShallowCopy` над ним)
+	 * отдаёт наружу `array<wrap<FrameInfo>>` — «тот же контейнер, лишь видом
+	 * ссылок», и `FrameInfoCollection@SetFrameEndTime` пишет `EndTime` в КЛОНЫ
+	 * кадров (клоны делает `A_REF` внутри `ArrayExtensions::GetReverse`).
+	 * Но распространить поверхностное копирование на все `array<структура>`
+	 * НЕЛЬЗЯ: значимая семантика тут реальна — на копиях-элементах игра строит
+	 * кнопки, и с общим доступом четыре кнопки футера (`Save`/`Load`/`Items`/
+	 * `Next`) и две кнопки `SceneYesNoDialog` слились в одну (замер: на кадре
+	 * остаётся один `Load`, кнопок диалога нет вовсе). Различать эти два случая
+	 * по одной странице невозможно — у неё нет объявленного типа элемента;
+	 * решать надо там, где тип известен (сайт `A_REF` / объявление приёмника).
+	 *
+	 * ★Различает эти два случая признак `elems_shared` (см. `struct page`): он
+	 * стоит только на контейнерах, СОЗДАННЫХ поверхностно (`Array.ShallowCopy`),
+	 * у которых элементы и так общие с источником — их копия обязана ссылаться на
+	 * те же объекты, чем бы элементы ни были объявлены.
+	 */
+	dst->elems_shared = src->elems_shared;
+	if (src->type == ARRAY_PAGE
+	    && (array_handle_elem_type(src->a_type) || src->elems_shared)) {
 		for (int i = 0; i < src->nr_vars; i++) {
 			dst->values[i] = src->values[i];
 			// Владеет только слот объекта (у многослотового элемента —
 			// нулевой); слот 0 кучи — глобальная страница, ею не владеют.
-			if (variable_type(src, i, NULL, NULL) == AIN_STRUCT
+			// ★Строка тут наравне со структурой: `variable_fini` считает
+			// AIN_STRING владеющим хэндлом, а через `elems_shared` сюда
+			// попадают и поверхностные копии массивов строк — без своей
+			// ссылки такая копия освобождала бы чужую строку.
+			enum ain_data_type et = variable_type(src, i, NULL, NULL);
+			if ((et == AIN_STRUCT || et == AIN_STRING)
 			    && dst->values[i].i > 0)
 				heap_ref(dst->values[i].i);
 		}
