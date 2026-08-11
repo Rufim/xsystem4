@@ -251,6 +251,12 @@ enum parts_cp_op_type {
 	// подложки интерфейса Dohna: прямоугольник + четыре сектора по углам
 	// (см. «Round128x40» в PlayerShopView.pactex).
 	PARTS_CP_FILL_PIE_AMAP,
+	// v14: заливка КРУГА/сектора ЦВЕТОМ с альфа-блендом (жёлтая метка
+	// следующего узла в данже Dohna).
+	PARTS_CP_FILL_PIE_BLEND,
+	// v14: заливка МНОГОУГОЛЬНИКА цветом с альфа-блендом (`SetFillPolygonAlphaBlend`,
+	// команда 97) — «труба» маршрута между узлами данжа Dohna.
+	PARTS_CP_FILL_POLYGON_BLEND,
 	// v14 (Ixseal): размытие поверхности по одной оси (команды 27/28 раскладки,
 	// `CASConstructionProcess@Set{H,V}BlurFilter`). Игра ставит их парой сразу за
 	// `SetCreateCG` — так собран размытый задник экранов (CONFIG, галерея, выбор
@@ -300,6 +306,18 @@ struct parts_cp_pie {
 	int start_angle;       // начало дуги, град.
 	int sweep_angle;       // длина дуги, град.
 	int a;                 // заливаемая альфа
+	// Цвет — для ЦВЕТНОЙ заливки фигуры (`SetFillCircleAlphaBlend`, команда
+	// 106): та же геометрия, но результат кладётся не в альфа-карту, а
+	// подмешивается цветом (у альфа-варианта поля просто не используются).
+	int r, g, b;
+};
+
+struct parts_cp_polygon {
+	int *pts;              // плоский список координат: x0,y0,x1,y1,…
+	int nr_pts;            // число ТОЧЕК (координат вдвое больше)
+	int r, g, b, a;
+	int round_corner;      // скругление углов (поле раскладки RoundCorner)
+	int angle;             // поле раскладки Angle
 };
 
 struct parts_cp_cut_cg {
@@ -368,6 +386,7 @@ struct parts_cp_op {
 		struct parts_cp_cg cg;
 		struct parts_cp_fill fill;
 		struct parts_cp_pie pie;
+		struct parts_cp_polygon polygon;
 		struct parts_cp_cut_cg cut_cg;
 		struct parts_cp_text text;
 		struct parts_cp_filter filter;
@@ -780,7 +799,7 @@ struct parts {
 	/*
 	 * `減算色モード` / `SetComponentSubColorMode` — добавочный цвет ВЫЧИТАЕТСЯ вместо
 	 * прибавления (см. parts_render_cg/parts_render_text: шейдер считает
-	 * `(tex + add_color) * multiply_color`, режим — смена знака).
+	 * `tex * multiply_color + add_color`, режим — смена знака).
 	 *
 	 * Функция была ДЫРОЙ: `SetComponentSubColorMode` не экспортировалась вовсе, а
 	 * незнакомая HLL-функция фатальна — экран просмотра CG уходил в отладочный REPL,

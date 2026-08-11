@@ -131,6 +131,20 @@ union vm_value variable_initval(enum ain_data_type type)
 	// инициализации нулём первый же `X_REF 1; DELETE` на непроинициализированном
 	// временном уносил heap-слот 0 → double free.
 	case AIN_IFACE:
+	/*
+	 * Тип 87 — ТА ЖЕ generic-ссылка на элемент контейнера, что WRAP(82), только
+	 * над `option<>`-элементом: в `MapView@GetNode` (единственный локал этого
+	 * типа во всей игре) в неё пишется возврат `Array.First#2` над
+	 * `array<option<wrap<MapNodeView>>>`, а ПЕРЕД записью стоит штатная идиома
+	 * освобождения старого содержимого (`X_REF 1; DELETE`). С нулём в
+	 * инициализации этот DELETE уносил heap-слот 0, то есть ГЛОБАЛЬНУЮ
+	 * СТРАНИЦУ: слот возвращался в пул, доставался под строку, и дальше чтение
+	 * глобалов давало ASCII-мусор — падало это далеко от причины (умирал
+	 * синглтон `Motion::ParsedObjectCache`, потом SIGSEGV в heap_ref со
+	 * «слотом» 0x30303031). Замер: `XSYS4_DELETE_TRACE=MapView@GetNode` →
+	 * `DELTRACE @708744 slot=0`.
+	 */
+	case AIN_UNKNOWN_TYPE_87:
 		return (union vm_value) { .i = -1 };
 	case AIN_ARRAY_TYPE:
 	case AIN_DELEGATE:

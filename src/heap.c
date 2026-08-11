@@ -325,6 +325,32 @@ void exit_unref(int slot)
 				case AIN_REF_TYPE:
 					if (page->values[i].i == -1)
 						break;
+					/*
+					 * Слот 0 — ГЛОБАЛЬНАЯ СТРАНИЦА: аллокатор его не выдаёт
+					 * (heap_free_ptr стартует с 1), владеть им не может НИ ОДНО
+					 * поле. Ноль в объектном поле — всегда чужое число, и
+					 * освобождать его нельзя: уносит ВСЕ глобалы, а падает это
+					 * далеко от причины — у Dohna слот 0 успевал
+					 * переиспользоваться под строку, и чтение глобалов давало
+					 * ASCII-мусор (SIGSEGV в heap_ref со «слотом» 0x30303031).
+					 * В `variable_fini` такая проверка есть давно, но
+					 * рекурсивный обход полей в exit_unref её обходил.
+					 */
+					if (page->values[i].i == 0) {
+						static bool warned;
+						if (!warned) {
+							warned = true;
+							WARNING("exit_unref: в объектном поле %d страницы %s лежит "
+								"heap-слот 0 (глобальная страница) — чужое число; "
+								"поле не освобождаем. Стек вызовов игры:", i,
+								page->type == STRUCT_PAGE && page->index >= 0
+								&& page->index < ain->nr_structures
+								? display_sjis0(ain->structures[page->index].name)
+								: "(не структура)");
+							vm_stack_trace();
+						}
+						break;
+					}
 					exit_unref(page->values[i].i);
 					break;
 				default:

@@ -827,7 +827,8 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		int font_r, int font_g, int font_b, int edge_r, int edge_g, int edge_b,
 		int full_size, float bold_weight, float edge_weight,
 		struct string *text, struct string *cg_name,
-		int radius_x, int radius_y, int start_angle, int sweep_angle, int blur, int a2)
+		int radius_x, int radius_y, int start_angle, int sweep_angle, int blur, int a2,
+		union vm_value *pos, int nr_pos, int round_corner, int poly_angle)
 {
 	(void)interp_type; (void)sw; (void)sh;
 	switch (command) {
@@ -978,6 +979,20 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		PE_AddFillGradationAMapToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
 				a, a2, command == 25, state);
 		break;
+	case 29:
+		/*
+		 * `CASConstructionProcess::SetCGBlend` — наложить CG ЦЕЛИКОМ в точку
+		 * `先矩形` с блендингом по альфе. Аргументов ровно три (имя CG, destX,
+		 * destY), размеров нет — их берёт `build_draw_cut_cg` из самого CG
+		 * (нулевой прямоугольник = натуральный размер).
+		 * ★Этим строится ФОН экрана данжа (`背景／会社`): два слоя 1280x720
+		 * ползут навстречу циклом, поверх — размытие (28) и градиент альфы (26).
+		 * Пока шаг пропускался, поверхности оставались пустыми и данж выходил
+		 * ЧЁРНЫМ (размытие и градиент честно применялись к пустоте).
+		 */
+		PE_AddDrawCutCGToPartsConstructionProcess(parts_no, cg_name,
+				dx, dy, 0, 0, 0, 0, 0, 0, interp_type, state);
+		break;
 	case 27:  // CASConstructionProcess::SetHBlurFilter (v14)
 	case 28:  // CASConstructionProcess::SetVBlurFilter (v14)
 		// Размытый задник экранов Dohna: CreateCG → HBlur → VBlur, сила в `ブラー`.
@@ -1007,6 +1022,39 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
 				radius_x, radius_y, 0, 360, a, state);
 		break;
+	case 97:
+		/*
+		 * `CASConstructionProcess::SetFillPolygonAlphaBlend` — многоугольник по
+		 * списку точек (`ArrayPos`, плоско x0,y0,x1,y1…) цветом с альфа-блендом.
+		 * Так в данже рисуется «труба» маршрута между узлами.
+		 */
+		if (pos && nr_pos >= 6) {
+			int nr_pts = nr_pos / 2;
+			int *pts = xcalloc(nr_pts * 2, sizeof(int));
+			for (int i = 0; i < nr_pts * 2; i++)
+				pts[i] = pos[i].i;
+			PE_AddFillPolygonBlendToPartsConstructionProcess(parts_no, pts, nr_pts,
+					r, g, b, a, round_corner, poly_angle, state);
+			free(pts);
+		} else {
+			static bool warned;
+			if (!warned) {
+				warned = true;
+				WARNING("SetFillPolygonAlphaBlend: список точек пуст (nr_pos=%d) — "
+					"шаг пропущен", nr_pos);
+			}
+		}
+		break;
+	case 106:
+		/*
+		 * `CASConstructionProcess::SetFillCircleAlphaBlend` — круг ЦВЕТОМ с
+		 * альфа-блендом: аргументы (x, y, radius, r, g, b, alpha), центр в
+		 * `先矩形`, радиус в `半径`. Так рисуется жёлтая метка СЛЕДУЮЩЕГО узла
+		 * в данже (без неё круг оставался пустым белым).
+		 */
+		PE_AddFillCircleBlendToPartsConstructionProcess(parts_no, dx, dy,
+				radius_x, radius_y, r, g, b, a, state);
+		break;
 	case 122:  // CASConstructionProcess::SetFillPieAMap (v14)
 		// Сектор в альфа-карту: из четырёх таких углов и двух прямоугольников
 		// собрана каждая скруглённая подложка интерфейса Dohna.
@@ -1021,7 +1069,8 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 
 
 static void PartsEngine_add_construction_process(union vm_value *ints,
-		union vm_value *floats, union vm_value *strings, int nr_ints)
+		union vm_value *floats, union vm_value *strings, int nr_ints,
+		union vm_value *pos, int nr_pos)
 {
 	int parts_no    = ints[0].i;
 	int state       = ints[1].i;
@@ -1065,6 +1114,10 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 	int sweep_angle = nr_ints > 37 ? ints[37].i : 0;
 	int blur = nr_ints > 38 ? ints[38].i : 0;  // поле `ブラー` (команды 27/28)
 	int a2   = nr_ints > 39 ? ints[39].i : 0;  // второй альфы (команды 25/26)
+	// Поля семейства полигонов (v14): скругление углов и угол — слоты раскладки
+	// 36/37, у нас за концом классического набора (см. PE_AddPartsConstructionProcess_ix).
+	int round_corner = nr_ints > 40 ? ints[40].i : 0;
+	int poly_angle   = nr_ints > 41 ? ints[41].i : 0;
 
 	if (getenv("XSYS4_BL_TRACE") && (command == 7 || command == 8 || command == 23 || command == 24))
 		NOTICE("TEXTOP cmd=%d part=%d dx=%d dy=%d ftype=%d fsize=%d col=%d,%d,%d edge=%d,%d,%d ew=%.2f bw=%.2f str0slot=%d str0len=%d text='%s'",
@@ -1076,7 +1129,8 @@ static void PartsEngine_add_construction_process(union vm_value *ints,
 			dx, dy, dw, dh, r, g, b, a, r2, g2, b2, char_space, line_space,
 			font_type, font_size, font_r, font_g, font_b,
 			edge_r, edge_g, edge_b, full_size, bold_weight, edge_weight,
-			text, cg_name, radius_x, radius_y, start_angle, sweep_angle, blur, a2);
+			text, cg_name, radius_x, radius_y, start_angle, sweep_angle, blur, a2,
+			pos, nr_pos, round_corner, poly_angle);
 }
 
 // Generic dispatch function for PartsEngine operations.
@@ -1180,7 +1234,7 @@ static int PartsEngine_PartsFunc(int func_id, struct page **array_int,
 		REQUIRE_INTS(32);
 		REQUIRE_FLOATS(2);
 		REQUIRE_STRINGS(2);
-		PartsEngine_add_construction_process(ints, floats, strings, 32);
+		PartsEngine_add_construction_process(ints, floats, strings, 32, NULL, 0);
 		return 1;
 	case 162:  // bool InitPartsMovie(int parts_no, int width, int height, int bg_r, int bg_g, int bg_b, int state)
 		REQUIRE_INTS(8);
@@ -1323,7 +1377,7 @@ static void PE_AddPartsConstructionProcess(struct page **ai, struct page **af, s
 	// формы номер части и состояние лежат в ints[0..1], точек нет.
 	PE_SaveConstructionRaw(ints[0].i, ints[1].i, ints, nr_ints, floats, nr_floats,
 			       strings, nr_strings, NULL, 0);
-	PartsEngine_add_construction_process(ints, floats, strings, nr_ints);
+	PartsEngine_add_construction_process(ints, floats, strings, nr_ints, NULL, 0);
 }
 
 // Ixseal (System 4 v14) form of the batch construction interface. The classic
@@ -1376,7 +1430,11 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
 	// 128 — `TileCGBlend` (зерно плёнки на титуле Haha Ranman).
-	static const int v14_ok[] = { 25, 26, 27, 28, 88, 90, 102, 122, 128 };
+	// 29 — `SetCGBlend` (наложить CG целиком): им строится ФОН экрана данжа
+	// (`背景／会社`), два ползущих слоя 1280x720; без него поверхности пустые и
+	// данж выходил ЧЁРНЫМ, а размытие (28) и градиент альфы (26) применялись к
+	// пустоте.
+	static const int v14_ok[] = { 25, 26, 27, 28, 29, 88, 90, 97, 102, 106, 122, 128 };
 	bool known_v14 = false;
 	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
 		known_v14 |= (command == v14_ok[i]);
@@ -1392,7 +1450,7 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 		return;
 	}
 
-	union vm_value ints[40] = {0};
+	union vm_value ints[42] = {0};
 	ints[0].i = parts_no;
 	ints[1].i = state;
 	ints[2].i = command;
@@ -1415,13 +1473,22 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 		// Имя CG — из строковых аргументов: без него по трассе не понять, ЧТО
 		// именно рисует шаг, а «посмотреть ассет» в этом проекте первично.
 		struct string *cgn = heap_get_string((*as)->values[1].i);
-		NOTICE("AddPartsConstructionProcess(ix) part=%d state=%d cmd=%d src=(%d,%d %dx%d) dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d blur=%d full=%d cg='%s'",
+		// Список точек — для семейства полигонов (команда 97): без него по
+		// трассе не понять, КУДА рисуется фигура.
+		char pbuf[128] = "";
+		if (ap && *ap && (*ap)->nr_vars > 0) {
+			int p = 0, n = (*ap)->nr_vars;
+			p += snprintf(pbuf + p, sizeof(pbuf) - p, " pos[%d]=", n);
+			for (int i = 0; i < n && i < 10 && p < (int)sizeof(pbuf) - 8; i++)
+				p += snprintf(pbuf + p, sizeof(pbuf) - p, "%d,", (*ap)->values[i].i);
+		}
+		NOTICE("AddPartsConstructionProcess(ix) part=%d state=%d cmd=%d src=(%d,%d %dx%d) dst=(%d,%d %dx%d) rgba=%d,%d,%d,%d blur=%d full=%d cg='%s'%s",
 		       parts_no, state, command,
 		       ints[4].i, ints[5].i, ints[6].i, ints[7].i,
 		       ints[8].i, ints[9].i, ints[12].i, ints[13].i,
 		       ints[14].i, ints[15].i, ints[16].i, ints[17].i,
 		       ints[38].i, ints[31].i,
-		       cgn ? display_sjis0(cgn->text) : "");
+		       cgn ? display_sjis0(cgn->text) : "", pbuf);
 	}
 	// Слоты 34..37 — наши, для полей фигур v14 (радиусы и углы дуги): классическая
 	// раскладка их не знает, а команде 122 они необходимы.
@@ -1429,7 +1496,10 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	ints[35] = src[33];  // RadiusY
 	ints[36] = src[38];  // StartAngle
 	ints[37] = src[39];  // SweepAngle
-	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values, 40);
+	ints[40] = src[36];  // RoundCorner (семейство полигонов)
+	ints[41] = src[37];  // Angle
+	PartsEngine_add_construction_process(ints, (*af)->values, (*as)->values, 42,
+			(ap && *ap) ? (*ap)->values : NULL, (ap && *ap) ? (*ap)->nr_vars : 0);
 }
 
 // --- Подсистема Activity (именованные наборы parts) ---
@@ -2084,8 +2154,13 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			continue;
 		// Команды за пределами реализованного набора пропускаем ЯВНО: пусть их
 		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
-		if (command > 24 && command != 27 && command != 28 && command != 88
-				&& command != 90 && command != 102 && command != 122) {
+		// Список тот же, что у ix-пути (v14_ok): 29 — CGBlend (фон данжа),
+		// 97 — полигон, 106 — круг цветом. Из раскладки полигон приходит без
+		// списка точек и просто ничего не рисует, но пропускать его молча нельзя.
+		if (command > 24 && command != 27 && command != 28 && command != 29
+				&& command != 88 && command != 90 && command != 97
+				&& command != 102 && command != 106 && command != 122
+				&& command != 128) {
 			static bool warned = false;
 			if (!warned) {
 				warned = true;
@@ -2119,7 +2194,10 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			act_float(op, "フォント縁取り", 0.0f), text, cg,
 			act_list_int(op, "半径", 0, 0), act_list_int(op, "半径", 1, 0),
 			act_list_int(op, "円弧角度", 0, 0), act_list_int(op, "円弧角度", 1, 0),
-			act_int(op, "ブラー", 0), act_list_int(op, "色２", 3, 255));
+			act_int(op, "ブラー", 0), act_list_int(op, "色２", 3, 255),
+			// Путь ИЗ РАСКЛАДКИ: списка точек у узла нет (полигоны подаёт только
+			// код игры), поля полигона берём из тех же имён, что и ix-путь.
+			NULL, 0, act_int(op, "角丸", 0), act_int(op, "角度", 0));
 		done++;
 	}
 	return done;

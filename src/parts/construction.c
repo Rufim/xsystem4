@@ -131,6 +131,7 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_FILL:
 	case PARTS_CP_FILL_ALPHA_COLOR:
 	case PARTS_CP_FILL_PIE_AMAP:
+	case PARTS_CP_FILL_PIE_BLEND:
 	case PARTS_CP_FILL_AMAP:
 	case PARTS_CP_FILL_WITH_ALPHA:
 	case PARTS_CP_DRAW_RECT:
@@ -143,6 +144,9 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_ADD_FILTER:
 	case PARTS_CP_FILL_GRADATION_AMAP:
 	case PARTS_CP_TILE_CG_BLEND:
+		break;
+	case PARTS_CP_FILL_POLYGON_BLEND:
+		free(op->polygon.pts);
 		break;
 	case PARTS_CP_DRAW_TEXT:
 	case PARTS_CP_COPY_TEXT:
@@ -265,6 +269,61 @@ bool PE_AddFillAMapToPartsConstructionProcess(int parts_no, int x, int y, int w,
  * подложки интерфейса Dohna строятся именно так: два прямоугольника крестом плюс
  * четыре четверти круга по углам (см. «Round128x40» в PlayerShopView.pactex).
  */
+/*
+ * `CASConstructionProcess::SetFillCircleAlphaBlend` (команда 106) — залить КРУГ
+ * ЦВЕТОМ с альфа-блендом. Геометрия та же, что у альфа-варианта (102), поэтому
+ * операция общая: полный сектор (0..360) с цветом.
+ */
+/*
+ * `CASConstructionProcess::SetFillPolygonAlphaBlend` (команда 97) — залить
+ * МНОГОУГОЛЬНИК по списку точек цветом с альфа-блендом. Список приходит в
+ * `ArrayPos` плоско (x0,y0,x1,y1,…), цвет и альфа — слоты 12..15, скругление
+ * углов и угол — 36/37.
+ */
+bool PE_AddFillPolygonBlendToPartsConstructionProcess(int parts_no, const int *pts,
+		int nr_pts, int r, int g, int b, int a, int round_corner, int angle, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+	if (!pts || nr_pts < 3)
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_FILL_POLYGON_BLEND;
+	op->polygon.pts = xcalloc(nr_pts * 2, sizeof(int));
+	memcpy(op->polygon.pts, pts, (size_t)nr_pts * 2 * sizeof(int));
+	op->polygon.nr_pts = nr_pts;
+	op->polygon.r = r;
+	op->polygon.g = g;
+	op->polygon.b = b;
+	op->polygon.a = a;
+	op->polygon.round_corner = round_corner;
+	op->polygon.angle = angle;
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
+bool PE_AddFillCircleBlendToPartsConstructionProcess(int parts_no, int x, int y,
+		int rx, int ry, int r, int g, int b, int a, int state)
+{
+	if (!parts_state_valid(--state))
+		return false;
+
+	struct parts_construction_process *cproc = get_cproc(parts_no, state);
+	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
+	op->type = PARTS_CP_FILL_PIE_BLEND;
+	op->pie = (struct parts_cp_pie) {
+		.x = x, .y = y, .rx = rx, .ry = ry,
+		.start_angle = 0, .sweep_angle = 360, .a = a,
+		.r = r, .g = g, .b = b
+	};
+
+	parts_add_cp_op(cproc, op);
+	return true;
+}
+
 bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int rx, int ry,
 		int start_angle, int sweep_angle, int a, int state)
 {
@@ -691,6 +750,158 @@ static bool build_fill_amap(struct parts_construction_process *cproc, struct par
  * Края сглаживаем суперсэмплингом 3×3: без него скруглённые подложки заметно
  * «лесенкой» отличаются от оригинала.
  */
+/*
+ * Положить ФИГУРУ (цвет + её альфа-маска) на поверхность построения.
+ * ★Двумя шагами, и это не перестраховка: `gfx_copy_stretch_blend_amap` даёт
+ * обычный source-over по ЦВЕТУ, но альфу приёмника НЕ поднимает
+ * (glBlendFuncSeparate(..., GL_DST_ALPHA, GL_ONE_MINUS_SRC_ALPHA) сводится к
+ * dstA_new = dstA). У семейства `*AlphaBlend` приёмник обычно только что
+ * обнулён по альфе (`SetFillWithAlpha` с A=0 — так строится «труба» маршрута в
+ * данже), поэтому одного цветового шага не видно вовсе: цвет ложится в
+ * полностью прозрачные пиксели. Сначала поднимаем альфу по маске, затем красим.
+ */
+static void cp_blend_shape(struct parts_construction_process *cproc, int x, int y,
+		int w, int h, Texture *shape)
+{
+	gfx_copy_amap_max(&cproc->common.texture, x, y, shape, 0, 0, w, h);
+	gfx_copy_stretch_blend_amap(&cproc->common.texture, x, y, w, h, shape, 0, 0, w, h);
+}
+
+/*
+ * Маска сектора/круга со сглаживанием (суперсэмплинг 3x3): общая и для заливки
+ * альфа-карты (команды 102/122), и для ЦВЕТНОЙ заливки с блендом (команда 106) —
+ * геометрия у них одна, различается только то, куда кладётся результат.
+ */
+static uint8_t *pie_mask(struct parts_cp_pie *op, int *out_w, int *out_h)
+{
+	int rx = abs(op->rx), ry = abs(op->ry);
+	if (rx <= 0 || ry <= 0)
+		return NULL;
+	int w = rx * 2, h = ry * 2;
+	uint8_t *amap = xcalloc(1, (size_t)w * h);
+	float a0 = op->start_angle * (float)M_PI / 180.0f;
+	float a1 = a0 + op->sweep_angle * (float)M_PI / 180.0f;
+	if (a1 < a0) { float t = a0; a0 = a1; a1 = t; }
+	float sweep = a1 - a0;
+	const int SS = 3;
+	for (int py = 0; py < h; py++) {
+		for (int px = 0; px < w; px++) {
+			int hits = 0;
+			for (int sy = 0; sy < SS; sy++) {
+				for (int sx = 0; sx < SS; sx++) {
+					float fx = px + (sx + 0.5f) / SS - rx;
+					float fy = py + (sy + 0.5f) / SS - ry;
+					float nx = fx / rx, ny = fy / ry;
+					if (nx * nx + ny * ny > 1.0f)
+						continue;
+					if (sweep < 2.0f * (float)M_PI - 0.001f) {
+						float ang = atan2f(fy, fx);
+						while (ang < a0)
+							ang += 2.0f * (float)M_PI;
+						if (ang > a1)
+							continue;
+					}
+					hits++;
+				}
+			}
+			if (hits)
+				amap[py * w + px] = op->a * hits / (SS * SS);
+		}
+	}
+	*out_w = w;
+	*out_h = h;
+	return amap;
+}
+
+/*
+ * Заливка многоугольника цветом с альфа-блендом (команда 97). Маска считается
+ * правилом «чётности пересечений» с суперсэмплингом 3x3 — тем же, что у круга,
+ * поэтому края сглажены одинаково.
+ * ★Скругление углов (`RoundCorner`) НЕ применяется: радиуса в аргументах метода
+ * нет, а выдумывать его нельзя — о факте сообщаем один раз.
+ */
+static bool build_fill_polygon_blend(struct parts_construction_process *cproc,
+		struct parts_cp_polygon *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	if (!op->pts || op->nr_pts < 3)
+		return false;
+	if (op->round_corner) {
+		static bool warned;
+		if (!warned) {
+			warned = true;
+			WARNING("SetFillPolygonAlphaBlend: RoundCorner=%d не применяется — "
+				"радиуса скругления в аргументах метода нет", op->round_corner);
+		}
+	}
+
+	int min_x = op->pts[0], max_x = op->pts[0];
+	int min_y = op->pts[1], max_y = op->pts[1];
+	for (int i = 1; i < op->nr_pts; i++) {
+		int x = op->pts[i * 2], y = op->pts[i * 2 + 1];
+		if (x < min_x) min_x = x;
+		if (x > max_x) max_x = x;
+		if (y < min_y) min_y = y;
+		if (y > max_y) max_y = y;
+	}
+	int w = max_x - min_x + 1, h = max_y - min_y + 1;
+	if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
+		return false;
+
+	uint8_t *amap = xcalloc(1, (size_t)w * h);
+	const int SS = 3;
+	for (int py = 0; py < h; py++) {
+		for (int px = 0; px < w; px++) {
+			int hits = 0;
+			for (int sy = 0; sy < SS; sy++) {
+				for (int sx = 0; sx < SS; sx++) {
+					float fx = min_x + px + (sx + 0.5f) / SS;
+					float fy = min_y + py + (sy + 0.5f) / SS;
+					bool in = false;
+					for (int i = 0, j = op->nr_pts - 1; i < op->nr_pts; j = i++) {
+						float xi = op->pts[i * 2], yi = op->pts[i * 2 + 1];
+						float xj = op->pts[j * 2], yj = op->pts[j * 2 + 1];
+						if ((yi > fy) != (yj > fy)
+								&& fx < (xj - xi) * (fy - yi) / (yj - yi) + xi)
+							in = !in;
+					}
+					if (in)
+						hits++;
+				}
+			}
+			if (hits)
+				amap[py * w + px] = op->a * hits / (SS * SS);
+		}
+	}
+
+	Texture tmp;
+	gfx_init_texture_amap(&tmp, w, h, amap, (SDL_Color){ op->r, op->g, op->b, 255 });
+	cp_blend_shape(cproc, min_x, min_y, w, h, &tmp);
+	gfx_delete_texture(&tmp);
+	free(amap);
+	return true;
+}
+
+// Заливка круга/сектора ЦВЕТОМ с альфа-блендом — `CASConstructionProcess::
+// SetFillCircleAlphaBlend` (команда 106): у метода аргументы (x, y, radius,
+// r, g, b, alpha), сектор всегда полный.
+static bool build_fill_pie_blend(struct parts_construction_process *cproc, struct parts_cp_pie *op)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int w, h;
+	uint8_t *amap = pie_mask(op, &w, &h);
+	if (!amap)
+		return false;
+	Texture tmp;
+	gfx_init_texture_amap(&tmp, w, h, amap, (SDL_Color){ op->r, op->g, op->b, 255 });
+	cp_blend_shape(cproc, op->x - abs(op->rx), op->y - abs(op->ry), w, h, &tmp);
+	gfx_delete_texture(&tmp);
+	free(amap);
+	return true;
+}
+
 static bool build_fill_pie_amap(struct parts_construction_process *cproc, struct parts_cp_pie *op)
 {
 	if (!cproc->common.texture.handle)
@@ -774,8 +985,19 @@ static bool build_draw_cut_cg(struct parts_construction_process *cproc, struct p
 	gfx_init_texture_with_cg(&src, cg);
 	cg_free(cg);
 
-	gfx_copy_stretch_blend_amap(&cproc->common.texture, op->dx, op->dy, op->dw, op->dh,
-			&src, op->sx, op->sy, op->sw, op->sh);
+	/*
+	 * Нулевой прямоугольник — «ВЕСЬ CG натуральным размером»: так подаёт
+	 * `CASConstructionProcess::SetCGBlend` (команда 29), у которой в аргументах
+	 * только имя CG и точка назначения, без размеров. Рисовать нулевой
+	 * прямоугольник смысла нет, поэтому соглашение ничего не ломает.
+	 */
+	int dw = op->dw > 0 ? op->dw : src.w;
+	int dh = op->dh > 0 ? op->dh : src.h;
+	int sw = op->sw > 0 ? op->sw : src.w;
+	int sh = op->sh > 0 ? op->sh : src.h;
+
+	gfx_copy_stretch_blend_amap(&cproc->common.texture, op->dx, op->dy, dw, dh,
+			&src, op->sx, op->sy, sw, sh);
 	gfx_delete_texture(&src);
 	return true;
 }
@@ -1151,6 +1373,14 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_FILL_ALPHA_COLOR:
 			if (!build_fill_alpha_color(cproc, &op->fill))
+				return false;
+			break;
+		case PARTS_CP_FILL_PIE_BLEND:
+			if (!build_fill_pie_blend(cproc, &op->pie))
+				return false;
+			break;
+		case PARTS_CP_FILL_POLYGON_BLEND:
+			if (!build_fill_polygon_blend(cproc, &op->polygon))
 				return false;
 			break;
 		case PARTS_CP_FILL_PIE_AMAP:

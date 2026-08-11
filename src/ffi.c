@@ -715,6 +715,49 @@ void hll_call(int libno, int fno, int elem_class)
 		 * вызывающий и освобождает своим DELETE.
 		 */
 		int eslots = array_elem_slots(ap);
+		/*
+		 * `option<wrap<структура>>` — элемент тоже ДВУХСЛОТОВЫЙ (объект + тег
+		 * наличия), но наружу идёт ССЫЛКА, а не значение. Единственный такой
+		 * сайт — `MapView@GetNode` (@0x708712, elem_class 0x30002): сразу после
+		 * `Array.First#2` он делает `X_ASSIGN 2` в локал типа type_87
+		 * (generic-ССЫЛКА) и тут же `X_REF 2` — и только разыменовав пару,
+		 * получает option-ЗНАЧЕНИЕ, которое вызывающий (`MapView@HideIcon`)
+		 * кладёт в локал объявленного типа `option<wrap<MapNodeView>>` и
+		 * проверяет тег (`PUSH 1; GTE` — 1 = пусто). У интерфейсной пары
+		 * (0x10003) `X_REF` после присваивания НЕТ — там значение, и локал
+		 * объявлен интерфейсным типом.
+		 * Со «значением» игра разыменовывала пару (узел, тег) как ссылку и
+		 * читала ПЕРВЫЕ ПОЛЯ САМОГО УЗЛА: `this` для `MapNodeView@HideIcon`
+		 * становился обёрткой парта (`CSpriteParts`, 2 поля), и `X_REF` на
+		 * поле 15 (`m_uiIcon`) падал «Out of bounds page index» — вылет карты
+		 * после события узла (2-й день hunting-фазы).
+		 * Гейт по объявлению САЙТА (бит 0x20000 = option), а не по странице:
+		 * массив option'ов встречается и на сайтах, объявивших элемент
+		 * объектом, и там форма прежняя.
+		 */
+		bool elem_is_option = (elem_class & 0x20000)
+			|| (elem_class == 0 && ap->a_type == AIN_OPTION);
+		if (elem_is_option && eslots > 1) {
+			if (idx >= 0 && (idx + 1) * eslots <= ap->nr_vars) {
+				// Ссылка на элемент держит массив живым, как и у скаляра ниже:
+				// счётчик поднимаем, вызывающий гасит его своим DELETE.
+				heap_ref(ref_array_slot);
+				stack_push(ref_array_slot);
+				stack_push(idx * eslots);
+				break;
+			}
+			// Элемента нет. Сайт -1 не проверяет — он СРАЗУ разыменовывает
+			// ссылку, поэтому отдаём ссылку на свежий ПУСТОЙ option
+			// (значение -1, тег 1 — раскладку строит init_array_elem):
+			// игра прочитает «значения нет» и освободит страницу своим DELETE.
+			union vm_value dim = { .i = 1 };
+			int slot = heap_alloc_slot(VM_PAGE);
+			heap_set_page(slot, alloc_array(1, &dim, ap->a_type,
+						       ap->array.struct_type, false));
+			stack_push(slot);
+			stack_push(0);
+			break;
+		}
 		if (eslots != 1) {
 			if (idx < 0 || (idx + 1) * eslots > ap->nr_vars) {
 				// Нет элемента — нулевой интерфейс той же формы (пара),

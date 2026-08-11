@@ -2226,6 +2226,38 @@ static enum opcode execute_instruction(enum opcode opcode)
 	}
 	case DELETE: {
 		int slot = stack_pop().i;
+		/*
+		 * `XSYS4_DELETE_TRACE=<имя функции игры>` — ЧТО ИМЕННО освобождает
+		 * DELETE в этой функции: снимаемый слот, тип его содержимого и адрес
+		 * инструкции. Нужен там, где владение зависит от ФОРМЫ значения,
+		 * которую отдал движок (generic-возвраты Array-HLL, option'ы): вотч по
+		 * слоту говорит «кто-то в этой функции унёс объект», но не говорит,
+		 * ОТКУДА взялось число на стеке.
+		 */
+		{
+			static const char *dt_fn = (const char *)1;
+			if (unlikely(dt_fn == (const char *)1))
+				dt_fn = getenv("XSYS4_DELETE_TRACE");
+			if (unlikely(dt_fn != NULL)) {
+				const char *cur = vm_current_function_name();
+				if (cur && !strcmp(cur, dt_fn)) {
+					struct page *lp = heap[local_page_slot()].page;
+					int fno = call_stack[call_stack_ptr-1].fno;
+					WARNING("DELTRACE @%lX slot=%d (%s) sp=%d nr_args=%d "
+						"локалы=[%d %d %d] in %s",
+						(unsigned long)instr_ptr, slot,
+						slot > 0 && heap_index_valid(slot)
+						? (heap[slot].type == VM_STRING ? "строка"
+						   : heap_slot_is_page(slot) ? "страница" : "мёртв")
+						: "-",
+						stack_ptr, ain->functions[fno].nr_args,
+						lp && lp->nr_vars > 0 ? lp->values[0].i : -777,
+						lp && lp->nr_vars > 1 ? lp->values[1].i : -777,
+						lp && lp->nr_vars > 2 ? lp->values[2].i : -777,
+						display_sjis0(cur));
+				}
+			}
+		}
 		if (slot != -1)
 			heap_unref(slot);
 		break;

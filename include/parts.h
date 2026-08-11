@@ -250,6 +250,10 @@ bool PE_AddFillToPartsConstructionProcess(int parts_no, int x, int y, int w, int
 bool PE_AddFillAlphaColorToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, int a, int state);
 bool PE_AddFillAMapToPartsConstructionProcess(int parts_no, int x, int y, int w, int h, int a, int state);
+bool PE_AddFillPolygonBlendToPartsConstructionProcess(int parts_no, const int *pts,
+		int nr_pts, int r, int g, int b, int a, int round_corner, int angle, int state);
+bool PE_AddFillCircleBlendToPartsConstructionProcess(int parts_no, int x, int y,
+		int rx, int ry, int r, int g, int b, int a, int state);
 bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int rx, int ry,
 		int start_angle, int sweep_angle, int a, int state);
 bool PE_AddFillWithAlphaToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
