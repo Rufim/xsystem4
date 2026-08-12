@@ -267,8 +267,22 @@ void heap_ref(int32_t slot)
 		vm_stack_trace();
 	}
 	heap[slot].ref++;
-	if (unlikely(heap_watched(slot)))
+	if (unlikely(heap_watched(slot))) {
 		heap_watch_msg("HEAPWATCH %d REF -> %d @%X [%s] in %s", slot, heap[slot].ref, instr_ptr, vm_current_instruction_name(), display_sjis0(vm_current_function_name()));
+		/*
+		 * XSYS4_HEAP_WATCH_REF_STACK=<адрес инструкции в hex> — СТЕК ИГРЫ на
+		 * взятии ссылки по этому адресу. Нужен, когда незакрытое взятие уже
+		 * найдено (адрес известен), а вопрос в том, КТО его заказал: одна и та
+		 * же строка геттера вызывается из десятков мест, и течёт лишь часть.
+		 */
+		static const char *w = (const char *)1;
+		if (w == (const char *)1)
+			w = getenv("XSYS4_HEAP_WATCH_REF_STACK");
+		if (w && *w && (unsigned)strtoul(w, NULL, 16) == (unsigned)instr_ptr) {
+			heap_watch_msg("HEAPWATCH %d REF-STACK — стек вызовов игры:", slot);
+			vm_stack_trace();
+		}
+	}
 #ifdef DEBUG_HEAP
 	heap[slot].ref_addr[heap[slot].ref_nr++ % 16] = instr_ptr;
 #endif

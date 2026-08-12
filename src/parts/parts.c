@@ -3040,6 +3040,35 @@ void PE_SetShow(int parts_no, bool show)
 
 void PE_SetAlpha(int parts_no, int alpha)
 {
+	/*
+	 * XSYS4_ALPHA_TRACE=<номер части | 1> — кто и какую альфу ставит части.
+	 * Нужна там, где альфу выставляют ДВЕ системы разом: подсветка боя Dohna
+	 * просит силуэту 180 (`PlayerFrameView@GetAlpha(3)`), а покадровая анимация
+	 * действия ставит слоям своё значение — если она перебивает корень, силуэт
+	 * выходит непрозрачно-розовым вместо фиолетового (жалоба: у ВРАГА закрас
+	 * срабатывает, у героя нет — у героя в это время играет анимация).
+	 * `=1` — печатать все части, иначе только указанную.
+	 */
+	{
+		static const char *w = (const char *)1;
+		if (w == (const char *)1)
+			w = getenv("XSYS4_ALPHA_TRACE");
+		if (w && *w) {
+			// `>=<номер>` — компактно (время + часть + альфа) для частей от номера;
+			// иначе прежнее поведение: стек игры для указанной части.
+			if (w[0] == '>' && w[1] == '=') {
+				if (parts_no >= atoi(w + 2))
+					NOTICE("SETALPHA t=%u часть %d <- %d",
+					       SDL_GetTicks(), parts_no, alpha);
+			} else {
+				int only = atoi(w);
+				if (only <= 1 || only == parts_no) {
+					NOTICE("SETALPHA part=%d alpha=%d — стек игры:", parts_no, alpha);
+					vm_stack_trace();
+				}
+			}
+		}
+	}
 	parts_set_alpha(parts_get(parts_no), alpha);
 }
 
@@ -3066,6 +3095,34 @@ void PE_SetAddColor(int parts_no, int r, int g, int b)
 	 * загрузчик раскладки, а по кадру и даже по значению автора не назвать. Печатаем
 	 * ТОЛЬКО непустой цвет и ограниченно, иначе стек на каждый кадр забьёт лог.
 	 */
+	/*
+	 * XSYS4_ADDCOLOR_TRACE=<r>,<g>,<b> — компактная строка (без стека, без лимита)
+	 * при установке ИМЕННО этого цвета. Нужна, когда цвет ставится редко, а до
+	 * интересного экрана запас печати вотча выше уже израсходован: так ищется
+	 * АДРЕСАТ закраса боя Dohna (add = 255,0,186 у состояния `Exclude`).
+	 */
+	{
+		static const char *w = (const char *)1;
+		if (w == (const char *)1)
+			w = getenv("XSYS4_ADDCOLOR_TRACE");
+		if (w && *w) {
+			// Форма `<r>,<g>,<b>` — только этот цвет; форма `>=<номер>` — ЛЮБОЙ
+			// цвет частям от указанного номера (так видно и постановку закраса,
+			// и то, чем его перебили, и через сколько миллисекунд).
+			int wr = -1, wg = -1, wb = -1, min_no = 0;
+			bool hit;
+			if (w[0] == '>' && w[1] == '=') {
+				min_no = atoi(w + 2);
+				hit = parts_no >= min_no;
+			} else {
+				sscanf(w, "%d,%d,%d", &wr, &wg, &wb);
+				hit = (r == wr && g == wg && b == wb);
+			}
+			if (hit)
+				NOTICE("ADDCOLOR t=%u часть %d <- %d,%d,%d",
+				       SDL_GetTicks(), parts_no, r, g, b);
+		}
+	}
 	if ((r || g || b) && getenv("XSYS4_COLOR_WATCH")) {
 		static int left = 24;
 		// ★Фильтр по МИНИМАЛЬНОМУ номеру части: интересные части (вьюшки боя) имеют
