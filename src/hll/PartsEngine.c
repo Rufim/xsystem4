@@ -1000,15 +1000,20 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 				full_size, blur, command == 28, state);
 		break;
 	/*
-	 * `CASConstructionProcess::TileCGBlend` — замостить поверхность картинкой и
-	 * подмешать её по альфе. Разбор `title::CScreen@Bulid`: у титула Haha Ranman
-	 * так кладётся зерно плёнки `タイトル／フィルム／ノイズ` ДО гашения краёв,
-	 * поэтому крупа попадает и в кайму, где снимок растворяется в бумаге.
-	 * Раньше команда падала в ветку «неизвестная v14-команда» и отбрасывалась.
+	 * Семейство `CASConstructionProcess::TileCG*` — замостить поверхность
+	 * картинкой. 128 `TileCGBlend` подмешивает по альфе (разбор
+	 * `title::CScreen@Bulid`: у титула Haha Ranman так кладётся зерно плёнки
+	 * `タイトル／フィルム／ノイズ` ДО гашения краёв, поэтому крупа попадает и в
+	 * кайму, где снимок растворяется в бумаге). 129 `TileCGCopy` копирует вместе
+	 * с альфой: сетка-ромбы данжа Dohna (`Grid` в `SceneHitokari.x`) — плитка
+	 * `システム／マップ／グリッド` на пустой поверхности 2048x2048, подмешивать
+	 * там не во что. Раньше команды падали в ветку «неизвестная v14-команда» и
+	 * отбрасывались.
 	 */
 	case 128:  // CASConstructionProcess::TileCGBlend (v14)
-		PE_AddTileCGBlendToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
-				cg_name, state);
+	case 129:  // CASConstructionProcess::TileCGCopy (v14)
+		PE_AddTileCGToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+				cg_name, command == 129, state);
 		break;
 	case 88:  // CASConstructionProcess::SetFillRect (v14) — заливка ЦВЕТОМ
 		PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh, r, g, b, state);
@@ -1429,12 +1434,13 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
 	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
-	// 128 — `TileCGBlend` (зерно плёнки на титуле Haha Ranman).
+	// 128/129 — `TileCGBlend`/`TileCGCopy` (зерно плёнки на титуле Haha Ranman;
+	// сетка-ромбы данжа Dohna).
 	// 29 — `SetCGBlend` (наложить CG целиком): им строится ФОН экрана данжа
 	// (`背景／会社`), два ползущих слоя 1280x720; без него поверхности пустые и
 	// данж выходил ЧЁРНЫМ, а размытие (28) и градиент альфы (26) применялись к
 	// пустоте.
-	static const int v14_ok[] = { 25, 26, 27, 28, 29, 88, 90, 97, 102, 106, 122, 128 };
+	static const int v14_ok[] = { 25, 26, 27, 28, 29, 88, 90, 97, 102, 106, 122, 128, 129 };
 	bool known_v14 = false;
 	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
 		known_v14 |= (command == v14_ok[i]);
@@ -2135,8 +2141,6 @@ static float act_float(struct ex_tree *t, const char *utf8, float dflt);
  * `AddPartsConstructionProcess`, поле в поле, поэтому обе дороги сходятся в
  * `construction_op`. Возвращает число ВЫПОЛНЕННЫХ операций (неизвестные команды
  * не в счёт) — вызывающему это нужно, чтобы понять, осталась ли часть пустой.
- * `blurred` — сколько шагов размытия встретилось: по нему вызывающий узнаёт, что
- * процедура строит РАЗМЫТЫЙ ЗАДНИК экрана, а не элемент интерфейса.
  */
 /*
  * Запомнить шаг раскладки как СЫРЬЁ процедуры построения — то, что игра получит,
@@ -2204,11 +2208,10 @@ static void act_save_construction_raw(int no, int state, struct ex_tree *op, int
 	PE_SaveConstructionRawValues(no, state, v, 40, f, 2, s, 2);
 }
 
-static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped, int *blurred)
+static int act_construction_run(int no, int state, struct ex_tree *proc, int *skipped)
 {
 	int done = 0;
 	*skipped = 0;
-	*blurred = 0;
 	for (int i = 1; ; i++) {
 		char key[32];
 		snprintf(key, sizeof(key), "手順%d", i);
@@ -2228,7 +2231,7 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 		if (command > 24 && command != 27 && command != 28 && command != 29
 				&& command != 88 && command != 90 && command != 97
 				&& command != 102 && command != 106 && command != 122
-				&& command != 128) {
+				&& command != 128 && command != 129) {
 			static bool warned = false;
 			if (!warned) {
 				warned = true;
@@ -2238,8 +2241,6 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 			(*skipped)++;
 			continue;
 		}
-		if (command == 27 || command == 28)
-			(*blurred)++;
 		struct string *text = act_str(op, "テキスト");
 		struct string *cg = act_str(op, "ＣＧ名");
 		construction_op(no, state, command, act_int(op, "補間タイプ", 0),
@@ -2540,8 +2541,8 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		 * XSYS4_CP_NO_ACT_BUILD=1.
 		 */
 		if (step1) {
-			int skipped = 0, blurred = 0;
-			int nr = act_construction_run(no, state, proc, &skipped, &blurred);
+			int skipped = 0;
+			int nr = act_construction_run(no, state, proc, &skipped);
 			// Операции только НАКАПЛИВАЮТСЯ; поверхность появляется лишь после
 			// сборки. В рантайме её запускает сама игра
 			// (`Parts_BuildPartsConstructionProcess`), а для процедуры из
@@ -2558,31 +2559,26 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 			 * маской альфа-клиппера.
 			 * XSYS4_CP_NO_ACT_BUILD=1 — A/B-ручка, отключает сборку целиком.
 			 */
-			// ★По умолчанию собираем ТОЛЬКО задники — процедуры с размытием
-			// (`Set{H,V}BlurFilter`): без них экран остаётся без фона, а сквозь
-			// панель просвечивает предыдущая сцена. Прочие процедуры (подложки
-			// счётчиков и т.п.) по-прежнему под ручкой XSYS4_CP_ACT_BUILD=1:
-			// с ними на экране подбора талантов ПРОПАДАЕТ логотип магазина
-			// (часть 90000941 остаётся `lshow=1 gshow=1 alpha=255`, то есть её
-			// перекрывают, а чем — пока не выяснено; в слое титула висит
-			// собранная поверхность 1480×920 `90000041` с alpha=255).
 			/*
-			 * ★Плюс процедуры, которые строят поверхность НЕ БОЛЬШЕ экрана:
-			 * поломка выше — про полноэкранные задники (1380×820 и 1480×920
-			 * при экране 1280×720), они перекрывают верхние слои. Элемент
-			 * интерфейса такого размера не бывает, и без сборки он остаётся
-			 * пустым: превью страницы `Text Area UI` — часть 640×180, чья
-			 * процедура берёт полосу `背景／ナユタ` (元矩形 0,360,1280,360) и
-			 * ужимает её в размер превью (команда 13). Без сборки на месте
-			 * картинки города был чёрный прямоугольник, а у оригинала там
-			 * сцена с рамкой окна реплик.
+			 * ★Собираем ВСЕ полностью реализованные процедуры (2026-08-12).
+			 * История гейтов: сначала строились только задники с размытием
+			 * (`Set{H,V}BlurFilter`), потом плюс поверхности не больше экрана —
+			 * потому что при полной сборке на экране подбора талантов пропадали
+			 * логотип магазина и портреты (§5bi). A/B-повтор на текущей сборке
+			 * (дампы частей + кадры, прогоны /tmp/dohna-match-{on,off}.log)
+			 * различий в показе/альфе/z НЕ находит: тот баг вылечили правки
+			 * владения (`d29b418` и далее), а не гейт. Сам гейт при этом резал
+			 * законные конструкции больше экрана: сетка данжа `Grid`
+			 * (SceneHitokari.x) строит плитку на поверхности 2048×2048 и
+			 * крутит её на 330° — с гейтом она не собиралась вовсе, и игра
+			 * (`SceneHitokari@MoveGrid` только двигает часть) показать её не
+			 * могла. Большие НЕПРОЗРАЧНЫЕ задники строиться обязаны тоже:
+			 * титульная часть 1480×920 собирается в прозрачную поверхность
+			 * (Create → FillAMap 0), а вред от неё был только ПОЛУСОБРАННОЙ —
+			 * от этого защищает `skipped == 0`.
+			 * XSYS4_CP_NO_ACT_BUILD=1 — A/B-ручка, отключает сборку целиком.
 			 */
-			int cw = act_list_int(step1, "先矩形", 4, 0);
-			int ch = act_list_int(step1, "先矩形", 5, 0);
-			bool fits_screen = cw > 0 && ch > 0
-				&& cw <= config.view_width && ch <= config.view_height;
-			bool build = blurred > 0 || fits_screen || getenv("XSYS4_CP_ACT_BUILD");
-			if (nr > 0 && skipped == 0 && build && !getenv("XSYS4_CP_NO_ACT_BUILD"))
+			if (nr > 0 && skipped == 0 && !getenv("XSYS4_CP_NO_ACT_BUILD"))
 				PE_BuildPartsConstructionProcess(no, state);
 			// Процедуры без единой ВЫПОЛНЕННОЙ операции (все команды
 			// неизвестны) оставляем прежним поведением — прямоугольной

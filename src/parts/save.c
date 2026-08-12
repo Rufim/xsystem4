@@ -329,6 +329,7 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->gradation_amap.vertical);
 		break;
 	case PARTS_CP_TILE_CG_BLEND:
+	case PARTS_CP_TILE_CG_COPY:
 		iarray_write(w, op->tile_cg.cg_no);
 		iarray_write(w, op->tile_cg.x);
 		iarray_write(w, op->tile_cg.y);
@@ -447,6 +448,7 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->gradation_amap.vertical = !!iarray_read(r);
 		break;
 	case PARTS_CP_TILE_CG_BLEND:
+	case PARTS_CP_TILE_CG_COPY:
 		op->tile_cg.cg_no = iarray_read(r);
 		op->tile_cg.x = iarray_read(r);
 		op->tile_cg.y = iarray_read(r);

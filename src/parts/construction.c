@@ -160,6 +160,7 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_ADD_FILTER:
 	case PARTS_CP_FILL_GRADATION_AMAP:
 	case PARTS_CP_TILE_CG_BLEND:
+	case PARTS_CP_TILE_CG_COPY:
 		break;
 	case PARTS_CP_FILL_POLYGON_BLEND:
 		free(op->polygon.pts);
@@ -552,22 +553,22 @@ bool PE_AddAddFilterToPartsConstructionProcess(int parts_no, int x, int y, int w
 	return true;
 }
 
-bool PE_AddTileCGBlendToPartsConstructionProcess(int parts_no, int x, int y,
-		int w, int h, struct string *cg_name, int state)
+bool PE_AddTileCGToPartsConstructionProcess(int parts_no, int x, int y,
+		int w, int h, struct string *cg_name, bool copy, int state)
 {
 	if (!parts_state_valid(--state))
 		return false;
 	int cg_no;
 	if (!cg_name || !cg_name->size ||
 			!asset_exists_by_name(ASSET_CG, cg_name->text, &cg_no)) {
-		WARNING("TileCGBlend: нет CG '%s'",
+		WARNING("TileCG%s: нет CG '%s'", copy ? "Copy" : "Blend",
 		        cg_name ? display_sjis0(cg_name->text) : "(null)");
 		return false;
 	}
 
 	struct parts_construction_process *cproc = get_cproc(parts_no, state);
 	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
-	op->type = PARTS_CP_TILE_CG_BLEND;
+	op->type = copy ? PARTS_CP_TILE_CG_COPY : PARTS_CP_TILE_CG_BLEND;
 	op->tile_cg = (struct parts_cp_tile_cg) {
 		.cg_no = cg_no, .x = x, .y = y, .w = w, .h = h
 	};
@@ -1349,17 +1350,20 @@ static bool build_fill_gradation_amap(struct parts_construction_process *cproc,
 }
 
 /*
- * `TileCGBlend` (команда 128) — замостить поверхность картинкой и подмешать её по
- * альфе. У титула Haha Ranman это зерно плёнки `タイトル／フィルム／ノイズ`: 32x32,
- * RGB нулевые, альфа 0…22 — то есть лёгкая тёмная крупа поверх фотографии.
+ * Семейство `TileCG*` — замостить поверхность картинкой. 128 `TileCGBlend`
+ * подмешивает по альфе: у титула Haha Ranman это зерно плёнки
+ * `タイトル／フィルム／ノイズ` (32x32, RGB нулевые, альфа 0…22 — лёгкая тёмная
+ * крупа поверх фотографии). 129 `TileCGCopy` копирует ВМЕСТЕ С АЛЬФОЙ: сетка
+ * данжа Dohna кладётся на пустую поверхность 2048x2048, где подмешивать не во
+ * что — вся видимость приходит из альфы самой плитки.
  *
- * ★Шаг идёт ДО гашения краёв (`Create → CutCGScaleBlend → HBlur → VBlur →
- * GrayFilter → AddFilter → TileCGBlend → Mul…Gradation ×4`), поэтому зерно
- * ложится и в кайму: у оригинала полоса, где снимок растворяется в бумаге,
- * заполнена крупой, а у нас была стерильной.
+ * ★Шаг у Haha Ranman идёт ДО гашения краёв (`Create → CutCGScaleBlend → HBlur →
+ * VBlur → GrayFilter → AddFilter → TileCGBlend → Mul…Gradation ×4`), поэтому
+ * зерно ложится и в кайму: у оригинала полоса, где снимок растворяется в
+ * бумаге, заполнена крупой, а у нас была стерильной.
  */
-static bool build_tile_cg_blend(struct parts_construction_process *cproc,
-		struct parts_cp_tile_cg *op)
+static bool build_tile_cg(struct parts_construction_process *cproc,
+		struct parts_cp_tile_cg *op, bool copy)
 {
 	if (!cproc->common.texture.handle)
 		return false;
@@ -1380,7 +1384,11 @@ static bool build_tile_cg_blend(struct parts_construction_process *cproc,
 				// вылезет за поверхность и ляжет на соседние шаги.
 				int tw = min(src.w, x + w - tx);
 				int th = min(src.h, y + h - ty);
-				gfx_blend_amap(&cproc->common.texture, tx, ty, &src, 0, 0, tw, th);
+				if (copy)
+					gfx_copy_with_alpha_map(&cproc->common.texture, tx, ty,
+							&src, 0, 0, tw, th);
+				else
+					gfx_blend_amap(&cproc->common.texture, tx, ty, &src, 0, 0, tw, th);
 			}
 		}
 	}
@@ -1484,7 +1492,9 @@ bool parts_build_construction_process(struct parts *parts,
 				return false;
 			break;
 		case PARTS_CP_TILE_CG_BLEND:
-			if (!build_tile_cg_blend(cproc, &op->tile_cg))
+		case PARTS_CP_TILE_CG_COPY:
+			if (!build_tile_cg(cproc, &op->tile_cg,
+					op->type == PARTS_CP_TILE_CG_COPY))
 				return false;
 			break;
 		case PARTS_CP_FILL_GRADATION_AMAP:
