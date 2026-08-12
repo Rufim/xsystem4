@@ -214,6 +214,40 @@ static bool parts_can_take_cursor(struct parts *parts)
 }
 
 /*
+ * ★★ВВОД, ВЫКЛЮЧЕННЫЙ У ЧАСТИ, ВЫКЛЮЧЕН И У ВСЕГО ЕЁ ПОДДЕРЕВА — как `表示` и
+ * `アルファ` (см. parts_update_global_show/alpha). `SetEnableInputProcess(корень, 0)`
+ * игра ставит именно КОНТЕЙНЕРУ, у которого своего hitbox нет: если бы флаг не
+ * наследовался, вызов был бы пустым действием.
+ *
+ * Живой случай (Dohna, бой): `BattleActionPanel@FadeIn(false)` сначала ставит корню
+ * панели действий `EnableInputProcess = false` (vtable 182), и только потом запускает
+ * движение `[Time:150|Alpha:255 0|X:0 -500]`. Пока панель уезжает, её карточки умений
+ * у нас продолжали ловить курсор, и первое же движение мыши давало им `MouseLeave` →
+ * `SkillButton@OnLeave` → `SceneBattle@HighlightTarget` → сброс боевого закраса
+ * `Exclude`, поставленного `BattleStage@PlayAction`. Замер прогона: ввод корня
+ * 90001199 снят на t=35928, а карточка 90001373 получила `LEAVE` на t=36084; ещё
+ * прямее — на t=52298 `ENTER` пришёл части 90001202 с parent=90001199, у которого
+ * ввод был выключен. Отсюда и привязка бага к мыши: без движения курсора закрас жил.
+ *
+ * Второй путь того же механизма — токен движения `DisableInput`
+ * (`Motion::Executer@DisableInput` → `PartsHelper::DisableInput` → обход поддерева
+ * через `PartsEngine.NumofChild/GetChild`): он выключает каждую часть поимённо, так
+ * что для него наследование безвредно (уже выключенные хелпер не трогает и в список
+ * восстановления не берёт — `PartsHelper::IsDisableTargetParts`).
+ * XSYS4_EIP_NO_INHERIT=1 — прежнее поведение (A/B).
+ */
+static bool parts_input_disabled_by_parent(struct parts *parts)
+{
+	if (getenv("XSYS4_EIP_NO_INHERIT"))
+		return false;
+	for (struct parts *p = parts->parent; p; p = p->parent) {
+		if (!p->enable_input_process)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Звук наведения/клика части: НЕ ЗАДАН — это −1 (`parts_init` в `parts.c`), и такие
  * поля у Tsumamigui 3 почти у всех частей (`オンカーソル効果音 = ""` в раскладках).
  * Прежде номер уходил в `audio_play_sound` без проверки, тот доходил до
@@ -250,7 +284,7 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		       parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos),
 		       cur_pos.x, cur_pos.y);
 	}
-	if (!parts->enable_input_process) {
+	if (!parts->enable_input_process || parts_input_disabled_by_parent(parts)) {
 		parts->is_hovered = false;
 		return;
 	}
@@ -293,10 +327,33 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 	// `表示 = 1`, но `アルファ = 0`, и полноэкранная (1280x720) поверх всего меню.
 	// Проверяем ТЕКУЩУЮ alpha, а не объявленную: игра проявляет размывку motion-фейдом,
 	// и как только она станет видимой, то и курсор обязана перехватывать.
-	bool is_hovered = parts->global.show
+	/*
+	 * ★ЧАСТЬ ПРОПАЛА С ЭКРАНА — ЭТО НЕ «КУРСОР УШЁЛ». Погашенная (`表示 = 0`),
+	 * прозрачная или скрытая слоем часть выпадает из обработки ввода ЦЕЛИКОМ, ровно
+	 * как часть с `SetEnableInputProcess(false)` выше: hover сбрасываем молча, без
+	 * `MouseLeave`. Иначе исчезновение части под курсором игра читает как уход
+	 * курсора и откатывает состояние, которое к мыши не относится.
+	 *
+	 * Живой случай (Dohna, бой): клик по умению закрывает панель умений, кнопка под
+	 * курсором гаснет — и мы посылали ей `MouseLeave`. Её обработчик
+	 * (`SkillButton@OnLeave` → `SkillSelector` → `SceneBattle@HighlightTarget`)
+	 * СБРАСЫВАЕТ подсветку боя, поэтому закрас `Exclude`, который только что
+	 * поставил `BattleStage@PlayAction` всем непричастным бойцам, жил 10–30 мс
+	 * вместо всей анимации удара (замер: цвет 255,0,186 ставился и тут же уезжал к
+	 * 0 за 150 мс). На ходу ВРАГА панели умений нет, `MouseLeave` некому прийти —
+	 * поэтому там закрас работал, а у героя нет.
+	 * XSYS4_LEAVE_ON_HIDE=1 — прежнее поведение (A/B).
+	 */
+	bool visible_for_input = parts->global.show
 		&& parts->global.alpha > 0
 		&& !parts->construction_mask
-		&& !parts_hidden_by_layer(parts)
+		&& !parts_hidden_by_layer(parts);
+	if (!visible_for_input && !getenv("XSYS4_LEAVE_ON_HIDE")) {
+		parts->is_hovered = false;
+		return;
+	}
+
+	bool is_hovered = visible_for_input
 		&& parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos)
 		&& !*hover_consumed;
 
@@ -329,10 +386,21 @@ static void parts_update_mouse(struct parts *parts, Point cur_pos, bool cur_clic
 		return;
 
 	if (is_hovered && !was_hovered) {
+		// XSYS4_HOVER_MSG_TRACE=1 — кому уходят ENTER/LEAVE, с меткой времени: только
+		// так видно, чей обработчик сбивает состояние, поставленное игрой миллисекундой
+		// раньше (см. закрас `Exclude` в §5er).
+		if (getenv("XSYS4_HOVER_MSG_TRACE"))
+			NOTICE("HOVERMSG t=%u ENTER часть %d parent=%d alpha=%d show=%d",
+			       SDL_GetTicks(), parts->no, parts->parent ? parts->parent->no : -1,
+			       parts->global.alpha, (int)parts->global.show);
 		parts_msg_push(parts, PARTS_MSG_MOUSE_ENTER, "ii", cur_pos.x, cur_pos.y);
 		parts->hover_time = 0;
 	}
 	if (!is_hovered && was_hovered) {
+		if (getenv("XSYS4_HOVER_MSG_TRACE"))
+			NOTICE("HOVERMSG t=%u LEAVE часть %d parent=%d alpha=%d show=%d",
+			       SDL_GetTicks(), parts->no, parts->parent ? parts->parent->no : -1,
+			       parts->global.alpha, (int)parts->global.show);
 		parts_msg_push(parts, PARTS_MSG_MOUSE_LEAVE, "ii", cur_pos.x, cur_pos.y);
 	}
 
@@ -858,7 +926,10 @@ void PE_SetPartsIsButton(int parts_no, bool is_button)
 void PE_SetEnableInputProcess(int parts_no, bool enable)
 {
 	if (getenv("XSYS4_EIP_TRACE")) {
-		NOTICE("EIP SetEnableInputProcess(%d, %d)", parts_no, (int)enable);
+		struct parts *p = parts_get(parts_no);
+		NOTICE("EIP t=%u SetEnableInputProcess(%d, %d) parent=%d ctrl=%d",
+		       SDL_GetTicks(), parts_no, (int)enable,
+		       p->parent ? p->parent->no : -1, p->controller_no);
 		if (getenv("XSYS4_EIP_TRACE_STACK"))
 			vm_stack_trace();
 	}
