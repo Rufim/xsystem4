@@ -1656,6 +1656,27 @@ void parts_debug_dump(void)
 {
 	struct parts *p;
 	int n = 0;
+	/*
+	 * `XSYS4_DETACH_TEST=<номер>` — ПРОВЕРКА ОТВЯЗКИ на живом дереве. Ни одна из
+	 * четырёх игр не зовёт `ClearParent`/`RemoveChild` из игрового кода (только из
+	 * редактора активностей и анкеты), поэтому семантику `Parent::set(0)` иначе
+	 * нечем предъявить. По ПЕРВОМУ `kill -USR1` заявляем отвязку указанной части,
+	 * по второму — в дампе у неё уже `parent=-1`, а прежний родитель не считает её
+	 * своим потомком.
+	 */
+	{
+		static bool detach_done = false;
+		const char *dt = getenv("XSYS4_DETACH_TEST");
+		if (dt && !detach_done) {
+			detach_done = true;
+			int no = atoi(dt);
+			struct parts *t = parts_try_get(no);
+			NOTICE("  DETACH_TEST: заявлена отвязка части %d (родитель сейчас %d)",
+			       no, t && t->parent ? t->parent->no : -1);
+			if (t)
+				PE_SetParentPartsNumber(no, 0);
+		}
+	}
 	{
 		char buf[256]; int m = 0;
 		for (int i = 0; i < ctrl_stack.nr_controllers && m < 200; i++)
@@ -1897,7 +1918,7 @@ void PE_UpdateComponent(possibly_unused int passed_time)
 		// Цикл предков: подвесить парт к собственному потомку нельзя — обход
 		// детей (CallUserComponentEventWithChild) уходит в бесконечную
 		// рекурсию (переполнение call_stack после загрузки сейва).
-		if (parts->pending_parent >= 0) {
+		if (parts->pending_parent > 0) {
 			struct parts *anc = parts_try_get(parts->pending_parent);
 			for (; anc; anc = anc->parent) {
 				if (anc == parts) {
@@ -1908,7 +1929,20 @@ void PE_UpdateComponent(possibly_unused int passed_time)
 				}
 			}
 		}
-		if (parts->pending_parent >= 0 && (parent = parts_try_get(parts->pending_parent))) {
+		// ОТВЯЗКА (`Parent::set(0)` / `RemoveChild`): рвём связь с родителем, слой
+		// части не трогаем — она остаётся на своём экране, просто ничья. Раньше
+		// сюда приходил -1 («изменений нет») или 0 (несуществующая часть 0), и то
+		// и другое молча вырождалось в no-op.
+		if (parts->pending_parent == 0 && parts->parent) {
+			struct parts *old = parts->parent;
+			TAILQ_REMOVE(&old->children, parts, child_list_entry);
+			parts->parent = NULL;
+			if (getenv("XSYS4_PARTS_TRACE") || parts_watched(parts->no))
+				NOTICE("PARTS   парт %d отвязан от %d", parts->no, old->no);
+			if (old->states[0].type == PARTS_LAYOUT_BOX)
+				parts_component_dirty(old);
+		}
+		if (parts->pending_parent > 0 && (parent = parts_try_get(parts->pending_parent))) {
 			if (parts->parent) {
 				TAILQ_REMOVE(&parts->parent->children, parts, child_list_entry);
 			}
@@ -3182,6 +3216,21 @@ void PE_SetParentPartsNumber(int parts_no, int parent_parts_no)
 		parts_component_dirty(parts);
 		return;
 	}
+	/*
+	 * ★НОЛЬ = ОТВЯЗАТЬ. `parts::detail::CParts@ClearParent` — это ровно
+	 * `Parent::set(0)` (индекс 226 таблицы IParts), а библиотечная
+	 * `Ｐ＿親解放(no)` = `Ｐ＿親設定(no, 0)`. Номер части 0 невалиден ни у одной
+	 * игры (см. `PE_GetParentPartsNumber`), поэтому 0 и служит признаком снятия
+	 * родителя — отдельного поля не нужно. Применяется отложенно, как и
+	 * назначение: сама отвязка — в dirty-очереди `PE_UpdateComponent`.
+	 *
+	 * Слой при этом НЕ меняется: часть остаётся на том же экране, просто
+	 * перестаёт быть чьим-то потомком.
+	 *
+	 * Внутренняя конвенция `-1` («изменений нет») — не путь наружу: раньше
+	 * `PE_RemoveChild` передавал сюда -1, и снять родителя было нельзя ВООБЩЕ,
+	 * помогал только `PE_ClearChild`, рвущий связь в обход очереди.
+	 */
 	parts->pending_parent = parent_parts_no;
 	parts_component_dirty(parts);
 }
@@ -3203,9 +3252,23 @@ void PE_SetParentPartsNumber(int parts_no, int parent_parts_no)
  */
 static int parts_effective_parent_no(struct parts *p)
 {
-	if (p->pending_parent >= 0)
+	if (p->pending_parent > 0)
 		return p->pending_parent;
+	// 0 — заказанная, но ещё не применённая ОТВЯЗКА (см. PE_SetParentPartsNumber):
+	// для перечисления потомков парт уже ничей.
+	if (p->pending_parent == 0)
+		return -1;
 	return p->parent ? p->parent->no : -1;
+}
+
+// «Убрать потомка» — отвязка, но только если он и правда потомок этого парта
+// (`IsExistChild` у игры устроен так же: `GetParent(child) == parent`).
+void PE_RemoveChild(int parts_no, int child_no)
+{
+	struct parts *child = parts_try_get(child_no);
+	if (!child || parts_effective_parent_no(child) != parts_no)
+		return;
+	PE_SetParentPartsNumber(child_no, 0);
 }
 
 int PE_NumofChild(int parts_no)
@@ -3301,6 +3364,50 @@ int PE_GetParentPartsNumber(int parts_no)
 	// CSpriteParts на каждом витке (RSS рос ~13 МБ/с, до 3.8 ГБ). Именно так
 	// зависал уход с титула Dohna: клик по «Start Game» → SceneTitle@TitleClose →
 	// EraseLayer → CallErasingLayerEvent → CModeMark@Init-лямбда → GetLayerIDByParts.
+	/*
+	 * ★У КОРНЕВОЙ ЧАСТИ РОДИТЕЛЬ — ЕЁ СЛОЙ. Цепочка родителей заканчивается не на
+	 * корневом парте, а на НОМЕРЕ СЛОЯ, и уже у слоя родителя нет (0). Это та же
+	 * двойственность «компонент = парт или слой», что и в `PE_SetParentPartsNumber`
+	 * выше, только со стороны чтения — иначе get/set не были бы обратны друг другу.
+	 *
+	 * Доказательства байткодом Dohna (v14), все сайты-потребители `Ｐ＿親設定取得`:
+	 *   • `AFL_Parts_GetLayerIDByParts` (@0x2b316c) и `ActivityInstances@GetLayer`
+	 *     (FUNC 26625) — ОДИН и тот же подъём «пока parent != 0, вернуть последний
+	 *     номер». Результат первого сравнивается с ID СТИРАЕМОГО СЛОЯ
+	 *     (`CMessageWindow@OnErasingLayer(id)`, `CModeMark@Init`-лямбда) и уходит в
+	 *     `モードマークレイヤ設定(layer)`; параметр второго так и зовётся
+	 *     `layerPartsNumber` (`ActivityInstances@EraseByLayer`). Возвращая номер
+	 *     КОРНЕВОГО ПАРТА, мы не совпадали с id слоя никогда: окно сообщений и
+	 *     мод-марк не освобождались при стирании слоя.
+	 *   • Round-trip get→set обязан сохранять размещение:
+	 *     `CMessageWindow@Reload` запоминает `GetRootParts().Parent::get()`,
+	 *     пересоздаёт окно и возвращает его тем же `Parent::set(...)`;
+	 *     `Tutorial::MoveSceneParent` переносит подложку 下地 в контейнер сцены
+	 *     через `bg.Core.Parent::set( sceneRoots[0].Parent::get() )`. С нулём
+	 *     оба сайта теряли слой: подложка оставалась в АКТИВНОМ слое поверх сцены
+	 *     и затемняла её (FINDINGS §5el, замер 46.9 против 70.9 у оригинала).
+	 *   • `CInfoText@IsCreated::get` = `Core.Parent::get() != 0` — «созданная часть
+	 *     всегда имеет ненулевого родителя», что верно только со слоем.
+	 *   • `Ａ＿システムボタン設定` поднимается тем же циклом до парта окна сообщений и
+	 *     ждёт 0 как «дошли до верха» — слой лишний виток даёт, но не ломает.
+	 *
+	 * Семантика ЕДИНА для всех версий, не только для Ixseal. В Tsumamigui (ain 7)
+	 * `message::detail::CMessageWindowManager@GetPartsLayer` так и устроена: если
+	 * список окон пуст — `AFL_Parts_GetActiveLayer()`, иначе `Ｐ＿親設定取得` от парта
+	 * окна сообщений. Обе ветки обязаны вернуть СЛОЙ, то есть родитель корневого
+	 * парта — его слой. Второй игровой потребитель там же (`CPartsPanel@
+	 * BeginUpdateEvent`) — подъём «пока номер != 0», лишний виток через слой ему
+	 * безразличен; остальные сайты Tsumamigui и Escalayer — редактор активностей,
+	 * в игре не работающий. `AddController` объявлен в PartsEngine у всех четырёх
+	 * игр (Dohna, Haha Ranman — ain 14; Tsumamigui — 7; Escalayer — 6.1), так что
+	 * слои есть везде, и гейт по `parts_multi_controller` был бы фикцией.
+	 *
+	 * Самоссылка (часть с номером, равным номеру своего слоя) оборвала бы подъём в
+	 * вечный цикл — отдаём 0.
+	 */
+	// Откат для замеров — та же ручка, что и у сеттера: `XSYS4_NO_PARENT_AS_LAYER=1`.
+	if (parts->controller_no != parts_no && !getenv("XSYS4_NO_PARENT_AS_LAYER"))
+		return parts->controller_no;
 	return 0;
 }
 

@@ -142,6 +142,7 @@ int PE_NumofChild(int parts_no);
 int PE_GetChild(int parts_no, int index);
 int PE_GetChildIndex(int parts_no, int child_no);
 void PE_ClearChild(int parts_no);
+void PE_RemoveChild(int parts_no, int child_no);
 bool PE_SetPartsGroupNumber(int parts_no, int group_no);
 void PE_SetPartsMessageWindowShowLink(int parts_no, bool message_window_show_link);
 bool PE_GetPartsMessageWindowShowLink(int parts_no);

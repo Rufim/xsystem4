@@ -4776,7 +4776,8 @@ HLL_QUIET_UNIMPLEMENTED(-1, int, PartsEngine, GetRadioButtonBoxChild, int a, int
 // запросы количества/по-индексу минимальны. ---
 static void PE_AddChild(int parent, int child) { PE_SetParentPartsNumber(child, parent); }
 static void PE_InsertChild(int parent, int child, int index) { (void)index; PE_SetParentPartsNumber(child, parent); }
-static void PE_RemoveChild(int parent, int child) { (void)parent; PE_SetParentPartsNumber(child, -1); }
+// PE_RemoveChild — в src/parts/parts.c: отвязка идёт через 0 (у неё есть доступ
+// к «действующему» родителю из dirty-очереди), а -1 наружу не годится вовсе.
 static bool PE_IsExistChild(int parent, int child) { return PE_GetParentPartsNumber(child) == parent; }
 // Parts_StopSwipe() — отменяет свайп-инерцию. Зовётся первым в
 // CBackLogView@MouseWheelEvent (и swipe-обработчиках). Свайп-инерцию не
