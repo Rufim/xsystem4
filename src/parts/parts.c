@@ -745,11 +745,54 @@ static Point parts_anchor_shift(struct parts *parts)
 static Point parts_child_origin(struct parts *parts)
 {
 	Point shift = parts_anchor_shift(parts);
+	/*
+	 * ★В ЗЕРКАЛЬНОЙ системе координат (часть стоит под развёрнутым контейнером)
+	 * сдвиг привязки МЕНЯЕТ ЗНАК. Это не догадка, а следствие правила «поддерево
+	 * отражается целиком»: точка отсчёта потомков — точка, и её образ относительно
+	 * позиции части равен −сдвиг. (У КОРОБКИ части правило другое, −(сдвиг+размер),
+	 * потому что у неё есть протяжённость, — см. parts_origin_offset_x.)
+	 *
+	 * Живого случая у Dohna нет: сдвиг привязки достаётся только
+	 * частям-`ユーザコンポーネント` без своего размера, а в зеркальных поддеревьях боя
+	 * стоят лишь CG-части и контейнеры с `原点座標モード` 1/8 (замер: дамп 837
+	 * частей, из них 60 зеркальных). Правило внесено, чтобы модель была
+	 * непротиворечивой, а не чтобы «сошлось» на одной сцене.
+	 */
+	if (parts->global.mirror_x)
+		shift.x = -shift.x;
+	if (parts->global.mirror_y)
+		shift.y = -shift.y;
 	return (Point) { parts->global.pos.x + shift.x, parts->global.pos.y + shift.y };
 }
 
+/*
+ * Зеркальность системы координат, в которой стоят ПОТОМКИ части: своя плюс
+ * унаследованная (XOR). Именно её `parts_update_global_pos` передаёт детям.
+ */
+static bool parts_children_mirror_x(struct parts *parts)
+{
+	return parts->global.mirror_x != parts->reverse_lr;
+}
+
+static bool parts_children_mirror_y(struct parts *parts)
+{
+	return parts->global.mirror_y != parts->reverse_tb;
+}
+
+// Зеркальность системы координат, в которой стоит САМА часть (от предков).
+static bool parts_frame_mirror_x(struct parts *parts)
+{
+	return parts->parent ? parts_children_mirror_x(parts->parent) : false;
+}
+
+static bool parts_frame_mirror_y(struct parts *parts)
+{
+	return parts->parent ? parts_children_mirror_y(parts->parent) : false;
+}
+
 static void parts_update_global_pos(struct parts *parts, Point parent_pos,
-		float parent_scale_x, float parent_scale_y)
+		float parent_scale_x, float parent_scale_y,
+		bool mirror_x, bool mirror_y)
 {
 	/*
 	 * ★Смещение ребёнка ПОВОРАЧИВАЕТСЯ вместе с родителем: наклон родителя — это
@@ -763,6 +806,26 @@ static void parts_update_global_pos(struct parts *parts, Point parent_pos,
 	float rot = parts->parent ? parts->parent->global.rotation.z : 0.0f;
 	float lx = parts->local.pos.x * parent_scale_x;
 	float ly = parts->local.pos.y * parent_scale_y;
+	/*
+	 * ★В ЗЕРКАЛЬНОЙ системе координат смещение потомка меняет знак: разворот
+	 * контейнера — это отражение всего поддерева вокруг его точки отсчёта, а не
+	 * переворот каждой картинки на своём месте. Без этого разворот, который игра
+	 * ставит рамке кадра бойца (`wh=0x0`, картинки нет), не давал ВООБЩЕ ничего:
+	 * враги Dohna смотрели вправо, как нарисован ассет, а не влево, как в
+	 * оригинале (§5ej).
+	 *
+	 * Зеркало применяется ДО поворота, а угол берётся с обратным знаком:
+	 * `M∘R(θ) = R(−θ)∘M`. У боевого поддерева Dohna углы нулевые, но правило
+	 * должно быть точным, иначе наклонённая зеркальная группа поедет.
+	 */
+	parts->global.mirror_x = mirror_x;
+	parts->global.mirror_y = mirror_y;
+	if (mirror_x)
+		lx = -lx;
+	if (mirror_y)
+		ly = -ly;
+	if (mirror_x != mirror_y)
+		rot = -rot;
 	if (rot != 0.0f) {
 		float a = rot * (float)M_PI / 180.0f;
 		float c = cosf(a), s = sinf(a);
@@ -780,7 +843,9 @@ static void parts_update_global_pos(struct parts *parts, Point parent_pos,
 	struct parts *child;
 	PARTS_FOREACH_CHILD(child, parts) {
 		parts_update_global_pos(child, child_origin,
-				parts->global.scale.x, parts->global.scale.y);
+				parts->global.scale.x, parts->global.scale.y,
+				parts_children_mirror_x(parts),
+				parts_children_mirror_y(parts));
 	}
 }
 
@@ -800,7 +865,8 @@ static void parts_reposition_family(struct parts *parts)
 {
 	parts_update_global_pos(parts,
 			parts->parent ? parts_child_origin(parts->parent) : root_pos,
-			parts_parent_scale_x(parts), parts_parent_scale_y(parts));
+			parts_parent_scale_x(parts), parts_parent_scale_y(parts),
+			parts_frame_mirror_x(parts), parts_frame_mirror_y(parts));
 }
 
 void parts_set_pos(struct parts *parts, Point pos)
@@ -817,7 +883,11 @@ void parts_set_global_pos(Point pos)
 	root_pos = pos;
 	struct parts *parts;
 	PARTS_LIST_FOREACH(parts) {
-		parts_update_global_pos(parts, root_pos, 1.0f, 1.0f);
+		// Позиционную семантику этого обхода не меняем (он гоняет ВЕСЬ список,
+		// не только корни), но зеркальность берём по настоящему предку — иначе
+		// глобальный сдвиг сбрасывал бы зеркало поддерева.
+		parts_update_global_pos(parts, root_pos, 1.0f, 1.0f,
+				parts_frame_mirror_x(parts), parts_frame_mirror_y(parts));
 	}
 	parts_engine_dirty();
 }
@@ -1604,7 +1674,7 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s rev=%d%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s rev=%d%d mir=%d%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
@@ -1619,7 +1689,12 @@ void parts_debug_dump(void)
 		       // ★Зеркалирование — рядом с масштабом: «спрайт смотрит не в ту
 		       // сторону» надо различать как «флаг стоит, а рисуем без отражения»
 		       // против «флаг не выставлен вовсе», а по кадру это одно и то же.
-		       p->reverse_lr, p->reverse_tb, p->global.scale.x, p->global.scale.y,
+		       // `mir=` — зеркальность системы координат, УНАСЛЕДОВАННАЯ от предков
+		       // (разворот контейнера). Без неё «rev=00 у спрайта» читается как
+		       // «зеркала нет», хотя отражать его обязан предок.
+		       p->reverse_lr, p->reverse_tb,
+		       p->global.mirror_x, p->global.mirror_y,
+		       p->global.scale.x, p->global.scale.y,
 		       p->local.rotation.z, p->global.rotation.z,
 		       p->local.rotation.x, p->local.rotation.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
@@ -1699,7 +1774,7 @@ static bool parts_has_dirty_parent(struct parts *parts)
 }
 
 static void parts_combine_params(struct parts_params *parent, struct parts_params *child,
-		struct parts_params *out)
+		struct parts_params *out, bool mirror_x, bool mirror_y)
 {
 	out->z = parent->z + child->z;
 	/*
@@ -1715,9 +1790,24 @@ static void parts_combine_params(struct parts_params *parent, struct parts_param
 	 * без масштаба выходило 832 - 301 = 531, и текст вылезал за левый край рамки
 	 * окна на картинку сцены.
 	 */
+	/*
+	 * ★И ЗЕРКАЛО — тоже в ОБОИХ путях: в зеркальной системе координат предков
+	 * смещение потомка меняет знак (см. parts_update_global_pos и
+	 * parts_params::mirror_x). Если внести правило только туда, ближайший
+	 * `UpdateComponent` вернёт незеркальную позицию, и разворот врагов Dohna будет
+	 * то появляться, то исчезать.
+	 */
+	out->mirror_x = mirror_x;
+	out->mirror_y = mirror_y;
+	float dx = child->pos.x * parent->scale.x;
+	float dy = child->pos.y * parent->scale.y;
+	if (mirror_x)
+		dx = -dx;
+	if (mirror_y)
+		dy = -dy;
 	out->pos = (Point) {
-		parent->pos.x + (int)roundf(child->pos.x * parent->scale.x),
-		parent->pos.y + (int)roundf(child->pos.y * parent->scale.y)
+		parent->pos.x + (int)roundf(dx),
+		parent->pos.y + (int)roundf(dy)
 	};
 	out->show = parent->show && child->show;
 	out->alpha = parent->alpha * (child->alpha / 255.0f);
@@ -1748,12 +1838,20 @@ static void parts_inherit_controller(struct parts *parts, int controller_no)
 static void parts_update_component(struct parts *parts)
 {
 	if (parts->parent) {
-		parts_combine_params(&parts->parent->global, &parts->local, &parts->global);
+		parts_combine_params(&parts->parent->global, &parts->local, &parts->global,
+				parts_children_mirror_x(parts->parent),
+				parts_children_mirror_y(parts->parent));
 		// Позиция считается ДВУМЯ путями (здесь и в parts_update_global_pos), и
 		// сдвиг привязки родителя-якоря нужен в обоих: иначе один путь затирает
 		// другой при ближайшем UpdateComponent. Ровно на этом правка сперва и не
 		// подействовала — панель Garage осталась за кромкой.
+		// ...и знак сдвига в зеркальной системе координат — тоже в обоих
+		// (parts_child_origin, где то же правило выведено подробно).
 		Point shift = parts_anchor_shift(parts->parent);
+		if (parts->parent->global.mirror_x)
+			shift.x = -shift.x;
+		if (parts->parent->global.mirror_y)
+			shift.y = -shift.y;
 		parts->global.pos.x += shift.x;
 		parts->global.pos.y += shift.y;
 	}
@@ -2049,26 +2147,87 @@ int PE_GetPartsCGDeform(int parts_no, possibly_unused int state)
  * стоячего спрайта персонажа в ADV-сцене). У обоих есть геттер, значит свойство
  * обязано храниться по-настоящему; рендер складывает их с `sprite_deform`.
  */
+/*
+ * Разворот ПОМЕНЯЛСЯ: у самой части достаточно попросить перерисовку (отражение
+ * своей картинки считает рендер), а вот система координат ПОТОМКОВ стала другой —
+ * их надо переставить.
+ *
+ * ★Пересчёт зовём ТОЛЬКО когда дети есть. Два пути расчёта позиции (здесь и в
+ * `parts_update_component`) сходятся не во всём — например, поворот родителя
+ * учитывает лишь первый, — поэтому лишний пересчёт у бездетной части мог бы
+ * сдвинуть её там, где раньше в силе было значение второго пути. Для бездетных
+ * частей (все стоячие спрайты ADV, где разворот работал и до этой правки) правка
+ * обязана быть строго нулевой.
+ */
+static void parts_reverse_changed(struct parts *parts)
+{
+	if (!TAILQ_EMPTY(&parts->children))
+		parts_reposition_family(parts);
+	parts_dirty(parts);
+}
+
 void PE_SetComponentReverseLR(int parts_no, bool reverse)
 {
 	// XSYS4_REV_WATCH=1 — КТО просит зеркалирование. Нужно, чтобы отличить «игра
 	// просит, а мы не рисуем» от «игра не просит вовсе» (спрайты врагов в бою: ассет
 	// нарисован лицом вправо, оригинал разворачивает врагов влево).
+	// ★Фильтра по номеру части здесь БЫТЬ НЕ ДОЛЖНО: части ADV-сцены лежат выше
+	// 1e9, а боевые — нет, и прежний порог `parts_no >= 1000000000` делал ловушку
+	// слепой ровно к тому случаю, ради которого её ставили (вывод «в бою не просят»
+	// был артефактом фильтра). Стек печатаем у первых вызовов, дальше — одну строку.
+	// ★Дедуп по паре «часть+значение»: ADV-сцена переставляет разворот одним и тем
+	// же спрайтам десятки раз и съедает любой бюджет ДО боя (именно так прежний
+	// замер и «не увидел» боевые вызовы).
 	if (getenv("XSYS4_REV_WATCH")) {
-		static int left = 40;
-		if (left > 0 && parts_no >= 1000000000) {
+		static int left = 400, stacks_left = 24;
+		static int seen_no[2048];
+		static int8_t seen_val[2048];
+		static int nseen = 0;
+		bool dup = false;
+		for (int i = 0; i < nseen; i++) {
+			if (seen_no[i] == parts_no && seen_val[i] == (int8_t)reverse) {
+				dup = true;
+				break;
+			}
+		}
+		if (!dup && nseen < 2048) {
+			seen_no[nseen] = parts_no;
+			seen_val[nseen] = (int8_t)reverse;
+			nseen++;
+		}
+		if (left > 0 && !dup) {
 			left--;
-			NOTICE("REVWATCH ReverseLR часть %d <- %d — стек вызовов игры:",
-			       parts_no, (int)reverse);
-			vm_stack_trace();
+			struct parts *p = parts_try_get(parts_no);
+			int nchildren = 0;
+			if (p) {
+				struct parts *child;
+				PARTS_FOREACH_CHILD(child, p)
+					nchildren++;
+			}
+			NOTICE("REVWATCH ReverseLR часть %d <- %d (тип=%d детей=%d родитель=%d)",
+			       parts_no, (int)reverse,
+			       p ? (int)p->states[p->state].type : -1, nchildren,
+			       (p && p->parent) ? p->parent->no : -1);
+			if (stacks_left > 0) {
+				stacks_left--;
+				vm_stack_trace();
+			}
 		}
 	}
-	parts_get(parts_no)->reverse_lr = reverse;
+	struct parts *parts = parts_get(parts_no);
+	if (parts->reverse_lr == reverse)
+		return;
+	parts->reverse_lr = reverse;
+	parts_reverse_changed(parts);
 }
 
 void PE_SetComponentReverseTB(int parts_no, bool reverse)
 {
-	parts_get(parts_no)->reverse_tb = reverse;
+	struct parts *parts = parts_get(parts_no);
+	if (parts->reverse_tb == reverse)
+		return;
+	parts->reverse_tb = reverse;
+	parts_reverse_changed(parts);
 }
 
 bool PE_GetComponentReverseLR(int parts_no)

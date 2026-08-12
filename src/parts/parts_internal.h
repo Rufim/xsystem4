@@ -648,6 +648,17 @@ struct parts_params {
 	struct { float x, y, z; } rotation;
 	SDL_Color add_color;
 	SDL_Color multiply_color;
+	/*
+	 * ★СИСТЕМА КООРДИНАТ поддерева, ЗЕРКАЛЬНАЯ ли она (только в `global`):
+	 * накопленный XOR флагов `reverse_lr`/`reverse_tb` СТРОГИХ предков. Своего
+	 * флага части здесь НЕТ — он складывается с этим уже в рендере.
+	 *
+	 * Зачем: `SetComponentReverseLR` игра ставит и на КОНТЕЙНЕР без картинки
+	 * (у Dohna — рамка кадра бойца, `wh=0x0`, `tex=0`), и «зеркалить свой квад»
+	 * для него не значит ничего. Разворот контейнера — это зеркало ВСЕГО
+	 * ПОДДЕРЕВА: смещения потомков меняют знак, а их содержимое переворачивается.
+	 */
+	bool mirror_x, mirror_y;
 };
 
 struct parts_message_window;
@@ -1106,6 +1117,58 @@ struct string *parts_text_line_get(struct parts_text_line *line);
 void parts_text_set_ruby(struct parts *parts, int state, const struct text_style *ts,
 		int line_space, const struct parts_ruby_spec *specs, int nr_specs);
 struct string *parts_text_get(struct parts_text *t);
+
+/*
+ * ЗЕРКАЛО ПОДДЕРЕВА (см. `parts_params::mirror_x`). Две величины нужны и рендеру,
+ * и hit-тесту, поэтому живут здесь.
+ *
+ * `parts_effective_reverse_*` — переворачивать ли СОДЕРЖИМОЕ части: свой флаг
+ * складывается (XOR) с зеркальностью системы координат предков.
+ *
+ * `parts_origin_offset_*` — где относительно точки привязки лежит КОРОБКА части.
+ * В зеркальной системе коробка отражается вокруг точки привязки, поэтому сдвиг
+ * становится `-(сдвиг + размер)`. Для привязки по центру (`原点座標モード` 2/5/8,
+ * сдвиг −w/2) это то же число — так что боевые спрайты Dohna не двигаются, а
+ * зеркалится только их картинка; для краевых привязок разница настоящая.
+ */
+static inline bool parts_effective_reverse_lr(struct parts *parts)
+{
+	return parts->global.mirror_x != parts->reverse_lr;
+}
+
+static inline bool parts_effective_reverse_tb(struct parts *parts)
+{
+	return parts->global.mirror_y != parts->reverse_tb;
+}
+
+/*
+ * ИТОГОВОЕ отражение картинки части: `sprite_deform` (0/1/2, приходит четвёртым
+ * аргументом `SetPartsCG`) плюс личные флаги плюс зеркальность системы координат.
+ * Одно место на всех, потому что этой величиной обязаны пользоваться и рендер, и
+ * ПОПИКСЕЛЬНЫЙ hit-тест, и маска альфа-клиппера: если они разойдутся, «клик по
+ * спрайту» будет проверять не те тексели, что видны на экране.
+ */
+static inline bool parts_render_flip_h(struct parts *parts)
+{
+	bool flip = parts_effective_reverse_lr(parts);
+	return parts->sprite_deform == 1 ? !flip : flip;
+}
+
+static inline bool parts_render_flip_v(struct parts *parts)
+{
+	bool flip = parts_effective_reverse_tb(parts);
+	return parts->sprite_deform == 2 ? !flip : flip;
+}
+
+static inline int parts_origin_offset_x(struct parts *parts, struct parts_common *c)
+{
+	return parts->global.mirror_x ? -(c->origin_offset.x + c->w) : c->origin_offset.x;
+}
+
+static inline int parts_origin_offset_y(struct parts *parts, struct parts_common *c)
+{
+	return parts->global.mirror_y ? -(c->origin_offset.y + c->h) : c->origin_offset.y;
+}
 
 // render.c
 void parts_render_init(void);

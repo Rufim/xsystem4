@@ -75,6 +75,13 @@ static void set_draw_filter_blend_func(int draw_filter)
  */
 static float parts_render_rotation_z(struct parts *parts)
 {
+	/*
+	 * В зеркальной системе координат (разворот предка-контейнера по ОДНОЙ оси)
+	 * угол меняет знак: `M∘R(θ) = R(−θ)∘M`. Зеркало по двум осям — это поворот на
+	 * 180°, ориентация сохраняется, и знак угла не меняется.
+	 */
+	if (parts->global.mirror_x != parts->global.mirror_y)
+		return -parts->global.rotation.z;
 	return parts->global.rotation.z;
 }
 
@@ -116,8 +123,19 @@ static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rec
 		glm_translate(clip_mw, (vec3) { clipper->global.pos.x, clipper->global.pos.y, 0 });
 		glm_rotate_z(clip_mw, glm_rad(parts_render_rotation_z(clipper)), clip_mw);
 		glm_scale(clip_mw, (vec3){ clipper->global.scale.x, clipper->global.scale.y, 1.0 });
-		glm_translate(clip_mw, (vec3){ c_common->origin_offset.x, c_common->origin_offset.y, 0 });
-		glm_scale(clip_mw, (vec3){ c_common->w, c_common->h, 1.0 });
+		// ★Маска считается ПО ТОЙ ЖЕ трансформации, что и картинка клиппера: если
+		// клиппер отражён (сам или зеркальной системой координат предков), а маска
+		// нет, отсечение поедет в другую сторону от того, что видно.
+		glm_translate(clip_mw, (vec3){ parts_origin_offset_x(clipper, c_common),
+				parts_origin_offset_y(clipper, c_common), 0 });
+		bool clip_flip_h = parts_render_flip_h(clipper);
+		bool clip_flip_v = parts_render_flip_v(clipper);
+		if (clip_flip_h)
+			glm_translate(clip_mw, (vec3){ c_common->w, 0.0f, 0.0f });
+		if (clip_flip_v)
+			glm_translate(clip_mw, (vec3){ 0.0f, c_common->h, 0.0f });
+		glm_scale(clip_mw, (vec3){ clip_flip_h ? -c_common->w : c_common->w,
+				clip_flip_v ? -c_common->h : c_common->h, 1.0 });
 		mat4 clip_inv;
 		glm_mat4_inv(clip_mw, clip_inv);
 
@@ -280,26 +298,19 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 	//glm_rotate_y(mw_transform, parts->rotation.y, mw_transform);
 	glm_rotate_z(mw_transform, glm_rad(parts_render_rotation_z(parts)), mw_transform);
 	glm_scale(mw_transform, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0 });
-	glm_translate(mw_transform, (vec3){ common->origin_offset.x, common->origin_offset.y, 0 });
+	// В зеркальной системе координат предков коробка части отражается вокруг её
+	// точки привязки (см. parts_origin_offset_x).
+	glm_translate(mw_transform, (vec3){ parts_origin_offset_x(parts, common),
+			parts_origin_offset_y(parts, common), 0 });
 
-	// `sprite_deform` (0 — нет, 1 — по горизонтали, 2 — по вертикали) и независимые
-	// флаги v14 `SetComponentReverseLR/TB` складываются: одним числом обе оси не
-	// выразить, а игра может зеркалить и ту и другую.
-	bool flip_h = parts->reverse_lr;
-	bool flip_v = parts->reverse_tb;
-	switch (parts->sprite_deform) {
-	case 1:
-		flip_h = !flip_h;
-		break;
-	case 2:
-		flip_v = !flip_v;
-		break;
-	case 0:
-		break;
-	default:
+	// `sprite_deform` (0 — нет, 1 — по горизонтали, 2 — по вертикали), личные флаги
+	// v14 `SetComponentReverseLR/TB` и зеркальность системы координат предков
+	// (разворот КОНТЕЙНЕРА, см. parts_params::mirror_x) — всё складывается в
+	// parts_render_flip_h/v, одинаково для рендера, hit-теста и маски клиппера.
+	bool flip_h = parts_render_flip_h(parts);
+	bool flip_v = parts_render_flip_v(parts);
+	if (parts->sprite_deform < 0 || parts->sprite_deform > 2)
 		WARNING("Invalid sprite_deform: %d", parts->sprite_deform);
-		break;
-	}
 	if (flip_h)
 		glm_translate(mw_transform, (vec3){ common->w, 0.0f, 0.0f });
 	if (flip_v)
@@ -952,14 +963,37 @@ void parts_render(struct parts *parts)
 		if (state->common.texture.handle)
 			parts_render_cg(parts, &state->common);
 		break;
+	/*
+	 * ★У этих трёх путей отражение НЕ реализовано: у текста, flash и flat
+	 * содержимое строится своими трансформациями, а зеркалить его надо вокруг
+	 * коробки, которой у них нет в общем виде. Молча рисовать незеркально —
+	 * значит спрятать расхождение, поэтому случай ЗОВЁТ СЕБЯ САМ: по разу на
+	 * номер части. У Dohna в зеркальных поддеревьях таких частей нет (замер:
+	 * только типы CG и `矩形判定パーツ`), так что строка означает новую игру или
+	 * новую сцену — и тогда её надо разбирать по кадру оригинала.
+	 */
 	case PARTS_TEXT:
-		parts_render_text(parts, &state->text);
-		break;
 	case PARTS_FLASH:
-		parts_render_flash(parts, &state->flash);
-		break;
 	case PARTS_FLAT:
-		parts_render_flat(parts, &state->flat);
+		if (parts->global.mirror_x || parts->global.mirror_y) {
+			static int seen[64], nr_seen = 0;
+			bool dup = false;
+			for (int i = 0; i < nr_seen; i++)
+				if (seen[i] == parts->no) dup = true;
+			if (!dup && nr_seen < 64) {
+				seen[nr_seen++] = parts->no;
+				WARNING("часть %d (тип %d) стоит в ЗЕРКАЛЬНОЙ системе координат "
+					"(mir=%d%d), но этот путь рендера отражения не умеет",
+					parts->no, (int)state->type,
+					parts->global.mirror_x, parts->global.mirror_y);
+			}
+		}
+		if (state->type == PARTS_TEXT)
+			parts_render_text(parts, &state->text);
+		else if (state->type == PARTS_FLASH)
+			parts_render_flash(parts, &state->flash);
+		else
+			parts_render_flat(parts, &state->flat);
 		break;
 	case PARTS_3DLAYER:
 		parts_render_3dlayer(parts, &state->layer3d);

@@ -69,21 +69,31 @@ static Point drag_initial_pos;
 static Point drag_start_cursor;
 static struct parts *drop_target = NULL;
 
-static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos);
+static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos,
+		bool flip_h, bool flip_v);
 
 static bool parts_hittest(struct parts *parts, int state, Point pos)
 {
 	struct parts_common *c = &parts->states[state].common;
 	float sx = parts->global.scale.x, sy = parts->global.scale.y;
 	Rectangle hitbox;
-	if (sx != 1.0f || sy != 1.0f) {
+	/*
+	 * Ветка «масштаб 1» складывает СВОЙ (локальный) hitbox с позицией родителя, а в
+	 * зеркальной системе координат локальные величины уже не годятся: знак смещения
+	 * учтён в `global.pos`. Поэтому зеркальные части считаем так же, как масштабные —
+	 * от `global.pos` (при sx=sy=1 формула совпадает с прежней).
+	 */
+	bool mirrored = parts->global.mirror_x || parts->global.mirror_y;
+	if (sx != 1.0f || sy != 1.0f || mirrored) {
 		// Scaled parts render as global.pos + scale·origin_offset, size scale·wh.
 		// The stored hitbox is unscaled, so recompute it here (e.g. the config
 		// message-window sample is drawn at 0.5× — its hit area must match, or
 		// its full-size box would swallow clicks meant for the buttons behind).
+		// Зеркальная система координат предков отражает коробку части вокруг её
+		// точки привязки — область попадания обязана ехать вместе с картинкой.
 		hitbox = (Rectangle){
-			parts->global.pos.x + (int)(c->origin_offset.x * sx),
-			parts->global.pos.y + (int)(c->origin_offset.y * sy),
+			parts->global.pos.x + (int)(parts_origin_offset_x(parts, c) * sx),
+			parts->global.pos.y + (int)(parts_origin_offset_y(parts, c) * sy),
 			(int)(c->w * sx),
 			(int)(c->h * sy),
 		};
@@ -101,13 +111,17 @@ static bool parts_hittest(struct parts *parts, int state, Point pos)
 	if (!parts->pixel_hittest
 	    && parts->states[parts->state].type != PARTS_CG_DETECTION)
 		return true;
-	return parts_pixel_hittest(c, hitbox, pos);
+	// Тексель ищем с тем же отражением, с которым часть НАРИСОВАНА: иначе клик
+	// по зеркальному спрайту проверял бы прозрачность его незеркальной половины.
+	return parts_pixel_hittest(c, hitbox, pos,
+			parts_render_flip_h(parts), parts_render_flip_v(parts));
 }
 
 // `マウスカーソルピクセル判定`: попадание считается только по НЕПРОЗРАЧНОМУ пикселю
 // текстуры. Альфа читается с GPU ОДИН раз на состояние (glReadPixels синхронизирует
 // конвейер, а hit-тест идёт каждый кадр) и кэшируется в common->hit_mask.
-static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos)
+static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point pos,
+		bool flip_h, bool flip_v)
 {
 	if (!c->texture.handle || c->texture.w <= 0 || c->texture.h <= 0)
 		return true;  // нечего проверять — остаётся прямоугольник
@@ -130,6 +144,10 @@ static bool parts_pixel_hittest(struct parts_common *c, Rectangle hitbox, Point 
 	int ty = (int)((int64_t)(pos.y - hitbox.y) * c->hit_mask_h / hitbox.h);
 	if (tx < 0 || ty < 0 || tx >= c->hit_mask_w || ty >= c->hit_mask_h)
 		return false;
+	if (flip_h)
+		tx = c->hit_mask_w - 1 - tx;
+	if (flip_v)
+		ty = c->hit_mask_h - 1 - ty;
 	return c->hit_mask[ty * c->hit_mask_w + tx] != 0;
 }
 
