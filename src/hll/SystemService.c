@@ -685,20 +685,139 @@ static void SystemService_OpenPlayingManual(void) {
 #endif
 }
 
-//static bool SystemService_IsExistSystemMessage(void);
-HLL_QUIET_UNIMPLEMENTED(false, bool, SystemService, IsExistSystemMessage);
 /*
- * Очередь системных сообщений рантайма. `IsExistSystemMessage` у нас уже
- * отвечает «пусто», поэтому единственный честный ответ здесь — тоже «пусто»:
- * игра вызывает пару в цикле `while (IsExistSystemMessage()) PopSystemMessage(&m)`,
- * и `true` без сообщения увёл бы её в вечный цикл. Выход НЕ трогаем только при
- * false — но ref-выходы обязаны быть заполнены (см. §7 FINDINGS), поэтому 0.
+ * ★ОЧЕРЕДЬ СИСТЕМНЫХ СООБЩЕНИЙ РАНТАЙМА.
+ *
+ * Игра разбирает её в `_system::detail::ProcessSystemMessage` (Dohna, FUNC 20605):
+ * `if (!IsExistSystemMessage()) return; if (!PopSystemMessage(&n)) error;` и
+ * раскладывает номер по `switch`:
+ *   1 — `gamesave::detail::SystemSuspend`: сохранить игру в служебный слот −6
+ *       («продолжить с того же места»); при старте `main` читает его обратно
+ *       (`IsSystemSuspended` → `SystemResume`);
+ *   2 — `DeleteSuspendSaveFile` — этот слот удалить;
+ *   3 — открыть конфиг (`Ｓ＿コンフィグ`);
+ *   4 — `PrepareReload`: слот −7 перед пересозданием окна (`IsReloaded` → `Reload`);
+ *   5 — снимок экрана в файл; номер приходит ВМЕСТЕ СО СТРОКОЙ, её игра забирает
+ *       вторым вызовом `PopSystemMessageString`.
+ *
+ * Пока очередь отвечала «пусто», suspend не писался НИКОГДА: закрытие окна убивало
+ * процесс на месте (`SDL_QUIT → vm_exit`). Тем самым у нас отсутствовало не только
+ * «продолжить с того же места», но и ЕДИНСТВЕННЫЙ путь, на котором игра читает
+ * образ частей обратно: `parts::detail::Load` вызывается лишь из
+ * `gamesave::detail::セーブ実行_ロード後復帰処理`, куда приходит `partsLibraryData`.
  */
+enum system_message {
+	SYS_MSG_SUSPEND = 1,
+	SYS_MSG_DELETE_SUSPEND = 2,
+	SYS_MSG_OPEN_CONFIG = 3,
+	SYS_MSG_PREPARE_RELOAD = 4,
+	SYS_MSG_SNAPSHOT = 5,
+};
+
+#define SYS_MSG_QUEUE_MAX 8
+static int sys_msg_queue[SYS_MSG_QUEUE_MAX];
+static struct string *sys_msg_param[SYS_MSG_QUEUE_MAX];
+static int sys_msg_head, sys_msg_count;
+// Строка последнего снятого сообщения: игра забирает её отдельным вызовом.
+static struct string *sys_msg_last_param;
+// Закрытие окна: сообщение поставлено — ждём, пока игра его переварит, и уходим.
+static bool sys_msg_quit_requested, sys_msg_quit_taken;
+static uint32_t sys_msg_quit_ticks;
+// Сколько ждём игру, прежде чем закрыться самим (см. sysservice_quit_watchdog).
+#define SYS_MSG_QUIT_GRACE_MS 1500
+
+void sysservice_push_system_message(int message, struct string *param)
+{
+	if (sys_msg_count >= SYS_MSG_QUEUE_MAX) {
+		WARNING("очередь системных сообщений переполнена, теряю %d", message);
+		return;
+	}
+	int slot = (sys_msg_head + sys_msg_count) % SYS_MSG_QUEUE_MAX;
+	sys_msg_queue[slot] = message;
+	sys_msg_param[slot] = param ? string_ref(param) : NULL;
+	sys_msg_count++;
+}
+
+/*
+ * Запрос закрытия окна (крестик, SIGTERM/SIGINT через SDL). Windows-рантайм на
+ * WM_CLOSE даёт игре сообщение 1 и завершает приложение уже ПОСЛЕ того, как та
+ * записала suspend-сейв, — повторяем ровно это. Второй запрос (пользователь жмёт
+ * крестик снова, потому что окно не закрылось) уходит немедленно: значит игра
+ * сообщение не разбирает и ждать нечего.
+ */
+void sysservice_request_quit(void)
+{
+	if (sys_msg_quit_requested)
+		vm_exit(0);
+	sysservice_push_system_message(SYS_MSG_SUSPEND, NULL);
+	sys_msg_quit_requested = true;
+	sys_msg_quit_ticks = SDL_GetTicks();
+}
+
+/*
+ * Страховка на игры, которые системные сообщения не разбирают вовсе (Tsumamigui,
+ * Escalayer, Haha Ranman — `ProcessSystemMessage` есть только у Ixseal-набора):
+ * там сообщение никто не заберёт, и без этого крестик перестал бы закрывать окно.
+ * Ждём короткую паузу и уходим сами — тем же путём, что до правки.
+ */
+void sysservice_quit_watchdog(void)
+{
+	if (!sys_msg_quit_requested || sys_msg_quit_taken)
+		return;
+	if (SDL_GetTicks() - sys_msg_quit_ticks > SYS_MSG_QUIT_GRACE_MS)
+		vm_exit(0);
+}
+
+static bool SystemService_IsExistSystemMessage(void)
+{
+	if (sys_msg_count > 0)
+		return true;
+	/*
+	 * Очередь опустела. Если это был наш запрос выхода, suspend-сейв уже НА ДИСКЕ:
+	 * `SystemSuspend` игра вызывает синхронно внутри того же `ProcessSystemMessage`,
+	 * а сюда мы попадаем на следующем витке игрового цикла.
+	 */
+	if (sys_msg_quit_requested && sys_msg_quit_taken)
+		vm_exit(0);
+	return false;
+}
+
 static bool SystemService_PopSystemMessage(int *message)
 {
+	// ref-выходы обязаны быть заполнены даже при отказе (см. §7 FINDINGS).
 	if (message)
 		*message = 0;
-	return false;
+	if (!sys_msg_count)
+		return false;
+
+	int msg = sys_msg_queue[sys_msg_head];
+	if (sys_msg_last_param)
+		free_string(sys_msg_last_param);
+	sys_msg_last_param = sys_msg_param[sys_msg_head];
+	sys_msg_param[sys_msg_head] = NULL;
+	sys_msg_head = (sys_msg_head + 1) % SYS_MSG_QUEUE_MAX;
+	sys_msg_count--;
+
+	if (msg == SYS_MSG_SUSPEND && sys_msg_quit_requested)
+		sys_msg_quit_taken = true;
+	if (message)
+		*message = msg;
+	return true;
+}
+
+// Строковый параметр сообщения (сейчас только 5 — имя файла снимка экрана).
+static bool SystemService_PopSystemMessageString(struct string **out)
+{
+	if (!sys_msg_last_param)
+		return false;
+	if (out) {
+		if (*out)
+			free_string(*out);
+		*out = string_ref(sys_msg_last_param);
+	}
+	free_string(sys_msg_last_param);
+	sys_msg_last_param = NULL;
+	return true;
 }
 
 static void SystemService_RestrainScreensaver(void) { }
@@ -715,26 +834,75 @@ static void SystemService_ShowWaitMessage(bool show)
 }
 
 /*
- * ★RESUME-СЕЙВ В БУФЕР (Ixseal v14): `bool Save(wrap<array<int>> SaveDataBuffer)` /
- * `bool Load(wrap<array<int>> SaveDataBuffer)`. Та же механика, что у
- * `system.ResumeSave/ResumeLoad`, только носитель — МАССИВ INT, который игра
- * хранит сама (Dohna: снимок карты — `SceneMap@SaveMapSnapShot` →
- * `SnapShotSave@Save` → `gamesave::detail::セーブ実行`; без реализации вход в
- * hunting-фазу валил движок фатальным hll_call).
+ * ★★СОСТОЯНИЕ БИБЛИОТЕКИ В БУФЕР (Ixseal v14): `bool Save(wrap<array<int>>)` /
+ * `bool Load(wrap<array<int>>)`. Это ОБЫЧНАЯ сериализация того, чем владеет
+ * SystemService, а НЕ снимок VM: снимок делает сама игра рядом, через
+ * `system.ResumeSave` (см. src/resume.c).
  *
- * Содержимое буфера для игры НЕПРОЗРАЧНО (она его только хранит и отдаёт
- * обратно), поэтому носим готовый RSM-образ: vm_save_image пишет во временный
- * файл в папке сейвов, байты упаковываются в int-массив (магия + длина +
- * по 4 байта LE на int). Семантика возврата — как у ResumeSave с
- * hll-конвенцией: 1 при сохранении; при ВОССТАНОВЛЕНИИ образа выполнение
- * продолжается из точки Save со значением 0 на стеке (кладётся в снимок,
- * см. save_stack_to_rsave) — по нему игра уходит в «ロード後復帰処理».
- * Из Load при успехе управление не возвращается.
+ * Доказательство порядком в `gamesave::detail::セーブ実行` (Dohna):
+ *   backlog → `MainEXFile.Save` → `parts::detail::Save` → `SystemService.Save`
+ *   → `HashMap.Save` → … → `system.ResumeSave`,
+ * и у каждого из первых пяти вызовов сразу за ним стоит только проверка на
+ * ошибку (`IFZ` → `system.Error("Failed to save …")`). Возобновление приходит
+ * ИМЕННО в точку `ResumeSave`, и дальше по коду идёт
+ * `セーブ実行_ロード後復帰処理`, где буферы читаются обратно в порядке
+ * `MainEXFile.Load` → … → `SystemService.Load` → `parts::detail::Load`.
+ *
+ * Отсюда: `Load` ОБЯЗАН вернуть управление. Прежняя реализация носила в буфере
+ * готовый RSM-образ и уходила из `Load` прыжком в точку `Save` — тогда
+ * `parts::detail::Load` уже не исполнялся: образ частей не восстанавливался
+ * (`XPE load` не случался ни разу), возобновление в данже падало на
+ * `SceneHitokari@MoveGrid` (`Out of bounds heap index: -1/0`), а возврат «0»
+ * в точку Save игра читала как отказ — `*GAME ERROR*: Failed to save system
+ * service.` ★Прежнюю модель оставили под ручкой `XSYS4_SS_SAVE_RESUME=1`:
+ * на ней держался вход в hunting-фазу (снимок карты `SceneMap@SaveMapSnapShot`
+ * → `SnapShotSave@Save`), и A/B на одном бинаре показывает разницу сразу.
+ *
+ * Формат буфера наш: игра его только хранит и отдаёт обратно. Носим то, что
+ * НЕ переезжает вместе с VM-образом, потому что живёт в C: словари
+ * SystemVariable/GameVariable и настройку курсора. Масштаб вида и режим окна
+ * сюда не идут намеренно — их игра задаёт заново при старте через `AFL_View_*`
+ * (и хранит в своём конфиге, `コンフィグセーブ` рядом в том же `セーブ実行`).
  */
-#define SS_RESUME_MAGIC 0x53535253  // "SRSS"
+#define SS_RESUME_MAGIC 0x53535253  // "SRSS" — прежний формат (RSM-образ)
+#define SS_STATE_MAGIC 0x53535453   // "SSTS" — состояние библиотеки
+#define SS_STATE_VERSION 1
 #define SS_RESUME_TMP "SystemServiceResume.rsm"
 
-static bool SystemService_Save(struct page **buffer)
+static void sv_store_write(struct iarray_writer *w, struct sv_store *st)
+{
+	iarray_write(w, st->nr_entries);
+	for (int i = 0; i < st->nr_entries; i++) {
+		iarray_write_string(w, st->entries[i].key);
+		iarray_write_string(w, st->entries[i].value);
+	}
+}
+
+static void sv_store_read(struct iarray_reader *r, struct sv_store *st)
+{
+	// Порядок ключей — порядок вставки (его видит NumofKey/GetKey), поэтому
+	// читаем в тот же словарь через sv_set, а прежнее содержимое сносим.
+	for (int i = 0; i < st->nr_entries; i++) {
+		free_string(st->entries[i].key);
+		free_string(st->entries[i].value);
+	}
+	st->nr_entries = 0;
+
+	int n = iarray_read(r);
+	if (n < 0 || n > 100000) {
+		WARNING("SystemService.Load: битое число переменных (%d)", n);
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		struct string *k = iarray_read_string(r);
+		struct string *v = iarray_read_string(r);
+		sv_set(st, k, v);
+		free_string(k);
+		free_string(v);
+	}
+}
+
+static bool ss_save_resume_image(struct page **buffer)
 {
 	char *path = savedir_path(SS_RESUME_TMP);
 	if (getenv("XSYS4_SAVE_TRACE"))
@@ -772,16 +940,12 @@ static bool SystemService_Save(struct page **buffer)
 	return true;
 }
 
-static bool SystemService_Load(struct page **buffer)
+static bool ss_load_resume_image(struct page **buffer)
 {
-	if (!*buffer || (*buffer)->nr_vars < 2) {
-		WARNING("SystemService.Load: пустой буфер");
-		return false;
-	}
 	struct iarray_reader r;
 	iarray_init_reader(&r, *buffer, NULL);
 	if (iarray_read(&r) != SS_RESUME_MAGIC) {
-		WARNING("SystemService.Load: буфер не похож на наш образ");
+		WARNING("SystemService.Load: буфер не похож на RSM-образ");
 		return false;
 	}
 	int len = iarray_read(&r);
@@ -810,6 +974,82 @@ static bool SystemService_Load(struct page **buffer)
 	unlink(path);
 	free(path);
 	return false;
+}
+
+// Прежняя модель (RSM-образ вместо состояния) — только для A/B-замеров.
+static bool ss_save_resume_mode(void)
+{
+	static int on = -1;
+	if (on < 0)
+		on = getenv("XSYS4_SS_SAVE_RESUME") ? 1 : 0;
+	return on;
+}
+
+static bool SystemService_Save(struct page **buffer)
+{
+	if (ss_save_resume_mode())
+		return ss_save_resume_image(buffer);
+
+	struct iarray_writer w;
+	iarray_init_writer(&w, NULL);
+	iarray_write(&w, SS_STATE_MAGIC);
+	iarray_write(&w, SS_STATE_VERSION);
+	sv_store_write(&w, &sv_system);
+	sv_store_write(&w, &sv_game);
+	iarray_write(&w, NR_MOUSE_CURSOR_CONFIG);
+	for (int i = 0; i < NR_MOUSE_CURSOR_CONFIG; i++)
+		iarray_write(&w, mouse_cursor_config[i]);
+
+	if (*buffer) {
+		delete_page_vars(*buffer);
+		free_page(*buffer);
+	}
+	*buffer = iarray_to_page(&w);
+	iarray_free_writer(&w);
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE SystemService.Save: sys=%d game=%d переменных",
+		       sv_system.nr_entries, sv_game.nr_entries);
+	return true;
+}
+
+static bool SystemService_Load(struct page **buffer)
+{
+	if (!*buffer || (*buffer)->nr_vars < 2) {
+		WARNING("SystemService.Load: пустой буфер");
+		return false;
+	}
+	// Образы прежней сборки (RSM) читаем прежним путём: у них своя магия, и без
+	// этого возобновление старого сейва молча получило бы пустое состояние.
+	struct iarray_reader probe;
+	iarray_init_reader(&probe, *buffer, NULL);
+	int magic = iarray_read(&probe);
+	if (magic == SS_RESUME_MAGIC)
+		return ss_load_resume_image(buffer);
+	if (magic != SS_STATE_MAGIC) {
+		WARNING("SystemService.Load: чужой буфер (магия 0x%08x)", magic);
+		return false;
+	}
+
+	struct iarray_reader r;
+	iarray_init_reader(&r, *buffer, NULL);
+	iarray_read(&r); // магия
+	int version = iarray_read(&r);
+	if (version > SS_STATE_VERSION) {
+		WARNING("SystemService.Load: версия состояния %d новее нашей", version);
+		return false;
+	}
+	sv_store_read(&r, &sv_system);
+	sv_store_read(&r, &sv_game);
+	int nr_cursor = iarray_read(&r);
+	for (int i = 0; i < nr_cursor; i++) {
+		int v = iarray_read(&r);
+		if (i < NR_MOUSE_CURSOR_CONFIG)
+			mouse_cursor_config[i] = v;
+	}
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE SystemService.Load: sys=%d game=%d переменных",
+		       sv_system.nr_entries, sv_game.nr_entries);
+	return true;
 }
 
 /*
@@ -1136,6 +1376,7 @@ HLL_LIBRARY(SystemService,
 	    HLL_EXPORT(IsExistPlayingManual, SystemService_IsExistPlayingManual),
 	    HLL_EXPORT(IsExistSystemMessage, SystemService_IsExistSystemMessage),
 	    HLL_EXPORT(PopSystemMessage, SystemService_PopSystemMessage),
+	    HLL_EXPORT(PopSystemMessageString, SystemService_PopSystemMessageString),
 	    HLL_EXPORT(RestrainScreensaver, SystemService_RestrainScreensaver),
 	    HLL_EXPORT(ShowWaitMessage, SystemService_ShowWaitMessage),
 	    HLL_EXPORT(Save, SystemService_Save),

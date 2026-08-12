@@ -900,13 +900,25 @@ static void handle_window_event(SDL_Event *e)
 	}
 }
 
+/*
+ * ★ЗАКРЫТИЕ ОКНА ИДЁТ ЧЕРЕЗ ИГРУ, А НЕ МИМО НЕЁ. Windows-рантайм AliceSoft на
+ * WM_CLOSE не убивает приложение, а кладёт игре системное сообщение 1, и та
+ * успевает записать suspend-сейв («продолжить с того же места»); процесс уходит
+ * уже после этого. См. очередь в src/hll/SystemService.c. Игры без разбора
+ * системных сообщений закроются от второго запроса (крестик ещё раз) —
+ * первое обращение для них no-op.
+ */
+void sysservice_request_quit(void);
+void sysservice_quit_watchdog(void);
+
 void handle_window_events(void)
 {
+	sysservice_quit_watchdog();
 	SDL_Event e;
 	while (SDL_PollEvent(&e)) {
 		switch (e.type) {
 		case SDL_QUIT:
-			vm_exit(0);
+			sysservice_request_quit();
 			break;
 		case SDL_WINDOWEVENT:
 			handle_window_event(&e);
@@ -919,12 +931,13 @@ void handle_events(void)
 {
 	test_input_update();
 	fire_deferred_events();
+	sysservice_quit_watchdog();
 
 	SDL_Event e;
 	while (SDL_PollEvent(&e)) {
 		switch (e.type) {
 		case SDL_QUIT:
-			vm_exit(0);
+			sysservice_request_quit();
 			break;
 		case SDL_WINDOWEVENT:
 			handle_window_event(&e);
