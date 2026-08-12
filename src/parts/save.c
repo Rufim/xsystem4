@@ -31,12 +31,30 @@
  * осиротели бы: слоя с их номером нет, и они уходят под всё
  * (parts_get_sprite_z = 0) — экран после загрузки пустой/чёрный.
  */
-#define CURRENT_SAVE_VERSION 9
+/*
+ * v10: у операций построения `PARTS_CP_FILL_PIE_BLEND` и
+ * `PARTS_CP_FILL_POLYGON_BLEND` пишутся ПОЛЯ, а не только тип. Раньше за типом
+ * сразу шла следующая операция (поток не разъезжался — читатель тоже ничего не
+ * брал), но загруженная часть собиралась пустой: у метки следующего узла данжа
+ * Dohna обнулялись радиусы и альфа, у «трубы» маршрута список точек оставался
+ * NULL, а её растеризация отсекает `nr_pts < 3` — метка и труба исчезали после
+ * загрузки сейва, сделанного на экране данжа.
+ */
+/*
+ * v11: у ЧИСЛОВОЙ части пишутся `use_font` и стиль текста (у Dohna шрифтом
+ * нарисованы ВСЕ счётчики интерфейса, и без этих полей после загрузки исчезали
+ * все цифры), у ТЕКСТОВОЙ — флаг разрешённой разметки.
+ */
+#define CURRENT_SAVE_VERSION 11
 
 // Тайминг загрузки образа по типам состояний (печать под XSYS4_XPE_TRACE):
 // «задержки листания scrollback» — это перезагрузка образа на каждую страницу,
 // и без разбивки не видно, платим мы за CG (декодирование+текстуры) или за текст.
 static uint32_t xpe_load_cg_ms, xpe_load_text_ms;
+
+// Сколько blend-фигур (метка узла данжа / «труба» маршрута) прошло через образ —
+// печатается в строках «XPE save/load» под XSYS4_XPE_TRACE.
+static uint32_t xpe_cp_pie_blend, xpe_cp_polygon_blend;
 
 // Пересчёт номера слоя из образа версии < 9 (0-based) в текущий 1-based.
 static int migrate_controller_no(int no, int version)
@@ -100,6 +118,9 @@ static void save_parts_text(struct iarray_writer *w, struct parts_text *text)
 {
 	iarray_write(w, text->line_space);
 	iarray_write_text_style(w, &text->ts);
+	// v11: разрешена ли разметка в этой части (`Parts_SetTextEnableTag`) — игра
+	// читает флаг обратно (`Parts_IsTextEnableTag`), и после загрузки он терялся.
+	iarray_write(w, text->enable_tag);
 	iarray_write(w, text->nr_lines);
 	for (unsigned i = 0; i < text->nr_lines; i++) {
 		struct string *s = parts_text_line_get(&text->lines[i]);
@@ -109,12 +130,14 @@ static void save_parts_text(struct iarray_writer *w, struct parts_text *text)
 }
 
 static void load_parts_text(struct iarray_reader *r, struct parts *parts,
-		struct parts_text *text)
+		struct parts_text *text, int version)
 {
 	// FIXME: this won't accurately restore the text state if the text style
 	//        varies per-character
 	text->line_space = iarray_read(r);
 	iarray_read_text_style(r, &text->ts);
+	if (version >= 11)
+		text->enable_tag = !!iarray_read(r);
 
 	text->nr_lines = 0;
 	text->lines = NULL;
@@ -184,10 +207,21 @@ static void save_parts_numeral(struct iarray_writer *w, struct parts_numeral *nu
 	iarray_write(w, num->show_comma);
 	iarray_write(w, num->length);
 	iarray_write(w, num->font_no);
+	/*
+	 * v11: ВТОРОЙ СПОСОБ РИСОВАНИЯ ЧИСЛА — ШРИФТОМ (`表示タイプ = 2`), и у Dohna
+	 * так сделаны ВСЕ счётчики интерфейса. Без этих двух полей часть приезжала из
+	 * образа с `use_font = 0` и `ts` из xcalloc: `parts_numeral_update` уходила в
+	 * CG-ветку, а там у шрифтовой части `font_no = -1` — и число не рисовалось
+	 * вовсе. На экране данжа после возобновления это давало пустые карточки
+	 * бойцов: подписи Power/Tech/Speed и оценки скорости («B+», «A») на месте (они
+	 * текстовые), а ВСЕ цифры — уровень, значения, MP/VP — исчезали.
+	 */
+	iarray_write(w, num->use_font);
+	iarray_write_text_style(w, &num->ts);
 }
 
 static void load_parts_numeral(struct iarray_reader *r, struct parts *parts,
-		struct parts_numeral *num)
+		struct parts_numeral *num, int version)
 {
 	num->have_num = iarray_read(r);
 	num->num = iarray_read(r);
@@ -195,6 +229,10 @@ static void load_parts_numeral(struct iarray_reader *r, struct parts *parts,
 	num->show_comma = iarray_read(r);
 	num->length = iarray_read(r);
 	num->font_no = iarray_read(r);
+	if (version >= 11) {
+		num->use_font = !!iarray_read(r);
+		iarray_read_text_style(r, &num->ts);
+	}
 
 	if (num->have_num)
 		parts_numeral_set_number(parts, num, num->num);
@@ -222,6 +260,20 @@ static void load_parts_gauge(struct iarray_reader *r, struct parts *parts,
 		parts_vgauge_set_rate(parts, gauge, gauge->rate);
 	else
 		parts_hgauge_set_rate(parts, gauge, gauge->rate);
+}
+
+/*
+ * Откат для замеров A/B на одном бинаре (как `XSYS4_NO_CTYPE_RESTORE` у видов
+ * компонента): с `XSYS4_NO_CPBLEND_FIELDS=1` поля двух blend-операций НЕ пишутся
+ * и НЕ читаются — ровно поведение сборок до v10. Образ, записанный с ручкой,
+ * читать тоже с ручкой: версия в нём 10, а полей нет.
+ */
+static bool cp_blend_fields_off(void)
+{
+	static int off = -1;
+	if (off < 0)
+		off = getenv("XSYS4_NO_CPBLEND_FIELDS") ? 1 : 0;
+	return off;
 }
 
 static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
@@ -319,6 +371,40 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->pie.sweep_angle);
 		iarray_write(w, op->pie.a);
 		break;
+	case PARTS_CP_FILL_PIE_BLEND:
+		xpe_cp_pie_blend++;
+		if (cp_blend_fields_off())
+			break;
+		// Геометрия та же, что у альфа-варианта, но результат кладётся цветом —
+		// поэтому к семёрке полей добавлены r/g/b (у 122 они не используются, и
+		// его раскладку в образе трогать нельзя).
+		iarray_write(w, op->pie.x);
+		iarray_write(w, op->pie.y);
+		iarray_write(w, op->pie.rx);
+		iarray_write(w, op->pie.ry);
+		iarray_write(w, op->pie.start_angle);
+		iarray_write(w, op->pie.sweep_angle);
+		iarray_write(w, op->pie.a);
+		iarray_write(w, op->pie.r);
+		iarray_write(w, op->pie.g);
+		iarray_write(w, op->pie.b);
+		break;
+	case PARTS_CP_FILL_POLYGON_BLEND:
+		xpe_cp_polygon_blend++;
+		if (cp_blend_fields_off())
+			break;
+		// Список точек — длиной вперёд, дальше плоско x0,y0,x1,y1,… Длина в
+		// ТОЧКАХ, как в самой структуре; координат вдвое больше.
+		iarray_write(w, op->polygon.nr_pts);
+		for (int i = 0; i < op->polygon.nr_pts * 2; i++)
+			iarray_write(w, op->polygon.pts[i]);
+		iarray_write(w, op->polygon.r);
+		iarray_write(w, op->polygon.g);
+		iarray_write(w, op->polygon.b);
+		iarray_write(w, op->polygon.a);
+		iarray_write(w, op->polygon.round_corner);
+		iarray_write(w, op->polygon.angle);
+		break;
 	case PARTS_CP_FILL_GRADATION_AMAP:
 		iarray_write(w, op->gradation_amap.x);
 		iarray_write(w, op->gradation_amap.y);
@@ -339,7 +425,10 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 	}
 }
 
-static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
+// `version` нужен ради двух операций, чьи поля появились в образе только в v10
+// (см. комментарий у CURRENT_SAVE_VERSION): в прежних образах за их типом сразу
+// идёт следующая операция, и лишнее чтение сдвинуло бы весь поток партов.
+static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r, int version)
 {
 	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
 	op->type = iarray_read(r);
@@ -438,6 +527,45 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r)
 		op->pie.sweep_angle = iarray_read(r);
 		op->pie.a = iarray_read(r);
 		break;
+	case PARTS_CP_FILL_PIE_BLEND:
+		xpe_cp_pie_blend++;
+		if (version >= 10 && !cp_blend_fields_off()) {
+			op->pie.x = iarray_read(r);
+			op->pie.y = iarray_read(r);
+			op->pie.rx = iarray_read(r);
+			op->pie.ry = iarray_read(r);
+			op->pie.start_angle = iarray_read(r);
+			op->pie.sweep_angle = iarray_read(r);
+			op->pie.a = iarray_read(r);
+			op->pie.r = iarray_read(r);
+			op->pie.g = iarray_read(r);
+			op->pie.b = iarray_read(r);
+		}
+		// В образах до v10 полей нет — часть остаётся пустой, как и грузилась
+		// прежними сборками (нулевые радиусы просто ничего не рисуют).
+		break;
+	case PARTS_CP_FILL_POLYGON_BLEND:
+		xpe_cp_polygon_blend++;
+		if (version >= 10 && !cp_blend_fields_off()) {
+			int nr_pts = iarray_read(r);
+			// Мусорная длина увела бы выделение в гигабайты; поток после этого
+			// всё равно потерян, но падать на аллокации не за что.
+			if (nr_pts < 0 || nr_pts > 100000) {
+				WARNING("сейв-образ партов: битый список точек многоугольника (%d)", nr_pts);
+				nr_pts = 0;
+			}
+			op->polygon.nr_pts = nr_pts;
+			op->polygon.pts = nr_pts ? xcalloc(nr_pts * 2, sizeof(int)) : NULL;
+			for (int i = 0; i < nr_pts * 2; i++)
+				op->polygon.pts[i] = iarray_read(r);
+			op->polygon.r = iarray_read(r);
+			op->polygon.g = iarray_read(r);
+			op->polygon.b = iarray_read(r);
+			op->polygon.a = iarray_read(r);
+			op->polygon.round_corner = iarray_read(r);
+			op->polygon.angle = iarray_read(r);
+		}
+		break;
 	case PARTS_CP_FILL_GRADATION_AMAP:
 		op->gradation_amap.x = iarray_read(r);
 		op->gradation_amap.y = iarray_read(r);
@@ -476,11 +604,11 @@ static void save_parts_construction_process(struct iarray_writer *w,
 }
 
 static void load_parts_construction_process(struct iarray_reader *r, struct parts *parts,
-		struct parts_construction_process *cproc)
+		struct parts_construction_process *cproc, int version)
 {
 	int ops_count = iarray_read(r);
 	for (int i = 0; i < ops_count; i++) {
-		struct parts_cp_op *op = load_parts_cp_op(r);
+		struct parts_cp_op *op = load_parts_cp_op(r, version);
 		parts_add_cp_op(cproc, op);
 	}
 	parts_build_construction_process(parts, cproc);
@@ -610,7 +738,7 @@ static void save_parts_state(struct iarray_writer *w, struct parts_state *state)
 }
 
 static void load_parts_state(struct iarray_reader *r, struct parts *parts,
-		struct parts_state *state)
+		struct parts_state *state, int version)
 {
 	parts_state_reset(state, iarray_read(r));
 	state->common.w = iarray_read(r);
@@ -655,7 +783,7 @@ static void load_parts_state(struct iarray_reader *r, struct parts *parts,
 	}
 	case PARTS_TEXT: {
 		uint32_t t0 = SDL_GetTicks();
-		load_parts_text(r, parts, &state->text);
+		load_parts_text(r, parts, &state->text, version);
 		xpe_load_text_ms += SDL_GetTicks() - t0;
 		break;
 	}
@@ -663,7 +791,7 @@ static void load_parts_state(struct iarray_reader *r, struct parts *parts,
 		load_parts_animation(r, parts, &state->anim);
 		break;
 	case PARTS_NUMERAL:
-		load_parts_numeral(r, parts, &state->num);
+		load_parts_numeral(r, parts, &state->num, version);
 		break;
 	case PARTS_HGAUGE:
 		load_parts_gauge(r, parts, &state->gauge, false);
@@ -672,7 +800,7 @@ static void load_parts_state(struct iarray_reader *r, struct parts *parts,
 		load_parts_gauge(r, parts, &state->gauge, true);
 		break;
 	case PARTS_CONSTRUCTION_PROCESS:
-		load_parts_construction_process(r, parts, &state->cproc);
+		load_parts_construction_process(r, parts, &state->cproc, version);
 		break;
 	case PARTS_FLASH:
 		load_parts_flash(r, parts, &state->flash);
@@ -827,6 +955,60 @@ static void save_parts(struct iarray_writer *w, struct parts *parts)
 		iarray_write_string_or_null(w, parts->user_component_data[i].key);
 		iarray_write_string_or_null(w, parts->user_component_data[i].value);
 	}
+	/*
+	 * v11: ОСТАЛЬНОЕ СОСТОЯНИЕ ЧАСТИ. Раньше эти поля не писались «потому что
+	 * формат менять нельзя» (так и стояло у `sub_color_mode`), и после загрузки
+	 * образа часть теряла:
+	 *   • попиксельный hit-тест — у Dohna его несут ровно те 13 частей, что дают
+	 *     диагональные кнопки титула и SceneHome: без флага перекрывающиеся боксы
+	 *     снова воруют клик друг у друга;
+	 *   • виды слайдера/поля ввода/радиогруппы (v8 сохранял только кнопку,
+	 *     чекбокс и две полосы) — а `CompParts(имя, вид, состояние)` при
+	 *     несовпадении молча отдаёт игре null: так пропадала заметка к сейву и не
+	 *     регистрировался `ChangedEvent` группы;
+	 *   • геометрию и доли полос, состав радиогруппы, состояние и доступность
+	 *     чекбокса — то есть весь конфиг-экран после загрузки ехал;
+	 *   • выключатель ввода, приём колеса, область отсечения, вид свайпа, связи
+	 *     прокрутки и `オンカーソル表示連動` (без него все подсказки страницы Window
+	 *     показывались разом), режим вычитания цвета и опт-аут бэк-сцены.
+	 * `is_hovered`/`hover_time` намеренно не пишем: это состояние курсора «здесь и
+	 * сейчас», а не свойство части.
+	 */
+	iarray_write(w, parts->pixel_hittest);
+	iarray_write(w, parts->construction_mask);
+	iarray_write(w, parts->is_slider_bar);
+	iarray_write(w, parts->is_textbox);
+	iarray_write(w, parts->is_radio_box);
+	iarray_write_float(w, parts->hscroll_rate);
+	iarray_write_float(w, parts->vscroll_rate);
+	iarray_write(w, parts->checkbox_checked);
+	iarray_write(w, parts->checkbox_enabled);
+	iarray_write(w, parts->checkbox_r);
+	iarray_write(w, parts->checkbox_g);
+	iarray_write(w, parts->checkbox_b);
+	iarray_write_string_or_null(w, parts->checkbox_cg_base);
+	iarray_write(w, parts->sb_length);
+	iarray_write(w, parts->sb_width);
+	iarray_write(w, parts->sb_total);
+	iarray_write(w, parts->sb_view);
+	iarray_write(w, parts->sb_base_x);
+	iarray_write(w, parts->sb_base_y);
+	iarray_write(w, parts->sb_up_size);
+	iarray_write(w, parts->sb_down_size);
+	iarray_write(w, parts->sb_move_by_button);
+	iarray_write(w, parts->nr_radio_children);
+	for (int i = 0; i < parts->nr_radio_children; i++)
+		iarray_write(w, parts->radio_children[i]);
+	iarray_write(w, parts->enable_input_process);
+	iarray_write(w, parts->wheelable);
+	iarray_write(w, parts->clip_area_enabled);
+	iarray_write_rectangle(w, &parts->clip_area);
+	iarray_write(w, parts->swipe_type);
+	iarray_write(w, parts->scroll_pos_x_link);
+	iarray_write(w, parts->scroll_pos_y_link);
+	iarray_write(w, parts->on_cursor_show_link);
+	iarray_write(w, parts->sub_color_mode);
+	iarray_write(w, parts->want_save_back_scene);
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and save unconditionally
 	if (parts_multi_controller) {
@@ -873,7 +1055,7 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 		NOTICE("BS load part=%d%s", no, back_scene ? " (копия бэк-сцены)" : "");
 	parts->state = iarray_read(r);
 	for (int i = 0; i < PARTS_NR_STATES; i++) {
-		load_parts_state(r, parts, &parts->states[i]);
+		load_parts_state(r, parts, &parts->states[i], version);
 	}
 
 	load_parts_params(r, &parts->local);
@@ -981,6 +1163,54 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 			}
 		}
 	}
+	// v11: остальное состояние части — состав и обоснование см. в save_parts.
+	if (version >= 11) {
+		parts->pixel_hittest = !!iarray_read(r);
+		parts->construction_mask = !!iarray_read(r);
+		parts->is_slider_bar = !!iarray_read(r);
+		parts->is_textbox = !!iarray_read(r);
+		parts->is_radio_box = !!iarray_read(r);
+		parts->hscroll_rate = iarray_read_float(r);
+		parts->vscroll_rate = iarray_read_float(r);
+		parts->checkbox_checked = !!iarray_read(r);
+		parts->checkbox_enabled = !!iarray_read(r);
+		parts->checkbox_r = iarray_read(r);
+		parts->checkbox_g = iarray_read(r);
+		parts->checkbox_b = iarray_read(r);
+		struct string *cb_base = iarray_read_string_or_null(r);
+		if (parts->checkbox_cg_base)
+			free_string(parts->checkbox_cg_base);
+		parts->checkbox_cg_base = cb_base;
+		parts->sb_length = iarray_read(r);
+		parts->sb_width = iarray_read(r);
+		parts->sb_total = iarray_read(r);
+		parts->sb_view = iarray_read(r);
+		parts->sb_base_x = iarray_read(r);
+		parts->sb_base_y = iarray_read(r);
+		parts->sb_up_size = iarray_read(r);
+		parts->sb_down_size = iarray_read(r);
+		parts->sb_move_by_button = iarray_read(r);
+		int nr_radio = iarray_read(r);
+		if (nr_radio < 0 || nr_radio > 100000) {
+			WARNING("сейв-образ партов: битый состав радиогруппы (%d)", nr_radio);
+			nr_radio = 0;
+		}
+		free(parts->radio_children);
+		parts->radio_children = nr_radio ? xcalloc(nr_radio, sizeof(int)) : NULL;
+		parts->nr_radio_children = nr_radio;
+		for (int i = 0; i < nr_radio; i++)
+			parts->radio_children[i] = iarray_read(r);
+		parts->enable_input_process = !!iarray_read(r);
+		parts->wheelable = !!iarray_read(r);
+		parts->clip_area_enabled = !!iarray_read(r);
+		iarray_read_rectangle(r, &parts->clip_area);
+		parts->swipe_type = iarray_read(r);
+		parts->scroll_pos_x_link = iarray_read(r);
+		parts->scroll_pos_y_link = iarray_read(r);
+		parts->on_cursor_show_link = iarray_read(r);
+		parts->sub_color_mode = !!iarray_read(r);
+		parts->want_save_back_scene = !!iarray_read(r);
+	}
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
 	if (parts_multi_controller) {
@@ -1068,6 +1298,8 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 {
 	// get parts into clean state first
 	PE_UpdateComponent(0);
+
+	xpe_cp_pie_blend = xpe_cp_polygon_blend = 0;
 
 	struct iarray_writer w;
 	iarray_init_writer(&w, "XPE");
@@ -1176,6 +1408,13 @@ static bool parts_engine_save(struct page **buffer, bool save_hidden, bool back_
 
 	iarray_write_at(&w, count_pos, count);
 
+	// Счёт blend-фигур в образе: без него «пропала метка/труба после загрузки»
+	// не отличить от «их и не было на экране в момент снимка».
+	if (getenv("XSYS4_XPE_TRACE"))
+		NOTICE("XPE save[%s]: parts=%d (pie_blend=%u polygon_blend=%u)",
+		       back_scene ? "back" : "game", count,
+		       xpe_cp_pie_blend, xpe_cp_polygon_blend);
+
 	if (*buffer) {
 		delete_page_vars(*buffer);
 		free_page(*buffer);
@@ -1221,6 +1460,7 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 	// «задержки листания» иначе не отличить от задержек самой игры.
 	uint32_t t_start = SDL_GetTicks();
 	xpe_load_cg_ms = xpe_load_text_ms = 0;
+	xpe_cp_pie_blend = xpe_cp_polygon_blend = 0;
 	if (!(*buffer)) {
 		WARNING("savedata array is empty");
 		return false;
@@ -1345,9 +1585,10 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 		void asset_cg_cache_stats(unsigned *hits, unsigned *misses);
 		unsigned ch, cm;
 		asset_cg_cache_stats(&ch, &cm);
-		NOTICE("XPE load: version=%d parts=%d (restore_globals=%d back_scene=%d) %u ms (cg %u [hit %u miss %u], text %u)",
+		NOTICE("XPE load: version=%d parts=%d (restore_globals=%d back_scene=%d) %u ms (cg %u [hit %u miss %u], text %u) pie_blend=%u polygon_blend=%u",
 		       version, nr_parts, restore_globals, back_scene,
-		       SDL_GetTicks() - t_start, xpe_load_cg_ms, ch, cm, xpe_load_text_ms);
+		       SDL_GetTicks() - t_start, xpe_load_cg_ms, ch, cm, xpe_load_text_ms,
+		       xpe_cp_pie_blend, xpe_cp_polygon_blend);
 		static int per_ctrl[PARTS_CONTROLLER_STACK_MAX + 2];
 		memset(per_ctrl, 0, sizeof(per_ctrl));
 		struct parts *p;
