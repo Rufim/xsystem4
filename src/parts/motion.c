@@ -103,8 +103,14 @@ void parts_clear_motion(struct parts *parts)
 void parts_add_motion(struct parts *parts, struct parts_motion *motion)
 {
 	if (getenv("XSYS4_MOTION_TRACE") || parts_watched(parts->no))
-		NOTICE("MOTION часть %d <- вид %d, время %d..%d", parts->no,
-		       (int)motion->type, motion->begin_time, motion->end_time);
+		// ★Печатать и ЗНАЧЕНИЯ «откуда→куда»: без них не отличить «игра просит не тот
+		// цвет» от «мы применяем анимацию не к той части». Целое и пару показываем
+		// сразу — у цветовых видов параметр упакован в i (0xRRGGBB у add/mul), у
+		// позиции это x,y.
+		NOTICE("MOTION часть %d <- вид %d, время %d..%d, %d(%d,%d) -> %d(%d,%d)",
+		       parts->no, (int)motion->type, motion->begin_time, motion->end_time,
+		       motion->begin.i, motion->begin.x, motion->begin.y,
+		       motion->end.i, motion->end.x, motion->end.y);
 	parts_motion_list_add(&parts->motion, motion);
 }
 

@@ -5053,7 +5053,15 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(SetVGaugeSurfaceArea, PE_SetVGaugeSurfaceArea),
 	    HLL_EXPORT(SetNumeralCG, PE_SetNumeralCG),
 	    HLL_EXPORT(SetNumeralLinkedCGNumberWidthWidthList, PE_SetNumeralLinkedCGNumberWidthWidthList),
-	    HLL_TODO_EXPORT(SetNumeralFont, PartsEngine_SetNumeralFont),
+	    // ★Здесь стояла ЗАГЛУШКА `HLL_TODO_EXPORT(SetNumeralFont, …)`, а тремя
+	    // строками ниже — рабочий `HLL_EXPORT(SetNumeralFont, PE_SetNumeralFont)`.
+	    // Линковка идёт по ИМЕНИ и берёт ПЕРВОЕ совпадение, поэтому побеждала
+	    // заглушка: реализованная функция была недостижима, а игра падала
+	    // `*ERROR* Unimplemented HLL function: PartsEngine.SetNumeralFont`
+	    // (Dohna, ЧИСЛА УРОНА в битве: `CNumeralParts@Font::set` ←
+	    // `DamageNumber@0` ← `DamageNumberCollection@CreateDamage`). Дубликат
+	    // снят; проверка на дубли по всем блокам HLL_LIBRARY этого файла даёт
+	    // ноль остальных случаев.
 	    HLL_EXPORT(SetNumeralNumber, PE_SetNumeralNumber),
 	    HLL_EXPORT(SetNumeralShowComma, PE_SetNumeralShowComma),
 	    HLL_EXPORT(SetNumeralFont, PE_SetNumeralFont),

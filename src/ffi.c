@@ -607,6 +607,48 @@ void hll_call(int libno, int fno, int elem_class)
 				&& ci < heap[0].page->nr_vars)
 			canary_before = heap[0].page->values[ci].i;
 	}
+	/*
+	 * XSYS4_CONST_CANARY=<индекс глобали> — НАЗВАТЬ ТОГО, КТО ПОРТИТ ГЛОБАЛЬНУЮ
+	 * КОНСТАНТУ-ОБЪЕКТ (`CASColor::BLACK`/`WHITE` и подобные). Игра раздаёт такие
+	 * объекты наружу, и если кто-то запишет в них, «чёрный» станет цветным по всей
+	 * игре, а видно это будет далеко от причины. Сверяем поля объекта ДО и ПОСЛЕ
+	 * каждого HLL-вызова — так же, как XSYS4_GLOBAL_CANARY сверяет сам слот глобали.
+	 */
+	static int const_gi = -2;
+	static int const_slot = -1;
+	static int const_vals[8];
+	static bool const_told = false;
+	if (const_gi == -2) {
+		const char *e = getenv("XSYS4_CONST_CANARY");
+		const_gi = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+	}
+	if (const_gi >= 0 && !const_told && heap_index_valid(0) && heap[0].page
+	    && const_gi < heap[0].page->nr_vars) {
+		int slot = heap[0].page->values[const_gi].i;
+		if (slot > 0 && heap_slot_is_page(slot)) {
+			struct page *cp = heap_get_page(slot);
+			if (cp && cp->type == STRUCT_PAGE) {
+				if (slot != const_slot) {
+					// объект пересоздан (напр. загрузкой сейва) — перезапомнить
+					const_slot = slot;
+					for (int i = 0; i < 8 && i < cp->nr_vars; i++)
+						const_vals[i] = cp->values[i].i;
+				} else {
+					for (int i = 0; i < 8 && i < cp->nr_vars; i++) {
+						if (cp->values[i].i == const_vals[i])
+							continue;
+						const_told = true;
+						WARNING("CONSTCANARY глобаль %d (слот %d): поле %d было %d, стало %d — "
+							"перед HLL-вызовом %s. Стек вызовов игры:",
+							const_gi, slot, i, const_vals[i], cp->values[i].i,
+							f->name ? f->name : "?");
+						vm_stack_trace();
+						break;
+					}
+				}
+			}
+		}
+	}
 	if (lenient_noop) {
 		r.i = 0;
 		if (f->return_type.data == AIN_STRING)

@@ -1718,8 +1718,35 @@ void delegate_release_env(struct page *page)
 		delegate_env_unref(page->values[i+3].i);
 }
 
+/*
+ * XSYS4_DG_FN=<номер FUNC>[,<номер>...] — ЖИЗНЬ ПОДПИСКИ на указанный
+ * обработчик: создана делегатом, добавлена в список, отброшена при добавлении
+ * (объект уже мёртв — `seq` не совпал), выброшена уплотнением, вызвана при
+ * рассылке. Отвечает на «обработчик молча не тикает»: обычная трасса вызовов
+ * (XSYS4_FN_TRACE) показывает только ноль вызовов и не различает «не подписан»,
+ * «подписка потеряна» и «источник не рассылает».
+ */
+static bool dg_fn_watch(int fun)
+{
+	static const char *list = (const char *)1;
+	if (list == (const char *)1)
+		list = getenv("XSYS4_DG_FN");
+	if (!list || !*list)
+		return false;
+	for (const char *p = list; p && *p; ) {
+		if (strtol(p, (char**)&p, 0) == fun)
+			return true;
+		while (*p == ',' || *p == ' ') p++;
+		if (*p && !(*p >= '0' && *p <= '9')) break;
+	}
+	return false;
+}
+
 struct page *delegate_new_from_method(int obj, int fun, int env)
 {
+	if (dg_fn_watch(fun))
+		WARNING("DGFN делегат создан: fn %d obj=%d seq=%u env=%d",
+			fun, obj, heap_get_seq(obj), env);
 	if (fun < 1)
 		return alloc_page(DELEGATE_PAGE, 0, 0);
 	struct page *page = alloc_page(DELEGATE_PAGE, 0, DG_ENTRY_SLOTS);
@@ -1800,8 +1827,16 @@ struct page *delegate_append(struct page *dst, int obj, int fun, int env)
 		VM_ERROR("Not a delegate");
 	// Одна и та же лямбда с РАЗНЫМ окружением — это разные обработчики
 	// (по обработчику на элемент в foreach), поэтому env входит в сравнение.
-	if (delegate_contains_env(dst, obj, fun, env))
+	if (delegate_contains_env(dst, obj, fun, env)) {
+		if (dg_fn_watch(fun))
+			WARNING("DGFN уже подписан: fn %d obj=%d env=%d, длина=%d",
+				fun, obj, env, dst->nr_vars / DG_ENTRY_SLOTS);
 		return dst;
+	}
+	if (dg_fn_watch(fun))
+		WARNING("DGFN подписан: fn %d obj=%d seq=%u env=%d, длина станет %d",
+			fun, obj, heap_get_seq(obj), env,
+			dst->nr_vars / DG_ENTRY_SLOTS + 1);
 
 	dst = xrealloc(dst, sizeof(struct page) + sizeof(union vm_value) * (dst->nr_vars + DG_ENTRY_SLOTS));
 	dst->values[dst->nr_vars+0].i = obj;
@@ -1896,6 +1931,11 @@ static void delegate_compact(struct page *page)
 	int w = 0;
 	for (int i = 0; i < page->nr_vars; i += DG_ENTRY_SLOTS) {
 		if (heap_get_seq(page->values[i].i) != page->values[i+2].i) {
+			if (dg_fn_watch(page->values[i+1].i))
+				WARNING("DGFN выброшен уплотнением: fn %d obj=%d seq %u != %u",
+					page->values[i+1].i, page->values[i].i,
+					heap_get_seq(page->values[i].i),
+					(unsigned)page->values[i+2].i);
 			delegate_env_unref(page->values[i+3].i);
 			continue;
 		}
@@ -1955,9 +1995,15 @@ struct page *delegate_plusa(struct page *dst, struct page *add)
 		VM_ERROR("Not a delegate");
 
 	for (int i = 0; i < add->nr_vars; i += DG_ENTRY_SLOTS) {
-		if (heap_get_seq(add->values[i].i) == add->values[i+2].i)
+		if (heap_get_seq(add->values[i].i) == add->values[i+2].i) {
 			dst = delegate_append(dst, add->values[i].i, add->values[i+1].i,
 					      add->values[i+3].i);
+		} else if (dg_fn_watch(add->values[i+1].i)) {
+			WARNING("DGFN ОТБРОШЕН при добавлении: fn %d obj=%d seq %u != %u",
+				add->values[i+1].i, add->values[i].i,
+				heap_get_seq(add->values[i].i),
+				(unsigned)add->values[i+2].i);
+		}
 	}
 	return dst;
 }
@@ -2016,6 +2062,11 @@ bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out, int *env
 			*env_out = page->values[at+3].i;
 			return true;
 		}
+		if (dg_fn_watch(page->values[at+1].i))
+			WARNING("DGFN снят при рассылке: fn %d obj=%d seq %u != %u",
+				page->values[at+1].i, page->values[at].i,
+				heap_get_seq(page->values[at].i),
+				(unsigned)page->values[at+2].i);
 		delegate_remove_slot(page, at);
 	}
 	return false;

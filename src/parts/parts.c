@@ -1604,7 +1604,7 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
+		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s rev=%d%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
@@ -1615,7 +1615,11 @@ void parts_debug_dump(void)
 		       // маршрута в данже из белой поверхности выходит светло-розовой именно
 		       // добавочным цветом (§5dw).
 		       p->global.add_color.r, p->global.add_color.g, p->global.add_color.b,
-		       p->sub_color_mode ? "(sub)" : "", p->global.scale.x, p->global.scale.y,
+		       p->sub_color_mode ? "(sub)" : "",
+		       // ★Зеркалирование — рядом с масштабом: «спрайт смотрит не в ту
+		       // сторону» надо различать как «флаг стоит, а рисуем без отражения»
+		       // против «флаг не выставлен вовсе», а по кадру это одно и то же.
+		       p->reverse_lr, p->reverse_tb, p->global.scale.x, p->global.scale.y,
 		       p->local.rotation.z, p->global.rotation.z,
 		       p->local.rotation.x, p->local.rotation.y,
 		       p->pass_cursor, p->enable_input_process, p->clickable, p->is_button, p->construction_mask,
@@ -2047,6 +2051,18 @@ int PE_GetPartsCGDeform(int parts_no, possibly_unused int state)
  */
 void PE_SetComponentReverseLR(int parts_no, bool reverse)
 {
+	// XSYS4_REV_WATCH=1 — КТО просит зеркалирование. Нужно, чтобы отличить «игра
+	// просит, а мы не рисуем» от «игра не просит вовсе» (спрайты врагов в бою: ассет
+	// нарисован лицом вправо, оригинал разворачивает врагов влево).
+	if (getenv("XSYS4_REV_WATCH")) {
+		static int left = 40;
+		if (left > 0 && parts_no >= 1000000000) {
+			left--;
+			NOTICE("REVWATCH ReverseLR часть %d <- %d — стек вызовов игры:",
+			       parts_no, (int)reverse);
+			vm_stack_trace();
+		}
+	}
 	parts_get(parts_no)->reverse_lr = reverse;
 }
 
@@ -2815,6 +2831,27 @@ void PE_SetAddColor(int parts_no, int r, int g, int b)
 	// и по кадру не отличить «игра не покрасила» от «покрасила, а не доехало».
 	if (getenv("XSYS4_MUL_TRACE"))
 		NOTICE("ADD part %d <- rgb %d,%d,%d", parts_no, r, g, b);
+	/*
+	 * XSYS4_COLOR_WATCH=1 — СТЕК ИГРЫ на первых непустых установках добавочного
+	 * цвета. Отвечает на «кто это покрасил»: цвет ставят и подсветки, и анимации, и
+	 * загрузчик раскладки, а по кадру и даже по значению автора не назвать. Печатаем
+	 * ТОЛЬКО непустой цвет и ограниченно, иначе стек на каждый кадр забьёт лог.
+	 */
+	if ((r || g || b) && getenv("XSYS4_COLOR_WATCH")) {
+		static int left = 24;
+		// ★Фильтр по МИНИМАЛЬНОМУ номеру части: интересные части (вьюшки боя) имеют
+		// номера от 1000000000, а UI-подсветки титула/меню — 90000xxx, и без фильтра
+		// весь запас печати уходит на них ещё до нужного экрана.
+		static int min_no = -1;
+		if (min_no < 0)
+			min_no = atoi(getenv("XSYS4_COLOR_WATCH"));
+		if (left > 0 && parts_no >= min_no) {
+			left--;
+			NOTICE("COLORWATCH ADD часть %d <- %d,%d,%d — стек вызовов игры:",
+			       parts_no, r, g, b);
+			vm_stack_trace();
+		}
+	}
 	parts_set_add_color(parts_get(parts_no), add_color);
 }
 

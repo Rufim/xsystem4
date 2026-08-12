@@ -3364,6 +3364,21 @@ static enum opcode execute_instruction(enum opcode opcode)
 		break;
 	}
 	case A_REF: {
+		/*
+		 * ОТКУДА пришло значение: из АРГУМЕНТА текущей функции (одолженный хэндл)
+		 * или из переменной, которая объектом ВЛАДЕЕТ (локал/член/глобаль). Разница
+		 * решает, копировать объект или отдать его же — см. длинный разбор ниже.
+		 * Источник знает `stack_pop_var` (его вызывает X_REF прямо перед A_REF).
+		 */
+		bool src_is_borrowed_arg = false;
+		if (call_stack_ptr > 0 && last_var_page && last_var_index >= 0) {
+			struct function_call *fc = &call_stack[call_stack_ptr-1];
+			if (fc->page_slot >= 0 && heap_index_valid(fc->page_slot)
+			    && heap[fc->page_slot].page == last_var_page
+			    && fc->fno >= 0 && fc->fno < ain->nr_functions
+			    && last_var_index < ain->functions[fc->fno].nr_args)
+				src_is_borrowed_arg = true;
+		}
 		int array = stack_pop().i;
 		/* Ixseal (System 4 v14+) reuses A_REF as a polymorphic "duplicate
 		 * reference value": the operand may be a string heap slot (e.g. a
@@ -3371,11 +3386,90 @@ static enum opcode execute_instruction(enum opcode opcode)
 		 * actual heap slot type so we don't cast a struct string* to a page. */
 		if (heap_index_valid(array) && heap[array].type == VM_STRING) {
 			stack_push(vm_string_ref(heap[array].s));
-		} else {
-			int slot = heap_alloc_slot(VM_PAGE);
-			heap_set_page(slot, copy_page(heap_index_valid(array) ? heap[array].page : NULL));
-			stack_push(slot);
+			break;
 		}
+		struct page *ap = heap_index_valid(array) ? heap[array].page : NULL;
+		/*
+		 * ★★ЧТО ЗНАЧИТ `A_REF` НАД ОБЪЕКТОМ — ВЫВЕДЕНО ИЗ ПРОТОКОЛА САМОЙ ИГРЫ.
+		 *
+		 * Протокол владения у Ixseal задан в байткоде ЯВНО, и его надо повторять
+		 * буквально, иначе дефекты неустранимы:
+		 *   `NEW`          — объект со счётчиком 1 (владеет выражение);
+		 *   `SP_INC`       — «взять владение» (у нас `heap_ref`), компилятор ставит
+		 *                    его ровно там, где значение должно пережить выражение;
+		 *   `DELETE`       — отпустить; `.LOCALDELETE x` = отпустить И записать в `x`
+		 *                    −1, поэтому автоматическая финализация локала его уже
+		 *                    не тронет (видно в сыром дампе: 36 байт на макрос);
+		 *   АРГУМЕНТЫ      — ОДОЛЖЕНЫ: их не `SP_INC`-ают и не удаляют в вызываемой
+		 *                    функции (см. `variable_fini`).
+		 * Отсюда: значение, которое отдаёт `A_REF`, обязано нести РОВНО ОДНУ
+		 * собственную ссылку — сайт кладёт его в локал наравне с результатом `NEW` и
+		 * потом отпускает штатным `DELETE`.
+		 *
+		 * ЧЕМ РАЗЛИЧАЮТСЯ ДВА КЛАССА САЙТОВ (замеры §5eg/§5eh):
+		 *  (а) `.GLOBALREF CASColor::BLACK; A_REF` (`PlayerFrameView@GetAddColor`),
+		 *      `.LOCALREF c; A_REF` (`SetColor`, `Footer@GetColor`) — источник ВЛАДЕЕТ
+		 *      объектом, а получатель обращается с полученным как со своим: пишет в
+		 *      него и удаляет. Отдать здесь сам объект нельзя: глобальные
+		 *      КОНСТАНТЫ-цвета перестают быть чёрным и белым, и в бою подсветкой
+		 *      залиты все бойцы вместо одного (замер: `GetAddColor` отдаёт слот
+		 *      константы, а в скрипт движения из него читается `219,136,0`).
+		 *  (б) `.LOCALREF w; A_REF; CALLHLL Array Insert` (`IdArray@Add`) — источник
+		 *      это АРГУМЕНТ, то есть одолженный хэндл: копия здесь ломает ТОЖДЕСТВО.
+		 *      Живой случай — `SharedTimer::Get` кладёт `NEW VariableTimer(id)` в общий
+		 *      массив; конструктор подписал СВОЙ `Update` на `RCASTimerManager`, и если
+		 *      в массив уходит копия, общий таймер не тикает никогда: кадр боевого
+		 *      действия стоит на нуле (§5eg), а мерцание выделенного бойца, которое
+		 *      в оригинале ЕСТЬ, гоняется тем же общим таймером `SharedTimer("Focus")`.
+		 *      То есть эталонный движок здесь тождество СОХРАНЯЕТ.
+		 *
+		 * Значит правило — по ПРОИСХОЖДЕНИЮ значения, а не по его типу: над одолженным
+		 * аргументом `A_REF` отдаёт ТОТ ЖЕ объект (плюс своя ссылка), над владеющей
+		 * переменной — копию, как в апстриме. Источник берём из `stack_pop_var`
+		 * (X_REF стоит прямо перед A_REF), при любой неясности — копия.
+		 *
+		 * ★Ручки: `XSYS4_AREF_SHARE_STRUCT=1` — отдавать тот же объект ВСЕГДА,
+		 * `XSYS4_AREF_COPY_STRUCT=1` — всегда копию (обе для бисекта).
+		 */
+		bool share = getenv("XSYS4_AREF_SHARE_STRUCT")
+			|| (src_is_borrowed_arg && !getenv("XSYS4_AREF_COPY_STRUCT"));
+		if (ap && ap->type == STRUCT_PAGE && share) {
+			const char *w = getenv("XSYS4_AREF_WATCH");
+			if (w && *w && ap->index >= 0 && ap->index < ain->nr_structures
+			    && ain->structures[ap->index].name
+			    && strstr(ain->structures[ap->index].name, w)) {
+				WARNING("AREF ссылка на объект: слот %d (структура '%s', источник %s)"
+					" — стек вызовов игры:", array,
+					ain->structures[ap->index].name,
+					src_is_borrowed_arg ? "аргумент" : "принудительно");
+				vm_stack_trace();
+			}
+			heap_ref(array);
+			stack_push(array);
+			break;
+		}
+		if (ap && ap->type == STRUCT_PAGE) {
+			const char *w = getenv("XSYS4_AREF_WATCH");
+			if (w && *w && ap->index >= 0 && ap->index < ain->nr_structures
+			    && ain->structures[ap->index].name
+			    && strstr(ain->structures[ap->index].name, w)) {
+				static int left = 8;
+				if (left > 0) {
+					left--;
+					WARNING("AREF КОПИЯ объекта: слот %d (структура '%s'), источник:"
+						" переменная %d в %s (аргументов %d) — стек игры:",
+						array, ain->structures[ap->index].name,
+						last_var_index,
+						(call_stack_ptr > 0) ? display_sjis0(vm_current_function_name()) : "?",
+						(call_stack_ptr > 0 && call_stack[call_stack_ptr-1].fno >= 0)
+							? ain->functions[call_stack[call_stack_ptr-1].fno].nr_args : -1);
+					vm_stack_trace();
+				}
+			}
+		}
+		int slot = heap_alloc_slot(VM_PAGE);
+		heap_set_page(slot, copy_page(ap));
+		stack_push(slot);
 		break;
 	}
 	case A_NUMOF: {
@@ -4627,6 +4721,28 @@ int vm_execute_ain(struct ain *program)
 
 	if (ain->alloc >= 0)
 		vm_call(ain->alloc, -1); // function "0": allocate global arrays
+
+	/*
+	 * XSYS4_GLOBAL_OBJ_WATCH=<индекс глобали> — вотч на ОБЪЕКТ, лежащий в глобали
+	 * (не на саму глобаль). Нужен для глобальных КОНСТАНТ-объектов: игра раздаёт
+	 * `CASColor::BLACK`/`WHITE` наружу через A_REF, и если такую константу кто-то
+	 * освободит, слот достанется чужому цвету — дальше «чёрный» станет оранжевым, а
+	 * падать/красить не туда будет в произвольном месте. `XSYS4_GLOBAL_WATCH` тут
+	 * не помогает: он следит за СЛОТОМ глобали, а портится объект по ссылке.
+	 */
+	{
+		const char *e = getenv("XSYS4_GLOBAL_OBJ_WATCH");
+		if (e && *e) {
+			int gi = atoi(e);
+			if (gi >= 0 && gi < ain->nr_globals) {
+				int slot = heap[0].page->values[gi].i;
+				NOTICE("GLOBALOBJ глобаль %d (%s) -> слот %d, ставлю вотч",
+				       gi, display_sjis0(ain->globals[gi].name), slot);
+				if (slot > 0)
+					heap_watch_slot_set(slot);
+			}
+		}
+	}
 
 	if (ix_globals_self_ctor) {
 		// Конструкторы уже отработали внутри функции "0". Здесь только проверяем

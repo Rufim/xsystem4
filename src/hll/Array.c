@@ -407,6 +407,46 @@ static bool ix_elem_is_object(enum ain_data_type array_dt)
 // Сколько слотов значения кладёт вызывающий под элемент этого контейнера.
 static int ix_value_slots(struct page **self) { return self ? array_elem_slots(*self) : 1; }
 
+/*
+ * XSYS4_ARRAY_OWN=<подстрока имени структуры> — ВЛАДЕНИЕ элементом при укладке в
+ * контейнер: печатает, взял ли контейнер ссылку на объект, и какой у контейнера
+ * тип элемента. Отвечает на «объект умер сразу после того, как его положили в
+ * массив»: идиома игры — `NEW T(...); Add/PushBack; DELETE своей временной
+ * ссылки`, и если контейнер ссылку НЕ взял, объект гибнет на возврате, а его
+ * heap-слот достаётся чужой странице. Читается это очень далеко от причины
+ * (поле «молча стало нулём», подписка делегата «сама отвалилась»).
+ *
+ * ★Фильтр по ИМЕНИ структуры, а не «похоже на объект»: числа в int-массивах
+ * (индексы свободных мест в пулах) сплошь совпадают с номерами живых слотов, и
+ * проверка «значение указывает на структурную страницу» даёт ложные
+ * срабатывания пачками (замер: 12 из 12 первых — пулы `CPartsMessageManager`).
+ */
+static void ix_own_check(const char *who, struct page **self, union vm_value *value, bool took)
+{
+	static const char *want = (const char *)1;
+	if (want == (const char *)1)
+		want = getenv("XSYS4_ARRAY_OWN");
+	if (!want || !*want || !self || !value)
+		return;
+	if (value->i <= 0 || !heap_index_valid(value->i) || !heap_slot_is_page(value->i))
+		return;
+	struct page *p = heap_get_page(value->i);
+	if (!p || p->type != STRUCT_PAGE)
+		return;
+	const char *name = (p->index >= 0 && p->index < ain->nr_structures
+			    && ain->structures[p->index].name)
+		? ain->structures[p->index].name : "?";
+	if (!strstr(name, want))
+		return;
+	WARNING("ARRAYOWN %s: слот %d (структура '%s') — владение %s "
+		"(тип элемента контейнера %d, структура элемента %d, ранг %d, страница %s)"
+		" — стек вызовов игры:",
+		who, value->i, name, took ? "ВЗЯТО" : "НЕ ВЗЯТО",
+		(int)ix_dtype(*self), ix_stype(*self), ix_rank(*self),
+		*self ? "есть" : "ОТСУТСТВУЕТ (NULL)");
+	vm_stack_trace();
+}
+
 static void Array_PushBack(struct page **self, union vm_value *value)
 {
 	if (!self || !value)
@@ -416,8 +456,10 @@ static void Array_PushBack(struct page **self, union vm_value *value)
 	// (CPartsMessageManager@GetFunctionSet: `NEW 328; PushBack; DELETE local`).
 	// Без heap_ref DELETE уносил бы только что добавленный элемент (ref 1→0) →
 	// висячий слот в пуле → use-after-free при следующем чтении пула.
-	if (ix_elem_is_object(ix_dtype(*self)))
+	bool pb_own = ix_elem_is_object(ix_dtype(*self));
+	if (pb_own)
 		heap_ref(value->i);
+	ix_own_check("PushBack", self, value, pb_own);
 	// `value` указывает на первый из слотов значения на стеке VM: у
 	// wrap<интерфейс> их два (объект, база интерфейса) — оба идут в элемент.
 	int pb_slots = ix_value_slots(self);
@@ -462,8 +504,10 @@ static void Array_ix_Insert(struct page **self, int index, union vm_value *value
 	if (!self || !value)
 		return;
 	// см. Array_PushBack: объектный элемент — контейнер владеет своим счётчиком.
-	if (ix_elem_is_object(ix_dtype(*self)))
+	bool ins_own = ix_elem_is_object(ix_dtype(*self));
+	if (ins_own)
 		heap_ref(value->i);
+	ix_own_check("Insert", self, value, ins_own);
 	*self = array_insert_n(*self, index, value, ix_value_slots(self), ix_dtype(*self), ix_stype(*self));
 }
 
