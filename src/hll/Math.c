@@ -49,6 +49,107 @@ static inline float deg2rad(float deg)
 	return deg * (M_PI / 180.0);
 }
 
+static inline float rad2deg(float rad)
+{
+	return rad * (180.0 / M_PI);
+}
+
+/*
+ * ★MERSENNE TWISTER (MT19937) — ОТДЕЛЬНЫЙ от `Rand` генератор: `Math.MTSetSeed` +
+ * `Math.MTRand*`. Нужен не «для случайности», а ради ВОСПРОИЗВОДИМОСТИ: Dohna строит
+ * им ДЕТЕРМИНИРОВАННЫЕ таблицы (`stageeditor::detail::CGroupTool::UpdateRandTable` —
+ * `MTSetSeed(seed)`, затем массив на `createNum * 7` заполняется `MTRandFInclude1`),
+ * по которым расставляются детали карты города. Без этих функций игра падала фаталом
+ * `Unimplemented HLL function: Math.MTRandFInclude1` при открытии карты.
+ *
+ * Алгоритм — канонический MT19937 (инициализация 2002 года, множитель 1812433253);
+ * `libsys4`-овский `mtrand43` не годится: там урезанный вариант N=4/M=3 для генератора
+ * подземелий Rance, у него другая последовательность.
+ * ★ЧТО ПРОВЕРЯЕМО: раскладка деталей карты города по seed обязана совпасть с
+ * оригиналом пиксельно — если разойдётся, вариант инициализации у AliceSoft другой
+ * (`sgenrand` 1998 года), и его надо будет заменить здесь же.
+ */
+#define MT_N 624
+#define MT_M 397
+#define MT_MATRIX_A 0x9908b0dfUL
+#define MT_UPPER_MASK 0x80000000UL
+#define MT_LOWER_MASK 0x7fffffffUL
+
+static uint32_t mt_state[MT_N];
+static int mt_index = MT_N + 1;  // > MT_N — ещё не засеян
+
+static void mt_seed(uint32_t seed)
+{
+	mt_state[0] = seed;
+	for (int i = 1; i < MT_N; i++)
+		mt_state[i] = 1812433253UL * (mt_state[i - 1] ^ (mt_state[i - 1] >> 30)) + i;
+	mt_index = MT_N;
+}
+
+static uint32_t mt_next(void)
+{
+	if (mt_index >= MT_N) {
+		if (mt_index == MT_N + 1)
+			mt_seed(5489UL);  // значение по умолчанию из эталонной реализации
+		for (int i = 0; i < MT_N; i++) {
+			uint32_t y = (mt_state[i] & MT_UPPER_MASK)
+				| (mt_state[(i + 1) % MT_N] & MT_LOWER_MASK);
+			mt_state[i] = mt_state[(i + MT_M) % MT_N] ^ (y >> 1)
+				^ ((y & 1) ? MT_MATRIX_A : 0);
+		}
+		mt_index = 0;
+	}
+	uint32_t y = mt_state[mt_index++];
+	y ^= y >> 11;
+	y ^= (y << 7) & 0x9d2c5680UL;
+	y ^= (y << 15) & 0xefc60000UL;
+	y ^= y >> 18;
+	return y;
+}
+
+static void Math_MTSetSeed(int seed)
+{
+	mt_seed((uint32_t)seed);
+}
+
+static void Math_MTSetSeedByCurrentTime(void)
+{
+	mt_seed((uint32_t)time(NULL));
+}
+
+static int Math_MTRand(void)
+{
+	return (int)mt_next();
+}
+
+// `MTRandF` — [0,1), `MTRandFInclude1` — [0,1] ВКЛЮЧИТЕЛЬНО (отсюда и имя): делители
+// 2^32 и 2^32−1 соответственно, как `genrand_real2`/`genrand_real1` у авторов MT.
+static float Math_MTRandF(void)
+{
+	return mt_next() * (1.0 / 4294967296.0);
+}
+
+static float Math_MTRandFInclude1(void)
+{
+	return mt_next() * (1.0 / 4294967295.0);
+}
+
+/*
+ * Обратные тригонометрические — В ГРАДУСАХ, как прямые `Sin`/`Cos`/`Tan` этой же
+ * библиотеки (у Dohna сайтов нет: `Math.Asin`/`Acos` зовут только обёртки
+ * `AFL_Asin`/`AFL_Acos`, а рядом лежащие `AFL_Sin`/`AFL_Cos` работают в градусах —
+ * единицы у пары обязаны совпадать, иначе обратное преобразование не сойдётся).
+ */
+static float Math_Asin(float x)
+{
+	return rad2deg(asinf(x));
+}
+
+static float Math_Acos(float x)
+{
+	return rad2deg(acosf(x));
+}
+
 static float Math_Cos(float x)
 {
 	return cosf(deg2rad(x));
@@ -242,6 +343,8 @@ HLL_LIBRARY(Math,
 	    HLL_EXPORT(Sqrt, sqrtf),
 	    HLL_EXPORT(Atan, atanf),
 	    HLL_EXPORT(Atan2, atan2f),
+	    HLL_EXPORT(Asin, Math_Asin),
+	    HLL_EXPORT(Acos, Math_Acos),
 	    HLL_EXPORT(Abs, Math_Abs),
 	    HLL_EXPORT_F(Abs, fabsf),
 	    HLL_EXPORT(AbsF, fabsf),
@@ -251,6 +354,13 @@ HLL_LIBRARY(Math,
 	    //HLL_EXPORT(SetRandMode, Math_SetRandMode),
 	    HLL_EXPORT(Rand, rand),
 	    HLL_EXPORT(RandF, Math_RandF),
+	    // Mersenne Twister — отдельный генератор с воспроизводимой
+	    // последовательностью (таблицы деталей карты Dohna, см. mt_next).
+	    HLL_EXPORT(MTSetSeed, Math_MTSetSeed),
+	    HLL_EXPORT(MTSetSeedByCurrentTime, Math_MTSetSeedByCurrentTime),
+	    HLL_EXPORT(MTRand, Math_MTRand),
+	    HLL_EXPORT(MTRandF, Math_MTRandF),
+	    HLL_EXPORT(MTRandFInclude1, Math_MTRandFInclude1),
 	    HLL_EXPORT(RandTableInit, Math_RandTableInit),
 	    HLL_EXPORT(RandTable, Math_RandTable),
 	    //HLL_EXPORT(RandTable2Init, Math_RandTable2Init),
