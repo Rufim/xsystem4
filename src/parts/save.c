@@ -405,6 +405,36 @@ static void save_parts_cp_op(struct iarray_writer *w, struct parts_cp_op *op)
 		iarray_write(w, op->polygon.round_corner);
 		iarray_write(w, op->polygon.angle);
 		break;
+	// Остальные режимы заливки фигур — те же поля, что у *_BLEND-вариантов
+	// (см. load_parts_cp_op).
+	case PARTS_CP_FILL_PIE_COLOR:
+	case PARTS_CP_FILL_PIE_WITH_ALPHA:
+	case PARTS_CP_FILL_PIE_COLOR_BLEND:
+		iarray_write(w, op->pie.x);
+		iarray_write(w, op->pie.y);
+		iarray_write(w, op->pie.rx);
+		iarray_write(w, op->pie.ry);
+		iarray_write(w, op->pie.start_angle);
+		iarray_write(w, op->pie.sweep_angle);
+		iarray_write(w, op->pie.a);
+		iarray_write(w, op->pie.r);
+		iarray_write(w, op->pie.g);
+		iarray_write(w, op->pie.b);
+		break;
+	case PARTS_CP_FILL_POLYGON_COLOR:
+	case PARTS_CP_FILL_POLYGON_WITH_ALPHA:
+	case PARTS_CP_FILL_POLYGON_AMAP:
+	case PARTS_CP_FILL_POLYGON_COLOR_BLEND:
+		iarray_write(w, op->polygon.nr_pts);
+		for (int i = 0; i < op->polygon.nr_pts * 2; i++)
+			iarray_write(w, op->polygon.pts[i]);
+		iarray_write(w, op->polygon.r);
+		iarray_write(w, op->polygon.g);
+		iarray_write(w, op->polygon.b);
+		iarray_write(w, op->polygon.a);
+		iarray_write(w, op->polygon.round_corner);
+		iarray_write(w, op->polygon.angle);
+		break;
 	case PARTS_CP_FILL_GRADATION_AMAP:
 		iarray_write(w, op->gradation_amap.x);
 		iarray_write(w, op->gradation_amap.y);
@@ -566,6 +596,46 @@ static struct parts_cp_op *load_parts_cp_op(struct iarray_reader *r, int version
 			op->polygon.angle = iarray_read(r);
 		}
 		break;
+	/*
+	 * Остальные режимы заливки фигур (команды 88…127, `enum parts_cp_shape_mode`).
+	 * Типы новые, поэтому в прежних образах их номеров не бывает — гейта по версии
+	 * не нужно, поля пишутся всегда.
+	 */
+	case PARTS_CP_FILL_PIE_COLOR:
+	case PARTS_CP_FILL_PIE_WITH_ALPHA:
+	case PARTS_CP_FILL_PIE_COLOR_BLEND:
+		op->pie.x = iarray_read(r);
+		op->pie.y = iarray_read(r);
+		op->pie.rx = iarray_read(r);
+		op->pie.ry = iarray_read(r);
+		op->pie.start_angle = iarray_read(r);
+		op->pie.sweep_angle = iarray_read(r);
+		op->pie.a = iarray_read(r);
+		op->pie.r = iarray_read(r);
+		op->pie.g = iarray_read(r);
+		op->pie.b = iarray_read(r);
+		break;
+	case PARTS_CP_FILL_POLYGON_COLOR:
+	case PARTS_CP_FILL_POLYGON_WITH_ALPHA:
+	case PARTS_CP_FILL_POLYGON_AMAP:
+	case PARTS_CP_FILL_POLYGON_COLOR_BLEND: {
+		int nr_pts = iarray_read(r);
+		if (nr_pts < 0 || nr_pts > 100000) {
+			WARNING("сейв-образ партов: битый список точек многоугольника (%d)", nr_pts);
+			nr_pts = 0;
+		}
+		op->polygon.nr_pts = nr_pts;
+		op->polygon.pts = nr_pts ? xcalloc(nr_pts * 2, sizeof(int)) : NULL;
+		for (int i = 0; i < nr_pts * 2; i++)
+			op->polygon.pts[i] = iarray_read(r);
+		op->polygon.r = iarray_read(r);
+		op->polygon.g = iarray_read(r);
+		op->polygon.b = iarray_read(r);
+		op->polygon.a = iarray_read(r);
+		op->polygon.round_corner = iarray_read(r);
+		op->polygon.angle = iarray_read(r);
+		break;
+	}
 	case PARTS_CP_FILL_GRADATION_AMAP:
 		op->gradation_amap.x = iarray_read(r);
 		op->gradation_amap.y = iarray_read(r);

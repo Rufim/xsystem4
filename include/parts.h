@@ -251,14 +251,29 @@ bool PE_AddFillToPartsConstructionProcess(int parts_no, int x, int y, int w, int
 bool PE_AddFillAlphaColorToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, int a, int state);
 bool PE_AddFillAMapToPartsConstructionProcess(int parts_no, int x, int y, int w, int h, int a, int state);
-bool PE_AddFillPolygonBlendToPartsConstructionProcess(int parts_no, const int *pts,
-		int nr_pts, int r, int g, int b, int a, int round_corner, int angle, int state);
 bool PE_AddFillCircleBlendToPartsConstructionProcess(int parts_no, int x, int y,
 		int rx, int ry, int r, int g, int b, int a, int state);
 bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int rx, int ry,
 		int start_angle, int sweep_angle, int a, int state);
 bool PE_AddFillWithAlphaToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, int a, int state);
+/*
+ * Заливка ФИГУРЫ в одном из пяти режимов записи (команды 88…127, см. таблицу
+ * номеров в docs/FINDINGS.md). `mode` — `enum parts_cp_shape_mode`; круг, эллипс
+ * и сектор идут одним «pie»-путём (у круга rx == ry, у полного круга sweep = 360).
+ */
+enum parts_cp_shape_mode {
+	PARTS_CP_SHAPE_COLOR,        // RGB подменяется, альфа приёмника не трогается
+	PARTS_CP_SHAPE_WITH_ALPHA,   // RGB и альфа подменяются целиком
+	PARTS_CP_SHAPE_AMAP,         // меняется только альфа
+	PARTS_CP_SHAPE_COLOR_BLEND,  // цвет подмешивается по своей альфе, альфа приёмника та же
+	PARTS_CP_SHAPE_ALPHA_BLEND,  // альфа поднимается по маске, затем ложится цвет
+};
+bool PE_AddFillPieModeToPartsConstructionProcess(int parts_no, int mode, int x, int y,
+		int rx, int ry, int start_angle, int sweep_angle,
+		int r, int g, int b, int a, int state);
+bool PE_AddFillPolygonModeToPartsConstructionProcess(int parts_no, int mode, const int *pts,
+		int nr_pts, int r, int g, int b, int a, int round_corner, int angle, int state);
 bool PE_AddDrawRectToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
 		int r, int g, int b, int state);
 bool PE_AddDrawCutCGToPartsConstructionProcess(int parts_no, struct string *cg_name,

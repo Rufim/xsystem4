@@ -330,7 +330,28 @@ enum parts_cp_op_type {
 	 * сейва (src/parts/save.c), новое ПОЛЕ сломало бы чтение старых сейвов.
 	 */
 	PARTS_CP_TILE_CG_COPY,
-#define PARTS_NR_CP_TYPES (PARTS_CP_TILE_CG_COPY+1)
+	/*
+	 * v14: ОСТАЛЬНЫЕ РЕЖИМЫ ЗАЛИВКИ ФИГУР. Номера команд 88…127 разложены по двум
+	 * осям (см. таблицу в docs/FINDINGS.md): фигура (прямоугольник, многоугольник,
+	 * круг, эллипс, сектор) и способ записи результата — ровно пятёрка
+	 * `Fill / WithAlpha / AMap / Blend / AlphaBlend`, та же, что у прямоугольника
+	 * (команды 3/6/5/4 старого набора). Геометрию считает общая маска покрытия,
+	 * различие только в том, что делается с пикселем приёмника:
+	 *   COLOR      — RGB подменяется, альфа не трогается;
+	 *   WITH_ALPHA — RGB и альфа подменяются целиком (так узлы миникарты Dohna
+	 *                рисуют белый круг d=24 на обнулённой по альфе поверхности);
+	 *   AMAP       — меняется только альфа (уже было: PARTS_CP_FILL_PIE_AMAP);
+	 *   COLOR_BLEND— цвет подмешивается по своей альфе, альфа приёмника неизменна;
+	 *   ALPHA_BLEND— альфа поднимается по маске, затем цвет (PARTS_CP_FILL_*_BLEND).
+	 */
+	PARTS_CP_FILL_PIE_COLOR,
+	PARTS_CP_FILL_PIE_WITH_ALPHA,
+	PARTS_CP_FILL_PIE_COLOR_BLEND,
+	PARTS_CP_FILL_POLYGON_COLOR,
+	PARTS_CP_FILL_POLYGON_WITH_ALPHA,
+	PARTS_CP_FILL_POLYGON_AMAP,
+	PARTS_CP_FILL_POLYGON_COLOR_BLEND,
+#define PARTS_NR_CP_TYPES (PARTS_CP_FILL_POLYGON_COLOR_BLEND+1)
 };
 
 struct parts_cp_create {

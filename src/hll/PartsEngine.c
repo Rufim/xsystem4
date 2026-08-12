@@ -813,6 +813,106 @@ static void PartsEngine_AddComponentMotionPos(int parts_no, float begin_x, float
 }
 
 /*
+ * ★★ЗАЛИВКИ ФИГУР (команды 88…127) — ОДНА РЕГУЛЯРНАЯ ТАБЛИЦА, а не россыпь
+ * отдельных номеров. Номер команды раскладывается по двум осям (доказано разбором
+ * всех методов `CASConstructionProcess@Set*`: у каждого первое присваивание —
+ * поле 0 = номер команды, см. docs/FINDINGS.md):
+ *
+ *   фигура:  88 прямоугольник, 93 многоугольник, 98 круг, 108 эллипс, 118 сектор
+ *   режим:   +0 Fill (RGB), +1 WithAlpha (RGBA), +2 AMap (альфа),
+ *            +3 Blend (цвет по своей альфе), +4 AlphaBlend (альфа + цвет)
+ *
+ * У круглых фигур на каждый режим ДВЕ команды: по радиусу и «InRect» (геометрия
+ * из `先矩形`, чётный/нечётный номер), поэтому их блоки по 10 номеров.
+ * Так закрываются в том числе 100/101 (`FillCircleWithAlpha`) — узлы миникарты и
+ * карточки боя, 94/95 — плашки экранов результата, 103 — круг в альфа-карту по
+ * прямоугольнику. Раньше реализованными были только 88/90/97/102/106/122.
+ */
+static bool construction_fill_shape(int parts_no, int state, int command,
+		int dx, int dy, int dw, int dh, int r, int g, int b, int a,
+		int radius_x, int radius_y, int start_angle, int sweep_angle,
+		union vm_value *pos, int nr_pos, int round_corner, int poly_angle)
+{
+	if (command < 88 || command > 127)
+		return false;
+
+	int base, mode, in_rect = 0;
+	if (command < 93)      { base = 88;  mode = command - base; }
+	else if (command < 98) { base = 93;  mode = command - base; }
+	else {
+		base = command < 108 ? 98 : (command < 118 ? 108 : 118);
+		mode = (command - base) / 2;
+		in_rect = (command - base) % 2;
+	}
+
+	// Прямоугольник: три режима уже имеют свои операции (те же, что у старых
+	// команд 3/6/5/4), два оставшихся сводятся к многоугольнику из четырёх точек —
+	// у оси-параллельного прямоугольника с целыми координатами маска покрытия
+	// точная, лишнего сглаживания не появляется.
+	if (base == 88) {
+		switch (mode) {
+		case PARTS_CP_SHAPE_COLOR:
+			return PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
+					r, g, b, state);
+		case PARTS_CP_SHAPE_WITH_ALPHA:
+			return PE_AddFillWithAlphaToPartsConstructionProcess(parts_no, dx, dy,
+					dw, dh, r, g, b, a, state);
+		case PARTS_CP_SHAPE_AMAP:
+			return PE_AddFillAMapToPartsConstructionProcess(parts_no, dx, dy,
+					dw, dh, a, state);
+		case PARTS_CP_SHAPE_COLOR_BLEND:
+			return PE_AddFillAlphaColorToPartsConstructionProcess(parts_no, dx, dy,
+					dw, dh, r, g, b, a, state);
+		default: {
+			int pts[8] = { dx, dy, dx + dw, dy, dx + dw, dy + dh, dx, dy + dh };
+			return PE_AddFillPolygonModeToPartsConstructionProcess(parts_no,
+					PARTS_CP_SHAPE_ALPHA_BLEND, pts, 4, r, g, b, a,
+					round_corner, poly_angle, state);
+		}
+		}
+	}
+
+	if (base == 93) {
+		// Список точек приходит в `ArrayPos` плоско (x0,y0,x1,y1,…) и ТОЛЬКО из кода
+		// игры: у узла раскладки его нет, поэтому там шаг честно ничего не рисует.
+		if (!pos || nr_pos < 6) {
+			static bool warned;
+			if (!warned) {
+				warned = true;
+				WARNING("заливка многоугольника (команда %d): список точек пуст "
+					"(nr_pos=%d) — шаг пропущен", command, nr_pos);
+			}
+			return true;
+		}
+		int nr_pts = nr_pos / 2;
+		int *pts = xcalloc(nr_pts * 2, sizeof(int));
+		for (int i = 0; i < nr_pts * 2; i++)
+			pts[i] = pos[i].i;
+		bool ok = PE_AddFillPolygonModeToPartsConstructionProcess(parts_no, mode, pts,
+				nr_pts, r, g, b, a, round_corner, poly_angle, state);
+		free(pts);
+		return ok;
+	}
+
+	// Круг (rx == ry), эллипс (два радиуса) и сектор (плюс углы) — один путь.
+	int cx = dx, cy = dy, rx, ry;
+	if (in_rect) {
+		// `InRect`: фигура ВПИСАНА в прямоугольник `先矩形`.
+		rx = dw / 2;
+		ry = dh / 2;
+		cx = dx + rx;
+		cy = dy + ry;
+	} else {
+		rx = radius_x;
+		ry = base == 98 ? radius_x : radius_y;
+	}
+	int sa = base == 118 ? start_angle : 0;
+	int sw = base == 118 ? sweep_angle : 360;
+	return PE_AddFillPieModeToPartsConstructionProcess(parts_no, mode, cx, cy,
+			rx, ry, sa, sw, r, g, b, a, state);
+}
+
+/*
  * Одна операция процедуры построения (構築パーツ). Раньше это был инлайн-switch
  * внутри HLL-обёртки; вынесен отдельно, потому что ТЕ ЖЕ операции приходят из
  * ДВУХ мест: игра добавляет их в рантайме через AddPartsConstructionProcess, а
@@ -831,6 +931,11 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 		union vm_value *pos, int nr_pos, int round_corner, int poly_angle)
 {
 	(void)interp_type; (void)sw; (void)sh;
+	// Заливки фигур — регулярным разбором номера (см. construction_fill_shape).
+	if (construction_fill_shape(parts_no, state, command, dx, dy, dw, dh,
+			r, g, b, a, radius_x, radius_y, start_angle, sweep_angle,
+			pos, nr_pos, round_corner, poly_angle))
+		return;
 	switch (command) {
 	case 0:  // CASConstructionProcess::SetCreate
 		PE_AddCreateToPartsConstructionProcess(parts_no, dw, dh, state);
@@ -1014,57 +1119,6 @@ static void construction_op(int parts_no, int state, int command, int interp_typ
 	case 129:  // CASConstructionProcess::TileCGCopy (v14)
 		PE_AddTileCGToPartsConstructionProcess(parts_no, dx, dy, dw, dh,
 				cg_name, command == 129, state);
-		break;
-	case 88:  // CASConstructionProcess::SetFillRect (v14) — заливка ЦВЕТОМ
-		PE_AddFillToPartsConstructionProcess(parts_no, dx, dy, dw, dh, r, g, b, state);
-		break;
-	case 90:  // CASConstructionProcess::SetFillRectAMap (v14) — заливка АЛЬФЫ
-		PE_AddFillAMapToPartsConstructionProcess(parts_no, dx, dy, dw, dh, a, state);
-		break;
-	case 102:  // CASConstructionProcess::SetFillCircleAMap (v14)
-		// Круг = сектор на 360°: центр в `先矩形`, радиусы в `半径`, альфа из `色１`.
-		// Так собраны точки-индикаторы страниц и круглые подложки иконок.
-		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
-				radius_x, radius_y, 0, 360, a, state);
-		break;
-	case 97:
-		/*
-		 * `CASConstructionProcess::SetFillPolygonAlphaBlend` — многоугольник по
-		 * списку точек (`ArrayPos`, плоско x0,y0,x1,y1…) цветом с альфа-блендом.
-		 * Так в данже рисуется «труба» маршрута между узлами.
-		 */
-		if (pos && nr_pos >= 6) {
-			int nr_pts = nr_pos / 2;
-			int *pts = xcalloc(nr_pts * 2, sizeof(int));
-			for (int i = 0; i < nr_pts * 2; i++)
-				pts[i] = pos[i].i;
-			PE_AddFillPolygonBlendToPartsConstructionProcess(parts_no, pts, nr_pts,
-					r, g, b, a, round_corner, poly_angle, state);
-			free(pts);
-		} else {
-			static bool warned;
-			if (!warned) {
-				warned = true;
-				WARNING("SetFillPolygonAlphaBlend: список точек пуст (nr_pos=%d) — "
-					"шаг пропущен", nr_pos);
-			}
-		}
-		break;
-	case 106:
-		/*
-		 * `CASConstructionProcess::SetFillCircleAlphaBlend` — круг ЦВЕТОМ с
-		 * альфа-блендом: аргументы (x, y, radius, r, g, b, alpha), центр в
-		 * `先矩形`, радиус в `半径`. Так рисуется жёлтая метка СЛЕДУЮЩЕГО узла
-		 * в данже (без неё круг оставался пустым белым).
-		 */
-		PE_AddFillCircleBlendToPartsConstructionProcess(parts_no, dx, dy,
-				radius_x, radius_y, r, g, b, a, state);
-		break;
-	case 122:  // CASConstructionProcess::SetFillPieAMap (v14)
-		// Сектор в альфа-карту: из четырёх таких углов и двух прямоугольников
-		// собрана каждая скруглённая подложка интерфейса Dohna.
-		PE_AddFillPieAMapToPartsConstructionProcess(parts_no, dx, dy,
-				radius_x, radius_y, start_angle, sweep_angle, a, state);
 		break;
 	default:
 		WARNING("AddConstructProcess: unknown command %d", command);
@@ -1431,8 +1485,8 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 			       (*as)->values, nr_strings,
 			       (ap && *ap) ? (*ap)->values : NULL,
 			       (ap && *ap) ? (*ap)->nr_vars : 0);
-	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28),
-	// заливки прямоугольником (88/90) и круг в альфа-карту (102), сектор (122).
+	// Расширения v14 за классическим набором, которые мы УМЕЕМ: размытие (27/28)
+	// и ВСЁ семейство заливок фигур 88…127 (construction_fill_shape).
 	// Остальные по-прежнему отбрасываем — иначе они молча портили бы поверхность.
 	// 128/129 — `TileCGBlend`/`TileCGCopy` (зерно плёнки на титуле Haha Ranman;
 	// сетка-ромбы данжа Dohna).
@@ -1440,8 +1494,8 @@ static void PE_AddPartsConstructionProcess_ix(int parts_no, struct page **ai, st
 	// (`背景／会社`), два ползущих слоя 1280x720; без него поверхности пустые и
 	// данж выходил ЧЁРНЫМ, а размытие (28) и градиент альфы (26) применялись к
 	// пустоте.
-	static const int v14_ok[] = { 25, 26, 27, 28, 29, 88, 90, 97, 102, 106, 122, 128, 129 };
-	bool known_v14 = false;
+	static const int v14_ok[] = { 25, 26, 27, 28, 29, 128, 129 };
+	bool known_v14 = command >= 88 && command <= 127;  // всё семейство заливок фигур
 	for (size_t i = 0; i < sizeof(v14_ok) / sizeof(v14_ok[0]); i++)
 		known_v14 |= (command == v14_ok[i]);
 	if (command < 0 || (command >= NR_CLASSIC_CONSTRUCTION_COMMANDS && !known_v14)) {
@@ -2226,11 +2280,11 @@ static int act_construction_run(int no, int state, struct ex_tree *proc, int *sk
 		// Команды за пределами реализованного набора пропускаем ЯВНО: пусть их
 		// перечисляет один WARNING, а не тихий «unknown command» на каждую часть.
 		// Список тот же, что у ix-пути (v14_ok): 29 — CGBlend (фон данжа),
-		// 97 — полигон, 106 — круг цветом. Из раскладки полигон приходит без
-		// списка точек и просто ничего не рисует, но пропускать его молча нельзя.
+		// 88…127 — ВСЁ семейство заливок фигур (construction_fill_shape). Из
+		// раскладки многоугольник приходит без списка точек и просто ничего не
+		// рисует, но пропускать его молча нельзя.
 		if (command > 24 && command != 27 && command != 28 && command != 29
-				&& command != 88 && command != 90 && command != 97
-				&& command != 102 && command != 106 && command != 122
+				&& !(command >= 88 && command <= 127)
 				&& command != 128 && command != 129) {
 			static bool warned = false;
 			if (!warned) {

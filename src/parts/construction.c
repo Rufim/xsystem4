@@ -161,8 +161,15 @@ void parts_cp_op_free(struct parts_cp_op *op)
 	case PARTS_CP_FILL_GRADATION_AMAP:
 	case PARTS_CP_TILE_CG_BLEND:
 	case PARTS_CP_TILE_CG_COPY:
+	case PARTS_CP_FILL_PIE_COLOR:
+	case PARTS_CP_FILL_PIE_WITH_ALPHA:
+	case PARTS_CP_FILL_PIE_COLOR_BLEND:
 		break;
 	case PARTS_CP_FILL_POLYGON_BLEND:
+	case PARTS_CP_FILL_POLYGON_COLOR:
+	case PARTS_CP_FILL_POLYGON_WITH_ALPHA:
+	case PARTS_CP_FILL_POLYGON_AMAP:
+	case PARTS_CP_FILL_POLYGON_COLOR_BLEND:
 		free(op->polygon.pts);
 		break;
 	case PARTS_CP_DRAW_TEXT:
@@ -297,7 +304,33 @@ bool PE_AddFillAMapToPartsConstructionProcess(int parts_no, int x, int y, int w,
  * `ArrayPos` плоско (x0,y0,x1,y1,…), цвет и альфа — слоты 12..15, скругление
  * углов и угол — 36/37.
  */
-bool PE_AddFillPolygonBlendToPartsConstructionProcess(int parts_no, const int *pts,
+// Режим записи → тип операции. Пятёрка режимов одна и та же у всех фигур
+// (см. `enum parts_cp_shape_mode` и таблицу команд 88…127 в docs/FINDINGS.md);
+// у сектора и многоугольника «свой» тип на каждый режим, потому что тип уходит
+// числом в образ частей сейва, а поля у семейств разные.
+static enum parts_cp_op_type pie_type_for_mode(int mode)
+{
+	switch (mode) {
+	case PARTS_CP_SHAPE_COLOR:       return PARTS_CP_FILL_PIE_COLOR;
+	case PARTS_CP_SHAPE_WITH_ALPHA:  return PARTS_CP_FILL_PIE_WITH_ALPHA;
+	case PARTS_CP_SHAPE_AMAP:        return PARTS_CP_FILL_PIE_AMAP;
+	case PARTS_CP_SHAPE_COLOR_BLEND: return PARTS_CP_FILL_PIE_COLOR_BLEND;
+	default:                         return PARTS_CP_FILL_PIE_BLEND;
+	}
+}
+
+static enum parts_cp_op_type polygon_type_for_mode(int mode)
+{
+	switch (mode) {
+	case PARTS_CP_SHAPE_COLOR:       return PARTS_CP_FILL_POLYGON_COLOR;
+	case PARTS_CP_SHAPE_WITH_ALPHA:  return PARTS_CP_FILL_POLYGON_WITH_ALPHA;
+	case PARTS_CP_SHAPE_AMAP:        return PARTS_CP_FILL_POLYGON_AMAP;
+	case PARTS_CP_SHAPE_COLOR_BLEND: return PARTS_CP_FILL_POLYGON_COLOR_BLEND;
+	default:                         return PARTS_CP_FILL_POLYGON_BLEND;
+	}
+}
+
+bool PE_AddFillPolygonModeToPartsConstructionProcess(int parts_no, int mode, const int *pts,
 		int nr_pts, int r, int g, int b, int a, int round_corner, int angle, int state)
 {
 	if (!parts_state_valid(--state))
@@ -307,7 +340,7 @@ bool PE_AddFillPolygonBlendToPartsConstructionProcess(int parts_no, const int *p
 
 	struct parts_construction_process *cproc = get_cproc(parts_no, state);
 	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
-	op->type = PARTS_CP_FILL_POLYGON_BLEND;
+	op->type = polygon_type_for_mode(mode);
 	op->polygon.pts = xcalloc(nr_pts * 2, sizeof(int));
 	memcpy(op->polygon.pts, pts, (size_t)nr_pts * 2 * sizeof(int));
 	op->polygon.nr_pts = nr_pts;
@@ -322,18 +355,23 @@ bool PE_AddFillPolygonBlendToPartsConstructionProcess(int parts_no, const int *p
 	return true;
 }
 
-bool PE_AddFillCircleBlendToPartsConstructionProcess(int parts_no, int x, int y,
-		int rx, int ry, int r, int g, int b, int a, int state)
+bool PE_AddFillPieModeToPartsConstructionProcess(int parts_no, int mode, int x, int y,
+		int rx, int ry, int start_angle, int sweep_angle,
+		int r, int g, int b, int a, int state)
 {
 	if (!parts_state_valid(--state))
 		return false;
 
+	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
+		NOTICE("CP AddFillPie part=%d mode=%d c=(%d,%d) r=(%d,%d) angle=%d+%d "
+		       "rgba=(%d,%d,%d,%d)", parts_no, mode, x, y, rx, ry,
+		       start_angle, sweep_angle, r, g, b, a);
 	struct parts_construction_process *cproc = get_cproc(parts_no, state);
 	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
-	op->type = PARTS_CP_FILL_PIE_BLEND;
+	op->type = pie_type_for_mode(mode);
 	op->pie = (struct parts_cp_pie) {
 		.x = x, .y = y, .rx = rx, .ry = ry,
-		.start_angle = 0, .sweep_angle = 360, .a = a,
+		.start_angle = start_angle, .sweep_angle = sweep_angle, .a = a,
 		.r = r, .g = g, .b = b
 	};
 
@@ -341,25 +379,18 @@ bool PE_AddFillCircleBlendToPartsConstructionProcess(int parts_no, int x, int y,
 	return true;
 }
 
+bool PE_AddFillCircleBlendToPartsConstructionProcess(int parts_no, int x, int y,
+		int rx, int ry, int r, int g, int b, int a, int state)
+{
+	return PE_AddFillPieModeToPartsConstructionProcess(parts_no, PARTS_CP_SHAPE_ALPHA_BLEND,
+			x, y, rx, ry, 0, 360, r, g, b, a, state);
+}
+
 bool PE_AddFillPieAMapToPartsConstructionProcess(int parts_no, int x, int y, int rx, int ry,
 		int start_angle, int sweep_angle, int a, int state)
 {
-	if (!parts_state_valid(--state))
-		return false;
-
-	if (getenv("XSYS4_CP_TRACE") && parts_no >= 90000000)
-		NOTICE("CP AddFillPieAMap part=%d c=(%d,%d) r=(%d,%d) angle=%d+%d a=%d",
-		       parts_no, x, y, rx, ry, start_angle, sweep_angle, a);
-	struct parts_construction_process *cproc = get_cproc(parts_no, state);
-	struct parts_cp_op *op = xcalloc(1, sizeof(struct parts_cp_op));
-	op->type = PARTS_CP_FILL_PIE_AMAP;
-	op->pie = (struct parts_cp_pie) {
-		.x = x, .y = y, .rx = rx, .ry = ry,
-		.start_angle = start_angle, .sweep_angle = sweep_angle, .a = a
-	};
-
-	parts_add_cp_op(cproc, op);
-	return true;
+	return PE_AddFillPieModeToPartsConstructionProcess(parts_no, PARTS_CP_SHAPE_AMAP,
+			x, y, rx, ry, start_angle, sweep_angle, 0, 0, 0, a, state);
 }
 
 bool PE_AddFillWithAlphaToPartsConstructionProcess(int parts_no, int x, int y, int w, int h,
@@ -788,11 +819,13 @@ static void cp_blend_shape(struct parts_construction_process *cproc, int x, int 
 }
 
 /*
- * Маска сектора/круга со сглаживанием (суперсэмплинг 3x3): общая и для заливки
- * альфа-карты (команды 102/122), и для ЦВЕТНОЙ заливки с блендом (команда 106) —
- * геометрия у них одна, различается только то, куда кладётся результат.
+ * Маска сектора/круга со сглаживанием (суперсэмплинг 3x3): общая на все режимы
+ * записи (команды 98…127) — геометрия у них одна, различается только то, куда
+ * кладётся результат. `full` — значение при ПОЛНОМ покрытии пикселя: у альфа-карты
+ * это заливаемая альфа, у остальных режимов 255 (чистая доля площади, дальше её
+ * применяет apply_shape_cov).
  */
-static uint8_t *pie_mask(struct parts_cp_pie *op, int *out_w, int *out_h)
+static uint8_t *pie_cov_mask(struct parts_cp_pie *op, int full, int *out_w, int *out_h)
 {
 	int rx = abs(op->rx), ry = abs(op->ry);
 	if (rx <= 0 || ry <= 0)
@@ -825,12 +858,122 @@ static uint8_t *pie_mask(struct parts_cp_pie *op, int *out_w, int *out_h)
 				}
 			}
 			if (hits)
-				amap[py * w + px] = op->a * hits / (SS * SS);
+				amap[py * w + px] = full * hits / (SS * SS);
 		}
 	}
 	*out_w = w;
 	*out_h = h;
 	return amap;
+}
+
+/*
+ * Покрытие пикселей МНОГОУГОЛЬНИКОМ (правило чётности пересечений, суперсэмплинг
+ * 3x3 — тот же, что у круга, поэтому края сглажены одинаково). Возвращает маску
+ * размером с описанный прямоугольник, его левый верхний угол — в out_x/out_y.
+ * `full` — значение при полном покрытии (см. pie_cov_mask).
+ */
+static uint8_t *polygon_cov_mask(struct parts_cp_polygon *op, int full,
+		int *out_x, int *out_y, int *out_w, int *out_h)
+{
+	if (!op->pts || op->nr_pts < 3)
+		return NULL;
+
+	int min_x = op->pts[0], max_x = op->pts[0];
+	int min_y = op->pts[1], max_y = op->pts[1];
+	for (int i = 1; i < op->nr_pts; i++) {
+		int x = op->pts[i * 2], y = op->pts[i * 2 + 1];
+		if (x < min_x) min_x = x;
+		if (x > max_x) max_x = x;
+		if (y < min_y) min_y = y;
+		if (y > max_y) max_y = y;
+	}
+	int w = max_x - min_x + 1, h = max_y - min_y + 1;
+	if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
+		return NULL;
+
+	uint8_t *amap = xcalloc(1, (size_t)w * h);
+	const int SS = 3;
+	for (int py = 0; py < h; py++) {
+		for (int px = 0; px < w; px++) {
+			int hits = 0;
+			for (int sy = 0; sy < SS; sy++) {
+				for (int sx = 0; sx < SS; sx++) {
+					float fx = min_x + px + (sx + 0.5f) / SS;
+					float fy = min_y + py + (sy + 0.5f) / SS;
+					bool in = false;
+					for (int i = 0, j = op->nr_pts - 1; i < op->nr_pts; j = i++) {
+						float xi = op->pts[i * 2], yi = op->pts[i * 2 + 1];
+						float xj = op->pts[j * 2], yj = op->pts[j * 2 + 1];
+						if ((yi > fy) != (yj > fy)
+								&& fx < (xj - xi) * (fy - yi) / (yj - yi) + xi)
+							in = !in;
+					}
+					if (in)
+						hits++;
+				}
+			}
+			if (hits)
+				amap[py * w + px] = full * hits / (SS * SS);
+		}
+	}
+	*out_x = min_x;
+	*out_y = min_y;
+	*out_w = w;
+	*out_h = h;
+	return amap;
+}
+
+/*
+ * Положить фигуру на поверхность построения по маске ПОКРЫТИЯ, режимы записи
+ * `PARTS_CP_SHAPE_*` кроме ALPHA_BLEND (у того свой текстурный путь, cp_blend_shape).
+ * Пиксельно, а не шейдером: фигура строится один раз в текстуру (не горячий путь),
+ * а формулу для каждого режима надо иметь ровно ту, что у прямоугольных заливок —
+ * COLOR не трогает альфу, WITH_ALPHA подменяет всё, AMAP только альфу,
+ * COLOR_BLEND подмешивает цвет по своей альфе, не меняя альфу приёмника.
+ * Буфер `gfx_get_pixels` идёт СНИЗУ ВВЕРХ (см. build_blur_filter).
+ */
+static void apply_shape_cov(struct parts_construction_process *cproc, int ox, int oy,
+		int w, int h, const uint8_t *cov, int r, int g, int b, int a, int mode)
+{
+	Texture *t = &cproc->common.texture;
+	uint8_t *px = gfx_get_pixels(t);
+	for (int py = 0; py < h; py++) {
+		int ty = oy + py;
+		if (ty < 0 || ty >= t->h)
+			continue;
+		int by = t->h - 1 - ty;
+		for (int pxi = 0; pxi < w; pxi++) {
+			int tx = ox + pxi;
+			if (tx < 0 || tx >= t->w)
+				continue;
+			int c = cov[py * w + pxi];
+			if (!c)
+				continue;
+			uint8_t *p = px + ((size_t)by * t->w + tx) * 4;
+			int k = c;
+			switch (mode) {
+			case PARTS_CP_SHAPE_COLOR_BLEND:
+				k = a * c / 255;
+				// fallthrough: та же формула по цвету, альфа приёмника не меняется
+			case PARTS_CP_SHAPE_COLOR:
+				p[0] = (p[0] * (255 - k) + r * k) / 255;
+				p[1] = (p[1] * (255 - k) + g * k) / 255;
+				p[2] = (p[2] * (255 - k) + b * k) / 255;
+				break;
+			case PARTS_CP_SHAPE_WITH_ALPHA:
+				p[0] = (p[0] * (255 - k) + r * k) / 255;
+				p[1] = (p[1] * (255 - k) + g * k) / 255;
+				p[2] = (p[2] * (255 - k) + b * k) / 255;
+				p[3] = (p[3] * (255 - k) + a * k) / 255;
+				break;
+			case PARTS_CP_SHAPE_AMAP:
+				p[3] = (p[3] * (255 - k) + a * k) / 255;
+				break;
+			}
+		}
+	}
+	gfx_update_texture_with_pixels(t, px);
+	free(px);
 }
 
 /*
@@ -856,50 +999,58 @@ static bool build_fill_polygon_blend(struct parts_construction_process *cproc,
 		}
 	}
 
-	int min_x = op->pts[0], max_x = op->pts[0];
-	int min_y = op->pts[1], max_y = op->pts[1];
-	for (int i = 1; i < op->nr_pts; i++) {
-		int x = op->pts[i * 2], y = op->pts[i * 2 + 1];
-		if (x < min_x) min_x = x;
-		if (x > max_x) max_x = x;
-		if (y < min_y) min_y = y;
-		if (y > max_y) max_y = y;
-	}
-	int w = max_x - min_x + 1, h = max_y - min_y + 1;
-	if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
+	int min_x, min_y, w, h;
+	uint8_t *amap = polygon_cov_mask(op, op->a, &min_x, &min_y, &w, &h);
+	if (!amap)
 		return false;
-
-	uint8_t *amap = xcalloc(1, (size_t)w * h);
-	const int SS = 3;
-	for (int py = 0; py < h; py++) {
-		for (int px = 0; px < w; px++) {
-			int hits = 0;
-			for (int sy = 0; sy < SS; sy++) {
-				for (int sx = 0; sx < SS; sx++) {
-					float fx = min_x + px + (sx + 0.5f) / SS;
-					float fy = min_y + py + (sy + 0.5f) / SS;
-					bool in = false;
-					for (int i = 0, j = op->nr_pts - 1; i < op->nr_pts; j = i++) {
-						float xi = op->pts[i * 2], yi = op->pts[i * 2 + 1];
-						float xj = op->pts[j * 2], yj = op->pts[j * 2 + 1];
-						if ((yi > fy) != (yj > fy)
-								&& fx < (xj - xi) * (fy - yi) / (yj - yi) + xi)
-							in = !in;
-					}
-					if (in)
-						hits++;
-				}
-			}
-			if (hits)
-				amap[py * w + px] = op->a * hits / (SS * SS);
-		}
-	}
 
 	Texture tmp;
 	gfx_init_texture_amap(&tmp, w, h, amap, (SDL_Color){ op->r, op->g, op->b, 255 });
 	cp_blend_shape(cproc, min_x, min_y, w, h, &tmp);
 	gfx_delete_texture(&tmp);
 	free(amap);
+	return true;
+}
+
+/*
+ * Остальные четыре режима заливки многоугольника (команды 93…96): геометрия та же,
+ * различие — в формуле записи (см. apply_shape_cov). Так `WorkResultScreen`
+ * и `SceneSendResult` рисуют свои косые плашки (94), а `BattleResultPlayerView` —
+ * вырез в альфа-карте (95).
+ */
+static bool build_fill_polygon_mode(struct parts_construction_process *cproc,
+		struct parts_cp_polygon *op, int mode)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int min_x, min_y, w, h;
+	uint8_t *cov = polygon_cov_mask(op, 255, &min_x, &min_y, &w, &h);
+	if (!cov)
+		return false;
+	apply_shape_cov(cproc, min_x, min_y, w, h, cov, op->r, op->g, op->b, op->a, mode);
+	free(cov);
+	return true;
+}
+
+/*
+ * Остальные три режима заливки круга/эллипса/сектора (команды 98/99, 100/101,
+ * 104/105 и их эллиптические и секторные близнецы). ★Узлы миникарты Dohna — это
+ * ровно 101 (`FillCircleWithAlphaInRect`): на обнулённой по альфе поверхности
+ * 32x32 белый круг d=24, дальше часть красится множителем (жёлтый — следующий
+ * узел, белый — уже пройденный).
+ */
+static bool build_fill_pie_mode(struct parts_construction_process *cproc,
+		struct parts_cp_pie *op, int mode)
+{
+	if (!cproc->common.texture.handle)
+		return false;
+	int w, h;
+	uint8_t *cov = pie_cov_mask(op, 255, &w, &h);
+	if (!cov)
+		return false;
+	apply_shape_cov(cproc, op->x - abs(op->rx), op->y - abs(op->ry), w, h, cov,
+			op->r, op->g, op->b, op->a, mode);
+	free(cov);
 	return true;
 }
 
@@ -911,7 +1062,7 @@ static bool build_fill_pie_blend(struct parts_construction_process *cproc, struc
 	if (!cproc->common.texture.handle)
 		return false;
 	int w, h;
-	uint8_t *amap = pie_mask(op, &w, &h);
+	uint8_t *amap = pie_cov_mask(op, op->a, &w, &h);
 	if (!amap)
 		return false;
 	Texture tmp;
@@ -922,81 +1073,17 @@ static bool build_fill_pie_blend(struct parts_construction_process *cproc, struc
 	return true;
 }
 
+/*
+ * ★Альфу в пределах сектора ЗАПИСЫВАЕМ, а не берём максимумом: игра шлёт этот
+ * шаг и для СТИРАНИЯ (`a = 0`). Круговая шкала автомода Haha Ranman так и
+ * устроена — поверхность = зелёное кольцо из CG, а непройденная доля круга
+ * вырезается сектором с нулевой альфой (`CWaitPie@BuildCg`: sweep = 360 − угол).
+ * При `gfx_copy_amap_max` стирание было no-op, и кольцо всегда стояло полным.
+ * Формула (old·(1 − cov) + a·cov) — общая для всех режимов, см. apply_shape_cov.
+ */
 static bool build_fill_pie_amap(struct parts_construction_process *cproc, struct parts_cp_pie *op)
 {
-	if (!cproc->common.texture.handle)
-		return false;
-	int rx = abs(op->rx), ry = abs(op->ry);
-	if (rx <= 0 || ry <= 0)
-		return false;
-	int w = rx * 2, h = ry * 2;
-	uint8_t *amap = xcalloc(1, (size_t)w * h);
-	float a0 = op->start_angle * (float)M_PI / 180.0f;
-	float a1 = a0 + op->sweep_angle * (float)M_PI / 180.0f;
-	if (a1 < a0) { float t = a0; a0 = a1; a1 = t; }
-	float sweep = a1 - a0;
-	const int SS = 3;
-	for (int py = 0; py < h; py++) {
-		for (int px = 0; px < w; px++) {
-			int hits = 0;
-			for (int sy = 0; sy < SS; sy++) {
-				for (int sx = 0; sx < SS; sx++) {
-					float fx = px + (sx + 0.5f) / SS - rx;
-					float fy = py + (sy + 0.5f) / SS - ry;
-					float nx = fx / rx, ny = fy / ry;
-					if (nx * nx + ny * ny > 1.0f)
-						continue;
-					if (sweep < 2.0f * (float)M_PI - 0.001f) {
-						// atan2(y, x) при экранном Y (вниз) уже даёт угол по
-						// часовой стрелке — ровно соглашение раскладки.
-						float ang = atan2f(fy, fx);
-						while (ang < a0)
-							ang += 2.0f * (float)M_PI;
-						if (ang > a1)
-							continue;
-					}
-					hits++;
-				}
-			}
-			if (hits)
-				amap[py * w + px] = 255 * hits / (SS * SS);
-		}
-	}
-	/*
-	 * ★Альфу в пределах сектора ЗАПИСЫВАЕМ, а не берём максимумом: игра шлёт этот
-	 * шаг и для СТИРАНИЯ (`a = 0`). Круговая шкала автомода Haha Ranman так и
-	 * устроена — поверхность = зелёное кольцо из CG, а непройденная доля круга
-	 * вырезается сектором с нулевой альфой (`CWaitPie@BuildCg`: sweep = 360 − угол).
-	 * При `gfx_copy_amap_max` стирание было no-op, и кольцо всегда стояло полным.
-	 *
-	 * `amap` здесь — ПОКРЫТИЕ пикселя сектором (суперсэмплинг 3×3), а не готовая
-	 * альфа: результат = old·(1 − cov) + a·cov. Для `a = 255` поверх нуля это
-	 * ровно прежнее поведение (скруглённые подложки Dohna не меняются), а края
-	 * остаются сглаженными в обе стороны.
-	 */
-	Texture *t = &cproc->common.texture;
-	int ox = op->x - rx, oy = op->y - ry;
-	uint8_t *px = gfx_get_pixels(t);
-	for (int py = 0; py < h; py++) {
-		int ty = oy + py;                  // экранная строка
-		if (ty < 0 || ty >= t->h)
-			continue;
-		int by = t->h - 1 - ty;            // буфер идёт снизу вверх (см. build_blur_filter)
-		for (int pxi = 0; pxi < w; pxi++) {
-			int tx = ox + pxi;
-			if (tx < 0 || tx >= t->w)
-				continue;
-			int cov = amap[py * w + pxi];
-			if (!cov)
-				continue;
-			uint8_t *dst = px + ((size_t)by * t->w + tx) * 4 + 3;
-			*dst = (*dst * (255 - cov) + op->a * cov) / 255;
-		}
-	}
-	gfx_update_texture_with_pixels(t, px);
-	free(px);
-	free(amap);
-	return true;
+	return build_fill_pie_mode(cproc, op, PARTS_CP_SHAPE_AMAP);
 }
 
 static bool build_fill_with_alpha(struct parts_construction_process *cproc, struct parts_cp_fill *op)
@@ -1441,6 +1528,36 @@ bool parts_build_construction_process(struct parts *parts,
 			break;
 		case PARTS_CP_FILL_PIE_AMAP:
 			if (!build_fill_pie_amap(cproc, &op->pie))
+				return false;
+			break;
+		// Остальные режимы заливки фигур (см. `enum parts_cp_shape_mode`):
+		// геометрия та же, различие только в формуле записи пикселя.
+		case PARTS_CP_FILL_PIE_COLOR:
+			if (!build_fill_pie_mode(cproc, &op->pie, PARTS_CP_SHAPE_COLOR))
+				return false;
+			break;
+		case PARTS_CP_FILL_PIE_WITH_ALPHA:
+			if (!build_fill_pie_mode(cproc, &op->pie, PARTS_CP_SHAPE_WITH_ALPHA))
+				return false;
+			break;
+		case PARTS_CP_FILL_PIE_COLOR_BLEND:
+			if (!build_fill_pie_mode(cproc, &op->pie, PARTS_CP_SHAPE_COLOR_BLEND))
+				return false;
+			break;
+		case PARTS_CP_FILL_POLYGON_COLOR:
+			if (!build_fill_polygon_mode(cproc, &op->polygon, PARTS_CP_SHAPE_COLOR))
+				return false;
+			break;
+		case PARTS_CP_FILL_POLYGON_WITH_ALPHA:
+			if (!build_fill_polygon_mode(cproc, &op->polygon, PARTS_CP_SHAPE_WITH_ALPHA))
+				return false;
+			break;
+		case PARTS_CP_FILL_POLYGON_AMAP:
+			if (!build_fill_polygon_mode(cproc, &op->polygon, PARTS_CP_SHAPE_AMAP))
+				return false;
+			break;
+		case PARTS_CP_FILL_POLYGON_COLOR_BLEND:
+			if (!build_fill_polygon_mode(cproc, &op->polygon, PARTS_CP_SHAPE_COLOR_BLEND))
 				return false;
 			break;
 		case PARTS_CP_FILL_AMAP:
