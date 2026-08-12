@@ -1826,6 +1826,32 @@ static void parts_combine_params(struct parts_params *parent, struct parts_param
 		dx = -dx;
 	if (mirror_y)
 		dy = -dy;
+	/*
+	 * ★И ПОВОРОТ — тоже в ОБОИХ путях. Наклон родителя разворачивает смещение
+	 * потомка (правило и его доказательство — в parts_update_global_pos, §5dx:
+	 * розовая бирка `M11` обязана держаться за наклонной подписью узла данжа).
+	 * Здесь его не было, и ближайший `UpdateComponent` возвращал НЕповёрнутое
+	 * смещение — то есть §5dx воспроизводился заново на любом пересчёте.
+	 *
+	 * Замер (узел `Parking Ent.`, подпись 90000967 наклонена на 323.75°, бирка
+	 * 90000969 смещена на (84,-14)): в живой игре бирка стоит в (744,272), после
+	 * загрузки образа сейва вставала в (769,319) — ровно неповёрнутое смещение.
+	 * Поворот на −36.25° даёт (59,-61) и возвращает бирку в (744,272).
+	 *
+	 * Порядок как в первом пути: зеркало применяется ДО поворота, а угол берётся
+	 * с обратным знаком при зеркальности по одной оси (`M∘R(θ) = R(−θ)∘M`).
+	 */
+	float rot = parent->rotation.z;
+	if (mirror_x != mirror_y)
+		rot = -rot;
+	if (rot != 0.0f) {
+		float a = rot * (float)M_PI / 180.0f;
+		float c = cosf(a), s = sinf(a);
+		float rx = dx * c - dy * s;
+		float ry = dx * s + dy * c;
+		dx = rx;
+		dy = ry;
+	}
 	out->pos = (Point) {
 		parent->pos.x + (int)roundf(dx),
 		parent->pos.y + (int)roundf(dy)
@@ -1837,9 +1863,19 @@ static void parts_combine_params(struct parts_params *parent, struct parts_param
 	out->rotation.x = parent->rotation.x + child->rotation.x;
 	out->rotation.y = parent->rotation.y + child->rotation.y;
 	out->rotation.z = parent->rotation.z + child->rotation.z;
-	out->add_color.r = parent->add_color.r * (child->add_color.r / 255.0f);
-	out->add_color.g = parent->add_color.g * (child->add_color.g / 255.0f);
-	out->add_color.b = parent->add_color.b * (child->add_color.b / 255.0f);
+	/*
+	 * ★ДОБАВОЧНЫЙ ЦВЕТ СКЛАДЫВАЕТСЯ — та же модель, что в
+	 * `parts_update_global_add_color` (там она и доказана: мерцающий белым маркер
+	 * события на карте Haha Ranman). Здесь оставалась апстримная умножительная
+	 * формула, и ВТОРОЙ путь расчёта затирал первый на ближайшем
+	 * `UpdateComponent`: у части с родителем добавка гасилась в ноль
+	 * (`parent.add = 0` у корня → `0 * local = 0`) — ровно та ловушка «правило
+	 * нужно в ОБА пути», о которой предупреждает §5ej для позиции.
+	 * Клампим, иначе на цепочке контейнеров сумма переполнит байт.
+	 */
+	out->add_color.r = min(255, parent->add_color.r + child->add_color.r);
+	out->add_color.g = min(255, parent->add_color.g + child->add_color.g);
+	out->add_color.b = min(255, parent->add_color.b + child->add_color.b);
 	out->multiply_color.r = parent->multiply_color.r * (child->multiply_color.r / 255.0f);
 	out->multiply_color.g = parent->multiply_color.g * (child->multiply_color.g / 255.0f);
 	out->multiply_color.b = parent->multiply_color.b * (child->multiply_color.b / 255.0f);
