@@ -1205,7 +1205,26 @@ static void delegate_call(int dg_no, int return_address)
 				WARNING("DGARG dg=%d nr_args=%d nr_vars=%d i=%d type=%d val=%d",
 					dg_no, dg->nr_arguments, dg->nr_variables, i,
 					dg->variables[i].type.data, arg.i);
-			heap[slot].page->values[i] = vm_copy(arg, dg->variables[i].type.data);
+			/*
+			 * ★АРГУМЕНТ-ХЭНДЛ (`wrap<T>`, `ref <интерфейс>`) КЛАДЁМ БЕЗ
+			 * ССЫЛКИ — симметрично `delete_page_vars`, который у аргументов
+			 * этих типов освобождение ПРОПУСКАЕТ (они одолженные: сайт кладёт
+			 * значение чтением, владения не передаёт). Пока здесь стоял
+			 * `vm_copy`, каждый делегатный вызов брал +1 и никто его не отдавал.
+			 *
+			 * Чем это ломало Dohna (§5eq): покадровое событие боя рассылается
+			 * ДВУМ обработчикам с аргументом-контроллером
+			 * (`ActionViewControllerSet@<lambda CreateActionMotion>` и
+			 * `PlayerActionView@UpdateFrame`), поэтому счётчик
+			 * `ActionFrameController` рос на +2 на КАЖДЫЙ кадр анимации
+			 * (замер вотчем: 2 → 46 за одно действие). Контроллер не умирал
+			 * никогда: после действия он продолжал тикать вместе с новым —
+			 * анимация сходившего бойца дёргалась, а фаза действия схлопывалась,
+			 * и закрас `Exclude` снимался почти сразу.
+			 */
+			enum ain_data_type at = dg->variables[i].type.data;
+			heap[slot].page->values[i] = (at == AIN_WRAP || at == AIN_IFACE)
+				? arg : vm_copy(arg, at);
 		}
 
 		set_struct_page(obj);
@@ -2033,6 +2052,9 @@ static enum opcode execute_instruction(enum opcode opcode)
 			WARNING("OPT set class=0x%x n=%d tag=%d val=%d (old tag=%d val=%d)",
 				elem_class, n, vals[n].i, vals[0].i, ref[n].i, ref[0].i);
 		}
+		// ПРЕЖНЕЕ содержимое отдаём: раз запись берёт +1 (ниже), перезапись
+		// обязана снять −1, иначе владение асимметрично и объект живёт вечно.
+		int opt_old_val = ref[0].i, opt_old_tag = ref[n].i;
 		for (int i = 0; i <= n; i++)
 			ref[i] = vals[i];
 		// Взять ВЛАДЕНИЕ значением. Дисциплина ссылок в Ixseal явная (SP_INC /
@@ -2040,12 +2062,26 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// `AFL_Parts_CreateSprite` приходит с +1 (SP_INC перед RETURN), а сразу
 		// после X_OP_SET сайт освобождает временный локал («X_REF 1; DELETE») —
 		// без своей ссылки option оставался бы висячим.
-		// Прежнее содержимое НЕ освобождаем: сайты установки в None
-		// (`PUSH -1; PUSH -1; PUSH 1`) не делают этого сами, но семантика по
-		// байткоду не установлена — лишний unref дал бы double free, а лишняя
-		// ссылка только течёт.
-		if (x_option_class_is_ref(elem_class) && vals[n].i == 0 && vals[0].i != -1)
+		/*
+		 * ★ПРЕЖНЕЕ СОДЕРЖИМОЕ ОСВОБОЖДАЕМ (2026-08-12, §5eq). Сайты установки в
+		 * None (`PUSH -1; PUSH -1; PUSH 1`) сами этого не делают — и не должны:
+		 * `option`-поле ВЛАДЕЕТ значением (мы берём +1 строкой ниже), значит
+		 * перезапись обязана отдать прежнее. Без этого объекты живут вечно:
+		 * `SkillSelector@Release` кладёт None в поле кнопок, `SkillButton`
+		 * не умирает, его деструктор (а с ним `ActivityPool@Return` и
+		 * `Show(false)`) не вызывается — на экране остаётся карточка умения
+		 * прошлого персонажа; так же не умирал `ActionFrameController`
+		 * (два создания на один деструктор — две анимации на одном бойце).
+		 * Порядок «сначала +1 новому, потом −1 старому» обязателен: при записи
+		 * того же объекта в то же поле счётчик не должен проваливаться в ноль.
+		 * XSYS4_XOPT_NO_RELEASE=1 — откат поведения (A/B на случай double free).
+		 */
+		bool opt_ref_class = x_option_class_is_ref(elem_class);
+		if (opt_ref_class && vals[n].i == 0 && vals[0].i != -1)
 			heap_ref(vals[0].i);
+		if (opt_ref_class && opt_old_tag == 0 && opt_old_val != -1
+				&& !getenv("XSYS4_XOPT_NO_RELEASE"))
+			heap_unref(opt_old_val);
 		for (int i = 0; i <= n; i++)
 			stack[stack_ptr++] = vals[i];
 		break;
@@ -2067,8 +2103,9 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Счётчик берём ТОЛЬКО для типов, которые владеют heap-слотом (набор
 		// тот же, что освобождает variable_fini): для int/float это затронуло
 		// бы чужой слот кучи. Тип берётся из ОБЪЯВЛЕНИЯ приёмника.
-		// Прежнее содержимое не освобождаем — как и в X_OP_SET: семантика по
-		// байт-коду не установлена, лишний unref дал бы double free.
+		// Прежнее содержимое ОСВОБОЖДАЕМ — симметрично взятию ссылки ниже и по
+		// той же причине, что в X_OP_SET (§5eq): владеющий член, у которого
+		// перезапись не отдаёт старое значение, держит объект вечно.
 		int val = stack_pop().i;
 		int page_index = stack_pop().i;
 		int heap_index = stack_pop().i;
@@ -2076,9 +2113,14 @@ static enum opcode execute_instruction(enum opcode opcode)
 			    || page_index < 0 || page_index >= heap[heap_index].page->nr_vars))
 			VM_ERROR("X_SET: out of bounds page index: %d/%d", heap_index, page_index);
 		struct page *page = heap[heap_index].page;
-		if (val != -1 && slot_owns_heap_ref(variable_type(page, page_index, NULL, NULL)))
+		bool xset_owns = slot_owns_heap_ref(variable_type(page, page_index, NULL, NULL));
+		int xset_old = page->values[page_index].i;
+		if (val != -1 && xset_owns)
 			heap_ref(val);
 		page->values[page_index].i = val;
+		if (xset_owns && xset_old != -1 && xset_old != val
+				&& !getenv("XSYS4_XOPT_NO_RELEASE"))
+			heap_unref(xset_old);
 		stack_push(val);
 		break;
 	}
