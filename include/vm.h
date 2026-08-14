@@ -165,6 +165,9 @@ const char *vm_current_instruction_name(void);
 // Диагностика: сообщение о double free должно называть ТИП и место, а не только
 // номер слота — слоты переиспользуются, по номеру виновника не опознать.
 void vm_note_last_fini(int type, int value, const char *fn);
+// Чьё поле освобождается (структура + номер члена) — контекст для сообщений о
+// double free: тип и значение без имени поля почти ничего не говорят.
+void vm_note_fini_owner(const char *struct_name, const char *field_name, int field);
 const char *vm_last_fini_str(void);
 
 // Системные окна сообщений (у оригинала на Windows это MessageBox). Один путь и для

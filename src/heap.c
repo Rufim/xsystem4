@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include <assert.h>
 #include "system4/string.h"
 #include "vm.h"
@@ -50,11 +52,31 @@ static const char *vm_ptrtype_string(enum vm_pointer_type type) {
 	return "INVALID POINTER TYPE";
 }
 
+// Некролог слота — см. развёрнутый комментарий у heap_note_death ниже.
+struct heap_dead_rec {
+	const char *fn;    // функция игры, в которой слот умер (имя из ain — стабильный указатель)
+	const char *what;  // чем слот был: имя структуры либо тип страницы
+	uint32_t addr;     // адрес инструкции VM в момент смерти
+	uint32_t seq;      // поколение слота на момент смерти — отличает старую смерть от свежей
+	int32_t nr_vars;   // размер страницы (у массива — длина)
+};
+static struct heap_dead_rec *heap_dead;
+// XSYS4_DEAD_STACK=<N> — N верхних кадров стека игры на момент смерти, по записи на слот.
+static int dead_stack_n = -1;
+static const char **dead_stack;
+
 void heap_grow(size_t new_size)
 {
 	assert(new_size > heap_size);
 	heap = xrealloc(heap, sizeof(struct vm_pointer) * new_size);
 	heap_free_stack = xrealloc(heap_free_stack, sizeof(int32_t) * new_size);
+	heap_dead = xrealloc(heap_dead, sizeof(struct heap_dead_rec) * new_size);
+	memset(heap_dead + heap_size, 0, sizeof(struct heap_dead_rec) * (new_size - heap_size));
+	if (dead_stack) {
+		dead_stack = xrealloc(dead_stack, sizeof(const char *) * new_size * dead_stack_n);
+		memset(dead_stack + heap_size * dead_stack_n, 0,
+		       sizeof(const char *) * (new_size - heap_size) * dead_stack_n);
+	}
 	for (size_t i = heap_size; i < new_size; i++) {
 		heap[i].ref = 0;
 		heap_free_stack[i] = i;
@@ -77,8 +99,10 @@ void heap_init(void)
 		heap_size = INITIAL_HEAP_SIZE;
 		heap = xcalloc(1, INITIAL_HEAP_SIZE * sizeof(struct vm_pointer));
 		heap_free_stack = xmalloc(INITIAL_HEAP_SIZE * sizeof(int32_t));
+		heap_dead = xcalloc(INITIAL_HEAP_SIZE, sizeof(struct heap_dead_rec));
 	} else {
 		memset(heap, 0, heap_size * sizeof(struct vm_pointer*));
+		memset(heap_dead, 0, heap_size * sizeof(struct heap_dead_rec));
 	}
 
 	for (size_t i = 0; i < heap_size; i++) {
@@ -171,6 +195,96 @@ void heap_watch_slot_set(int32_t slot)
 		heap_watch_slots[heap_watch_nr - 1] = slot; // последняя ячейка — по кругу
 }
 
+/*
+ * ★НЕКРОЛОГ СЛОТА — `heap_dead[]`, по записи на слот кучи.
+ *
+ * Зачем: аллокатор выдаёт слоты СТЕКОМ (LIFO), то есть только что освобождённый
+ * слот уходит следующему объекту НЕМЕДЛЕННО. Из-за этого use-after-free никогда не
+ * виден на месте: хэндл, переживший свой объект, читает не пустоту, а ЧУЖОЙ живой
+ * объект, и падение случается позже и в другой функции. Живой случай — §5eu:
+ * `m_parts` привёл к странице, чей `values[0]` оказался vtable на 18 методов
+ * (`parts::detail::CCGParts`) вместо 316 у `CParts`, и запрос метода 31 вышел за
+ * границы. Некролог отвечает на «чем слот был раньше и кто его убил» одной строкой,
+ * без второго прогона.
+ *
+ * Стоимость — 24 байта на слот и запись четырёх полей при смерти, поэтому ведём
+ * всегда: диагностика, включаемая задним числом, для однократно воспроизводимого
+ * падения бесполезна.
+ */
+// Описание страницы для некролога: имя структуры, если это объект, иначе тип страницы.
+static const char *heap_page_what(struct page *p)
+{
+	if (!p)
+		return "(нет страницы)";
+	if (p->type == STRUCT_PAGE && p->index >= 0 && p->index < ain->nr_structures)
+		return ain->structures[p->index].name;
+	return pagetype_string(p->type);
+}
+
+/*
+ * `XSYS4_DEAD_STACK=<N>` — хранить в некрологе ещё и N ВЕРХНИХ КАДРОВ стека игры на
+ * момент смерти. Одного имени функции хватает не всегда: `variable_fini` зовётся из
+ * общего `delete_page`, и по нему видно «кто освободил страницу», но не «чью». Имена
+ * функций берутся из ain (указатели стабильны), поэтому цена — N указателей на слот.
+ */
+// (объявлены выше, рядом с heap_dead — их перевыделяет heap_grow)
+
+// Вызывается ДО delete_page: после него страница уже освобождена и прочитать
+// её тип/размер нельзя (heap[slot].page остаётся висячим указателем).
+static void heap_note_death(int32_t slot)
+{
+	if (!heap_dead || slot < 0 || (size_t)slot >= heap_size)
+		return;
+	struct heap_dead_rec *d = &heap_dead[slot];
+	d->fn = (call_stack_ptr > 0) ? vm_current_function_name() : NULL;
+	d->addr = instr_ptr;
+	d->seq = heap[slot].seq;
+	if (heap[slot].type == VM_STRING) {
+		d->what = "VM_STRING";
+		d->nr_vars = -1;
+	} else {
+		struct page *p = heap[slot].page;
+		d->what = heap_page_what(p);
+		d->nr_vars = p ? p->nr_vars : -1;
+	}
+	if (unlikely(dead_stack_n < 0)) {
+		const char *s = getenv("XSYS4_DEAD_STACK");
+		dead_stack_n = (s && *s) ? atoi(s) : 0;
+	}
+	if (unlikely(dead_stack_n > 0)) {
+		if (!dead_stack)
+			dead_stack = xcalloc(heap_size * dead_stack_n, sizeof(const char *));
+		const char **st = dead_stack + (size_t)slot * dead_stack_n;
+		for (int i = 0; i < dead_stack_n; i++) {
+			int f = call_stack_ptr - 1 - i;
+			st[i] = (f >= 0) ? ain->functions[call_stack[f].fno].name : NULL;
+		}
+	}
+}
+
+const char *heap_dead_str(int32_t slot, bool with_stack)
+{
+	static char buf[1024];
+	if (!heap_dead || slot < 0 || (size_t)slot >= heap_size || !heap_dead[slot].what)
+		return "(некролога нет: слот ещё не умирал)";
+	struct heap_dead_rec *d = &heap_dead[slot];
+	int n = snprintf(buf, sizeof(buf), "БЫЛ %s (nr_vars=%d, seq=%u), умер @%X в %s%s",
+			 display_sjis0(d->what), d->nr_vars, d->seq, d->addr,
+			 d->fn ? display_sjis2(d->fn) : "(не в коде игры)",
+			 // heap_free_slot обнуляет seq, поэтому «seq не совпал» у мёртвого
+			 // слота ещё не значит переиспользования — различаем по ref.
+			 heap[slot].ref <= 0 ? " — и слот сейчас СВОБОДЕН (никем не занят)"
+			 : heap[slot].seq != d->seq ? " — и слот с тех пор ПЕРЕИСПОЛЬЗОВАН"
+			 : "");
+	if (with_stack && dead_stack && n > 0) {
+		const char **st = dead_stack + (size_t)slot * dead_stack_n;
+		for (int i = 0; i < dead_stack_n && st[i] && n < (int)sizeof(buf) - 1; i++)
+			n += snprintf(buf + n, sizeof(buf) - n, "\n            ← %s",
+				      display_sjis1(st[i]));
+	}
+	return buf;
+}
+
 int32_t heap_alloc_slot(enum vm_pointer_type type)
 {
 	if (heap_free_ptr >= heap_size) {
@@ -229,6 +343,86 @@ static void heap_free_slot(int32_t slot)
 		return;
 	}
 	heap[slot].seq = 0;
+	/*
+	 * ★КАРАНТИН: `XSYS4_HEAP_NO_REUSE=1` — освобождённый слот НЕ возвращается в
+	 * список свободных вовсе; `XSYS4_HEAP_NO_REUSE=<N>` (N>1) — возвращается лишь
+	 * после N последующих смертей (отложенный возврат, память ограничена).
+	 *
+	 * Зачем: аллокатор здесь LIFO, поэтому мёртвый слот достаётся следующему же
+	 * объекту, и хэндл, переживший свой объект, читает ЧУЖИЕ ЖИВЫЕ данные вместо
+	 * мусора — падение уезжает далеко от причины (§5eu: вместо vtable `CParts` на
+	 * 316 методов читалась vtable `CCGParts` на 18, и падало на «индексе метода вне
+	 * границ» тремя вызовами позже). С карантином первое же обращение по мёртвому
+	 * хэндлу падает НА МЕСТЕ, со стеком виновника и некрологом слота.
+	 * Цена — куча не сжимается; для диагностического прогона это приемлемо.
+	 */
+	static int quarantine = -1;
+	if (unlikely(quarantine < 0)) {
+		const char *s = getenv("XSYS4_HEAP_NO_REUSE");
+		quarantine = (s && *s) ? atoi(s) : 0;
+	}
+	/*
+	 * `XSYS4_HEAP_NO_REUSE_AFTER=<секунды>` — включить карантин не сразу, а через N
+	 * секунд после старта. Нужно потому, что первый же пойманный UAF останавливает
+	 * прогон: у Dohna карантин со старта падает ещё на загрузке данных
+	 * (`BattleSkillCollection@Load`, мёртвые локальные страницы в лямбдах `ExTable`),
+	 * и до сцены, которую меряют, дело не доходит. Часы смотрим раз в 4096
+	 * освобождений: их здесь сотни тысяч в секунду.
+	 */
+	static int delay_sec, delayed_off, delay_init;
+	if (unlikely(!delay_init)) {
+		delay_init = 1;
+		const char *s = getenv("XSYS4_HEAP_NO_REUSE_AFTER");
+		// Одна ручка без другой — молча ничего не делает, а прогон уже потрачен.
+		if (s && *s && !quarantine)
+			WARNING("XSYS4_HEAP_NO_REUSE_AFTER задан без XSYS4_HEAP_NO_REUSE — "
+				"карантин слотов ВЫКЛЮЧЕН, отсрочка ни на что не влияет");
+		// `=file` — ждать команды: `touch /tmp/xsys4-quarantine` НА ЖИВОМ процессе,
+		// когда игра доведена до нужного места (надёжнее, чем угадывать секунды).
+		delay_sec = (s && *s) ? (!strcmp(s, "file") ? -2 : atoi(s)) : 0;
+		delayed_off = delay_sec != 0;
+	}
+	if (unlikely(delayed_off)) {
+		static unsigned tick;
+		if (!(++tick & 0xfff)) {
+			bool on;
+			if (delay_sec == -2) {
+				on = access("/tmp/xsys4-quarantine", F_OK) == 0;
+			} else {
+				struct timespec ts;
+				static time_t t0;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				if (!t0)
+					t0 = ts.tv_sec;
+				on = ts.tv_sec - t0 >= delay_sec;
+			}
+			if (on) {
+				delayed_off = 0;
+				WARNING("карантин слотов ВКЛЮЧЁН (%s)", delay_sec == -2
+					? "по /tmp/xsys4-quarantine" : "по таймеру");
+			}
+		}
+	}
+	if (unlikely(quarantine && !delayed_off)) {
+		if (quarantine == 1)
+			return; // бессрочно: слот больше никому не достанется
+		// Отложенный возврат: очередь FIFO на `quarantine` слотов; выпускаем
+		// самый старый, когда очередь переполнилась.
+		static int32_t *queue;
+		static int qcap, qhead, qcount;
+		if (!queue) {
+			qcap = quarantine;
+			queue = xcalloc(qcap, sizeof(int32_t));
+		}
+		if (qcount < qcap) {
+			queue[(qhead + qcount++) % qcap] = slot;
+			return;
+		}
+		int32_t old = queue[qhead];
+		queue[qhead] = slot;
+		qhead = (qhead + 1) % qcap;
+		slot = old;
+	}
 	heap_free_stack[--heap_free_ptr] = slot;
 }
 
@@ -236,8 +430,13 @@ static void heap_double_free(int32_t slot)
 {
 	// Стек вызовов игры — иначе виновника приходится угадывать по номеру слота, а
 	// слоты переиспользуются и от прогона к прогону разные.
-	WARNING("double free of slot %d (%s); последнее variable_fini: %s — стек вызовов игры:",
-		slot, vm_ptrtype_string(heap[slot].type), vm_last_fini_str());
+	// ★НЕКРОЛОГ обязателен именно здесь: double free означает, что ПЕРВОЕ
+	// освобождение уже случилось, и весь вопрос в том, КТО его сделал — а не в том,
+	// кто пришёл вторым (второй виден по стеку ниже).
+	WARNING("double free of slot %d (%s); некролог: %s\nпоследнее variable_fini: %s — "
+		"стек вызовов игры (это ВТОРОЕ освобождение):",
+		slot, vm_ptrtype_string(heap[slot].type), heap_dead_str(slot, true),
+		vm_last_fini_str());
 	vm_stack_trace();
 #ifdef DEBUG_HEAP
 		WARNING("double free of slot %d (%s) ref=%d seq=%u\nOriginally allocated at %X\nOriginally freed at %X",
@@ -342,6 +541,7 @@ void heap_unref(int slot)
 #ifdef DEBUG_HEAP
 	heap[slot].free_addr = instr_ptr;
 #endif
+	heap_note_death(slot);
 	switch (heap[slot].type) {
 	case VM_PAGE:
 		if (heap[slot].page) {
@@ -383,6 +583,7 @@ void exit_unref(int slot)
 		heap[slot].ref--;
 		return;
 	}
+	heap_note_death(slot);
 	switch (heap[slot].type) {
 	case VM_PAGE:
 		if (heap[slot].page) {

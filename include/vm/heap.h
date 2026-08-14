@@ -68,6 +68,12 @@ void exit_unref(int slot);
 
 uint32_t heap_get_seq(int slot);
 
+// НЕКРОЛОГ СЛОТА: чем слот был до смерти, кто его убил и переиспользован ли он с тех
+// пор. Нужен там, где падение случается ПОЗЖЕ причины: аллокатор выдаёт слоты LIFO,
+// поэтому по мёртвому хэндлу читается не пустота, а чужой живой объект.
+// `with_stack` — дописать кадры стека игры на момент смерти (XSYS4_DEAD_STACK=<N>).
+const char *heap_dead_str(int32_t slot, bool with_stack);
+
 bool heap_index_valid(int index);
 bool page_index_valid(int index);
 bool string_index_valid(int index);

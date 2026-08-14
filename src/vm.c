@@ -560,17 +560,64 @@ static int last_var_index = -1;
 // вложенные объекты печатаются именно слотами (`f1=41281`).
 static int last_var_slot = -1;
 
+/*
+ * ★СЛЕД РАЗЫМЕНОВАНИЙ — последние N обращений «слот[поле]».
+ *
+ * Зачем: сообщение об ошибке называет ТОЛЬКО последний слот, а обращение к объекту
+ * в Ixseal всегда многошаговое (`объект → values[0] = vtable → vtable[base+метод]`).
+ * В §5eu упало чтение vtable, и по номеру её слота нельзя сказать, ЧЕЙ это объект —
+ * а он назван предыдущим шагом следа. Плюс к каждому шагу печатается некролог слота:
+ * так «объект умер и слот занял другой» видно прямо в сообщении о падении.
+ */
+#define DEREF_TRAIL_LEN 8
+static struct { int32_t slot, index; uint32_t seq; } deref_trail[DEREF_TRAIL_LEN];
+static int deref_trail_ptr;
+
+static void vm_print_deref_trail(void)
+{
+	sys_message("*** След разыменований (свежие сверху):\n");
+	for (int i = 0; i < DEREF_TRAIL_LEN; i++) {
+		int k = (deref_trail_ptr - 1 - i + DEREF_TRAIL_LEN * 2) % DEREF_TRAIL_LEN;
+		int32_t slot = deref_trail[k].slot;
+		if (!slot && !deref_trail[k].index)
+			continue;
+		// «Сменил хозяина» — только если слот ЖИВ и поколение другое:
+		// heap_free_slot зануляет seq, и у просто умершего слота сравнение
+		// поколений всегда расходится — метка уводила бы в сторону.
+		bool alive = heap_index_valid(slot);
+		bool reused = alive && heap_get_seq(slot) != deref_trail[k].seq;
+		bool suspect = !alive || reused;
+		sys_message("      слот %d[поле %d] (%s)%s\n", slot, deref_trail[k].index,
+			    alive ? describe_heap_slot(slot) : "слот МЁРТВ",
+			    reused ? " ★слот сменил хозяина ПОСЛЕ этого чтения" : "");
+		// Некролог — только у подозрительных шагов и без стека: полный стек
+		// смерти печатается у слота, на котором упали (иначе 8 стеков подряд).
+		if (suspect)
+			sys_message("          %s\n", heap_dead_str(slot, false));
+	}
+}
+
 // Pop a reference off the stack, returning the address of the referenced object.
 static union vm_value *stack_pop_var(void)
 {
 	int32_t page_index = stack_pop().i;
 	int32_t heap_index = stack_pop().i;
-	if (unlikely(!heap_index_valid(heap_index)))
-		VM_ERROR("Out of bounds heap index: %d/%d", heap_index, page_index);
-	if (unlikely(!heap[heap_index].page || page_index >= heap[heap_index].page->nr_vars))
-		VM_ERROR("Out of bounds page index: %d/%d (в слоте: %s; последнее fini: %s)",
+	if (unlikely(!heap_index_valid(heap_index))) {
+		vm_print_deref_trail();
+		VM_ERROR("Out of bounds heap index: %d/%d (слот: %s)", heap_index, page_index,
+			 heap_dead_str(heap_index, true));
+	}
+	if (unlikely(!heap[heap_index].page || page_index >= heap[heap_index].page->nr_vars)) {
+		vm_print_deref_trail();
+		VM_ERROR("Out of bounds page index: %d/%d (в слоте: %s; некролог слота: %s; "
+			 "последнее fini: %s)",
 			 heap_index, page_index, describe_heap_slot(heap_index),
-			 vm_last_fini_str());
+			 heap_dead_str(heap_index, true), vm_last_fini_str());
+	}
+	deref_trail[deref_trail_ptr].slot = heap_index;
+	deref_trail[deref_trail_ptr].index = page_index;
+	deref_trail[deref_trail_ptr].seq = heap[heap_index].seq;
+	deref_trail_ptr = (deref_trail_ptr + 1) % DEREF_TRAIL_LEN;
 	last_var_page = heap[heap_index].page;
 	last_var_index = page_index;
 	last_var_slot = heap_index;
@@ -686,6 +733,16 @@ static void field_watch(union vm_value val)
 	NOTICE("FIELDWATCH %s (слот %d) поле %d <- %d — стек вызовов игры:",
 	       display_sjis0(sname), last_var_slot, watch_index, val.i);
 	vm_stack_trace();
+	/*
+	 * ★И БЕРЁМ ЗАПИСАННОЕ ЗНАЧЕНИЕ ПОД ВОТЧ. Вопрос «кто испортил поле» почти
+	 * всегда переходит в «что случилось с тем, что в него положили»: у Dohna в
+	 * `option<string> MusicId` кладётся живая строка, а к разрушению контекста её
+	 * слот уже успел побывать чужим объектом. Ставить вотч руками нельзя — номер
+	 * слота заранее не известен, а вручную его не подсмотреть: он рождается в этот
+	 * самый момент.
+	 */
+	if (val.i > 0 && heap_index_valid(val.i))
+		heap_watch_slot_set(val.i);
 }
 
 union vm_value *stack_peek_var(void)
@@ -1339,8 +1396,14 @@ union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *
 		 * Копия по-прежнему нужна остальным типам (строка, массив, структура):
 		 * иначе кадр лямбды освободит на выходе слот, которым владеет контейнер.
 		 */
+		// Откат для замеров: XSYS4_LAMBDA_ARG_COPY=1 — прежнее (течёт) поведение.
+		// Нужен, чтобы отличать «правка сломала» от «правка сняла маску»: пока
+		// ссылки текли, объекты не умирали, и чтение мёртвой страницы не наступало.
+		static int arg_copy = -1;
+		if (arg_copy < 0)
+			arg_copy = getenv("XSYS4_LAMBDA_ARG_COPY") ? 1 : 0;
 		enum ain_data_type at = f->vars[i].type.data;
-		heap[slot].page->values[i] = (at == AIN_WRAP || at == AIN_IFACE)
+		heap[slot].page->values[i] = (!arg_copy && (at == AIN_WRAP || at == AIN_IFACE))
 			? argv[i] : vm_copy(argv[i], at);
 	}
 	if (heap_index_valid(obj) && heap[obj].page) {
@@ -2101,9 +2164,38 @@ static enum opcode execute_instruction(enum opcode opcode)
 		bool opt_ref_class = x_option_class_is_ref(elem_class);
 		if (opt_ref_class && vals[n].i == 0 && vals[0].i != -1)
 			heap_ref(vals[0].i);
+		// Кто пишет в поле — тем же путём, что у X_ASSIGN (XSYS4_FIELD_WATCH).
+		// Без этого записи в option-члены были невидимы для вотча полей, а
+		// именно они и интересны: option владеет значением.
+		if (opt_ref_class)
+			field_watch(vals[0]);
 		if (opt_ref_class && opt_old_tag == 0 && opt_old_val != -1
-				&& !getenv("XSYS4_XOPT_NO_RELEASE"))
-			heap_unref(opt_old_val);
+				&& !getenv("XSYS4_XOPT_NO_RELEASE")) {
+			/*
+			 * ★ПРЕЖНЕЕ ЗНАЧЕНИЕ МОЖЕТ БЫТЬ УЖЕ МЁРТВЫМ (§5eu): в поле
+			 * `option<BattleContext>` у Dohna к третьему бою оказывается слот,
+			 * который никогда не был контекстом (замер вотчем по типу: оба
+			 * созданных контекста живы). Снимать ссылку по такому слоту нельзя —
+			 * это либо double free, либо тихая порча ЧУЖОГО объекта, который
+			 * успел занять слот, и умрёт он потом далеко отсюда. Называем момент
+			 * со стеком игры и некрологом слота, освобождение пропускаем.
+			 */
+			if (unlikely(!heap_index_valid(opt_old_val))) {
+				// ★Печатаем и СТРАНИЦУ-ПОЛУЧАТЕЛЬ: она разводит две разные
+				// беды — «поле правильное, но его содержимое испортили» и
+				// «пишем вообще не в ту страницу» (копия объекта, съехавший
+				// индекс поля). Без этого обе выглядят одинаково.
+				WARNING("X_OP_SET: в option-поле лежал МЁРТВЫЙ слот %d — "
+					"освобождение пропущено. Пишем в: слот %d %s, поле %d. "
+					"Некролог прежнего: %s\nстек вызовов игры:",
+					opt_old_val, last_var_slot,
+					describe_heap_slot(last_var_slot), last_var_index,
+					heap_dead_str(opt_old_val, true));
+				vm_stack_trace();
+			} else {
+				heap_unref(opt_old_val);
+			}
+		}
 		for (int i = 0; i <= n; i++)
 			stack[stack_ptr++] = vals[i];
 		break;
@@ -4923,19 +5015,45 @@ int vm_execute_ain(struct ain *program)
 
 static int last_fini_type = -1, last_fini_value = -1;
 static char last_fini_fn[128] = "(none)";
+// Чьё поле освобождалось последним (структура + номер члена) — ставится
+// delete_page_vars перед каждым variable_fini, см. комментарий там.
+static const char *last_fini_owner, *last_fini_field_name;
+static int last_fini_field = -1;
+// «Владелец свежий»: variable_fini зовут не только из delete_page_vars (ещё DELETE,
+// присваивания, аргументы), и без этого флага имя поля прилипало к ЧУЖОМУ
+// освобождению — сообщение уверенно называло поле, которое ни при чём.
+static bool fini_owner_pending;
+
+void vm_note_fini_owner(const char *struct_name, const char *field_name, int field)
+{
+	last_fini_owner = struct_name;
+	last_fini_field_name = field_name;
+	last_fini_field = field;
+	fini_owner_pending = true;
+}
 
 void vm_note_last_fini(int type, int value, const char *fn)
 {
 	last_fini_type = type;
 	last_fini_value = value;
 	snprintf(last_fini_fn, sizeof(last_fini_fn), "%s", fn ? fn : "(null)");
+	if (!fini_owner_pending) {
+		last_fini_owner = last_fini_field_name = NULL;
+		last_fini_field = -1;
+	}
+	fini_owner_pending = false;
 }
 
 const char *vm_last_fini_str(void)
 {
-	static char buf[192];
-	snprintf(buf, sizeof(buf), "type=%d v=%d in %s", last_fini_type,
-		 last_fini_value, last_fini_fn);
+	static char buf[320];
+	int n = snprintf(buf, sizeof(buf), "type=%d v=%d in %s", last_fini_type,
+			 last_fini_value, last_fini_fn);
+	if (last_fini_owner && n > 0 && n < (int)sizeof(buf))
+		snprintf(buf + n, sizeof(buf) - n, " (поле %d '%s' в %s)",
+			 last_fini_field,
+			 last_fini_field_name ? display_sjis2(last_fini_field_name) : "?",
+			 display_sjis1(last_fini_owner));
 	return buf;
 }
 

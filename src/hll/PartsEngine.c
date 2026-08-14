@@ -3060,6 +3060,70 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 	 * с разными именами полей (`is_slider`) и своей пометкой части.
 	 */
 	int ptype14 = ti ? act_parts_type_v14(ti) : -1;
+	/*
+	 * `XSYS4_ACT_NODE_DUMP=<подстрока имени узла>` — ВЫСЫПАТЬ САМ УЗЕЛ РАСКЛАДКИ.
+	 *
+	 * Зачем: когда часть построена «не тем» типом, единственный способ понять
+	 * почему — увидеть, что в .pactex на самом деле лежит. Файлы эти внешними
+	 * средствами не читаются (`alice ex` на .pactex спотыкается об отсутствие
+	 * HEAD), так что смотреть их можно только изнутри движка. Живой случай:
+	 * `SYS_メッセージウィンドウ` в `AdvMessageWindow_main` строится с ptype=-1, и
+	 * ветка окна реплик не срабатывает — текста в ADV нет.
+	 */
+	/*
+	 * `XSYS4_PART_WATCH_NAME=<подстрока имени узла>` — вотч части ПО ИМЕНИ УЗЛА
+	 * раскладки, а не по номеру. Номера активностей раздаются по порядку
+	 * обращения, поэтому от прохода к проходу одна и та же часть получает разные
+	 * номера (у `SYS_メッセージウィンドウ` за три прогона было 90000088, 90000157 и
+	 * 90000226) — вотч по номеру задать заранее просто нельзя.
+	 */
+	// ★Имена узлов в .pactex — SJIS, а переменная окружения приходит в UTF-8:
+	// сравнивать их напрямую нельзя (японская подстрока не совпадёт никогда,
+	// и вотч молча не сработает — так и вышло в первом прогоне). Переводим один раз.
+	{
+		static char *w = (char *)1;
+		if (unlikely(w == (char *)1)) {
+			const char *e = getenv("XSYS4_PART_WATCH_NAME");
+			w = (e && *e) ? utf2sjis(e, strlen(e)) : NULL;
+		}
+		if (unlikely(w && node->name && strstr(node->name->text, w)))
+			parts_watch_add(no);
+	}
+	{
+		// Та же оговорка про кодировку, что у XSYS4_PART_WATCH_NAME выше.
+		static char *want = (char *)1;
+		if (unlikely(want == (char *)1)) {
+			const char *e = getenv("XSYS4_ACT_NODE_DUMP");
+			want = (e && *e) ? utf2sjis(e, strlen(e)) : NULL;
+		}
+		if (unlikely(want && node->name && strstr(node->name->text, want))) {
+			NOTICE("NODE '%s' (часть %d): детей %u, 種類別情報 %s",
+			       display_sjis0(node->name->text), no,
+			       node->is_leaf ? 0 : node->nr_children, ti ? "ЕСТЬ" : "НЕТ");
+			if (!node->is_leaf) {
+				for (unsigned i = 0; i < node->nr_children; i++)
+					NOTICE("  узел[%u] '%s'%s", i,
+					       node->children[i].name
+					       ? display_sjis0(node->children[i].name->text) : "?",
+					       node->children[i].is_leaf ? " (лист)" : "");
+			}
+			if (ti && !ti->is_leaf) {
+				for (unsigned i = 0; i < ti->nr_children; i++) {
+					struct ex_tree *c = &ti->children[i];
+					const char *nm = c->name ? display_sjis0(c->name->text) : "?";
+					if (c->is_leaf && c->leaf.value.type == EX_STRING
+							&& c->leaf.value.s)
+						NOTICE("  種類別情報.%s = '%s'", nm,
+						       display_sjis1(c->leaf.value.s->text));
+					else if (c->is_leaf && c->leaf.value.type == EX_INT)
+						NOTICE("  種類別情報.%s = %d", nm, c->leaf.value.i);
+					else
+						NOTICE("  種類別情報.%s (тип %d)", nm,
+						       c->is_leaf ? (int)c->leaf.value.type : -1);
+				}
+			}
+		}
+	}
 	bool is_slider = (ptype14 == 12 || ptype14 == 13);
 	if (is_slider)
 		ptype = (ptype14 == 13) ? 3 : 2;
@@ -4663,6 +4727,29 @@ static void PE_SetButtonFlatName(int parts_no, struct string *name) {
 // proceeds to the title menu instead of waiting forever on a black screen.
 static bool PE_CreatePartsMovie(int parts_no, struct string *filename, int a, int b, int c, int d, int e, int f) {
 	(void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+	/*
+	 * ★ГОВОРИМ ВСЛУХ, КАКОЙ РОЛИК ПРОПУЩЕН (§5ex). Заглушка молчала, и «в
+	 * оригинале тут ролик, а у нас нет» приходилось искать сверкой с оригиналом.
+	 * Печатаем ПО РАЗУ НА ИМЯ: это и список того, что предстоит поддержать, и
+	 * ответ на вопрос «каким файлом играется вот эта сцена» без отдельного
+	 * прогона с полной трассой частей.
+	 */
+	{
+		static struct string *seen[16];
+		static int nr_seen;
+		const char *name = filename ? filename->text : "(null)";
+		bool known = false;
+		for (int i = 0; i < nr_seen; i++)
+			if (!strcmp(seen[i]->text, name))
+				known = true;
+		if (!known) {
+			if (nr_seen < 16 && filename)
+				seen[nr_seen++] = string_ref(filename);
+			WARNING("movie-parts: игра просит ролик '%s' (часть %d) — "
+				"воспроизведение не реализовано, ролик пропущен",
+				display_sjis0(name), parts_no);
+		}
+	}
 	if (getenv("XSYS4_PARTS_TRACE"))
 		NOTICE("PARTS CreatePartsMovie(%d, '%s') [skip]", parts_no,
 		       filename ? filename->text : "(null)");
