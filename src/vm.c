@@ -1319,8 +1319,31 @@ union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *
 	size_t saved_ip = instr_ptr;
 	int slot = _function_call(fno, VM_RETURN);
 	struct ain_function *f = &ain->functions[fno];
-	for (int i = 0; i < argc; i++)
-		heap[slot].page->values[i] = vm_copy(argv[i], f->vars[i].type.data);
+	for (int i = 0; i < argc; i++) {
+		/*
+		 * ★АРГУМЕНТ-ХЭНДЛ (`wrap<…>`, `ref <интерфейс>`) КОПИЕЙ НЕ БЕРЁТСЯ — то
+		 * же правило, что у `delegate_call` (§5eq) и симметрично
+		 * `delete_page_vars`, который освобождение таких аргументов ПРОПУСКАЕТ
+		 * (они одолженные). `vm_copy` для них делает `heap_ref`, а отдать эту
+		 * ссылку некому: кадр лямбды при выходе её не трогает.
+		 *
+		 * Чем это ломало Dohna (§5es): элемент `array<wrap<iwrap<IPlayerActionView>>>`
+		 * уходит В ПРЕДИКАТ на каждом переборе (`Array.Find/Any/EraseAll/…`), а
+		 * вьюшку бойца игра перебирает десятки раз за ход — счётчик рос на +1 за
+		 * КАЖДЫЙ вызов лямбды. К концу боя у восьми `PlayerActionView` набиралось
+		 * `ref` = 78…757 БЕЗ ЕДИНОГО сильного держателя (замер `kill -USR2`), они
+		 * переживали свою коллекцию и сцену боя, а вместе с ними жили их
+		 * `BattlePlayerParamView`, чьи активности поэтому никто не освобождал, —
+		 * и части боевого интерфейса оставались на экране после боя (136 партов
+		 * мёртвого слоя 12 в дампе, после правки — ноль).
+		 *
+		 * Копия по-прежнему нужна остальным типам (строка, массив, структура):
+		 * иначе кадр лямбды освободит на выходе слот, которым владеет контейнер.
+		 */
+		enum ain_data_type at = f->vars[i].type.data;
+		heap[slot].page->values[i] = (at == AIN_WRAP || at == AIN_IFACE)
+			? argv[i] : vm_copy(argv[i], at);
+	}
 	if (heap_index_valid(obj) && heap[obj].page) {
 		set_struct_page(obj);
 		heap[slot].page->local.struct_ptr = obj;
