@@ -147,6 +147,9 @@ struct string *string_format(struct string *fmt, union vm_value arg, enum string
 
 void vm_stack_trace(void);
 void vm_stack_trace_file(FILE *out);
+// Заявка «кто держит объект» (kill -USR2): обработчик сигнала только ставит флаг,
+// исполняет обход главный цикл — из сигнала куча видна в промежуточном состоянии.
+void vm_take_who_refs_request(void);
 // Есть ли на стеке вызовов игровая функция, чьё имя содержит `substr` (сырые
 // байты имени, то есть Shift-JIS). Только для диагностики: позволяет печатать
 // трейс лишь для интересных путей вызова, когда сам HLL-обработчик дёргается

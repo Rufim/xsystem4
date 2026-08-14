@@ -1685,6 +1685,11 @@ void parts_debug_dump(void)
 		buf[m] = 0;
 		NOTICE("  СТЕК СЛОЁВ (низ→верх): %s| активный %d", buf, ctrl_stack.active);
 	}
+	// Реестр активностей — рядом со стеком слоёв: часть, числящаяся за живой
+	// активностью, свой слой ПЕРЕЖИВАЕТ (см. `keep_act` в PE_RemoveController), и
+	// без этой сводки «остаток на экране» не отличить от «игра не позвала
+	// ReleaseActivity».
+	pe_dump_activities();
 	PARTS_LIST_FOREACH(p) {
 		Rectangle *hb = &p->states[0].common.hitbox;
 		// Имя CG у состояния 0 — без него в дампе не отличить «наш прямоугольник не
@@ -1695,8 +1700,11 @@ void parts_debug_dump(void)
 			if (p->states[0].cg.name)
 				cgname = display_sjis0(p->states[0].cg.name->text);
 		}
-		NOTICE("  dump part %d: ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s rev=%d%d mir=%d%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
-		       p->no, p->controller_no, p->local.show, p->global.show, p->global.z,
+		// Активность, за которой числится часть (пусто — часть создана игрой).
+		const char *actname = pe_parts_activity_name(p->no);
+		NOTICE("  dump part %d: act=\"%s\" ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s rev=%d%d mir=%d%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
+		       p->no, actname ? actname : "", p->controller_no,
+		       p->local.show, p->global.show, p->global.z,
 		       p->global.pos.x, p->global.pos.y, p->states[0].type, p->parent ? p->parent->no : -1,
 		       p->is_hovered, p->state, hb->x, hb->y, hb->w, hb->h,
 		       p->states[0].common.w, p->states[0].common.h, p->origin_mode,
@@ -5225,6 +5233,17 @@ bool parts_controller_get_show(int id)
 {
 	int pos = ctrl_stack_pos(id);
 	return pos < 0 ? false : !ctrl_stack.hidden[pos];
+}
+
+/*
+ * Слой части по её номеру, или −1, если части уже нет. Нужна диагностике
+ * реестра активностей (`pe_dump_activities`): по одному номеру не отличить
+ * «часть снята» от «часть жива, но на чужом слое».
+ */
+int PE_parts_controller_no(int parts_no)
+{
+	struct parts *p = parts_try_get(parts_no);
+	return p ? p->controller_no : -1;
 }
 
 bool parts_hidden_by_layer(struct parts *parts)

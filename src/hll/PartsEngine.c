@@ -1650,6 +1650,97 @@ bool pe_parts_in_activity(int parts_no)
 	return s.found;
 }
 
+/*
+ * ДИАГНОСТИКА РЕЕСТРА АКТИВНОСТЕЙ (для дампа частей по `kill -USR1`).
+ *
+ * Части, числящиеся за живой активностью, `PE_RemoveController` со слоем НЕ
+ * сносит (см. `keep_act` там же), поэтому в дампе надо видеть, ЗА КАКОЙ
+ * активностью числится часть и какие активности вообще живы: иначе «часть
+ * пережила свой слой» не отличить от «игра не позвала ReleaseActivity».
+ */
+struct pe_act_name_scan { int number; const char *name; bool helper; };
+
+static void pe_act_name_cb(struct ht_slot *slot, void *data)
+{
+	struct pe_act_name_scan *s = data;
+	struct pe_activity *a = slot->value;
+	if (!a || s->name)
+		return;
+	for (int i = 0; i < a->nr_parts; i++) {
+		if (a->parts[i].number == s->number) {
+			s->name = slot->key;
+			return;
+		}
+	}
+	for (int i = 0; i < a->nr_helpers; i++) {
+		if (a->helpers[i] == s->number) {
+			s->name = slot->key;
+			s->helper = true;
+			return;
+		}
+	}
+}
+
+const char *pe_parts_activity_name(int parts_no)
+{
+	if (!pe_activities)
+		return NULL;
+	struct pe_act_name_scan s = { .number = parts_no, .name = NULL, .helper = false };
+	ht_foreach(pe_activities, pe_act_name_cb, &s);
+	if (!s.name)
+		return NULL;
+	// display_sjis2, а не 0: строка дампа частей одновременно держит имя CG в
+	// нулевом буфере, и общий буфер затёр бы его.
+	static char buf[512];
+	snprintf(buf, sizeof(buf), "%s%s", display_sjis2(s.name), s.helper ? " (служ.)" : "");
+	return buf;
+}
+
+static void pe_act_dump_cb(struct ht_slot *slot, void *data)
+{
+	int *total = data;
+	struct pe_activity *a = slot->value;
+	if (!a)
+		return;
+	(*total)++;
+	int alive = 0, alive_helpers = 0;
+	// Слои, на которых лежат живые части активности: расхождение «активность одна,
+	// слоёв несколько» само по себе улика.
+	char layers[128]; int lm = 0; int seen[16]; int nr_seen = 0;
+	for (int i = 0; i < a->nr_parts; i++) {
+		int c = PE_parts_controller_no(a->parts[i].number);
+		if (c < 0)
+			continue;
+		alive++;
+		bool dup = false;
+		for (int j = 0; j < nr_seen; j++)
+			if (seen[j] == c)
+				dup = true;
+		if (!dup && nr_seen < 16) {
+			seen[nr_seen++] = c;
+			lm += snprintf(layers + lm, sizeof(layers) - lm, "%d ", c);
+		}
+	}
+	for (int i = 0; i < a->nr_helpers; i++)
+		if (PE_parts_controller_no(a->helpers[i]) >= 0)
+			alive_helpers++;
+	layers[lm] = 0;
+	NOTICE("  АКТИВНОСТЬ '%s': частей %d (живых %d), служебных %d (живых %d), слои [%s]",
+	       display_sjis0(slot->key), a->nr_parts, alive,
+	       a->nr_helpers, alive_helpers, layers);
+}
+
+void pe_dump_activities(void)
+{
+	if (!pe_activities) {
+		NOTICE("  ЖИВЫХ АКТИВНОСТЕЙ: реестр пуст");
+		return;
+	}
+	int total = 0;
+	ht_foreach(pe_activities, pe_act_dump_cb, &total);
+	NOTICE("  ЖИВЫХ АКТИВНОСТЕЙ: %d", total);
+}
+
 static struct pe_activity *pe_act_find(struct string *name)
 {
 	if (!pe_activities)
@@ -1920,6 +2011,12 @@ static bool PE_ReleaseActivity(struct string *name, struct page **out)
 {
 	struct pe_activity *a = pe_act_find(name);
 	int n = a ? a->nr_parts : 0;
+	// Парная к `ACT CreateActivity` строка: без неё по логу не сказать, ПРИХОДИЛ
+	// ли Release для активности, чьи части остались на экране.
+	if (getenv("XSYS4_ACT_TRACE"))
+		NOTICE("ACT ReleaseActivity(name='%s'): частей %d, найдена=%d [%s]",
+		       display_sjis0(name->text), n, a ? 1 : 0,
+		       display_sjis1(vm_current_function_name()));
 	if (getenv("XSYS4_BS_TRACE")) {
 		NOTICE("BS ReleaseActivity('%s'): %d партов", display_sjis0(name->text), n);
 		for (int i = 0; i < n; i++)

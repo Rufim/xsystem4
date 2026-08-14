@@ -603,6 +603,10 @@ void PE_UpdateInputState(int passed_time)
 	 * печатаем само состояние гейта — по одной строке видно, ввод выключен или
 	 * перехвачен какой-то частью.
 	 */
+	// «Кто держит объект» по kill -USR2 — здесь же и по той же причине: обход кучи
+	// из обработчика сигнала ловит её в промежуточном состоянии (см. комментарий
+	// у vm_take_who_refs_request).
+	vm_take_who_refs_request();
 	if (parts_take_debug_dump_request()) {
 		NOTICE("--- PARTS DUMP (по сигналу) --- ввод %s, курсор %d,%d, кнопка %d",
 		       parts_input_enabled ? "ВКЛЮЧЁН" : "ВЫКЛЮЧЕН (SetEnableInput(false))",

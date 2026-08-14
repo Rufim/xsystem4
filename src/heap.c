@@ -274,13 +274,26 @@ void heap_ref(int32_t slot)
 		 * взятии ссылки по этому адресу. Нужен, когда незакрытое взятие уже
 		 * найдено (адрес известен), а вопрос в том, КТО его заказал: одна и та
 		 * же строка геттера вызывается из десятков мест, и течёт лишь часть.
+		 *
+		 * ★Значение `all` — стек на КАЖДОМ взятии. Экономит прогон, когда адрес
+		 * ещё не известен: иначе нужен один прогон, чтобы найти непарный REF по
+		 * адресу, и второй — чтобы снять по нему стек. Вывод объёмный, поэтому
+		 * применять вместе с `XSYS4_HEAP_WATCH_FILE` и точечным вотчем
+		 * (`XSYS4_STRUCT_WATCH==<Тип>`), а не по слою целиком.
 		 */
 		static const char *w = (const char *)1;
 		if (w == (const char *)1)
 			w = getenv("XSYS4_HEAP_WATCH_REF_STACK");
-		if (w && *w && (unsigned)strtoul(w, NULL, 16) == (unsigned)instr_ptr) {
+		bool all = w && !strcmp(w, "all");
+		if (w && *w && (all || (unsigned)strtoul(w, NULL, 16) == (unsigned)instr_ptr)) {
 			heap_watch_msg("HEAPWATCH %d REF-STACK — стек вызовов игры:", slot);
-			vm_stack_trace();
+			// В файл вотча, если он задан: общий лог режется по числу строк, а
+			// со стеком на каждом REF счёт идёт на десятки тысяч.
+			FILE *sf = heap_watch_out();
+			if (sf)
+				vm_stack_trace_file(sf);
+			else
+				vm_stack_trace();
 		}
 	}
 #ifdef DEBUG_HEAP

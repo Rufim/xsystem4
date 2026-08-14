@@ -40,6 +40,15 @@ void PE_UpdateParts(int passed_time, bool is_skip, bool message_window_show);
 void PE_SetDelegateIndex(int parts_no, int delegate_index);
 void PE_SetEventID(int parts_no, int delegate_index, int unique_id);
 int PE_GetDelegateIndex(int parts_no);
+// Слой части по номеру, или −1, если части уже нет.
+int PE_parts_controller_no(int parts_no);
+// Диагностика реестра активностей (для дампа частей по kill -USR1).
+bool pe_parts_in_activity(int parts_no);
+// Имя активности, за которой числится часть, или NULL. Строка — во внутреннем
+// буфере вызова, действительна до следующего вызова.
+const char *pe_parts_activity_name(int parts_no);
+// Сводка живых активностей: имя, сколько частей числится и сколько из них живо.
+void pe_dump_activities(void);
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state);
 bool PE_SetPartsCG_by_index(int parts_no, int cg_no, int sprite_deform, int state);
 bool PE_SetPartsCG_by_string_index(int parts_no, struct string *cg_no,

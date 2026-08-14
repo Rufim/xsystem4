@@ -1325,7 +1325,7 @@ union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *
 		 * же правило, что у `delegate_call` (§5eq) и симметрично
 		 * `delete_page_vars`, который освобождение таких аргументов ПРОПУСКАЕТ
 		 * (они одолженные). `vm_copy` для них делает `heap_ref`, а отдать эту
-		 * ссылку некому: кадр лямбды при выходе её не трогает.
+		 * ссылку некому — кадр лямбды при выходе её не трогает.
 		 *
 		 * Чем это ломало Dohna (§5es): элемент `array<wrap<iwrap<IPlayerActionView>>>`
 		 * уходит В ПРЕДИКАТ на каждом переборе (`Array.Find/Any/EraseAll/…`), а
@@ -1334,8 +1334,7 @@ union vm_value vm_call_hll_func(const union vm_value *fn, const union vm_value *
 		 * `ref` = 78…757 БЕЗ ЕДИНОГО сильного держателя (замер `kill -USR2`), они
 		 * переживали свою коллекцию и сцену боя, а вместе с ними жили их
 		 * `BattlePlayerParamView`, чьи активности поэтому никто не освобождал, —
-		 * и части боевого интерфейса оставались на экране после боя (136 партов
-		 * мёртвого слоя 12 в дампе, после правки — ноль).
+		 * и части боевого интерфейса оставались на экране после боя.
 		 *
 		 * Копия по-прежнему нужна остальным типам (строка, массив, структура):
 		 * иначе кадр лямбды освободит на выходе слот, которым владеет контейнер.
@@ -4528,10 +4527,74 @@ static void who_dump_delegate(struct page *dp, const char *indent)
 	}
 }
 
+// Имя структуры входит в список «A,B,C»? Сравнение поэлементное и целиком.
+static bool who_name_in_list(const char *name, const char *list)
+{
+	size_t nl = strlen(name);
+	for (const char *p = list; *p;) {
+		const char *comma = strchr(p, ',');
+		size_t len = comma ? (size_t)(comma - p) : strlen(p);
+		if (len == nl && !strncmp(p, name, len))
+			return true;
+		p = comma ? comma + 1 : p + len;
+	}
+	return false;
+}
+
+/*
+ * ★ОБХОД КУЧИ ИДЁТ НЕ ИЗ ОБРАБОТЧИКА СИГНАЛА, а из главного цикла (как разовый
+ * дамп частей по USR1, см. `parts_request_debug_dump`). Обработчик прерывает VM
+ * в ЛЮБОЙ точке, в том числе внутри `heap_alloc_slot`, где слоту уже проставлен
+ * `type = VM_PAGE`, а `page` ещё держит указатель из прошлой жизни слота — и
+ * проверка `heap[s].page` пропускает висячий указатель. Ровно так это и упало
+ * (SIGSEGV на `p->type` в отборе целей, core 19708 от 2026-08-14): пока в куче
+ * ничего не двигалось, обход везло, а на возобновлении из образа VM — нет.
+ */
+static volatile sig_atomic_t who_refs_requested = 0;
+static void vm_who_refs_dump(void);
+
 static void vm_sigusr2_handler(int sig)
 {
 	(void)sig;
+	who_refs_requested = 1;
+}
+
+void vm_take_who_refs_request(void)
+{
+	if (!who_refs_requested)
+		return;
+	who_refs_requested = 0;
+	vm_who_refs_dump();
+}
+
+static void vm_who_refs_dump(void)
+{
+	/*
+	 * ★ЦЕЛЬ МОЖНО СМЕНИТЬ У ЖИВОГО ПРОЦЕССА — файлом `/tmp/xsys4-who-refs`
+	 * (перекрывает `XSYS4_WHO_REFS`, путь меняется `XSYS4_WHO_REFS_FILE`).
+	 * Окружение запущенного процесса снаружи не правится (ptrace на этой машине
+	 * запрещён политикой yama), а без этого каждый новый вопрос «а кто держит
+	 * ТОГО» стоил бы полного повторного прохода до нужного места — у боя Dohna
+	 * это десятки минут игры руками.
+	 *
+	 * Имён можно перечислить НЕСКОЛЬКО через запятую: цепочка владения обычно
+	 * известна заранее (вьюшка ← её коллекция ← сцена), и спросить обо всех
+	 * сразу дешевле, чем разворачивать по одному.
+	 */
+	static char want_buf[512];
 	const char *want = getenv("XSYS4_WHO_REFS");
+	{
+		const char *wf = getenv("XSYS4_WHO_REFS_FILE");
+		FILE *f = fopen(wf && *wf ? wf : "/tmp/xsys4-who-refs", "r");
+		if (f) {
+			if (fgets(want_buf, sizeof(want_buf), f)) {
+				want_buf[strcspn(want_buf, "\r\n")] = 0;
+				if (want_buf[0])
+					want = want_buf;
+			}
+			fclose(f);
+		}
+	}
 	if (!want || !*want) {
 		sys_warning("SIGUSR2: XSYS4_WHO_REFS не задан\n");
 		return;
@@ -4567,13 +4630,21 @@ static void vm_sigusr2_handler(int sig)
 		}
 	} else {
 		for (size_t s = 0; s < heap_size && nr_targets < WHO_MAX; s++) {
-			if (heap[s].type != VM_PAGE || !heap[s].page)
+			// ★Только heap_slot_is_page: у ОСВОБОЖДЁННОГО слота `page` остаётся
+			// ненулевым (обнуляется не он, а счётчик), и пара «type == VM_PAGE &&
+			// page != NULL» пропускает висячий указатель. Обход падал именно на
+			// таких слотах — сначала списали на гонку с обработчиком сигнала, но
+			// после переноса в главный цикл падение повторилось (core 21168).
+			if (!heap_slot_is_page((int)s))
 				continue;
 			struct page *p = heap[s].page;
 			if (p->type != STRUCT_PAGE || p->index < 0 || p->index >= ain->nr_structures)
 				continue;
 			const char *name = ain->structures[p->index].name;
-			if (!name || strcmp(name, want))
+			// Список имён через запятую: сравниваем с каждым элементом целиком
+			// (подстрока не годится — "PlayerActionView" матчил бы и
+			// "PlayerActionViewCollection", а это разные звенья цепочки).
+			if (!name || !who_name_in_list(name, want))
 				continue;
 			sys_warning("  объект '%s' слот %d, ref=%d\n", name, (int)s, heap[s].ref);
 			targets[nr_targets++] = (int)s;
@@ -4590,7 +4661,7 @@ static void vm_sigusr2_handler(int sig)
 	for (int level = 0; level < depth_limit && nr_targets; level++) {
 		int nr_next = 0, found = 0;
 		for (size_t o = 0; o < heap_size; o++) {
-			if (heap[o].type != VM_PAGE || !heap[o].page)
+			if (!heap_slot_is_page((int)o))
 				continue;
 			struct page *op = heap[o].page;
 			for (int i = 0; i < op->nr_vars; i++) {
@@ -4632,8 +4703,20 @@ static void vm_sigusr2_handler(int sig)
 				found++;
 				// Безымянных держателей (делегат, окружение лямбды, массив)
 				// разворачиваем дальше — именно они и прячут виновника.
+				// ★СТРУКТУРЫ-ДЕРЖАТЕЛИ тоже (XSYS4_WHO_STRUCTS=0 — прежнее
+				// поведение): цепочка владения у новых игр идёт через ИМЕНОВАННЫЕ
+				// звенья (вьюшка ← её коллекция ← сцена), и обрыв на первом же
+				// таком звене отвечает «держит поле такого-то объекта», не говоря
+				// главного — почему жив ОН. Разрастание ограничивают WHO_MAX и
+				// глубина.
+				static int want_structs = -1;
+				if (want_structs < 0) {
+					const char *ws = getenv("XSYS4_WHO_STRUCTS");
+					want_structs = (ws && *ws) ? atoi(ws) : 1;
+				}
 				bool anon = op->type == DELEGATE_PAGE || op->type == ARRAY_PAGE
-				            || op->type == LOCAL_PAGE;
+				            || op->type == LOCAL_PAGE
+				            || (want_structs && op->type == STRUCT_PAGE);
 				bool dup = false;
 				for (int k = 0; k < nr_seen; k++)
 					if (seen[k] == (int)o) { dup = true; break; }
