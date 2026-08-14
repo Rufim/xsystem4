@@ -171,6 +171,30 @@ static struct gsave_flat_array *collect_flat_arrays(struct page *page, struct gs
 	return ++fa;
 }
 
+/*
+ * ГДЕ МЫ СЕЙЧАС В ГРАФЕ СОХРАНЕНИЯ — «структура.член» последнего шага.
+ * Сериализация рекурсивна и обходит весь мир игры, поэтому сообщение «в слоте не
+ * структура» без этого контекста бесполезно: неясно, чьё поле виновато.
+ */
+static const char *save_path_owner, *save_path_field;
+
+static void save_path_note(const char *owner, const char *field)
+{
+	save_path_owner = owner;
+	save_path_field = field;
+}
+
+static const char *save_path_str(void)
+{
+	static char buf[256];
+	if (!save_path_owner)
+		return "(вне поля структуры)";
+	snprintf(buf, sizeof(buf), "поле '%s' структуры %s",
+		 save_path_field ? display_sjis0(save_path_field) : "?",
+		 display_sjis1(save_path_owner));
+	return buf;
+}
+
 static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, struct gsave *save)
 {
 	switch (type) {
@@ -258,7 +282,19 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 			struct page *page = heap_get_page(val.i);
 			if (!page)
 				return -1;
-			assert(page->type == STRUCT_PAGE);
+			/*
+			 * ★НЕ СТРУКТУРА В ОБЪЕКТНОМ СЛОТЕ — называем, ЧТО именно сохраняли.
+			 * Голый assert сообщал только факт: с ассертами игра падала на
+			 * автосохранении, без них (release) сериализация шла по чужой
+			 * странице и в сейв уезжал мусор. Контекст (структура и член, а для
+			 * делегата — его receiver) ставит save_path_note ниже.
+			 */
+			if (page->type != STRUCT_PAGE) {
+				strict_or_warn("сохранение",
+					"в объектном слоте %d не структура, а %s — %s; поле сохранено пустым",
+					val.i, pagetype_string(page->type), save_path_str());
+				return -1;
+			}
 			// Этот объект уже записан — отдаём ТУ ЖЕ запись, чтобы после
 			// загрузки он остался одним объектом, а не размножился по числу
 			// ссылок (см. «тождество объектов» выше).
@@ -286,6 +322,7 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 			for (int i = 0; i < page->nr_vars; i++) {
 				enum ain_data_type type = st->members[i].type.data;
 				int32_t value;
+				save_path_note(st->name, st->members[i].name);
 				/*
 				 * Обёртки Ixseal — `wrap<T>` (82), `option<T>` (86) и ссылка на
 				 * интерфейс (89). В слоте у них либо heap-слот объекта, либо
@@ -308,7 +345,18 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 						|| inner->data == AIN_STRUCT
 						|| inner->data == AIN_IFACE
 						|| inner->data == AIN_IFACE_WRAP;
-					if (!is_obj)
+					/*
+					 * ★ПУСТОЙ `option` СОХРАНЯЕМ КАК ПУСТОЙ — по ТЕГУ, а не по
+					 * содержимому слота. У пустого option там лежит не −1, а мусор
+					 * от последней записи (сайт вида `X_REF 2; A_REF; X_OP_SET`
+					 * оставляет номер уже освобождённого временного слота, §5eu).
+					 * Без проверки сериализация шла по этому номеру как по
+					 * структуре: с ассертами — падение `page->type == STRUCT_PAGE`
+					 * на автосохранении, без них — в сейв уезжал ЧУЖОЙ объект.
+					 */
+					if (type == AIN_OPTION && !option_var_has_value(page, i))
+						value = -1;
+					else if (!is_obj)
 						value = add_value_to_gsave(inner->data, page->values[i], save);
 					else if (page->values[i].i < 0)
 						value = -1;
@@ -344,6 +392,32 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 				return gsave_add_array(save, &array);
 			}
 			assert(page->type == ARRAY_PAGE);
+			/*
+			 * ★`array<option<T>>` В СЕЙВ НЕ ИДЁТ — И ЭТО ЧЕСТНЕЕ ПОЛУМЕР.
+			 *
+			 * Элемент такого массива занимает несколько слотов (значение…, тег), а
+			 * формат сейва раскладку элемента не хранит: тип угадывается по
+			 * ПЕРВОМУ значению плоского массива, и при загрузке контейнер всегда
+			 * восстанавливается с шагом 1. То есть круговой прогон невозможен в
+			 * принципе, чем его ни заполняй: сериализация «по слотам» уводит
+			 * тег-слот (число 0) в объектную ветку — там `heap_get_page(0)` даёт
+			 * ГЛОБАЛЬНУЮ страницу; попытка писать пустым значением −1 ломает
+			 * загрузку (`save->records[-1]` — чтение за границей массива записей).
+			 * Поэтому сохраняем такой массив ПУСТЫМ и говорим об этом вслух:
+			 * потеря видна сразу, а не всплывает «пустым пулом после загрузки».
+			 */
+			if (page->a_type == AIN_OPTION) {
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					strict_or_warn("сохранение",
+						"array<option<...>> не сериализуется (формат не хранит "
+						"раскладку элемента) — массив сохранён пустым: %s",
+						save_path_str());
+				}
+				struct gsave_array array = { .rank = -1 };
+				return gsave_add_array(save, &array);
+			}
 			struct gsave_array array = {
 				.rank = page->array.rank,
 				.dimensions = xcalloc(page->array.rank, sizeof(int32_t)),
@@ -781,6 +855,17 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		int obj_struct_type = -1;
 		if (data_type == AIN_WRAP || data_type == AIN_OPTION || data_type == AIN_IFACE) {
 			struct ain_type *inner = st->members[index].type.array_type;
+			/*
+			 * ★ЗАГРУЗКА СИММЕТРИЧНА СОХРАНЕНИЮ: прежнее значение ПУСТОГО option
+			 * освобождать нельзя — в его слоте не хэндл, а мусор от последней
+			 * записи (разбор у option_var_has_value). Иначе загрузка посреди
+			 * игры роняет счётчик чужого объекта — тот же §5eu, только в
+			 * загрузчике: сохранение чинили, а эту сторону нет.
+			 */
+			bool stale_option = data_type == AIN_OPTION
+				&& !option_var_has_value(page, index);
+			if (stale_option)
+				page->values[index].i = -1;
 			bool is_obj = data_type == AIN_IFACE || !inner
 				|| inner->data == AIN_STRUCT
 				|| inner->data == AIN_IFACE
@@ -1093,8 +1178,18 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			case AIN_ENUM2:     guessed = AIN_ARRAY_INT; break;
 			case AIN_STRUCT:
 				guessed = AIN_ARRAY_STRUCT;
-				if (fa->nr_values) {
-					struct gsave_record *rec = &save->records[fa->values[0].value];
+				// ★Тип элемента угадываем по ПЕРВОЙ НЕПУСТОЙ записи: в объектном
+				// слоте законно лежит −1 («значения нет»), и `records[-1]` — это
+				// чтение за границей массива записей с мусорным struct_index.
+				int probe = -1;
+				for (int i = 0; i < fa->nr_values; i++) {
+					if (fa->values[i].value >= 0) {
+						probe = fa->values[i].value;
+						break;
+					}
+				}
+				if (probe >= 0 && probe < save->nr_records) {
+					struct gsave_record *rec = &save->records[probe];
 					char *name = save->version >= 7
 						? save->struct_defs[rec->struct_index].name
 						: rec->struct_name;

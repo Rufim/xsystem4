@@ -756,6 +756,98 @@ static struct ain_type *page_var_decl_type(struct page *page, int varno)
  * объект или строка). option<int>/option<enum> хранят голое число — их трогать
  * нельзя. Подтип берём из объявления: 86 → array_type.
  */
+/*
+ * ★ЕСТЬ ЛИ У `option<T>`-переменной ЗНАЧЕНИЕ — по ТЕГУ, а не по содержимому слота.
+ *
+ * Раскладка `option` в странице: слоты значения, СЛЕДОМ тег (0 = значение есть,
+ * 1 = пусто) — ровно как их кладёт `X_OP_SET` (формы сайтов: «PUSH val; PUSH 0»
+ * против «PUSH -1[; PUSH -1]; PUSH 1»). Ширина значения — 1 слот у строки и
+ * структуры, 2 у `wrap<интерфейс>` (объект + база интерфейса).
+ *
+ * Зачем проверять (§5eu): у пустого `option` слот значения НЕ ОБЯЗАН быть −1.
+ * Живой случай — `BattleContext@0` пишет `MusicId` из `params` идиомой
+ * `X_REF 2; A_REF; X_OP_SET 2`: при `None` тег приходит 1, а `A_REF` всё равно
+ * отдаёт свежий heap-слот, и он попадает в слот значения. `X_OP_SET` ссылку на
+ * него НЕ берёт (тег не 0) и правильно делает; сайт следом делает `DELETE`, слот
+ * умирает — а в поле остаётся его номер. Освобождение «по содержимому» роняло
+ * счётчик чужого объекта, который к тому времени занял слот: он умирал раньше
+ * срока, и падало это далеко от места ошибки (в бою — на чтении мёртвой vtable).
+ */
+// Список объявлений переменных страницы — тот же, по которому init_option_vars
+// раскладывал значение и тег. Берём ширину ОТТУДА ЖЕ (decl_slots, по филлерам
+// <void>), а не по типу: гадание по типу расходится с раскладкой на любом
+// двухслотовом не-интерфейсном подтипе, и тогда «тег» читался бы из второй
+// половины значения — Some уехал бы в сейв как None.
+static struct ain_variable *page_var_decls(struct page *page, int *nr)
+{
+	switch (page->type) {
+	case GLOBAL_PAGE:
+		*nr = ain->nr_globals;
+		return ain->globals;
+	case LOCAL_PAGE:
+		if (page->index < 0 || page->index >= ain->nr_functions)
+			return NULL;
+		*nr = ain->functions[page->index].nr_vars;
+		return ain->functions[page->index].vars;
+	case STRUCT_PAGE:
+		if (page->index < 0 || page->index >= ain->nr_structures)
+			return NULL;
+		*nr = ain->structures[page->index].nr_members;
+		return ain->structures[page->index].members;
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * То же самое для ЭЛЕМЕНТА МАССИВА `array<option<T>>`: объявления у элемента нет,
+ * зато раскладка фиксирована — [слоты значения…, тег], ширина известна из
+ * `array_elem_slots`. Без этой проверки массивы повторяют ту же беду, что была у
+ * полей: пустой элемент хранит номер уже освобождённого слота, а обход страницы
+ * (разрушение, копирование) трогает его как живой хэндл. У Dohna таких
+ * объявлений 32 (`array<option<wrap<Worker>>>` и т.п.).
+ */
+static bool array_elem_has_value(struct page *page, int varno)
+{
+	if (!page || page->type != ARRAY_PAGE || page->a_type != AIN_OPTION)
+		return true;
+	int es = array_elem_slots(page);
+	if (es < 2)
+		return true;
+	int tag = (varno / es) * es + es - 1;
+	if (tag >= page->nr_vars)
+		return true;
+	return page->values[tag].i == 0;
+}
+
+bool option_var_has_value(struct page *page, int varno)
+{
+	// XSYS4_OPT_TAG_OFF=1 — откат к прежнему поведению «значение по содержимому
+	// слота, тег не смотрим». Нужен для A/B без пересборки: правка трогает
+	// разрушение, копирование и сериализацию сразу, и подозрение в регрессе
+	// снимается одним прогоном.
+	static int off = -1;
+	if (unlikely(off < 0))
+		off = getenv("XSYS4_OPT_TAG_OFF") ? 1 : 0;
+	if (unlikely(off))
+		return true;
+	// Элемент массива — ПОСЛЕ проверки ручки: иначе A/B-прогон с XSYS4_OPT_TAG_OFF
+	// возвращал бы прежнее поведение только для полей, а замер соврал бы.
+	if (page->type == ARRAY_PAGE)
+		return array_elem_has_value(page, varno);
+	int nr = 0;
+	struct ain_variable *vars = page_var_decls(page, &nr);
+	if (!vars || varno >= nr)
+		return true;  // объявления нет — судить не по чему, ведём себя как раньше
+	int slots = decl_slots(vars, nr, varno);
+	if (slots < 2)
+		return true;  // однослотовый option: тега нет вовсе (см. init_option_vars)
+	int tag = varno + slots - 1;
+	if (tag >= page->nr_vars)
+		return true;
+	return page->values[tag].i == 0;
+}
+
 static bool option_var_value_owns(struct page *page, int varno)
 {
 	struct ain_type *t = page_var_decl_type(page, varno);
@@ -824,6 +916,26 @@ void delete_page_vars(struct page *page)
 		if ((t == AIN_IFACE || t == AIN_WRAP) && i < nr_args)
 			continue;
 		/*
+		 * ★ЧЬЁ ЭТО ПОЛЕ — ставим В НАЧАЛЕ итерации, до всех веток. Ставили в
+		 * конце — и имя отставало на итерацию: поле `<void>` типа void своего
+		 * `variable_fini` не вызывает, поэтому его имя доставалось СЛЕДУЮЩЕМУ
+		 * освобождению (option-члену), и сообщение о double free уверенно
+		 * называло не то поле.
+		 */
+		const char *owner = NULL, *field = NULL;
+		if (page->type == STRUCT_PAGE && page->index >= 0
+				&& page->index < ain->nr_structures) {
+			owner = ain->structures[page->index].name;
+			if (i < ain->structures[page->index].nr_members)
+				field = ain->structures[page->index].members[i].name;
+		} else if (page->type == LOCAL_PAGE && page->index >= 0
+				&& page->index < ain->nr_functions) {
+			owner = ain->functions[page->index].name;
+			if (i < ain->functions[page->index].nr_vars)
+				field = ain->functions[page->index].vars[i].name;
+		}
+		vm_note_fini_owner(owner, field, i);
+		/*
 		 * ★`option<T>`-переменная страницы ВЛАДЕЕТ своим значением, но
 		 * variable_fini(AIN_OPTION) освободить его не может: без объявления
 		 * не отличить option<int> (не трогать!) от option<wrap<T>> (первый
@@ -844,6 +956,42 @@ void delete_page_vars(struct page *page)
 		 * чтением (X_REF n) без передачи владения.
 		 */
 		if (t == AIN_OPTION) {
+			/*
+			 * ★ЗНАЧЕНИЕ option МОЖЕТ ОКАЗАТЬСЯ УЖЕ МЁРТВЫМ (§5eu): у Dohna при
+			 * разрушении `BattleContext` в `option<string> MusicId` лежал слот,
+			 * давно ушедший под чужие объекты. Снимать по нему ссылку нельзя —
+			 * это либо double free, либо тихая порча чужого счётчика, и умрёт
+			 * тогда посторонний объект далеко отсюда. Называем момент, поле и
+			 * некролог слота; освобождение пропускаем.
+			 */
+			// ПУСТОЙ option (тег ≠ 0) значением НЕ ВЛАДЕЕТ: в его слоте
+			// лежит не хэндл, а мусор от последней записи — см. разбор
+			// у option_var_has_value.
+			if (!option_var_has_value(page, i))
+				continue;
+			if (i >= nr_args && option_var_value_owns(page, i)
+			    && page->values[i].i > 0
+			    && !heap_index_valid(page->values[i].i)) {
+				static int reported;
+				if (reported < 10) {
+					reported++;
+					// ★Имена копируем ДО вызова heap_dead_str: он внутри сам
+					// зовёт display_sjis*, а те освобождают прошлый буфер —
+					// в одном printf порядок вычисления аргументов не задан,
+					// и имя поля успевало стать висячим указателем.
+					char fbuf[128], obuf[128];
+					snprintf(fbuf, sizeof(fbuf), "%s",
+						 field ? display_sjis0(field) : "?");
+					snprintf(obuf, sizeof(obuf), "%s",
+						 owner ? display_sjis0(owner) : "?");
+					WARNING("option-поле %d '%s' в %s держит МЁРТВЫЙ слот %d — "
+						"освобождение пропущено. Некролог: %s\nстек игры:",
+						i, fbuf, obuf, page->values[i].i,
+						heap_dead_str(page->values[i].i, true));
+					vm_stack_trace();
+				}
+				continue;
+			}
 			if (i >= nr_args && option_var_value_owns(page, i)
 			    && page->values[i].i > 0)
 				variable_fini(page->values[i], AIN_STRUCT, true);
@@ -880,8 +1028,17 @@ void delete_page_vars(struct page *page)
 					display_sjis0(owner), display_sjis1(vname), i, t, page->type);
 			}
 		}
+		// Пустой элемент `array<option<T>>` значением не владеет — см.
+		// array_elem_has_value (у элемента объявления нет, судим по тегу).
+		if (page->type == ARRAY_PAGE && !option_var_has_value(page, i))
+			continue;
 		variable_fini(page->values[i], t, true);
 	}
+	// Контекст «чьё поле» действует только на время обхода: variable_fini зовут и
+	// из других мест (DELETE, присваивания), и не сброшенный флаг отдал бы им имя
+	// последнего поля этой страницы — сообщение о double free уверенно назвало бы
+	// непричастное поле.
+	vm_note_fini_owner(NULL, NULL, -1);
 }
 
 void delete_page(int slot)
@@ -967,8 +1124,12 @@ struct page *copy_page(struct page *src)
 			// попадают и поверхностные копии массивов строк — без своей
 			// ссылки такая копия освобождала бы чужую строку.
 			enum ain_data_type et = variable_type(src, i, NULL, NULL);
+			// Пустой элемент `array<option<T>>` хэндла не содержит — брать по
+			// нему ссылку значит удерживать ЧУЖОЙ объект (парно к пропуску
+			// освобождения в delete_page_vars).
 			if ((et == AIN_STRUCT || et == AIN_STRING)
-			    && dst->values[i].i > 0)
+			    && dst->values[i].i > 0
+			    && option_var_has_value(src, i))
 				heap_ref(dst->values[i].i);
 		}
 		return dst;
@@ -982,7 +1143,12 @@ struct page *copy_page(struct page *src)
 		// option<int>), поэтому реф здесь, где объявление доступно.
 		if (t == AIN_OPTION) {
 			dst->values[i] = src->values[i];
-			if (option_var_value_owns(src, i) && src->values[i].i > 0)
+			// Только у НЕПУСТОГО option в слоте лежит настоящий хэндл: у
+			// пустого там мусор от последней записи, и ссылка на него —
+			// удержание чужого объекта (парная беда к освобождению в
+			// delete_page_vars, см. option_var_has_value).
+			if (option_var_has_value(src, i) && option_var_value_owns(src, i)
+			    && src->values[i].i > 0)
 				heap_ref(src->values[i].i);
 			continue;
 		}

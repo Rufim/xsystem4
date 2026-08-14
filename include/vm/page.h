@@ -160,6 +160,11 @@ bool array_handle_elem_type(enum ain_data_type a_type);
 // 2 для Ixseal-массива с интерфейсным элементом (см. выше).
 // Индексы элементов во всех array_*-функциях — в ЭЛЕМЕНТАХ.
 int array_elem_slots(struct page *page);
+// Есть ли у `option<T>`-переменной страницы ЗНАЧЕНИЕ — читается по ТЕГУ (слот
+// сразу за значением), а не по содержимому: у пустого option в слоте значения
+// остаётся мусор от последней записи. Нужна всем, кто ходит по полям страницы
+// (разрушение, копирование, сериализация).
+bool option_var_has_value(struct page *page, int varno);
 enum ain_data_type array_type(enum ain_data_type type);
 struct page *alloc_array(int rank, union vm_value *dimensions, enum ain_data_type data_type, int struct_type, bool init_structs);
 struct page *realloc_array(struct page *src, int rank, union vm_value *dimensions, enum ain_data_type data_type, int struct_type, bool init_structs);
