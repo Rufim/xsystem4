@@ -129,6 +129,13 @@ struct string *vm_func_stack_name(int index);
 // It describes the element type of a generic container and, with it, how many
 // stack slots the call site pushed for an AIN_HLL_PARAM argument.
 void hll_call(int libno, int fno, int elem_class);
+/*
+ * Позиция стека VM, с которой начинались аргументы ПОСЛЕДНЕГО `hll_call`
+ * (выставляется, когда все аргументы уже сняты). Нужна вызывающему CALLHLL,
+ * чтобы понять, какие временные значения на стеке были аргументами именно
+ * этого вызова — см. «одноразовые ссылки A_REF» в vm.c.
+ */
+extern int hll_last_arg_base;
 bool library_exists(int libno);
 bool library_function_exists(int libno, int fno);
 void init_libraries(void);

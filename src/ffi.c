@@ -364,6 +364,8 @@ static bool ffi_string_slot_ok(int slot, struct ain_hll_function *f, int argno)
 	return false;
 }
 
+int hll_last_arg_base = -1;
+
 void hll_call(int libno, int fno, int elem_class)
 {
 	struct ain_hll_function *f = &ain->libraries[libno].functions[fno];
@@ -591,6 +593,12 @@ void hll_call(int libno, int fno, int elem_class)
 			break;
 		}
 	}
+	// Все аргументы сняты — отсюда и начиналось их окно на стеке. По нему
+	// CALLHLL опознаёт временные значения `A_REF`, отданные ИМЕННО этому вызову
+	// (у соседних сайтов такое значение переживает промежуточный HLL-вызов:
+	// `A_REF; .LOCALREF index; CALLHLL PartsEngine.GetActivityEndKey;
+	// CALLHLL Array.PushBack`).
+	hll_last_arg_base = stack_ptr;
 
 	if (dbg_arr)
 		NOTICE("ARR %s consumed %d slots (sp %d->%d)", f->name, dbg_sp0 - stack_ptr, dbg_sp0, stack_ptr);

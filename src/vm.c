@@ -1851,8 +1851,106 @@ static int vm_message_function(void)
 	return cached;
 }
 
+/*
+ * ★★ОДНОРАЗОВЫЕ ССЫЛКИ `A_REF`: значение, положенное на стек этим опкодом, несёт
+ * СВОЮ ссылку (копия страницы — свежий слот со счётчиком 1; общий объект — плюс
+ * `heap_ref`). По протоколу игры сайт либо кладёт такое значение в переменную и
+ * отпускает штатным `DELETE`, либо отдаёт его аргументом, И ТОГДА ССЫЛКУ ОБЯЗАН
+ * СНЯТЬ ПОЛУЧАТЕЛЬ: собственного `DELETE` у такого сайта нет.
+ *
+ * Чем это ломало Dohna (§5fa). `PlayerWorkerViewCollection@CreateView` ведёт
+ * список видов разностно: ушедшего работника снимает `Array.Erase#1`, нового
+ * добавляет `.LOCALREF view; A_REF; CALLHLL Array PushBack`. Контейнер берёт
+ * СВОЙ счётчик (так и надо: обычная идиома `NEW; PushBack; DELETE` кладёт
+ * ОДОЛЖЕННЫЙ хэндл), а ссылка от `A_REF` не снималась — у каждого элемента
+ * `array<PlayerWorkerView>` счётчик был на единицу больше нужного. Замер
+ * (`XSYS4_WHO_REFS` + `kill -USR2`): у живого элемента ref=2 при ЕДИНСТВЕННОМ
+ * держателе-массиве, а у стёртого ref=1 и держателей НЕТ ВООБЩЕ. Объект не
+ * умирал, значит не умирал его `wrap<IActivity>`, значит не звался
+ * `AFL_Activity_Release` — за весь прогон 3 `CreateActivity` и ноль
+ * `ReleaseActivity`. На экране это иконка прогноза `MatchScore` ушедшего
+ * работника: она оставалась висеть и накладывалась на иконку следующего
+ * (дамп частей: две части в одной точке 204,238).
+ *
+ * Почему нужен реестр, а не «снять ссылку сразу после вызова». Значение `A_REF`
+ * может ПЕРЕЖИТЬ промежуточный HLL-вызов и быть аргументом следующего:
+ *   `A_REF; .LOCALREF index; CALLHLL PartsEngine.GetActivityEndKey;
+ *    CALLHLL Array.PushBack`
+ * Поэтому запоминаем ПОЗИЦИЮ значения на стеке и снимаем ссылку только у тех
+ * записей, что попали в окно аргументов конкретного вызова (`hll_last_arg_base`).
+ * Если значение ушло со стека иначе (`X_ASSIGN` в переменную, `DELETE`, аргумент
+ * игровой функции), запись просто забывается — владение там уже разобрано сайтом.
+ */
+#define AREF_TMP_MAX 32
+static struct { int slot; int32_t sp; } aref_tmp[AREF_TMP_MAX];
+static int aref_tmp_nr;
+
+static void aref_tmp_note(int slot)
+{
+	if (aref_tmp_nr >= AREF_TMP_MAX) {
+		// Переполнение реестра — не беда владения, а потеря диагностики:
+		// худшее последствие прежнее (утечка ссылки), поэтому молча роняем
+		// самую старую запись.
+		memmove(aref_tmp, aref_tmp + 1, sizeof(aref_tmp[0]) * (AREF_TMP_MAX - 1));
+		aref_tmp_nr--;
+	}
+	aref_tmp[aref_tmp_nr].slot = slot;
+	aref_tmp[aref_tmp_nr].sp = stack_ptr - 1;
+	aref_tmp_nr++;
+}
+
+// Запись ещё описывает ЖИВОЕ значение на стеке? Мало проверить глубину: слот
+// стека мог быть переиспользован под другое значение (сняли присваиванием,
+// положили новое) — тогда запись протухла и трогать её нельзя.
+static bool aref_tmp_alive(int i)
+{
+	return aref_tmp[i].sp < stack_ptr && stack[aref_tmp[i].sp].i == aref_tmp[i].slot;
+}
+
+// Забыть записи, чьё значение уже ушло со стека (владение разобрал сам сайт).
+static void aref_tmp_forget_gone(void)
+{
+	int w = 0;
+	for (int i = 0; i < aref_tmp_nr; i++) {
+		if (aref_tmp_alive(i))
+			aref_tmp[w++] = aref_tmp[i];
+	}
+	aref_tmp_nr = w;
+}
+
+// Снять ссылки у значений, ушедших аргументами в только что исполненный HLL-вызов.
+// `XSYS4_AREF_KEEP_TMP=1` — прежнее поведение (ссылку не снимать) для бисекта.
+static void aref_tmp_release_args(int32_t arg_base, int32_t sp_before)
+{
+	static const char *keep = (const char *)1;
+	if (keep == (const char *)1)
+		keep = getenv("XSYS4_AREF_KEEP_TMP");
+	if (keep && *keep) {
+		aref_tmp_nr = 0;
+		return;
+	}
+	int w = 0;
+	for (int i = 0; i < aref_tmp_nr; i++) {
+		if (aref_tmp[i].sp >= arg_base && aref_tmp[i].sp < sp_before)
+			heap_unref(aref_tmp[i].slot);
+		else
+			aref_tmp[w++] = aref_tmp[i];
+	}
+	aref_tmp_nr = w;
+}
+
+void vm_aref_tmp_reset(void)
+{
+	aref_tmp_nr = 0;
+}
+
 static enum opcode execute_instruction(enum opcode opcode)
 {
+	// Дешевле одной проверки не сделать, а без неё реестр «протухает»: значение,
+	// снятое со стека присваиванием, иначе попало бы в окно аргументов чужого
+	// HLL-вызова и было бы освобождено дважды.
+	if (aref_tmp_nr)
+		aref_tmp_forget_gone();
 	switch (opcode) {
 	//
 	// --- Stack Management ---
@@ -2550,6 +2648,9 @@ static enum opcode execute_instruction(enum opcode opcode)
 		// Ixseal added a third operand describing the element type of a generic
 		// container (see hll_call). Older games emit only two.
 		int elem_class = instructions[CALLHLL].nr_args >= 3 ? get_argument(2) : 0;
+		// Верх стека ДО вызова: вместе с `hll_last_arg_base` задаёт окно
+		// аргументов, в котором снимаются одноразовые ссылки `A_REF`.
+		int32_t hll_sp_before = stack_ptr;
 		/*
 		 * XSYS4_HLL_IN_FUNC=<подстрока> — печатать HLL-вызовы, сделанные ИЗ игровой
 		 * функции с таким именем (по всему стеку вызовов). Нужна, когда игра ходит
@@ -2587,6 +2688,8 @@ static enum opcode execute_instruction(enum opcode opcode)
 				struct timespec t0, t1;
 				clock_gettime(CLOCK_MONOTONIC, &t0);
 				hll_call(lib, fun, elem_class);
+				if (aref_tmp_nr)
+					aref_tmp_release_args(hll_last_arg_base, hll_sp_before);
 				clock_gettime(CLOCK_MONOTONIC, &t1);
 				double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
 					+ (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
@@ -2601,6 +2704,8 @@ static enum opcode execute_instruction(enum opcode opcode)
 		{
 			int lib = get_argument(0), fun = get_argument(1);
 			hll_call(lib, fun, elem_class);
+			if (aref_tmp_nr)
+				aref_tmp_release_args(hll_last_arg_base, hll_sp_before);
 			/*
 			 * ★Форма возврата: если .ain объявляет ОБЪЕКТНЫЙ возврат (массив,
 			 * структура, строка, обёртка), а реализация положила на стек 0 —
@@ -3602,6 +3707,7 @@ static enum opcode execute_instruction(enum opcode opcode)
 			}
 			heap_ref(array);
 			stack_push(array);
+			aref_tmp_note(array);
 			break;
 		}
 		if (ap && ap->type == STRUCT_PAGE) {
@@ -3626,6 +3732,12 @@ static enum opcode execute_instruction(enum opcode opcode)
 		int slot = heap_alloc_slot(VM_PAGE);
 		heap_set_page(slot, copy_page(ap));
 		stack_push(slot);
+		// Копия — тоже одноразовое значение со своей ссылкой: если она уйдёт
+		// аргументом в HLL, снять её будет некому (у сайта нет DELETE).
+		// ★Только для СТРУКТУРНЫХ страниц: контейнеры (`A_REF` над массивом в
+		// `ArrayExtensions`) сайт кладёт в переменную и отпускает сам.
+		if (ap && ap->type == STRUCT_PAGE)
+			aref_tmp_note(slot);
 		break;
 	}
 	case A_NUMOF: {
@@ -4875,6 +4987,9 @@ int vm_execute_ain(struct ain *program)
 	}
 	stack_ptr = 0;
 	call_stack_ptr = 0;
+	// Реестр одноразовых ссылок `A_REF` описывает позиции на СТАРОМ стеке —
+	// после сброса он ссылается в никуда.
+	vm_aref_tmp_reset();
 
 	heap_init();
 	init_libraries();
