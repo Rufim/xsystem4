@@ -433,7 +433,51 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 			collect_flat_arrays(page, array.flat_arrays, save);
 			return gsave_add_array(save, &array);
 		}
-	case AIN_REF_TYPE:
+	/*
+	 * ★`ref <структура>` — ВЛАДЕЮЩАЯ ССЫЛКА В ОДИН СЛОТ, и сохранять её надо как
+	 * объект. Уходя в общую ref-ветку («не сериализуем»), она после загрузки
+	 * становилась −1, а игра этого не проверяет НИКОГДА: у неё ссылка не может
+	 * быть пустой, раз конструктор её заполнил.
+	 *
+	 * Живой случай (§5ey): `parts::detail::CSpriteParts { array<int> <vtable>;
+	 * ref CParts m_parts; }` — обёртка части, которую держит каждый компонент
+	 * интерфейса. `MoneyView` живёт в `GameContext`, то есть попадает в сейв
+	 * вместе с ним; после загрузки его `m_parts` пуст, и ПЕРВОЕ ЖЕ начисление
+	 * денег (`GameContext@Money::set` → `MoneyView@Set` → `Motion::Create` →
+	 * `CSpriteParts@IsValid::get`) роняло движок «Out of bounds heap index: −1/0».
+	 * Ловилось это и покупкой в магазине, и в конце фазы hustling
+	 * (`ShowIncomeToMoney`) — там пользователь и увидел «краш в конце подсчёта».
+	 * Замер, отделивший «не заполнили» от «обнулили»: XSYS4_FIELD_WATCH по полю
+	 * `m_parts` дал 103 879 записей за прогон и НИ ОДНОЙ для упавшего объекта —
+	 * значит объект пришёл не из конструктора, а из сейва.
+	 *
+	 * Тождество объектов даёт общий реестр записей (`save_obj_lookup`): если на
+	 * тот же объект ссылается ещё и обычное поле, запись будет ОДНА.
+	 *
+	 * Остальные `ref` (на скаляр, на элемент массива) в один слот не укладываются
+	 * — им нужна пара (страница, индекс), которой в формате нет, — и по-прежнему
+	 * не сохраняются.
+	 */
+	case AIN_REF_STRUCT:
+		if (val.i < 0)
+			return -1;
+		return add_value_to_gsave(AIN_STRUCT, val, save);
+	case AIN_REF_INT:
+	case AIN_REF_FLOAT:
+	case AIN_REF_STRING:
+	case AIN_REF_ARRAY_INT:
+	case AIN_REF_ARRAY_FLOAT:
+	case AIN_REF_ARRAY_STRING:
+	case AIN_REF_ARRAY_STRUCT:
+	case AIN_REF_FUNC_TYPE:
+	case AIN_REF_ARRAY_FUNC_TYPE:
+	case AIN_REF_BOOL:
+	case AIN_REF_ARRAY_BOOL:
+	case AIN_REF_LONG_INT:
+	case AIN_REF_ARRAY_LONG_INT:
+	case AIN_REF_DELEGATE:
+	case AIN_REF_ARRAY_DELEGATE:
+	case AIN_REF_ARRAY:
 		return -1;
 	default:
 		strict_or_warn("сохранение", "тип %s не сериализуется — поле потеряно",
@@ -897,6 +941,63 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		} else if (data_type == AIN_STRUCT && kv->value >= 0) {
 			rec_index = kv->value;
 			obj_struct_type = f_struct_type;
+		} else if (data_type == AIN_REF_STRUCT && kv->value >= 0) {
+			/*
+			 * `ref <структура>` — тот же объектный путь, что и у обычного поля
+			 * (один слот с heap-индексом, владеющая ссылка), НО тип берём ИЗ
+			 * САМОЙ ЗАПИСИ, а не из объявления члена.
+			 *
+			 * ★Разница принципиальная: у поля-значения динамический тип всегда
+			 * равен статическому, а ССЫЛКА законно держит производную (`ref
+			 * CParts` — и `CSpriteParts`, и прочие наследники). Сохранение
+			 * пишет ФАКТИЧЕСКИЙ тип объекта, и если при загрузке подставить
+			 * объявленный, `gsave_to_vm_value` сверит имя записи с именем базы
+			 * и упадёт «Bad save file: structure name mismatch» — то есть сейв
+			 * перестанет грузиться совсем. Читаем так же, как соседняя ветка
+			 * обёрток (wrap/option/iface), у которых та же природа.
+			 */
+			struct gsave_record *r = &save->records[kv->value];
+			struct gsave_struct_def *d = save->version >= 7
+				? &save->struct_defs[r->struct_index] : NULL;
+			obj_struct_type = ain_get_struct(ain, d ? d->name : r->struct_name);
+			if (obj_struct_type < 0) {
+				strict_or_warn("загрузка", "ref-поле %s: неизвестная структура %s",
+					display_sjis1(field_name),
+					display_sjis0(d ? d->name : r->struct_name));
+				continue;
+			}
+			rec_index = kv->value;
+		}
+		/*
+		 * `XSYS4_REF_TRACE=1` — что пришло в поля `ref <структура>`. Ими игра
+		 * пользуется БЕЗ проверки на пустоту (см. §5ey), поэтому надо видеть
+		 * ровно две вещи: пишет ли их сейв вообще (у ОРИГИНАЛЬНЫХ файлов это
+		 * отдельный вопрос) и не осталось ли поле пустым после загрузки.
+		 */
+		if (data_type == AIN_REF_STRUCT && getenv("XSYS4_REF_TRACE"))
+			NOTICE("REF %s.%s <- запись %d%s", display_sjis0(struct_name),
+			       display_sjis1(field_name), kv->value,
+			       kv->value < 0 ? " — В СЕЙВЕ ПУСТО (поле останется -1)" : "");
+		/*
+		 * ★ПУСТОЕ `ref <структура>` В ФАЙЛЕ. Две разные причины дают одно и то же
+		 * −1, и различить их по файлу нельзя: (а) сейв записан сборкой ДО правки
+		 * §5ey, когда такие поля не сериализовались вовсе, — тогда объект в файл
+		 * не попал и восстановить его нечем; (б) поле и правда было пустым.
+		 * Поэтому НЕ утверждаем ни возраст сейва, ни неизбежность падения — но
+		 * сказать надо: если игра к такому полю обратится (а пустоты она не ждёт,
+		 * ссылку ей заполнил конструктор), движок упадёт далеко от загрузки, и
+		 * связать «краш в магазине» с этим местом иначе невозможно.
+		 */
+		if (data_type == AIN_REF_STRUCT && kv->value < 0) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("поле %s.%s (ref) в сейве ПУСТО. Если игра к нему "
+					"обратится, движок упадёт («Out of bounds heap index: -1»); "
+					"частая причина — сейв, записанный сборкой до §5ey, где "
+					"ref-поля не сохранялись вовсе.",
+					display_sjis0(struct_name), display_sjis1(field_name));
+			}
 		}
 
 		if (rec_index >= 0) {
@@ -1213,7 +1314,28 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			gsave_load_array(save, page, array->flat_arrays);
 			return vm_int(slot);
 		}
-	case AIN_REF_TYPE:
+	// Зеркало записи (см. add_value_to_gsave): `ref <структура>` поднимается как
+	// объект и через тот же реестр тождества — ссылка окажется на ТОТ ЖЕ объект,
+	// что и у остальных полей восстановленного графа (§5ey).
+	case AIN_REF_STRUCT:
+		return gsave_to_vm_value(save, AIN_STRUCT, struct_type, array_rank, value,
+		                         container, varno);
+	case AIN_REF_INT:
+	case AIN_REF_FLOAT:
+	case AIN_REF_STRING:
+	case AIN_REF_ARRAY_INT:
+	case AIN_REF_ARRAY_FLOAT:
+	case AIN_REF_ARRAY_STRING:
+	case AIN_REF_ARRAY_STRUCT:
+	case AIN_REF_FUNC_TYPE:
+	case AIN_REF_ARRAY_FUNC_TYPE:
+	case AIN_REF_BOOL:
+	case AIN_REF_ARRAY_BOOL:
+	case AIN_REF_LONG_INT:
+	case AIN_REF_ARRAY_LONG_INT:
+	case AIN_REF_DELEGATE:
+	case AIN_REF_ARRAY_DELEGATE:
+	case AIN_REF_ARRAY:
 		return vm_int(-1);
 	default:
 		strict_or_warn("загрузка", "тип %s не восстанавливается — поле осталось пустым",
