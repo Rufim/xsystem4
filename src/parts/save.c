@@ -45,7 +45,12 @@
  * нарисованы ВСЕ счётчики интерфейса, и без этих полей после загрузки исчезали
  * все цифры), у ТЕКСТОВОЙ — флаг разрешённой разметки.
  */
-#define CURRENT_SAVE_VERSION 11
+/*
+ * v12: у части пишется признак КОРНЯ АКТИВНОСТИ (`is_activity_root`). Сцена после
+ * загрузки поднимается снимком частей, раскладка заново не читается — без признака
+ * корень терял точку привязки, которую ему ставит код игры (§5dz, п.1).
+ */
+#define CURRENT_SAVE_VERSION 12
 
 // Тайминг загрузки образа по типам состояний (печать под XSYS4_XPE_TRACE):
 // «задержки листания scrollback» — это перезагрузка образа на каждую страницу,
@@ -1079,6 +1084,11 @@ static void save_parts(struct iarray_writer *w, struct parts *parts)
 	iarray_write(w, parts->on_cursor_show_link);
 	iarray_write(w, parts->sub_color_mode);
 	iarray_write(w, parts->want_save_back_scene);
+	// v12: КОРЕНЬ АКТИВНОСТИ. Признак ставит загрузчик раскладки, а сцена после
+	// загрузки сейва приходит СНИМКОМ частей (раскладка заново не читается) — без
+	// него у восстановленной активности пропадала бы точка привязки корня, то есть
+	// карточки клиентов на экране наград снова уезжали бы вниз (§5dz).
+	iarray_write(w, parts->is_activity_root);
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and save unconditionally
 	if (parts_multi_controller) {
@@ -1281,6 +1291,10 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 		parts->sub_color_mode = !!iarray_read(r);
 		parts->want_save_back_scene = !!iarray_read(r);
 	}
+	// v12: корень активности (см. save_parts). В образах v11 и старше поля нет —
+	// часть остаётся без признака, то есть ведёт себя как до правки §5dz.
+	if (version >= 12)
+		parts->is_activity_root = !!iarray_read(r);
 	// TODO: once the Rance 9 save format stabilizes, bump save version
 	// and load based on version check
 	if (parts_multi_controller) {

@@ -704,11 +704,29 @@ static Point parts_anchor_shift(struct parts *parts)
 	 * Найдено ручкой XSYS4_NO_ANCHOR_SHIFT + XSYS4_ANCHOR_TRACE.
 	 *
 	 * Прежнее широкое поведение для замеров: XSYS4_ANCHOR_SHIFT_ANY=1.
+	 *
+	 * ★КОРЕНЬ АКТИВНОСТИ — второй законный случай, и по той же причине: своего
+	 * вида у него нет, а содержимое — вся активность. `原点座標モード` у корня в
+	 * раскладках Dohna не встречается НИ РАЗУ (все 195 корней — режим 1), его
+	 * ставит код игры, и единственный такой сеттер во всём байткоде —
+	 * `CustomerView@OriginPosMode::set(4)` (`IActivity@Root::get` →
+	 * `IParts@OriginPosMode::set`) для карточек клиентов на экране наград
+	 * hustling. Без сдвига карточка уезжала вниз ровно на половину своей высоты:
+	 * `ResultCustomerViewCollection@SetPartsPos` ставит y = 360, что при режиме 4
+	 * (середина-лево) есть вертикальный ЦЕНТР карточки, а у нас это был её верх
+	 * (кадр пользователя: верх карточки ~370 против ~118 у оригинала). Контейнер
+	 * Haha Ranman (часть 1000001035), ради которого сужение и делалось, корнем
+	 * активности не является — его создаёт сама игра. FINDINGS §5dz, пункт 1.
+	 * Откат: XSYS4_ANCHOR_ACT_ROOT=0.
 	 */
 	static const char *any = (const char *)1;
 	if (any == (const char *)1)
 		any = getenv("XSYS4_ANCHOR_SHIFT_ANY");
-	if (!parts->is_user_component && !(any && *any))
+	static const char *act_root = (const char *)1;
+	if (act_root == (const char *)1)
+		act_root = getenv("XSYS4_ANCHOR_ACT_ROOT");
+	bool root_ok = parts->is_activity_root && !(act_root && act_root[0] == '0');
+	if (!parts->is_user_component && !root_ok && !(any && *any))
 		return (Point) { 0, 0 };
 	struct parts_state *state = &parts->states[parts->state];
 	if (state->common.w || state->common.h)
@@ -721,6 +739,28 @@ static Point parts_anchor_shift(struct parts *parts)
 	if (!w && !h)
 		return (Point) { 0, 0 };
 	Point shift = calculate_offset(parts->origin_mode, w, h);
+	/*
+	 * ★СДВИГ ПРИВЯЗКИ МАСШТАБИРУЕТСЯ ВМЕСТЕ С СОДЕРЖИМЫМ. Размер содержимого
+	 * `parts_get_content_size` считает по ЛОКАЛЬНЫМ координатам потомков, а на
+	 * экране те стоят с масштабом самой части (`parts_update_global_pos` умножает
+	 * смещение ребёнка на `global.scale` родителя). Значит содержимое занимает
+	 * `w·scale`, и точка привязки обязана отсчитываться по нему же — иначе край,
+	 * за который часть привязана, уезжает на `w·(scale−1)`.
+	 *
+	 * Живой случай (FINDINGS §5dz, пункт 2): плашка денег `MoneyView` на экране
+	 * наград hustling стоит в (1264, 12) с `原点座標モード = 3` (привязка за ПРАВЫЙ
+	 * край) и при начислении РАСТЁТ (motion масштабирует её). С немасштабированным
+	 * сдвигом правый край уходил за экран — на кадре пользователя сумма обрезана
+	 * рамкой окна, у оригинала плашка кончается на 1264.
+	 * Откат: XSYS4_ANCHOR_NO_SCALE=1.
+	 */
+	static const char *noscale = (const char *)1;
+	if (noscale == (const char *)1)
+		noscale = getenv("XSYS4_ANCHOR_NO_SCALE");
+	if (!(noscale && *noscale)) {
+		shift.x = (int)roundf(shift.x * parts->global.scale.x);
+		shift.y = (int)roundf(shift.y * parts->global.scale.y);
+	}
 	/*
 	 * XSYS4_ANCHOR_TRACE=1 — назвать части, которым сдвиг реально достаётся (по
 	 * разу на номер): номер, режим привязки, размер содержимого и сам сдвиг, плюс
@@ -1072,6 +1112,14 @@ void parts_set_scale_y(struct parts *parts, float mag)
 	parts_dirty(parts);
 }
 
+/*
+ * ★РАЗВОРОТ ПО X/Y НАСЛЕДУЕТСЯ ПОДДЕРЕВОМ, как и плоский поворот по Z: у Dohna его
+ * ставят контейнеру без картинки (`Base` в `StandView`, 131×577, tex=0), а видимое
+ * висит на нём детьми. ТОЧКУ ОСИ здесь не храним — рендер берёт её обходом вверх
+ * (`parts_rot3d_origin`): хранимое поле пришлось бы синхронизировать ещё и при
+ * перемещении части, во втором пути расчёта параметров и при загрузке сейва, а
+ * каждый пропуск давал бы поворот вокруг угла экрана.
+ */
 static void parts_update_global_rotate_x(struct parts *parts, float parent_rot_x)
 {
 	parts->global.rotation.x = parent_rot_x + parts->local.rotation.x;
@@ -2792,6 +2840,34 @@ bool PE_SetNumeralLinkedCGNumberWidthWidthList(int parts_no, struct string *cg_n
 	return true;
 }
 
+/*
+ * `XSYS4_NUM_TRACE=1|<подстрока имени узла>` — КТО и ЧТО кладёт в числовые части.
+ *
+ * Зачем: счётчики интерфейса Dohna игра анимирует своим motion-движком
+ * (`Motion::Create("… |Number:<конец>")` → `Motion::Executer@Update` →
+ * `AFL_Parts_WrapNumeral` → `CNumeralParts@Number::set`), а движку достаются
+ * только `Set/GetNumeralNumber`. Когда счётчик на экране стоит на нуле, по кадру
+ * не отличить «игра не пишет» от «пишем, но не рисуется»: строка трассы называет
+ * узел раскладки, значение и состояние. Живой случай — `Total Take` на экране
+ * наград hustling (FINDINGS §5dz).
+ *
+ * Форма с подстрокой (`XSYS4_NUM_TRACE=Total`) отсекает шум: за анимацию в 500 мс
+ * счётчик получает несколько десятков записей, а на экране их несколько.
+ */
+static bool num_trace_match(int parts_no, const char **name_out)
+{
+	static const char *tr = (const char *)1;
+	if (tr == (const char *)1)
+		tr = getenv("XSYS4_NUM_TRACE");
+	if (!tr || !*tr)
+		return false;
+	const char *name = pe_parts_node_name(parts_no);
+	*name_out = name ? name : "?";
+	if (tr[0] == '1' && !tr[1])
+		return true;
+	return name && strstr(name, tr);
+}
+
 bool PE_SetNumeralNumber(int parts_no, int n, int state)
 {
 	if (!parts_state_valid(--state))
@@ -2799,6 +2875,11 @@ bool PE_SetNumeralNumber(int parts_no, int n, int state)
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_numeral *numeral = parts_get_numeral(parts, state);
+	const char *name;
+	if (num_trace_match(parts_no, &name))
+		NOTICE("NUM set part=%d '%s' state=%d %d -> %d (act='%s')",
+		       parts_no, name, state + 1, numeral->num, n,
+		       pe_parts_activity_name(parts_no) ?: "-");
 	return parts_numeral_set_number(parts, numeral, n);
 }
 
@@ -2813,9 +2894,16 @@ int PE_GetNumeralNumber(int parts_no, int state)
 	if (!parts_state_valid(--state))
 		return 0;
 	struct parts *parts = parts_try_get(parts_no);
-	if (!parts || parts->states[state].type != PARTS_NUMERAL)
-		return 0;
-	return parts->states[state].num.num;
+	bool numeral = parts && parts->states[state].type == PARTS_NUMERAL;
+	int r = numeral ? parts->states[state].num.num : 0;
+	// Читается ОДИН раз на анимацию (начало интерполяции), поэтому печатаем каждое
+	// чтение: важен и случай «часть не числовая» — тогда motion стартует с нуля, а
+	// причина молчаливая.
+	const char *name;
+	if (num_trace_match(parts_no, &name))
+		NOTICE("NUM get part=%d '%s' state=%d -> %d%s", parts_no, name,
+		       state + 1, r, numeral ? "" : " (СОСТОЯНИЕ НЕ ЧИСЛОВОЕ)");
+	return r;
 }
 
 bool PE_IsNumeralShowComma(int parts_no, int state)
@@ -3568,15 +3656,54 @@ float PE_GetPartsMagY(int parts_no)
 	return parts_get(parts_no)->local.scale.y;
 }
 
+/*
+ * `XSYS4_ROT_TRACE=1` — КТО и на сколько разворачивает часть по X/Y, со стеком
+ * игры (по одной строке на часть и ось). Нужен, чтобы понять СЕМАНТИКУ значения:
+ * по логу Dohna в `RotateX` приходит 1000.0 (686 раз за прогон) вперемешку с
+ * промежуточными 32.5/47.5/92.5/130 — то есть это анимация, но что за единицы,
+ * из HLL-объявления (`void SetComponentRotateX(int, float)`) не видно.
+ */
+static void rot_trace(const char *axis, int parts_no, float v)
+{
+	static const char *tr = (const char *)1;
+	if (tr == (const char *)1)
+		tr = getenv("XSYS4_ROT_TRACE");
+	if (!tr || !*tr)
+		return;
+	static struct { int no; char axis; } seen[128];
+	static int nr_seen;
+	for (int i = 0; i < nr_seen; i++)
+		if (seen[i].no == parts_no && seen[i].axis == axis[0])
+			return;
+	if (nr_seen < 128) {
+		seen[nr_seen].no = parts_no;
+		seen[nr_seen].axis = axis[0];
+		nr_seen++;
+	}
+	const char *name = pe_parts_node_name(parts_no);
+	NOTICE("ROT%s part=%d '%s' <- %.3f (act='%s') — стек игры:", axis, parts_no,
+	       name ? name : "?", v, pe_parts_activity_name(parts_no) ?: "-");
+	vm_stack_trace();
+}
+
+/*
+ * ★Предупреждение о 3D-развороте — ОДНОРАЗОВОЕ. Карточки-«двери» экрана наград
+ * hustling получают `RotateY` КАЖДЫЙ КАДР на восьми частях: за прогон это десятки
+ * тысяч строк, в которых тонет вся остальная диагностика (лог краша на итогах дня
+ * вышел 74 МБ, и полезных строк в нём было полсотни). Смысл сообщения — сказать,
+ * что разворот не реализован; повторы ничего не добавляют.
+ */
 void PE_SetPartsRotateX(int parts_no, float rot_x)
 {
-	UNIMPLEMENTED("(%d, %f)", parts_no, rot_x);
+	if (rot_x != 0.0f)
+		rot_trace("X", parts_no, rot_x);
 	parts_set_rotation_x(parts_get(parts_no), rot_x);
 }
 
 void PE_SetPartsRotateY(int parts_no, float rot_y)
 {
-	UNIMPLEMENTED("(%d, %f)", parts_no, rot_y);
+	if (rot_y != 0.0f)
+		rot_trace("Y", parts_no, rot_y);
 	parts_set_rotation_y(parts_get(parts_no), rot_y);
 }
 
@@ -4093,6 +4220,19 @@ void parts_mark_slider_bar(int parts_no, bool horizontal)
 	else
 		parts->is_vscrollbar = true;
 	parts->is_slider_bar = true;
+}
+
+/*
+ * Пометить часть как КОРЕНЬ АКТИВНОСТИ (`ルートパーツ` раскладки). Зовёт загрузчик
+ * раскладки — единственный, кто это знает: в рантайме корень от любого другого
+ * контейнера ничем не отличается. Признак нужен точке привязки, см.
+ * parts_anchor_shift и FINDINGS §5dz.
+ */
+void parts_mark_activity_root(int parts_no)
+{
+	struct parts *parts = parts_try_get(parts_no);
+	if (parts)
+		parts->is_activity_root = true;
 }
 
 int PE_GetComponentType(int parts_no, int state)

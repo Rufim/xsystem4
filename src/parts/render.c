@@ -15,6 +15,7 @@
  */
 
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <assert.h>
 #include <cglm/cglm.h>
@@ -83,6 +84,171 @@ static float parts_render_rotation_z(struct parts *parts)
 	if (parts->global.mirror_x != parts->global.mirror_y)
 		return -parts->global.rotation.z;
 	return parts->global.rotation.z;
+}
+
+/*
+ * 3D-РАЗВОРОТ ЧАСТИ (`SetComponentRotateX/Y`) — поворот вокруг горизонтальной или
+ * вертикальной оси С ПЕРСПЕКТИВОЙ. Раньше здесь стояла ЗАГЛУШКА: сеттеры значение
+ * хранили, рендер его игнорировал (закомментированные glm_rotate_x/y и `FIXME:
+ * need perspective`), то есть карточки-«двери» Dohna стояли неподвижно.
+ *
+ * Кто этим пользуется: `StandView@OnUpdate` качает карточку таланта маятником
+ * `cos(t)·15°` (константы 0x41700000 = 15.0 и 0x43B40000 = 360.0 в байткоде) —
+ * ровно один сайт на всю игру, остальные вызовы приходят с нулём.
+ *
+ * МОДЕЛЬ (две части, обе выведены замером, а не подбором):
+ *
+ * 1. Разворот — свойство ПОДДЕРЕВА, а не отдельной части: угол наследуется вниз
+ *    вместе с ТОЧКОЙ ОСИ (`global.rot3d_origin`), и группа поворачивается как
+ *    жёсткое тело. Иначе распадается: у Dohna разворот ставят прямоугольнику
+ *    `Base` (131×577, tex=0), а видимое — CG карточки, панель статов и подпись —
+ *    висит на нём детьми. Замер при заведомо сильной перспективе показал именно
+ *    развал: подложка схлопывалась в полоску, рамка оставалась на месте.
+ *
+ * 2. Перспектива — деление на `w = z/d + 1` относительно ЦЕНТРА ЭКРАНА. Без неё
+ *    поворот на 15° даёт лишь сжатие в cos θ (3.5%), тогда как у оригинала
+ *    дальний край карточки заметно КОРОЧЕ ближнего.
+ *
+ * ★ЗАМЕР `d` (экран TALENT, сверка с оригиналом под Proton, 12 кадров с каждой
+ * стороны, отношение высот ближнего и дальнего краёв качающейся карточки):
+ * у оригинала колебание укладывается в 1.000…1.0197, то есть при θ = 15° и
+ * полуширине 65.5 px вынос по глубине `s = 65.5·sin15° = 16.95` даёт
+ * `s/d = 0.00976` → **d ≈ 1750**. Отсюда и значение по умолчанию.
+ *
+ * ★ЛОВУШКА, СТОИВШАЯ ДВУХ ЗАМЕРОВ: трапеция карточек на кадре в основном
+ * НАРИСОВАНА В АССЕТЕ, а движок добавляет к ней лишь малое покачивание. Первый
+ * замер (по эталону экрана наград, `screenshots/dohna-results-original-cards-*`)
+ * принял всю трапецию за работу движка и дал d ≈ 442 — вчетверо меньше. Проверка:
+ * у НЕподвижных карточек отношение высот совпадает у нас и у оригинала с точностью
+ * 0.2…0.4% ДАЖЕ БЕЗ разворота (1.086/1.084 и 1.052/1.048) — значит их форма к
+ * развороту отношения не имеет.
+ *
+ * ★НЕ ЗАКОНЧЕНО: точная калибровка требует сверки НА ОДНОМ И ТОМ ЖЕ сейве —
+ * у оригинала под рукой был свой (Day 2, другой состав талантов), а подложить ему
+ * наш сейв — это писать в папку игры, чего без спроса не делаем. Пока `d` снят по
+ * амплитуде колебания, а она у оригинала мала (2%), так что точность оценки ±15%.
+ * Ручка `XSYS4_ROT_PERSP=<d>` меняет значение без пересборки, `=0` — выключает
+ * перспективу совсем (остаётся чистое ортогональное вращение).
+ */
+static float parts_persp_distance(void)
+{
+	static float d = -1.0f;
+	if (d < 0.0f) {
+		const char *e = getenv("XSYS4_ROT_PERSP");
+		d = (e && *e) ? strtof(e, NULL) : 1750.0f;
+	}
+	return d;
+}
+
+// Есть ли у части 3D-разворот (X или Y). Z — обычный плоский поворот, он идёт
+// своим путём и перспективы не требует.
+static bool parts_has_3d_rotation(struct parts *parts)
+{
+	return parts->global.rotation.x != 0.0f || parts->global.rotation.y != 0.0f;
+}
+
+/*
+ * ОСЬ разворота — позиция того предка, у кого поворот СВОЙ (`local`), а если свой
+ * поворот у самой части, то её собственная позиция.
+ *
+ * ★Считаем обходом вверх, а НЕ храним полем. Хранимое поле пришлось бы обновлять в
+ * четырёх местах сразу — в обеих ветках наследования угла (X и Y перезатирали бы
+ * друг друга при `RotateX(0)` поверх `RotateY(15)`), во втором пути расчёта
+ * параметров (`parts_combine_params`), при КАЖДОМ перемещении части и при загрузке
+ * образа из сейва. Любой пропущенный путь давал бы поворот вокруг точки (0,0), то
+ * есть улетевшее в угол экрана поддерево. Вычисление по месту не рассинхронизируется
+ * в принципе, а глубина обхода — единицы узлов и только у частей с 3D-углом.
+ */
+static Point parts_rot3d_origin(struct parts *parts)
+{
+	for (struct parts *p = parts; p; p = p->parent) {
+		if (p->local.rotation.x != 0.0f || p->local.rotation.y != 0.0f)
+			return p->global.pos;
+	}
+	return parts->global.pos;
+}
+
+/*
+ * Домножить матрицу на разворот ПОДДЕРЕВА вокруг оси группы.
+ *
+ * Зовётся ДО сдвига части в свою позицию, потому что ось общая для всей группы и
+ * задана в экранных координатах. Каждый потомок при этом остаётся на своём месте
+ * внутри группы, а вся группа поворачивается как жёсткое тело.
+ */
+static void parts_apply_3d_rotation(struct parts *parts, mat4 m)
+{
+	if (!parts_has_3d_rotation(parts))
+		return;
+	Point o = parts_rot3d_origin(parts);
+	glm_translate(m, (vec3){ o.x, o.y, 0.0f });
+	glm_rotate_x(m, glm_rad(parts->global.rotation.x), m);
+	glm_rotate_y(m, glm_rad(parts->global.rotation.y), m);
+	glm_translate(m, (vec3){ -o.x, -o.y, 0.0f });
+}
+
+/*
+ * Домножить готовую мировую матрицу на перспективу относительно центра экрана и
+ * ПОГАСИТЬ Z-строку вывода.
+ *
+ * Делит на w уже GPU: ортографическая `view_transform` строку w не трогает
+ * (`w_out = w_in`), поэтому `x_ndc = (2x/W)/w − 1` — ровно то, что нужно.
+ *
+ * ★ГАШЕНИЕ Z ОБЯЗАТЕЛЬНО, иначе повёрнутая часть ПРОПАДАЕТ. `WV_TRANSFORM` пишет
+ * `z_clip = z − w`, то есть в кадр проходит лишь полоса `0 ≤ z ≤ 2w` (при w≈1 это
+ * два пикселя глубины), а поворот карточки 131 px на 15° уводит её углы к z ≈ ±35 —
+ * они отсекаются near/far-плоскостями, и от части остаётся полоска вдоль оси.
+ * Тот же приём с тем же обоснованием уже стоит в flat-пути (`render_flat_cg`) и у
+ * частиц эмиттера. Гасим ПОСЛЕ перспективы: w считается из ВХОДНОГО z (строка
+ * `persp[2][3]`), поэтому обнуление ВЫХОДНОЙ z-строки его не трогает.
+ */
+static void parts_apply_perspective(struct parts *parts, mat4 mw)
+{
+	if (!parts_has_3d_rotation(parts))
+		return;
+	float d = parts_persp_distance();
+	if (d > 0.0f) {
+		float cx = config.view_width / 2.0f;
+		float cy = config.view_height / 2.0f;
+		mat4 persp = GLM_MAT4_IDENTITY_INIT;
+		persp[2][3] = 1.0f / d;          // w = z/d + 1
+		mat4 to_center, from_center, tmp;
+		glm_translate_make(to_center, (vec3){ cx, cy, 0.0f });
+		glm_translate_make(from_center, (vec3){ -cx, -cy, 0.0f });
+		glm_mat4_mul(to_center, persp, tmp);
+		glm_mat4_mul(tmp, from_center, persp);
+		mat4 with_persp;
+		glm_mat4_mul(persp, mw, with_persp);
+		/*
+		 * ★ЗАЩИТА ОТ ТОЧКИ ЗА КАМЕРОЙ. `w = z/d + 1` обращается в ноль при
+		 * `z = −d`: вершина уходит в плоскость наблюдателя, деление разносит
+		 * квад по всему экрану. В штатном режиме это недостижимо (у карточки
+		 * полуширина 65 px против d = 1750), но достижимо при большой части,
+		 * угле под 90° или заниженной ручке `XSYS4_ROT_PERSP`. Проверяем ЧЕТЫРЕ
+		 * УГЛА готовой матрицы — это четыре умножения, зато оценка точная, а не
+		 * по габаритам «на глаз». Опасный случай не рисуем перспективой вовсе
+		 * (остаётся ортогональный поворот) и говорим об этом вслух: молча
+		 * разлетевшаяся геометрия — худший из возможных исходов.
+		 */
+		float min_w = FLT_MAX;
+		for (int i = 0; i < 4; i++) {
+			vec4 corner = { (float)(i & 1), (float)((i >> 1) & 1), 0.0f, 1.0f }, out;
+			glm_mat4_mulv(with_persp, corner, out);
+			if (out[3] < min_w)
+				min_w = out[3];
+		}
+		if (min_w > 0.1f) {
+			glm_mat4_copy(with_persp, mw);
+		} else {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				WARNING("3D-разворот части %d: угол вершины уходит за камеру "
+					"(w=%.3f при d=%.0f) — перспектива для неё отключена, "
+					"остался плоский поворот", parts->no, min_w, d);
+			}
+		}
+	}
+	mw[0][2] = mw[1][2] = mw[2][2] = mw[3][2] = 0.0f;
 }
 
 static void parts_render_texture(struct texture *texture, mat4 mw_transform, Rectangle *rect, float blend_rate, vec3 add_color, vec3 multiply_color, int draw_filter, int alpha_clipper)
@@ -218,6 +384,9 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 	 * масштаб руками НЕ умножается — его применяет сама матрица.
 	 */
 	mat4 base = GLM_MAT4_IDENTITY_INIT;
+	// 3D-разворот достаётся и тексту: у карточки-«двери» подпись едет вместе с ней
+	// (эталон — имя `Kinose Fukuno` на повёрнутой карточке экрана наград).
+	parts_apply_3d_rotation(parts, base);
 	glm_translate(base, (vec3){ parts->global.pos.x, parts->global.pos.y, 0 });
 	glm_rotate_z(base, glm_rad(parts_render_rotation_z(parts)), base);
 	glm_scale(base, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0f });
@@ -252,6 +421,7 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 			glm_mat4_copy(base, mw_transform);
 			glm_translate(mw_transform, (vec3){ x, y, 0 });
 			glm_scale(mw_transform, (vec3){ ch->t.w, ch->t.h, 1.0f });
+			parts_apply_perspective(parts, mw_transform);
 			Rectangle r = { 0, 0, ch->t.w, ch->t.h };
 			parts_render_texture(&ch->t, mw_transform, &r, alpha, add_color, multiply_color, 0, parts_effective_clipper(parts));
 			x += ch->advance;
@@ -275,6 +445,7 @@ static void parts_render_text(struct parts *parts, struct parts_text *t)
 					glm_mat4_copy(base, rt);
 					glm_translate(rt, (vec3){ rx, ry, 0 });
 					glm_scale(rt, (vec3){ g->t.w, g->t.h, 1.0f });
+					parts_apply_perspective(parts, rt);
 					Rectangle rr = { 0, 0, g->t.w, g->t.h };
 					parts_render_texture(&g->t, rt, &rr, alpha, add_color,
 							multiply_color, 0, parts_effective_clipper(parts));
@@ -292,10 +463,8 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 	set_draw_filter_blend_func(parts->draw_filter);
 
 	mat4 mw_transform = GLM_MAT4_IDENTITY_INIT;
+	parts_apply_3d_rotation(parts, mw_transform);
 	glm_translate(mw_transform, (vec3) { parts->global.pos.x, parts->global.pos.y, 0 });
-	// FIXME: need perspective for 3D rotate
-	//glm_rotate_x(mw_transform, parts->rotation.x, mw_transform);
-	//glm_rotate_y(mw_transform, parts->rotation.y, mw_transform);
 	glm_rotate_z(mw_transform, glm_rad(parts_render_rotation_z(parts)), mw_transform);
 	glm_scale(mw_transform, (vec3){ parts->global.scale.x, parts->global.scale.y, 1.0 });
 	// В зеркальной системе координат предков коробка части отражается вокруг её
@@ -338,6 +507,9 @@ static void parts_render_cg(struct parts *parts, struct parts_common *common)
 		parts->global.multiply_color.g / 255.0f,
 		parts->global.multiply_color.b / 255.0f,
 	};
+	// Перспектива домножается ПОСЛЕДНЕЙ (самая внешняя): к этому моменту в матрице
+	// уже есть поворот, масштаб и размер части, то есть готовые мировые координаты.
+	parts_apply_perspective(parts, mw_transform);
 	parts_render_texture(&common->texture, mw_transform, &r, parts->global.alpha / 255.0, add_color, multiply_color, parts->draw_filter, parts_effective_clipper(parts));
 
 	glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);

@@ -1696,6 +1696,41 @@ const char *pe_parts_activity_name(int parts_no)
 	return buf;
 }
 
+/*
+ * Имя УЗЛА раскладки, которым часть заведена в своей активности (`Total`,
+ * `Income`, `MoneyView`…). Номера частей от прогона к прогону разные, а в
+ * трассах читать надо именно имя — по нему строка сходится с `.pactex`.
+ */
+struct pe_act_node_scan { int number; const char *name; };
+
+static void pe_act_node_name_cb(struct ht_slot *slot, void *data)
+{
+	struct pe_act_node_scan *s = data;
+	struct pe_activity *a = slot->value;
+	if (!a || s->name)
+		return;
+	for (int i = 0; i < a->nr_parts; i++) {
+		if (a->parts[i].number == s->number && a->parts[i].name) {
+			s->name = a->parts[i].name->text;
+			return;
+		}
+	}
+}
+
+const char *pe_parts_node_name(int parts_no)
+{
+	if (!pe_activities)
+		return NULL;
+	struct pe_act_node_scan s = { .number = parts_no, .name = NULL };
+	ht_foreach(pe_activities, pe_act_node_name_cb, &s);
+	if (!s.name)
+		return NULL;
+	// Свой буфер: общие display_sjis* в строке трассы уже заняты именем активности.
+	static char buf[256];
+	snprintf(buf, sizeof(buf), "%s", display_sjis2(s.name));
+	return buf;
+}
+
 static void pe_act_dump_cb(struct ht_slot *slot, void *data)
 {
 	int *total = data;
@@ -3810,6 +3845,11 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 	// x 965..976 против 939..954 у оригинала) — FINDINGS §5t. Вызов ЕДИНСТВЕННЫЙ: при
 	// слиянии ветвей он задваивался (идемпотентно, но это мусор).
 	PE_SetPartsOriginPosMode(no, act_int(node, "原点座標モード", 1));
+	// Корень активности (`ルートパーツ`): в рантайме его ничем не отличить от любого
+	// другого контейнера, а точке привязки это знать нужно — режим корню ставит КОД
+	// игры, и тогда привязка относится к содержимому всей активности (§5dz, п.1).
+	if (parent_no < 0)
+		parts_mark_activity_root(no);
 	// 原点座標 (explicit origin coordinate) is (0,0) in all 2708 parts of all 195 Dohna
 	// layouts and absent entirely in Tsumamigui 3, so its meaning is not established —
 	// check the assumption instead of silently ignoring a non-zero value.
@@ -3900,16 +3940,15 @@ static int act_build_part(struct pe_activity *a, struct ex_tree *node, int paren
 	// им нужна перспектива. Молча проглотить угол — ровно та ошибка, которую тут и
 	// починили, поэтому сообщаем. Ненулевой x/y во всех играх ровно один:
 	// `SceneBattleResult` Dohna с y=180.
+	// ★Теперь эти углы РАБОТАЮТ (§5ez: разворот с перспективой реализован), поэтому
+	// раскладочные x/y ставим наравне с z, а не выбрасываем с предупреждением.
+	// Случай во всех играх ровно один — `SceneBattleResult` Dohna с y = 180.
 	float rot_x = act_list_float(node, "回転", 0, 0.0f);
 	float rot_y = act_list_float(node, "回転", 1, 0.0f);
-	if (rot_x != 0.0f || rot_y != 0.0f) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			WARNING("act_build_part: part '%s' has 回転 x/y (%.1f,%.1f) — 3D rotation needs perspective, ignored",
-			        display_sjis0(node->name->text), rot_x, rot_y);
-		}
-	}
+	if (rot_x != 0.0f)
+		PE_SetPartsRotateX(no, rot_x);
+	if (rot_y != 0.0f)
+		PE_SetPartsRotateY(no, rot_y);
 	if (act_int(node, "クリック許可", 0))
 		PE_SetClickable(no, true);
 	/*

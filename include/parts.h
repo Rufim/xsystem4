@@ -47,6 +47,9 @@ bool pe_parts_in_activity(int parts_no);
 // Имя активности, за которой числится часть, или NULL. Строка — во внутреннем
 // буфере вызова, действительна до следующего вызова.
 const char *pe_parts_activity_name(int parts_no);
+// Имя УЗЛА раскладки, которым часть заведена в активности (`Total`, `Income`…),
+// или NULL. Строка — во внутреннем буфере вызова.
+const char *pe_parts_node_name(int parts_no);
 // Сводка живых активностей: имя, сколько частей числится и сколько из них живо.
 void pe_dump_activities(void);
 bool PE_SetPartsCG(int parts_no, struct string *cg_name, int sprite_deform, int state);
@@ -457,6 +460,8 @@ void parts_mark_textbox(int parts_no);
 void parts_mark_radio_box(int parts_no);
 // Пометить полосу как слайдер (v14 12/13, см. src/parts/parts.c).
 void parts_mark_slider_bar(int parts_no, bool horizontal);
+// Пометить часть как корень активности (см. src/parts/parts.c, §5dz).
+void parts_mark_activity_root(int parts_no);
 // Записать кнопку в состав группы (см. src/parts/parts.c).
 void parts_radio_box_add_child(int box_no, int child_no);
 // Номер группы, которой принадлежит кнопка, и её индекс в ней (-1 = вне группы).

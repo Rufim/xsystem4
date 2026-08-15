@@ -843,6 +843,17 @@ struct parts {
 	 * обязаны храниться по-настоящему. У Tsumamigui 3 этих функций нет вовсе.
 	 */
 	bool is_user_component;
+	/*
+	 * КОРЕНЬ АКТИВНОСТИ (`ルートパーツ` раскладки): часть, с которой загрузчик
+	 * начинает дерево, у неё нет родителя-части внутри своей активности.
+	 * Нужен ровно для точки привязки: `原点座標モード` у корня ни в одной из 195
+	 * раскладок Dohna не задан (всегда 1), его ставит КОД игры
+	 * (`CustomerView@OriginPosMode::set` → `IActivity@Root::get` →
+	 * `IParts@OriginPosMode::set` — единственный такой сеттер вне библиотеки),
+	 * и тогда привязка относится к СОДЕРЖИМОМУ активности — как у
+	 * `ユーザコンポーネント`. См. parts_anchor_shift и FINDINGS §5dz.
+	 */
+	bool is_activity_root;
 	struct string *user_component_name;
 	struct parts_uc_data {
 		struct string *key;
