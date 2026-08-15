@@ -341,8 +341,101 @@ static void *heap_item_to_rsave(int i)
 	}
 }
 
+/*
+ * `XSYS4_HEAP_STATS=<сколько строк>` — ЧТО ЛЕЖИТ В ОБРАЗЕ ВОЗОБНОВЛЕНИЯ.
+ *
+ * Зачем. Образ `ResumeSave` пишется игрой на КАЖДОМ шаге по карте данжа, и его
+ * размер — это прямо длительность фриза (§5fb). У нас он оказался кратно больше
+ * оригинального (замер по заголовкам GD-контейнера: 23,8 МБ против 7,8 МБ на
+ * сопоставимом месте и 305 МБ против тех же 7,8 МБ после получаса игры), а
+ * ФАЙЛ разобрать нечем — наш контейнер существующие скрипты не читают. Значит
+ * считать надо изнутри, в момент записи: сколько живых объектов и каких.
+ *
+ * Печатается три числа на строку: живых объектов типа, их доля от всех живых и
+ * суммарное число слотов значений (грубая мера веса в файле).
+ */
+static void heap_stats_report(void)
+{
+	static int top = -1;
+	if (top < 0) {
+		const char *e = getenv("XSYS4_HEAP_STATS");
+		top = e && *e ? atoi(e) : 0;
+	}
+	if (top <= 0)
+		return;
+
+	// Ключ статистики: имя структуры либо род страницы. Структур в .ain конечное
+	// число, поэтому таблица — простой массив по индексу структуры плюс пять
+	// корзин под остальные рода.
+	enum { B_STRING = 0, B_GLOBAL, B_LOCAL, B_ARRAY, B_DELEGATE, B_EXTRA };
+	int n = ain->nr_structures + B_EXTRA;
+	int *cnt = xcalloc(n, sizeof(int));
+	long *slots = xcalloc(n, sizeof(long));
+	long live = 0, total_slots = 0;
+	for (size_t i = 0; i < heap_size; i++) {
+		if (!heap[i].ref)
+			continue;
+		live++;
+		int k;
+		long sl = 1;
+		if (heap[i].type == VM_STRING) {
+			k = B_STRING;
+			sl = heap[i].s ? heap[i].s->size / 4 + 1 : 1;
+		} else if (!heap[i].page) {
+			k = B_ARRAY;
+		} else {
+			struct page *p = heap[i].page;
+			sl = p->nr_vars;
+			switch (p->type) {
+			case GLOBAL_PAGE:   k = B_GLOBAL; break;
+			case LOCAL_PAGE:    k = B_LOCAL; break;
+			case ARRAY_PAGE:    k = B_ARRAY; break;
+			case DELEGATE_PAGE: k = B_DELEGATE; break;
+			case STRUCT_PAGE:
+				k = (p->index >= 0 && p->index < ain->nr_structures)
+					? B_EXTRA + p->index : B_EXTRA;
+				break;
+			default: k = B_EXTRA; break;
+			}
+		}
+		cnt[k]++;
+		slots[k] += sl;
+		total_slots += sl;
+	}
+
+	NOTICE("HEAPSTATS образ: слотов кучи %zu, живых объектов %ld, слотов значений %ld",
+	       heap_size, live, total_slots);
+	for (int r = 0; r < top; r++) {
+		int best = -1;
+		for (int i = 0; i < n; i++)
+			if (cnt[i] > 0 && (best < 0 || slots[i] > slots[best]))
+				best = i;
+		if (best < 0)
+			break;
+		const char *name;
+		switch (best) {
+		case B_STRING:   name = "<строки>"; break;
+		case B_GLOBAL:   name = "<глобальные страницы>"; break;
+		case B_LOCAL:    name = "<локальные страницы>"; break;
+		case B_ARRAY:    name = "<массивы>"; break;
+		case B_DELEGATE: name = "<делегаты>"; break;
+		default:
+			name = ain->structures[best - B_EXTRA].name;
+			break;
+		}
+		NOTICE("  HEAPSTATS %-46s объектов %7d (%4.1f%%), слотов значений %8ld (%4.1f%%)",
+		       name, cnt[best], 100.0 * cnt[best] / (live ? live : 1),
+		       slots[best], 100.0 * slots[best] / (total_slots ? total_slots : 1));
+		cnt[best] = 0;
+		slots[best] = 0;
+	}
+	free(cnt);
+	free(slots);
+}
+
 static void save_heap_to_rsave(struct rsave *rs)
 {
+	heap_stats_report();
 	rs->nr_heap_objs = heap_size;
 	rs->heap = xcalloc(heap_size, sizeof(void*));
 	for (size_t i = 0; i < heap_size; i++) {

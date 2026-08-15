@@ -21,6 +21,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 
 #include "system4.h"
 #include "system4/cg.h"
@@ -31,6 +32,7 @@
 #include "gfx/private.h"
 #include "icon.h"
 #include "xsystem4.h"
+#include "vm.h"
 
 struct sdl_private sdl;
 
@@ -451,6 +453,48 @@ void gfx_swap(void)
 	glViewport(0, 0, sdl.w, sdl.h);
 
 	gfx_update_frame_rate_counter();
+	gfx_note_slow_frame();
+}
+
+/*
+ * `XSYS4_SLOW_FRAME_MS=<порог>` — ДЛИННЫЕ КАДРЫ со стеком вызовов игры.
+ *
+ * Зачем отдельно от `XSYS4_SLOW_MS` (тот меряет HLL-вызовы): фриз может лежать и
+ * ВНЕ HLL — в сборке частей, декодировании CG, пересортировке спрайтов. Тогда
+ * `SLOW` не печатает ни строки, и без этой ручки замер упирается в «времени
+ * нигде не видно». Здесь наоборот: меряется промежуток между двумя показами
+ * кадра, то есть ровно то, что видит игрок, а стек называет, чем игра была
+ * занята к концу кадра.
+ *
+ * Печатается ещё и «сколько кадров подряд были длинными»: одиночный кадр на
+ * 300 мс и десять кадров по 50 мс глазу видны одинаково, а чинятся по-разному.
+ */
+void gfx_note_slow_frame(void)
+{
+	static int threshold = -1;
+	if (threshold < 0) {
+		const char *e = getenv("XSYS4_SLOW_FRAME_MS");
+		threshold = e && *e ? atoi(e) : 0;
+	}
+	if (threshold <= 0)
+		return;
+
+	static uint64_t prev_ns;
+	static int streak;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+	if (prev_ns) {
+		double ms = (now_ns - prev_ns) / 1000000.0;
+		if (ms >= threshold) {
+			streak++;
+			NOTICE("SLOWFRAME %.0f ms (подряд %d) — стек вызовов игры:", ms, streak);
+			vm_stack_trace();
+		} else {
+			streak = 0;
+		}
+	}
+	prev_ns = now_ns;
 }
 
 void gfx_set_view(struct texture *t)
