@@ -244,6 +244,15 @@ bool PE_parts_get_want_save_back_scene(int parts_no);
 bool PE_save_thumbnail(struct string *filename, int thumbnail_width);
 bool PE_init_parts_movie(int parts_no, int width, int height, int bg_r, int bg_g, int bg_b, int state);
 int PE_get_movie_sprite(int parts_no, int state);
+// Новое API movie-частей (Ixseal): ролик APEG живёт в самой части.
+bool PE_create_parts_movie(int parts_no, struct string *filename, int sound_id, int sound_group,
+			   int back_y, int back_cb, int back_cr, int state);
+bool PE_release_parts_movie(int parts_no, int state);
+bool PE_play_parts_movie(int parts_no, int msec, int state);
+void PE_set_movie_time(int parts_no, int msec, int state);
+bool PE_is_end_parts_movie(int parts_no, int state);
+int PE_get_parts_movie_end_time(int parts_no, int state);
+int PE_get_parts_movie_current_time(int parts_no, int state);
 float PE_parts_get_absolute_x(int parts_no);
 float PE_parts_get_absolute_y(int parts_no);
 int PE_parts_get_absolute_z(int parts_no);
