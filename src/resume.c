@@ -722,6 +722,23 @@ static int save_json_image(const char *key, const char *path)
 
 int vm_save_image(const char *key, const char *path, bool hll_convention)
 {
+	/*
+	 * ★`XSYS4_KEEP_SUSPEND=hold` ЗАПРЕЩАЕТ И ПЕРЕЗАПИСЬ ОБРАЗА.
+	 *
+	 * Держать файл от удаления мало: игра пишет `SystemSuspend` при каждом
+	 * снимке и при закрытии окна, поэтому отложенный образ интересного места
+	 * затирается следующим же выходом — стенд живёт до первого выхода вместо
+	 * «сколько угодно перезапусков». Отказ здесь безвреден: запись образа
+	 * возобновления игре ничего не возвращает, кроме признака успеха.
+	 */
+	static const char *hold = (const char *)1;
+	if (hold == (const char *)1)
+		hold = getenv("XSYS4_KEEP_SUSPEND");
+	if (hold && !strcmp(hold, "hold") && path && strstr(path, "SystemSuspend")) {
+		NOTICE("XSYS4_KEEP_SUSPEND=hold: запись '%s' пропущена — образ сохранён "
+		       "как есть", display_utf0(path));
+		return 1;
+	}
 	switch (config.save_format) {
 	case SAVE_FORMAT_RSM:
 		return save_rsave_image(key, path, hll_convention);

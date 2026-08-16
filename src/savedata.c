@@ -2044,12 +2044,59 @@ struct string *load_struct_comment(const char *filename)
 	return s;
 }
 
+/*
+ * ★ОБРАЗ ВОЗОБНОВЛЕНИЯ ОДНОРАЗОВЫЙ — И ЭТО МЕШАЕТ ОТЛАДКЕ.
+ *
+ * `SystemSuspend.asd` удаляет САМА игра сразу после восстановления (штатное
+ * поведение, оригинал делает так же). Для замеров это дорого: каждый прогон
+ * цикла «дойти до места → F8 → перезапуск» приходится проходить заново, а
+ * снимок нужного экрана живёт ровно один запуск — за сессию мы дважды теряли
+ * его и переигрывали путь до ADV с нуля.
+ *
+ * `XSYS4_KEEP_SUSPEND=copy` — перед удалением отложить копию рядом
+ * (`<имя>.kept`): игра ведёт себя ровно как обычно, а файл остаётся стендом,
+ * который можно вернуть на место сколько угодно раз.
+ * `XSYS4_KEEP_SUSPEND=hold` — не удалять вовсе: каждый следующий запуск снова
+ * поднимется из того же образа (повторяемый прогон одного и того же места).
+ */
+static bool keep_suspend_file(const char *filename, const char *path)
+{
+	static const char *mode = (const char *)1;
+	if (mode == (const char *)1)
+		mode = getenv("XSYS4_KEEP_SUSPEND");
+	if (!mode || !*mode || !strstr(filename, "SystemSuspend"))
+		return false;
+	if (!strcmp(mode, "hold")) {
+		NOTICE("XSYS4_KEEP_SUSPEND=hold: '%s' НЕ удаляю — следующий запуск "
+		       "поднимется из того же образа", display_utf0(path));
+		return true;
+	}
+	// copy (и любое иное значение): откладываем копию, удаление оставляем игре
+	char *kept = xmalloc(strlen(path) + 6);
+	sprintf(kept, "%s.kept", path);
+	size_t len = 0;
+	uint8_t *data = file_read(path, &len);
+	if (data && file_write(kept, data, len))
+		NOTICE("XSYS4_KEEP_SUSPEND: копия образа отложена в '%s' (%zu байт)",
+		       display_utf0(kept), len);
+	else
+		WARNING("XSYS4_KEEP_SUSPEND: не удалось отложить копию '%s'",
+			display_utf0(kept));
+	free(data);
+	free(kept);
+	return false;
+}
+
 int delete_save_file(const char *filename)
 {
 	char *path = savedir_path(filename);
 	if (!file_exists(path)) {
 		free(path);
 		return 0;
+	}
+	if (keep_suspend_file(filename, path)) {
+		free(path);
+		return 1;  // игре отвечаем «удалено»: её логика не должна меняться
 	}
 	if (remove_utf8(path)) {
 		WARNING("remove(\"%s\"): %s", display_utf0(path), strerror(errno));
