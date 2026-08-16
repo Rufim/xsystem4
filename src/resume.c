@@ -162,8 +162,23 @@ static cJSON *vm_image_to_json(const char *key)
  * too many variables», «CRC mismatch»). Для неоднозначных пишем `имя#N` —
  * эту форму ain_get_function понимает.
  */
-static char *rsave_function_name(struct ain_function *f)
+/*
+ * Имя функции для образа.
+ *
+ * ★В ВЕРСИИ 14 — С СИГНАТУРОЙ, как оригинал: `main()`,
+ * `MapView@Move(MapEdge&, DG_Event)`. Именно сигнатура отличает у System40
+ * перегрузки друг от друга; в его образе нет ни одного суффикса `#N`, и наше
+ * «Foo#1» он бы просто не нашёл. Формат сверен с образом оригинала: все 285
+ * имён, встречающихся в двух его сохранённых образах, воспроизводятся нашим
+ * генератором дословно (`tools/fname_check.c`).
+ *
+ * Версии 9 и старше пишут `имя#N` — так эти образы читались до сих пор, и
+ * ломать их незачем.
+ */
+static char *rsave_function_name_ver(struct ain_function *f, int version)
 {
+	if (version >= 14)
+		return ain_function_signature(ain, f);
 	int ord = ain_get_function_index(ain, f);
 	if (ord > 0) {
 		size_t len = strlen(f->name) + 16;
@@ -174,7 +189,7 @@ static char *rsave_function_name(struct ain_function *f)
 	return strdup(f->name);
 }
 
-static struct rsave_heap_frame *frame_page_to_rsave(struct page *page, int slot)
+static struct rsave_heap_frame *frame_page_to_rsave(struct page *page, int slot, int version)
 {
 	struct rsave_heap_frame *o = xcalloc(1, sizeof(struct rsave_heap_frame) + page->nr_vars * sizeof(int32_t));
 	o->ref = heap[slot].ref;
@@ -188,10 +203,13 @@ static struct rsave_heap_frame *frame_page_to_rsave(struct page *page, int slot)
 	} else {
 		struct ain_function *f = &ain->functions[page->index];
 		o->tag = RSAVE_LOCALS;
-		o->func.name = rsave_function_name(f);
+		o->func.name = rsave_function_name_ver(f, version);
 		assert(page->nr_vars == f->nr_vars);
 		vars = f->vars;
 		o->struct_ptr = page->local.struct_ptr;
+		// Второе поле кадра в версии 14: «окружения нет» — это -1, а не ноль
+		// (ноль указывал бы на слот 0, то есть на страницу глобалей).
+		o->env_ptr = -1;
 	}
 	o->nr_types = page->nr_vars;
 	o->types = xcalloc(o->nr_types, sizeof(int32_t));
@@ -213,6 +231,15 @@ static struct rsave_heap_struct *struct_page_to_rsave(struct page *page, int slo
 	o->ctor.name = strdup(s->constructor >= 0 ? ain->functions[s->constructor].name : "");
 	o->dtor.name = strdup(s->destructor >= 0 ? ain->functions[s->destructor].name : "");
 	o->uk = 0;
+	/*
+	 * Версия 14 вместо ctor/dtor и таблицы типов членов держит список СТРАНИЦ
+	 * баз-интерфейсов и хвостовой признак. Мы отдельных страниц под базы не
+	 * заводим (интерфейс живёт слотами внутри самого объекта), поэтому пишем
+	 * пустой список; при ЧТЕНИИ чужого образа оба поля сохраняются как есть.
+	 * ★Открытый хвост: у оригинала список непустой у 818 структур из 43 тысяч.
+	 */
+	o->nr_ifaces = 0;
+	o->tail = 0;
 	o->struct_type.name = strdup(s->name);
 	o->nr_types = s->nr_members;
 	o->types = xcalloc(o->nr_types, sizeof(int32_t));
@@ -222,6 +249,47 @@ static struct rsave_heap_struct *struct_page_to_rsave(struct page *page, int slo
 	for (int i = 0; i < o->nr_slots; i++)
 		o->slots[i] = page->values[i].i;
 	return o;
+}
+
+/*
+ * Тип элемента массива для версии 14 — деревом. Формы, встречающиеся в образе
+ * оригинала (обе его сохранёнки, все 36 тысяч массивов), исчерпываются четырьмя:
+ *
+ *   10 / 12 / 13 / 47 / 21 / 92    — плоский тип;
+ *   82<13>                         — wrap<структура>;
+ *   82<100>                        — wrap<ИНТЕРФЕЙС> (100 = AIN_IFACE_WRAP);
+ *   86<82<13>>                     — option<wrap<структура>>.
+ *
+ * Имя структуры повторяется на КАЖДОМ уровне, кроме `option` — у того имени нет
+ * вовсе. Больше в дереве ничего нет, поэтому его хватает восстановить из пары
+ * (тип элемента страницы, индекс структуры), которую страница массива и хранит.
+ */
+static struct rsave_array_type *array_type_to_rsave(enum ain_data_type data_type, int struct_type)
+{
+	const char *name = struct_type >= 0 ? ain->structures[struct_type].name : NULL;
+	switch (data_type) {
+	case AIN_OPTION:
+		// у option имени нет, внутри — wrap над тем же типом
+		return rsave_array_type_new(AIN_OPTION, NULL,
+					    array_type_to_rsave(AIN_WRAP, struct_type));
+	/*
+	 * ★`wrap<интерфейс>` приходит сюда типом элемента AIN_IFACE_WRAP (100), а не
+	 * AIN_WRAP: маркер AIN_WRAP движок ставит только над структурой
+	 * (array_resolve_var_type, src/page.c). Поэтому оба случая ведут в одну
+	 * ветку — иначе интерфейсные массивы уходили бы в файл плоским типом `100`
+	 * там, где оригинал пишет дерево `82<100>` (в его образе таких 56 штук).
+	 */
+	case AIN_WRAP:
+	case AIN_IFACE_WRAP: {
+		bool iface = data_type == AIN_IFACE_WRAP
+			|| (struct_type >= 0 && ain->structures[struct_type].is_interface);
+		struct rsave_array_type *sub =
+			rsave_array_type_new(iface ? AIN_IFACE_WRAP : AIN_STRUCT, name, NULL);
+		return rsave_array_type_new(AIN_WRAP, name, sub);
+	}
+	default:
+		return rsave_array_type_new(data_type, name, NULL);
+	}
 }
 
 static struct rsave_heap_array *array_page_to_rsave(struct page *page, int slot)
@@ -237,6 +305,7 @@ static struct rsave_heap_array *array_page_to_rsave(struct page *page, int slot)
 	else
 		o->struct_type.name = strdup("");
 	o->root_rank = page->array.rank;  // FIXME: this is incorrect for subarrays
+	o->type = array_type_to_rsave(page->index, page->array.struct_type);
 	o->is_not_empty = page->nr_vars ? 1 : 0;
 	o->nr_slots = page->nr_vars;
 	for (int i = 0; i < o->nr_slots; i++)
@@ -275,9 +344,59 @@ static struct rsave_heap_array *array_page_to_rsave(struct page *page, int slot)
  */
 #define RSAVE_DG_ENV_MAGIC (-777)
 
-static struct rsave_heap_delegate *delegate_page_to_rsave(struct page *page, int slot)
+static struct rsave_heap_delegate *delegate_page_to_rsave(struct page *page, int slot, int version)
 {
 	int nr_entries = page->nr_vars / DG_ENTRY_SLOTS;
+
+	/*
+	 * Версия 14 держит записи делегата отдельным списком, а метод в них назван
+	 * ИМЕНЕМ функции. Поколение объекта (`seq`) в этот формат не влезает —
+	 * его там нет и у самих объектов, — а вот ОКРУЖЕНИЕ лямбды терять нельзя:
+	 * без него после загрузки ломается и поведение, и владение (см. длинный
+	 * комментарий выше про RSAVE_DG_ENV_MAGIC). Кладём его в третье поле
+	 * записи: у оригинала там −1 во всех 7918 записях из 7919, так что −1
+	 * остаётся значением «окружения нет».
+	 */
+	if (version >= 14) {
+		struct rsave_heap_delegate *o = xcalloc(1, sizeof(struct rsave_heap_delegate));
+		o->tag = RSAVE_DELEGATE;
+		o->ref = heap[slot].ref;
+		o->entries = xcalloc(nr_entries, sizeof(struct rsave_delegate_entry));
+		/*
+		 * ★ПРОТУХШИЕ ПОДПИСКИ В ОБРАЗ НЕ ПИШЕМ.
+		 *
+		 * Список чистится амортизированно (delegate_compact вызывается при
+		 * добавлении и рассылке), поэтому в момент снимка в нём всегда лежат
+		 * записи с уже умершими получателями — их и опознаёт сверка поколений
+		 * `heap_get_seq(obj) == values[i+2]`. В файл им ехать незачем: своего
+		 * поколения формат версии 14 не хранит, и на загрузке такая запись
+		 * неотличима от живой (§5fb-10a — из-за этого движок и падал).
+		 *
+		 * Сколько их: на снимке титула Dohna — 465 протухших против 325 живых,
+		 * то есть больше половины содержимого делегатов было мусором.
+		 */
+		int w = 0, dropped = 0;
+		for (int i = 0; i < nr_entries; i++) {
+			int obj = page->values[i*DG_ENTRY_SLOTS + 0].i;
+			if (heap_get_seq(obj) != (uint32_t)page->values[i*DG_ENTRY_SLOTS + 2].i) {
+				dropped++;
+				continue;
+			}
+			int fun = page->values[i*DG_ENTRY_SLOTS + 1].i;
+			o->entries[w].obj = obj;
+			o->entries[w].method = fun >= 0 && fun < ain->nr_functions
+				? rsave_function_name_ver(&ain->functions[fun], version)
+				: strdup("");
+			o->entries[w].uk = page->values[i*DG_ENTRY_SLOTS + 3].i;
+			w++;
+		}
+		o->nr_entries = w;
+		if (dropped && getenv("XSYS4_SAVE_TRACE"))
+			NOTICE("SAVETRACE делегат слот %d: записей %d, протухших отброшено %d",
+			       slot, w, dropped);
+		return o;
+	}
+
 	int nr_slots = 1 + nr_entries * 4;
 	struct rsave_heap_delegate *o = xcalloc(1, sizeof(struct rsave_heap_delegate) + nr_slots * sizeof(int32_t));
 	o->tag = RSAVE_DELEGATE;
@@ -292,7 +411,7 @@ static struct rsave_heap_delegate *delegate_page_to_rsave(struct page *page, int
 	return o;
 }
 
-static void *heap_item_to_rsave(int i)
+static void *heap_item_to_rsave(int i, int version)
 {
 	if (!heap[i].ref)
 		return rsave_null;
@@ -329,13 +448,13 @@ static void *heap_item_to_rsave(int i)
 	switch (page->type) {
 	case GLOBAL_PAGE:
 	case LOCAL_PAGE:
-		return frame_page_to_rsave(page, i);
+		return frame_page_to_rsave(page, i, version);
 	case STRUCT_PAGE:
 		return struct_page_to_rsave(page, i);
 	case ARRAY_PAGE:
 		return array_page_to_rsave(page, i);
 	case DELEGATE_PAGE:
-		return delegate_page_to_rsave(page, i);
+		return delegate_page_to_rsave(page, i, version);
 	default:
 		ERROR("unsupported type %d", page->type);
 	}
@@ -439,7 +558,7 @@ static void save_heap_to_rsave(struct rsave *rs)
 	rs->nr_heap_objs = heap_size;
 	rs->heap = xcalloc(heap_size, sizeof(void*));
 	for (size_t i = 0; i < heap_size; i++) {
-		rs->heap[i] = heap_item_to_rsave(i);
+		rs->heap[i] = heap_item_to_rsave(i, rs->version);
 	}
 }
 
@@ -484,7 +603,7 @@ static void save_call_stack_to_rsave(struct rsave *rs)
 				rs->return_records[i].local_addr = call->return_address - prev_func->address;
 			}
 		}
-		rs->return_records[i + 1].caller_func = rsave_function_name(func);
+		rs->return_records[i + 1].caller_func = rsave_function_name_ver(func, rs->version);
 		rs->return_records[i + 1].crc = func->crc;
 		prev_func = func;
 	}
@@ -529,7 +648,16 @@ static void save_func_names_to_rsave(struct rsave *rs)
 static struct rsave *make_rsave(const char *key)
 {
 	struct rsave *save = xcalloc(1, sizeof(struct rsave));
-	if (ain->nr_delegates > 0) {
+	/*
+	 * ain 14 («Ixseal», Dohna) — образ пишем ВЕРСИЕЙ 14, как оригинал.
+	 * Разница с девятой не косметическая: там нет ни `seq` у каждого объекта,
+	 * ни таблицы имён всех функций в хвосте (у Dohna это 37 737 имён, 1,77 МБ
+	 * в КАЖДОМ файле), ни имён ctor/dtor и таблиц типов членов у структур.
+	 * Формат разобран и сверен с образом оригинала побайтово (§5fb-2).
+	 */
+	if (ain->version >= 14) {
+		save->version = 14;
+	} else if (ain->nr_delegates > 0) {
 		save->version = 9;
 	} else {
 		// FIXME: This is not always correct. Pastel Chime Continue is AIN v4
@@ -547,7 +675,9 @@ static struct rsave *vm_image_to_rsave(const char *key, bool hll_convention)
 	save_heap_to_rsave(save);
 	save_call_stack_to_rsave(save);
 	save_stack_to_rsave(save, hll_convention);
-	save_func_names_to_rsave(save);
+	// Версия 14 таблицу имён функций не несёт вовсе.
+	if (save->version < 14)
+		save_func_names_to_rsave(save);
 	return save;
 }
 
@@ -566,7 +696,13 @@ static int save_rsave_image(const char *key, const char *path, bool hll_conventi
 	}
 	free(full_path);
 
-	bool encrypt = true;
+	/*
+	 * ★Версия 14 у оригинала НЕ ШИФРУЕТСЯ: тело GD-контейнера начинается прямо
+	 * с zlib-заголовка `78 01`, тогда как у шифрованного первый байт 0x1a.
+	 * Наш загрузчик понимает оба варианта, а вот System40 на наш образ мы
+	 * рассчитываем натравить, поэтому пишем ровно как он.
+	 */
+	bool encrypt = save->version < 14;
 	int compression_level = 1;
 	enum savefile_error error = rsave_write(save, fp, encrypt, compression_level);
 	if (error != SAVEFILE_SUCCESS)
@@ -696,6 +832,26 @@ static void delete_heap(void)
 // XXX: This only works while heap_free_stack[i]=i
 //      After calling delete_heap, this can be called for INCREASING indices.
 //      Out-of-order allocations would break the above assumption!
+/*
+ * ★СЛОТ ЗАНИМАЕТСЯ ТОЛЬКО ПОДРЯД — иначе свободный список ломается.
+ *
+ * Инвариант аллокатора: `heap_free_stack[i] == i` для нетронутой кучи, занятые
+ * слоты — префикс [0, heap_free_ptr). Прежний код снимал с ВЕРШИНЫ чужой номер
+ * (`heap_free_stack[slot] = heap_free_stack[heap_free_ptr]; heap_free_ptr++`),
+ * что верно ровно пока `slot == heap_free_ptr`.
+ *
+ * А образ идёт С ДЫРАМИ: пустых записей (`RSAVE_NULL`) у нас 1682, у оригинала
+ * 1629 — их загрузчик пропускал, следующий занятый слот оказывался больше
+ * границы, и в свободном списке появлялся ДУБЛИКАТ номера: позже аллокатор
+ * выдал бы его дважды. Замер после правки: предупреждений о рассогласовании
+ * ноль (диагностика ниже), то есть список согласован.
+ *
+ * ★Отдельно: падение `double free` после возобновления этим НЕ лечится —
+ * там объект из образа с `ref=1` освобождают двое (§5fb-10, открыто).
+ *
+ * Поэтому дыры теперь тоже ЗАНИМАЮТСЯ (heap[slot] остаётся пустой страницей с
+ * ref=0), а список остаётся согласованным: префикс занят, дальше — свободное.
+ */
 static void alloc_heap_slot(int slot)
 {
 	if ((size_t)slot >= heap_size) {
@@ -703,6 +859,10 @@ static void alloc_heap_slot(int slot)
 		while ((size_t)slot >= next_size)
 			next_size *= 2;
 		heap_grow(next_size);
+	}
+	if ((size_t)slot != heap_free_ptr) {
+		WARNING("восстановление кучи: слот %d при границе %zu — "
+		        "свободный список рассогласован", slot, heap_free_ptr);
 	}
 	heap_free_stack[slot] = heap_free_stack[heap_free_ptr];
 	heap_free_ptr++;
@@ -742,11 +902,106 @@ static void load_json_heap(cJSON *json)
 	}
 }
 
+/*
+ * Имя из образа версии 14 несёт СИГНАТУРУ (`MapView@Move(MapEdge&, DG_Event)`),
+ * и по нему функция определяется однозначно — в отличие от голого имени, на
+ * котором `ain_get_function` отдаёт первую попавшуюся перегрузку.
+ *
+ * Базовое имя — всё до ПОСЛЕДНЕЙ пары скобок: у лямбд скобки есть и внутри
+ * имени (`MapNodeView@<lambda : MapNodeView@RegisterEvent()(63, 38)>(EPartsState)`),
+ * так что отрезать по первой нельзя. Дальше перебираем перегрузки `имя`,
+ * `имя#1`, `имя#2`… и сравниваем их сигнатуры с искомой.
+ */
+static int resolve_func_by_signature(const char *name)
+{
+	size_t len = strlen(name);
+	if (!len || name[len-1] != ')')
+		return -1;
+	int depth = 0;
+	size_t open = 0;
+	bool found = false;
+	for (size_t i = len; i-- > 0; ) {
+		if (name[i] == ')') {
+			depth++;
+		} else if (name[i] == '(') {
+			if (--depth == 0) {
+				open = i;
+				found = true;
+				break;
+			}
+		}
+	}
+	if (!found || !open)
+		return -1;
+
+	char *base = xmalloc(open + 1);
+	memcpy(base, name, open);
+	base[open] = '\0';
+
+	int result = -1;
+	char buf[1024];
+	for (int n = 0; ; n++) {
+		int cand = n == 0 ? ain_get_function(ain, base)
+				  : (snprintf(buf, sizeof(buf), "%s#%d", base, n),
+				     ain_get_function(ain, buf));
+		if (cand < 0)
+			break;
+		char *sig = ain_function_signature(ain, &ain->functions[cand]);
+		bool hit = !strcmp(sig, name);
+		free(sig);
+		if (hit) {
+			result = cand;
+			break;
+		}
+	}
+	free(base);
+	return result;
+}
+
 static int resolve_func_symbol(struct rsave_symbol *sym)
 {
 	if (!sym->name)
 		return sym->id;
+	int by_sig = resolve_func_by_signature(sym->name);
+	if (by_sig >= 0)
+		return by_sig;
 	return ain_get_function(ain, sym->name);
+}
+
+/*
+ * Функция кадра стека по имени из образа. Путей два, и они не взаимозаменяемы:
+ *
+ *  - версия 14 пишет СИГНАТУРУ (`SceneAzito@Run(int)`) — тогда перегрузка
+ *    определена именем, и `ain_get_function` на нём не найдёт НИЧЕГО (в .ain
+ *    имена голые). Это и роняло возобновление: игра сама писала SystemSuspend,
+ *    а наш же загрузчик отвечал «Invalid save file».
+ *  - наши прежние версии писали голое имя, и перегрузку приходится добирать
+ *    перебором `имя#N` по CRC.
+ *
+ * CRC сверяем в обоих случаях: он ловит несовпадение .ain с образом.
+ */
+static int resolve_caller_func(const char *name, int32_t crc)
+{
+	int fno = resolve_func_by_signature(name);
+	if (fno >= 0)
+		return ain->functions[fno].crc == crc ? fno : -1;
+
+	fno = ain_get_function(ain, (char *)name);
+	if (fno < 0)
+		return -1;
+	if (ain->functions[fno].crc == crc)
+		return fno;
+	// ain_get_function уже отрезал `#N`, так что name здесь — базовое имя.
+	char buf[512];
+	for (int n = 0; ; n++) {
+		snprintf(buf, sizeof(buf), "%s#%d", name, n);
+		int cand = ain_get_function(ain, buf);
+		if (cand < 0)
+			break;
+		if (ain->functions[cand].crc == crc)
+			return cand;
+	}
+	return -1;
 }
 
 static int resolve_struct_symbol(struct rsave_symbol *sym)
@@ -761,6 +1016,15 @@ static bool rsave_frame_fits(int func, struct rsave_heap_frame *f)
 {
 	if (func < 0 || ain->functions[func].nr_vars < f->nr_types)
 		return false;
+	/*
+	 * ★В версии 14 таблицы типов у кадра нет вовсе (`nr_types == 0`), и без
+	 * неё эта проверка проходила бы тривиально для ЛЮБОЙ перегрузки — а имя в
+	 * образе голое, так что `ain_get_function` вернёт первую попавшуюся.
+	 * Единственное, что о кадре известно помимо имени, — сколько в нём
+	 * переменных; по нему перегрузки и различаем.
+	 */
+	if (!f->nr_types)
+		return ain->functions[func].nr_vars == f->nr_slots;
 	for (int i = 0; i < f->nr_types; i++) {
 		if (f->types[i] != ain->functions[func].vars[i].type.data)
 			return false;
@@ -910,6 +1174,41 @@ static void load_rsave_struct(int slot, struct rsave_heap_struct *s)
 
 static void load_rsave_delegate(int slot, struct rsave_heap_delegate *d)
 {
+	/*
+	 * Версия 14 (образ оригинала) держит записи делегата отдельным списком, и
+	 * метод в них назван ИМЕНЕМ, а не индексом функции: имена переживают
+	 * пересборку .ain, индексы — нет. Окружения лямбды в записи нет (у
+	 * оригинала оно, судя по всему, лежит в самом кадре, см. env_ptr в
+	 * savefile.h), поэтому ставим -1, как и для чужих троек.
+	 */
+	if (d->nr_entries) {
+		struct page *page = alloc_page(DELEGATE_PAGE, 0, d->nr_entries * DG_ENTRY_SLOTS);
+		for (int i = 0; i < d->nr_entries; i++) {
+			struct rsave_symbol sym = { .name = d->entries[i].method };
+			page->values[i*DG_ENTRY_SLOTS + 0].i = d->entries[i].obj;
+			page->values[i*DG_ENTRY_SLOTS + 1].i = resolve_func_symbol(&sym);
+			/*
+			 * Третий слот записи — ПОКОЛЕНИЕ получателя, по нему
+			 * delegate_compact/delegate_get отличают живую запись от
+			 * повисшей (`heap_get_seq(obj) == values[i+2]`, src/page.c).
+			 * Поколений в четырнадцатой версии нет: все объекты приходят
+			 * с нулём, значит и здесь обязан быть ноль — иначе первая же
+			 * рассылка выбросит ВСЕ записи делегата как протухшие.
+			 * ★Именно тут раньше лежало поле `uk` из файла (у оригинала
+			 * оно −1), и делегаты умирали молча.
+			 */
+			page->values[i*DG_ENTRY_SLOTS + 2].i = heap_get_seq(d->entries[i].obj);
+			// Окружение лямбды мы кладём в то же третье поле записи файла.
+			page->values[i*DG_ENTRY_SLOTS + 3].i = d->entries[i].uk;
+		}
+		alloc_heap_slot(slot);
+		heap[slot].ref = d->ref;
+		heap[slot].seq = d->seq;
+		heap[slot].type = VM_PAGE;
+		heap[slot].page = page;
+		return;
+	}
+
 	// Наш образ (маркер в нулевом слоте, см. delegate_page_to_rsave) — четвёрки с
 	// окружением; чужой/старый — тройки, окружение в нём не сохранено (env = -1).
 	bool with_env = d->nr_slots > 0 && d->slots[0] == RSAVE_DG_ENV_MAGIC;
@@ -967,6 +1266,80 @@ static void check_global_slot_after_load(void)
 	heap[0].page = alloc_page(GLOBAL_PAGE, 0, ain->nr_globals);
 }
 
+/*
+ * ★ПОКОЛЕНИЯ СЛОТОВ ПОСЛЕ ЗАГРУЗКИ ОБРАЗА ВЕРСИИ 14 — БЕЗ НИХ ДЕЛЕГАТЫ СЛЕПНУТ.
+ *
+ * Подписка делегата хранит поколение получателя, и `delegate_compact`/
+ * `delegate_get` отличают живую запись от повисшей сверкой
+ * `heap_get_seq(obj) == values[i+2]` (src/page.c). В формате версии 14
+ * поколений нет вовсе: все объекты приходят с нулём, у СВОБОДНОГО слота
+ * `heap_get_seq` тоже ноль — и сверка `0 == 0` объявляет годной ЛЮБУЮ запись,
+ * включая ту, чей получатель давно мёртв. Смерть после возобновления тоже
+ * перестаёт замечаться.
+ *
+ * Замерено (XSYS4_REF_DEAD_TRACE, стенд «снимок → перезапуск»): на обычном
+ * прогоне взятий ссылки на мёртвый слот НОЛЬ, после возобновления —
+ * «REF-DEAD слот 132189 (ref=0)» в `RCASTimer@AddTime` ← `RCASTimerManager@
+ * <lambda>` ← `CallPartsUpdateEvent`, то есть подписку вызвали с мёртвым
+ * получателем. Через десяток кадров это давало `double free`.
+ *
+ * Поэтому поколения назначаем сами: живому объекту — номер его слота плюс
+ * один (уникально и ненулевое; `heap_next_seq` для версии 14 стоит за
+ * пределами занятого, так что новые объекты не столкнутся), дыре — ноль, она
+ * и есть «мёртвый». Записям делегата проставляем актуальное поколение, а
+ * запись с мёртвым получателем помечаем заведомо не совпадающим значением:
+ * штатное уплотнение выбросит её само и штатно же отпустит окружение.
+ */
+static void rsave_fixup_generations(struct rsave *save)
+{
+	if (save->version < 14)
+		return;
+
+	for (int slot = 0; slot < save->nr_heap_objs; slot++) {
+		if (heap[slot].ref <= 0)
+			continue;
+		// Дыра образа (RSAVE_NULL) — пустая страница: пусть остаётся мёртвой.
+		if (heap[slot].type == VM_PAGE && !heap[slot].page)
+			continue;
+		heap[slot].seq = (uint32_t)slot + 1;
+	}
+
+	int fixed = 0, dropped = 0;
+	for (int slot = 0; slot < save->nr_heap_objs; slot++) {
+		if (heap[slot].ref <= 0 || heap[slot].type != VM_PAGE)
+			continue;
+		struct page *p = heap[slot].page;
+		if (!p || p->type != DELEGATE_PAGE)
+			continue;
+		for (int i = 0; i + DG_ENTRY_SLOTS <= p->nr_vars; i += DG_ENTRY_SLOTS) {
+			int obj = p->values[i].i;
+			/*
+			 * ★ПОДПИСКА БЕЗ ПОЛУЧАТЕЛЯ — ЗАКОННАЯ. Свободная функция (и
+			 * лямбда без `this`) подписывается с obj = −1, и поколение у неё
+			 * нулевое по построению: `heap_get_seq(−1)` = 0, сверка
+			 * `0 == 0` проходит. Без этой проверки такие записи уходили под
+			 * нож как «протухшие» — 166 штук на снимке титула при НУЛЕ
+			 * отброшенных на записи, что и выдало ошибку.
+			 */
+			if (obj < 0) {
+				p->values[i+2].i = 0;
+				fixed++;
+				continue;
+			}
+			uint32_t seq = heap_get_seq(obj);
+			if (seq) {
+				p->values[i+2].i = (int32_t)seq;
+				fixed++;
+			} else {
+				p->values[i+2].i = -1;  // не совпадёт ни с чем — под нож
+				dropped++;
+			}
+		}
+	}
+	if (getenv("XSYS4_RESUME_TRACE"))
+		NOTICE("RESUME поколения: подписок живых %d, протухших %d", fixed, dropped);
+}
+
 static void load_rsave_heap(struct rsave *save)
 {
 	delete_heap();
@@ -980,11 +1353,36 @@ static void load_rsave_heap(struct rsave *save)
 		case RSAVE_ARRAY:    load_rsave_array(slot, save->heap[slot]);    break;
 		case RSAVE_STRUCT:   load_rsave_struct(slot, save->heap[slot]);   break;
 		case RSAVE_DELEGATE: load_rsave_delegate(slot, save->heap[slot]); break;
-		case RSAVE_NULL: break;
+		case RSAVE_NULL:
+			/*
+			 * ★ДЫРУ ЗАНИМАЕМ, А НЕ ПРОПУСКАЕМ: иначе ломается свободный
+			 * список (разбор — у alloc_heap_slot). Дыр в образе много: у нас
+			 * 1682, у оригинала 1629.
+			 *
+			 * Счётчик 1, а не 0: слот отдаётся как обычный мёртвый объект и
+			 * при первом же освобождении честно возвращается в свободный
+			 * список, вместо того чтобы уводить счётчик ниже нуля.
+			 */
+			alloc_heap_slot(slot);
+			heap[slot].ref = 1;
+			heap[slot].type = VM_PAGE;
+			heap[slot].page = NULL;
+			break;
 		}
 	}
+	// Поколения назначаем ПОСЛЕ всей кучи: на момент загрузки делегата его
+	// получатель мог быть ещё не восстановлен (слоты идут по возрастанию).
+	rsave_fixup_generations(save);
 	check_global_slot_after_load();
-	heap_next_seq = save->next_seq;
+	/*
+	 * Поколения слотов (`seq`) — наша диагностика висячих ссылок
+	 * (`deref_trail`, src/vm.c), в формате версии 14 их нет. Тогда все слоты
+	 * приходят с нулём, и счётчик надо завести ЗА пределами занятого
+	 * диапазона, иначе первый же новый объект получит поколение, совпадающее
+	 * с чужим, и «слот переиспользован» перестанет ловиться.
+	 */
+	heap_next_seq = save->version >= 14 ? (uint32_t)save->nr_heap_objs + 1
+					    : (uint32_t)save->next_seq;
 }
 
 static void load_json_call_stack(cJSON *json)
@@ -1029,23 +1427,7 @@ static bool rsave_call_stack_loadable(struct rsave *save)
 		if (save->call_frames[i].type != RSAVE_CALL_STACK_BOTTOM) {
 			if (!rr->caller_func)
 				return false;
-			int fno = ain_get_function(ain, rr->caller_func);
-			if (fno < 0)
-				return false;
-			if (ain->functions[fno].crc != rr->crc) {
-				char buf[512];
-				for (int n = 0; ; n++) {
-					snprintf(buf, sizeof(buf), "%s#%d", rr->caller_func, n);
-					int cand = ain_get_function(ain, buf);
-					if (cand < 0)
-						break;
-					if (ain->functions[cand].crc == rr->crc) {
-						fno = cand;
-						break;
-					}
-				}
-			}
-			if (ain->functions[fno].crc != rr->crc)
+			if (resolve_caller_func(rr->caller_func, rr->crc) < 0)
 				return false;
 		}
 		if (++rr == save->return_records + save->nr_return_records)
@@ -1075,33 +1457,27 @@ static void load_rsave_call_stack(struct rsave *save)
 			if (!rr->caller_func)
 				VM_ERROR("Failed to load VM image: сейв сделан сборкой без "
 				         "поддержки кадров движка в стеке — пересохранитесь");
-			int fno = ain_get_function(ain, rr->caller_func);
+			// Имя версии 14 несёт сигнатуру, прежних версий — голое;
+			// перегрузка добирается по CRC. См. resolve_caller_func.
+			int fno = resolve_caller_func(rr->caller_func, rr->crc);
 			if (fno < 0)
 				VM_ERROR("Failed to load VM image: function '%s' not found", display_sjis0(rr->caller_func));
-			// Голое имя из сейва старой сборки у перегруженной функции
-			// разрешилось в первую перегрузку — подбираем по CRC (он
-			// однозначно указывает нужную). ain_get_function уже отрезал
-			// `#N`, так что rr->caller_func здесь — базовое имя.
-			if (ain->functions[fno].crc != rr->crc) {
-				char buf[512];
-				for (int n = 0; ; n++) {
-					snprintf(buf, sizeof(buf), "%s#%d", rr->caller_func, n);
-					int cand = ain_get_function(ain, buf);
-					if (cand < 0)
-						break;
-					if (ain->functions[cand].crc == rr->crc) {
-						fno = cand;
-						break;
-					}
-				}
-			}
-			if (ain->functions[fno].crc != rr->crc)
-				VM_ERROR("Failed to load VM image: CRC mismatch for function '%s'", display_sjis0(rr->caller_func));
 			call_stack[call_stack_ptr++] = (struct function_call) {
 				.fno            = fno,
 				.return_address = return_address,
 				.page_slot      = save->call_frames[i].local_ptr,
 				.struct_page    = save->call_frames[i].struct_ptr,
+				/*
+				 * ★ОКРУЖЕНИЕ ЛЯМБДЫ — ЯВНО «НЕТ», а не ноль по умолчанию.
+				 * `X_GETENV` считает окружением отсутствующим только
+				 * отрицательное значение (src/vm.c: `if (env < 0)`), а ноль —
+				 * это heap-слот ГЛОБАЛЬНОЙ страницы: восстановленный кадр
+				 * лямбды читал бы захваченные переменные из глобалей по их
+				 * индексам, а присваивание туда снимало бы чужие ссылки.
+				 * В образе окружение кадра не хранится (`env_ptr` мы только
+				 * переносим), так что взять его неоткуда — но и врать нельзя.
+				 */
+				.env_page       = -1,
 			};
 			// Calculate return address from the function address and offset
 			// to make it robust to ain changes.
@@ -1216,6 +1592,13 @@ static enum savefile_error load_rsave_image(const char *key, const char *path)
 	load_rsave_stack(save);
 	rsave_free(save);
 	vm_image_generation++;
+	/*
+	 * Приём кликов — состояние движка, в образе его нет; берём из
+	 * ВОССТАНОВЛЕННОГО стека (разбор — у самой функции). Без этого интерфейс
+	 * после возобновления не получает ни одного сообщения.
+	 */
+	void parts_input_resync_after_resume(void);
+	parts_input_resync_after_resume();
 	// Диагностика: XSYS4_HEAP_WATCH_AFTER_LOAD=<slot> — вотч на слот
 	// ВОССТАНОВЛЕННОЙ кучи (обычный XSYS4_HEAP_WATCH зашумляет лог жизнью
 	// слота до загрузки — номера переиспользуются).
@@ -1389,7 +1772,8 @@ static int write_rsave_image_comments(const char *key, const char *path, struct 
 	}
 	free(full_path);
 
-	bool encrypt = true;
+	// см. save_rsave_image: версия 14 у оригинала не шифрована
+	bool encrypt = save->version < 14;
 	int compression_level = 1;
 	error = rsave_write(save, fp, encrypt, compression_level);
 	if (error != SAVEFILE_SUCCESS)
