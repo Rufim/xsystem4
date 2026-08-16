@@ -147,6 +147,84 @@ static void load_rec_remember(int32_t rec, int slot)
 	load_rec_nr++;
 }
 
+/*
+ * ★ИНДЕКСЫ ИЗ ФАЙЛА — ЭТО ВХОДНЫЕ ДАННЫЕ, А НЕ ФАКТ.
+ *
+ * Загрузчик разыменовывал `struct_defs[rec->struct_index]`, `keyvals[...]`,
+ * `records[...]`, `strings[...]` прямо по числу из сейва: у битого файла это
+ * чтение за границей массива — то есть падение или, хуже, молча прочитанный
+ * мусор, который дальше выглядит как «странные данные игры». Аксессоры ниже
+ * возвращают NULL и один раз говорят, ЧТО именно вышло за диапазон; вызывающий
+ * дальше идёт своей веткой «данных нет».
+ */
+// Взводится любым битым индексом; вызывающий (load_struct_list / load_globals)
+// по нему отвечает игре «файл не прочитан», а не отдаёт полупустые данные —
+// иначе игра идёт дальше с дырами и виснет на чёрном экране (замер: битый
+// struct_index в Achievement.asd, титул не появлялся).
+static bool save_file_corrupt = false;
+
+static void save_bad_index(const char *what, int idx, int nr)
+{
+	save_file_corrupt = true;
+	static bool warned = false;
+	if (warned)
+		return;
+	warned = true;
+	WARNING("сейв повреждён: индекс %s = %d вне диапазона [0, %d) — "
+		"дальше загрузка идёт как при отсутствующих данных", what, idx, nr);
+}
+
+static struct gsave_struct_def *sd_get(struct gsave *save, int idx)
+{
+	if (idx < 0 || idx >= save->nr_struct_defs) {
+		save_bad_index("описания структуры", idx, save->nr_struct_defs);
+		return NULL;
+	}
+	return &save->struct_defs[idx];
+}
+
+static struct gsave_record *rec_get(struct gsave *save, int idx)
+{
+	if (idx < 0 || idx >= save->nr_records) {
+		save_bad_index("записи", idx, save->nr_records);
+		return NULL;
+	}
+	return &save->records[idx];
+}
+
+static struct gsave_keyval *kv_get(struct gsave *save, int idx)
+{
+	if (idx < 0 || idx >= save->nr_keyvals) {
+		save_bad_index("поля", idx, save->nr_keyvals);
+		return NULL;
+	}
+	return &save->keyvals[idx];
+}
+
+// Класс записи (v7+ — из таблицы описаний, раньше — именем в самой записи).
+// Отдельно, потому что у битого файла описания может не оказаться, и тогда имя
+// брать неоткуда: `ain_get_struct` с NULL-ключом падает внутри хеш-таблицы.
+static int save_rec_struct(struct gsave *save, struct gsave_record *rec)
+{
+	if (!rec)
+		return -1;
+	char *name = rec->struct_name;
+	if (save->version >= 7) {
+		struct gsave_struct_def *d = sd_get(save, rec->struct_index);
+		name = d ? d->name : NULL;
+	}
+	return name ? ain_get_struct(ain, name) : -1;
+}
+
+static struct string *save_str_get(struct gsave *save, int idx)
+{
+	if (idx < 0 || idx >= save->nr_strings || !save->strings[idx]) {
+		save_bad_index("строки", idx, save->nr_strings);
+		return NULL;
+	}
+	return save->strings[idx];
+}
+
 static void obj_maps_reset(void)
 {
 	free(save_obj_map); save_obj_map = NULL; save_obj_nr = 0;
@@ -927,10 +1005,7 @@ static int elem_struct_by_record(struct gsave *save, int32_t v, int dflt)
 {
 	if (v < 0 || v >= save->nr_records)
 		return dflt;
-	struct gsave_record *rec = &save->records[v];
-	struct gsave_struct_def *d = save->version >= 7
-		? &save->struct_defs[rec->struct_index] : NULL;
-	int actual = ain_get_struct(ain, d ? d->name : rec->struct_name);
+	int actual = save_rec_struct(save, &save->records[v]);
 	return actual >= 0 ? actual : dflt;
 }
 
@@ -1017,10 +1092,7 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 			int32_t v = flat_array->values[i].value;
 			int elem_struct = page_struct;
 			if (v >= 0 && v < save->nr_records) {
-				struct gsave_record *rec = &save->records[v];
-				struct gsave_struct_def *d = save->version >= 7
-					? &save->struct_defs[rec->struct_index] : NULL;
-				int actual = ain_get_struct(ain, d ? d->name : rec->struct_name);
+				int actual = save_rec_struct(save, &save->records[v]);
 				if (actual >= 0)
 					elem_struct = actual;
 			}
@@ -1059,10 +1131,8 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 		if (flat_array->values[i].type == AIN_REF_STRUCT
 				&& flat_array->values[i].value >= 0
 				&& flat_array->values[i].value < save->nr_records) {
-			struct gsave_record *r = &save->records[flat_array->values[i].value];
-			struct gsave_struct_def *d = save->version >= 7
-				? &save->struct_defs[r->struct_index] : NULL;
-			int actual = ain_get_struct(ain, d ? d->name : r->struct_name);
+			int actual = save_rec_struct(save,
+					&save->records[flat_array->values[i].value]);
 			if (actual >= 0)
 				struct_type = actual;
 		}
@@ -1116,7 +1186,9 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		if (sT && *sT && struct_name && strstr(struct_name, sT)) {
 			NOTICE("STRUCT '%s': полей %d", struct_name, rec->nr_indices);
 			for (int i = 0; i < rec->nr_indices; i++) {
-				struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
+				struct gsave_keyval *kv = kv_get(save, rec->indices[i]);
+				if (!kv)
+					continue;
 				const char *fn = sd ? sd->fields[i].name : kv->name;
 				enum ain_data_type ft = sd ? sd->fields[i].type : kv->type;
 				if (ft == AIN_STRING && kv->value >= 0
@@ -1130,7 +1202,9 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		}
 	}
 	for (int i = 0; i < rec->nr_indices; i++) {
-		struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
+		struct gsave_keyval *kv = kv_get(save, rec->indices[i]);
+		if (!kv)
+			continue;  // битый индекс поля: см. save_bad_index
 		const char *field_name = sd ? sd->fields[i].name : kv->name;
 		enum ain_data_type field_type = sd ? sd->fields[i].type : kv->type;
 		/*
@@ -1229,7 +1303,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 			// статического типа нет.
 			struct gsave_record *r = &save->records[kv->value];
 			struct gsave_struct_def *d = save->version >= 7
-				? &save->struct_defs[r->struct_index] : NULL;
+				? sd_get(save, r->struct_index) : NULL;
 			obj_struct_type = ain_get_struct(ain, d ? d->name : r->struct_name);
 			if (obj_struct_type < 0) {
 				strict_or_warn("загрузка", "обёртка %s: неизвестная структура %s",
@@ -1263,7 +1337,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 			}
 			struct gsave_record *r = &save->records[kv->value];
 			struct gsave_struct_def *d = save->version >= 7
-				? &save->struct_defs[r->struct_index] : NULL;
+				? sd_get(save, r->struct_index) : NULL;
 			obj_struct_type = ain_get_struct(ain, d ? d->name : r->struct_name);
 			if (obj_struct_type < 0) {
 				strict_or_warn("загрузка", "ref-поле %s: неизвестная структура %s",
@@ -1313,7 +1387,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 				? heap_get_page(page->values[index].i) : NULL;
 			struct gsave_record *r = &save->records[rec_index];
 			struct gsave_struct_def *d = save->version >= 7
-				? &save->struct_defs[r->struct_index] : NULL;
+				? sd_get(save, r->struct_index) : NULL;
 			const char *sname = d ? d->name : r->struct_name;
 			if (cur && cur->type == STRUCT_PAGE && cur->index == obj_struct_type) {
 				gsave_fill_struct(save, cur, r, d, sname,
@@ -1406,7 +1480,7 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 					if (obj_rec >= 0 && obj_rec < save->nr_records) {
 						struct gsave_record *r = &save->records[obj_rec];
 						struct gsave_struct_def *d = save->version >= 7
-							? &save->struct_defs[r->struct_index] : NULL;
+							? sd_get(save, r->struct_index) : NULL;
 						int sno = ain_get_struct(ain, d ? d->name : r->struct_name);
 						if (sno >= 0)
 							obj = gsave_to_vm_value(save, AIN_STRUCT, sno, 0, obj_rec, NULL, -1).i;
@@ -1442,7 +1516,7 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			struct gsave_record *rec = &save->records[value];
 			struct ain_struct *st = &ain->structures[struct_type];
 			struct gsave_struct_def *sd =
-				save->version >= 7 ? &save->struct_defs[rec->struct_index] : NULL;
+				save->version >= 7 ? sd_get(save, rec->struct_index) : NULL;
 			const char *struct_name = sd ? sd->name : rec->struct_name;
 			if (strcmp(struct_name, st->name))
 				VM_ERROR("Bad save file: structure name mismatch");
@@ -1624,14 +1698,16 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 						break;
 					}
 				}
-				if (probe >= 0 && probe < save->nr_records) {
-					struct gsave_record *rec = &save->records[probe];
-					char *name = save->version >= 7
-						? save->struct_defs[rec->struct_index].name
-						: rec->struct_name;
-					elem_struct = ain_get_struct(ain, name);
+				struct gsave_record *rec = probe >= 0 ? rec_get(save, probe) : NULL;
+				if (rec) {
+					struct gsave_struct_def *psd = save->version >= 7
+						? sd_get(save, rec->struct_index) : NULL;
+					char *name = (save->version >= 7)
+						? (psd ? psd->name : NULL) : rec->struct_name;
+					elem_struct = name ? ain_get_struct(ain, name) : -1;
 					if (elem_struct < 0) {
-						WARNING("array<?>: неизвестная структура %s", display_sjis0(name));
+						WARNING("array<?>: неизвестная структура %s",
+						        name ? display_sjis0(name) : "(нет описания)");
 						heap[slot].page = NULL;
 						return vm_int(slot);
 					}
@@ -1871,6 +1947,7 @@ int save_struct_list(const char *filename, struct page *list)
 int load_struct_list(const char *filename, struct page *list)
 {
 	obj_maps_reset();
+	save_file_corrupt = false;
 	int n = list && list->type == ARRAY_PAGE ? list->nr_vars : 0;
 	char *path = savedir_path(filename);
 	enum savefile_error error;
@@ -1911,7 +1988,7 @@ int load_struct_list(const char *filename, struct page *list)
 			continue;
 		struct gsave_record *rec = &save->records[rec_index];
 		struct gsave_struct_def *sd = save->version >= 7
-			? &save->struct_defs[rec->struct_index] : NULL;
+			? sd_get(save, rec->struct_index) : NULL;
 		const char *sname = sd ? sd->name : rec->struct_name;
 		struct ain_struct *st = &ain->structures[dst->index];
 		if (strcmp(sname, st->name)) {
@@ -1923,6 +2000,13 @@ int load_struct_list(const char *filename, struct page *list)
 	}
 	gsave_free(save);
 	obj_maps_reset();
+	if (save_file_corrupt) {
+		// Данные частично не разобраны — честнее отдать отказ: игра покажет
+		// своё «загрузка не удалась» и останется работоспособной.
+		WARNING("DeserializeStruct: '%s' повреждён — отвечаю игре отказом",
+			display_utf0(filename));
+		return 0;
+	}
 	return 1;
 }
 
