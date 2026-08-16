@@ -452,6 +452,26 @@ static void *heap_item_to_rsave(int i, int version)
 	case STRUCT_PAGE:
 		return struct_page_to_rsave(page, i);
 	case ARRAY_PAGE:
+		/*
+		 * Замер перед тем, как решать судьбу `elems_shared` (см. известное
+		 * ограничение): сколько ПОВЕРХНОСТНЫХ копий вообще попадает в образ.
+		 * Признак живёт только в памяти движка, у оригинала такого поля в
+		 * формате нет — значит цена его потери определяется тем, встречаются
+		 * ли такие страницы в снимке вообще.
+		 */
+		if (page->elems_shared) {
+			static int shared_seen;
+			static const char *tr = (const char *)1;
+			if (tr == (const char *)1)
+				tr = getenv("XSYS4_SHARED_TRACE");
+			shared_seen++;
+			if (tr && *tr && shared_seen <= 8)
+				NOTICE("SHARED: в образ идёт поверхностная копия — слот %d, "
+				       "элементов %d, тип %d (признак elems_shared будет потерян)",
+				       i, page->nr_vars, page->a_type);
+			if (tr && *tr && shared_seen == 1)
+				vm_stack_trace();
+		}
 		return array_page_to_rsave(page, i);
 	case DELEGATE_PAGE:
 		return delegate_page_to_rsave(page, i, version);
