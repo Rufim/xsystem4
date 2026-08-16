@@ -4592,6 +4592,10 @@ static void vm_execute(void)
 				vm_watchdog_last = now;
 			else if (now - vm_watchdog_last > (uint32_t)vm_watchdog_sec * 1000) {
 				vm_watchdog_last = now;
+				// Петля — самый подходящий момент спросить кучу: если
+				// причина в висячей ссылке, аудит назовёт пару «поле → чужая
+				// страница» прямо здесь (§5fb-12 именно так и выглядел).
+				heap_audit_ownership("зависание");
 				sys_warning("=== WATCHDOG: дамп стека (порог %d с), "
 					    "ip=0x%08lX ===\n", vm_watchdog_sec,
 					    (unsigned long)instr_ptr);

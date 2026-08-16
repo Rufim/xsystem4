@@ -829,3 +829,109 @@ void heap_describe_slot(int slot)
 		break;
 	}
 }
+
+/*
+ * ★АУДИТ ВЛАДЕНИЯ: КУДА НА САМОМ ДЕЛЕ СМОТРЯТ ОБЪЕКТНЫЕ ПОЛЯ.
+ *
+ * `XSYS4_HEAP_AUDIT=1` — обойти всю живую кучу и проверить каждое поле, которое
+ * ПО ОБЪЯВЛЕНИЮ держит объект (член структуры, локал кадра, элемент контейнера):
+ * ссылается ли оно на живой слот и лежит ли там страница ПОДХОДЯЩЕГО вида.
+ *
+ * Зачем именно так. Висячая ссылка почти никогда не выглядит как «ссылка на
+ * пустоту»: слот успевает переиспользоваться, и поле молча указывает на ЧУЖУЮ
+ * страницу. Так был устроен §5fb-12 — элемент очереди прочитанных реплик
+ * (`array<wrap<SReadMessageTextInfo>>`) указывал на ЛОКАЛЬНУЮ СТРАНИЦУ соседнего
+ * вызова, и запись «прочитано» уходила в счётчик чужого цикла. Ни счётчик ссылок,
+ * ни проверка «слот жив» такого не ловят — ловит только несовпадение ВИДА
+ * страницы с объявлением поля, что здесь и проверяется.
+ *
+ * Дорого (обход всей кучи), поэтому под ручкой и вызывается точечно — сразу
+ * после подъёма кучи из образа возобновления, где такие ссылки и рождаются.
+ */
+static bool audit_slot_is_object(enum ain_data_type t)
+{
+	switch (t) {
+	case AIN_STRUCT:
+	case AIN_REF_STRUCT:
+	case AIN_IFACE:
+	case AIN_IFACE_WRAP:
+	case AIN_WRAP:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void heap_audit_ownership(const char *when)
+{
+	static const char *on = (const char *)1;
+	if (on == (const char *)1)
+		on = getenv("XSYS4_HEAP_AUDIT");
+	if (!on || !*on)
+		return;
+
+	int checked = 0, dangling = 0, wrong_kind = 0, printed = 0;
+	for (size_t i = 1; i < heap_size; i++) {
+		if (heap[i].ref <= 0 || heap[i].type != VM_PAGE || !heap[i].page)
+			continue;
+		struct page *p = heap[i].page;
+		if (p->type == DELEGATE_PAGE)
+			continue;
+		for (int v = 0; v < p->nr_vars; v++) {
+			enum ain_data_type t = variable_type(p, v, NULL, NULL);
+			if (!audit_slot_is_object(t))
+				continue;
+			int32_t o = p->values[v].i;
+			if (o <= 0)
+				continue;  // −1/0 — законное «значения нет»
+			checked++;
+			bool bad_ref = !heap_index_valid(o) || heap[o].ref <= 0;
+			bool bad_kind = false;
+			if (!bad_ref && heap[o].type == VM_PAGE && heap[o].page)
+				bad_kind = heap[o].page->type == LOCAL_PAGE
+					|| heap[o].page->type == GLOBAL_PAGE;
+			if (!bad_ref && !bad_kind)
+				continue;
+			if (bad_ref)
+				dangling++;
+			else
+				wrong_kind++;
+			if (printed >= 12)
+				continue;
+			printed++;
+			// Кто держит ссылку и как называется поле — без этого номер слота
+			// ничего не говорит.
+			const char *owner = "?", *field = "?";
+			if (p->type == STRUCT_PAGE && p->index >= 0 && p->index < ain->nr_structures) {
+				owner = ain->structures[p->index].name;
+				if (v < ain->structures[p->index].nr_members)
+					field = ain->structures[p->index].members[v].name;
+			} else if (p->type == LOCAL_PAGE && p->index >= 0
+					&& p->index < ain->nr_functions) {
+				owner = ain->functions[p->index].name;
+				if (v < ain->functions[p->index].nr_vars)
+					field = ain->functions[p->index].vars[v].name;
+			} else if (p->type == ARRAY_PAGE) {
+				owner = "<массив>";
+				field = "<элемент>";
+			}
+			const char *what = bad_ref ? "цель МЕРТВА"
+				: (heap[o].page->type == LOCAL_PAGE ? "цель — ЛОКАЛЫ ЧУЖОГО КАДРА"
+								    : "цель — ГЛОБАЛЬНАЯ СТРАНИЦА");
+			WARNING("АУДИТ (%s): %s.%s (слот %d, поле %d) → %d: %s",
+				when, display_sjis0(owner), display_sjis1(field),
+				(int)i, v, o, what);
+		}
+	}
+	/*
+	 * Про массивы, ПОТЕРЯВШИЕ тип элемента, здесь молчим сознательно: пробная
+	 * эвристика «array<int>, все значения похожи на живые слоты» дала БОЛЬШЕ
+	 * срабатываний на исправной сборке (6), чем на сломанной (4) — у коротких
+	 * целочисленных массивов такое совпадение обычное дело. Этот класс ловится
+	 * не обходом кучи, а сторожем в САМОЙ вставке (см. Array.c: контейнер без
+	 * типа принимает объект без владения).
+	 */
+	NOTICE("АУДИТ ВЛАДЕНИЯ (%s): объектных полей проверено %d, "
+	       "ссылок на мёртвое %d, на чужую страницу %d",
+	       when, checked, dangling, wrong_kind);
+}

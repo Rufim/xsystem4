@@ -60,6 +60,9 @@ void heap_grow(size_t new_size);
 int32_t heap_alloc_slot(enum vm_pointer_type type);
 void heap_ref(int slot);
 void heap_unref(int slot);
+// Аудит владения: куда смотрят объектные поля живой кучи (см. heap.c).
+// Работает только под XSYS4_HEAP_AUDIT=1.
+void heap_audit_ownership(const char *when);
 // Диагностика владения: следить за этим слотом (как XSYS4_HEAP_WATCH, но слот
 // задаётся из кода — номер слота переиспользуется, поэтому по нему объект не
 // опознать; ставится при создании структуры, чьё имя совпало с XSYS4_STRUCT_WATCH).

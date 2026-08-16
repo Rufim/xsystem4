@@ -32,6 +32,7 @@
 #include "gfx/private.h"
 #include "icon.h"
 #include "xsystem4.h"
+#include "vm/heap.h"
 #include "vm.h"
 
 struct sdl_private sdl;
@@ -454,6 +455,28 @@ void gfx_swap(void)
 
 	gfx_update_frame_rate_counter();
 	gfx_note_slow_frame();
+	/*
+	 * ★АУДИТ ВЛАДЕНИЯ РАЗ В N КАДРОВ: `XSYS4_HEAP_AUDIT_EVERY=<кадров>`.
+	 *
+	 * Точка после подъёма образа ловит только ссылки, битые УЖЕ В ФАЙЛЕ. А самые
+	 * дорогие висячие ссылки рождаются в ходе игры: объект умирает раньше
+	 * времени, слот достаётся чужой странице, и поле молча смотрит не туда
+	 * (§5fb-12 — элемент очереди реплик указывал на локалы соседнего кадра).
+	 * Периодический прогон называет такую пару сразу, вместо раскопки от
+	 * симптома.
+	 */
+	{
+		static int every = -1;
+		static int frames;
+		if (every < 0) {
+			const char *e = getenv("XSYS4_HEAP_AUDIT_EVERY");
+			every = e && *e ? atoi(e) : 0;
+		}
+		if (every > 0 && ++frames >= every) {
+			frames = 0;
+			heap_audit_ownership("кадр");
+		}
+	}
 }
 
 /*

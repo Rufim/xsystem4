@@ -1131,7 +1131,13 @@ static void load_rsave_array(int slot, struct rsave_heap_array *a)
 		 * страницу при сжатии до нуля.
 		 */
 		struct page *empty = NULL;
-		if (a->data_type) {
+		// Откат прежнего поведения для бисекта и проверки диагностики:
+		// XSYS4_EMPTY_ARRAY_NULL=1 — поднимать пустой массив голым NULL, как
+		// это делалось до §5fb-12 (тогда тип элемента терялся).
+		static const char *no_typed = (const char *)1;
+		if (no_typed == (const char *)1)
+			no_typed = getenv("XSYS4_EMPTY_ARRAY_NULL");
+		if (a->data_type && !(no_typed && *no_typed)) {
 			union vm_value dim = { .i = 0 };
 			int rank = a->root_rank >= 0 ? a->root_rank + 1 : 1;
 			empty = alloc_array(rank, &dim, a->data_type,
@@ -1412,6 +1418,11 @@ static void load_rsave_heap(struct rsave *save)
 	// получатель мог быть ещё не восстановлен (слоты идут по возрастанию).
 	rsave_fixup_generations(save);
 	check_global_slot_after_load();
+	// Куча поднята и поколения расставлены — самое место спросить, куда на самом
+	// деле смотрят объектные поля (XSYS4_HEAP_AUDIT=1). Именно здесь рождаются
+	// висячие ссылки образа: §5fb-12 нашёлся бы этим аудитом сразу, а не через
+	// петлю в игровом коде.
+	heap_audit_ownership("после подъёма кучи из образа");
 	/*
 	 * Поколения слотов (`seq`) — наша диагностика висячих ссылок
 	 * (`deref_trail`, src/vm.c), в формате версии 14 их нет. Тогда все слоты
