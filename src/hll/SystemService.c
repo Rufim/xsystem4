@@ -745,8 +745,48 @@ void sysservice_push_system_message(int message, struct string *param)
  * крестик снова, потому что окно не закрылось) уходит немедленно: значит игра
  * сообщение не разбирает и ждать нечего.
  */
+/*
+ * ★SUSPEND ПРИ ВЫХОДЕ — ТОЛЬКО ПОД ФЛАГОМ `XSYS4_SUSPEND_ON_QUIT=1`.
+ *
+ * Оригинал состояние после обычного выхода не возвращает: закрыл окно — при
+ * следующем запуске титул с начала. Значит слот −6 у него служит чему-то
+ * другому (отладка, перезапуск окна), и писать его на каждый крестик — наша
+ * самодеятельность.
+ *
+ * Цена самодеятельности замерена: игра читает `SystemSuspend.asd` на КАЖДОМ
+ * старте (`System.ResumeLoad`, видно в XSYS4_SAVE_TRACE), и после нашего
+ * восстановления экран выходит НЕМЫМ — части на месте и курсор над пунктом
+ * опознаётся (`hovered=1`), но НИ ОДНОЙ части не помечено кликабельной
+ * (`clk=1`: при обычном старте таких 46, после resume — ноль). То есть каждый
+ * второй запуск игры оказывался нерабочим, и лечилось это только удалением
+ * файла руками.
+ */
+static bool suspend_on_quit_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("XSYS4_SUSPEND_ON_QUIT");
+		on = v && *v && strcmp(v, "0") ? 1 : 0;
+	}
+	return on;
+}
+
+/*
+ * Снимок состояния по F8: то же системное сообщение 1, но БЕЗ пометки выхода —
+ * игра запишет образ и продолжит играть. Восстановление из такого образа
+ * возвращает её в игровой цикл, а не в ветку завершения; оригинал этот слот
+ * использует именно так (снимок карты, `SceneMap@SaveMapSnapShot`).
+ */
+void sysservice_request_snapshot(void)
+{
+	NOTICE("SUSPEND: снимок состояния по F8 (слот −6)");
+	sysservice_push_system_message(SYS_MSG_SUSPEND, NULL);
+}
+
 void sysservice_request_quit(void)
 {
+	if (!suspend_on_quit_enabled())
+		vm_exit(0);
 	if (sys_msg_quit_requested)
 		vm_exit(0);
 	sysservice_push_system_message(SYS_MSG_SUSPEND, NULL);

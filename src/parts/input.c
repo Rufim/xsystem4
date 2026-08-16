@@ -1104,6 +1104,34 @@ void PE_EndInput(void)
 	drag_state_reset();
 }
 
+/*
+ * ★ПОСЛЕ ВОЗОБНОВЛЕНИЯ ГЛУБИНУ ПРИЁМА БЕРЁМ ИЗ СТЕКА.
+ *
+ * `parts_began_click` — состояние ДВИЖКА, а не игры: в образе его нет и быть
+ * не может. Игра же поднимается прямо внутри `parts::detail::WaitForClick`,
+ * то есть считает приём кликов открытым. Пока движок думает иначе,
+ * `parts_update_mouse` уходит по `if (!parts_began_click) return` и НЕ РОЖДАЕТ
+ * сообщений вовсе: замер на восстановленном титуле — ноль `MSG PUSH` против
+ * сорока в живой игре, при том что части на месте и курсор над кнопкой
+ * опознан (`hovered=1`). Это и есть «немой экран».
+ *
+ * Считаем то же, что и `PE_EndInput` в своей самокоррекции: сколько кадров
+ * ожидания клика реально живёт в стеке. Без «−1» — текущего вызова здесь нет.
+ */
+void parts_input_resync_after_resume(void)
+{
+	int live_waits = vm_count_frames("parts::detail::WaitForClick");
+	parts_input_depth = live_waits > 0 ? live_waits : 0;
+	parts_began_click = parts_input_depth > 0;
+	clicked_parts = 0;
+	click_down_parts = 0;
+	active_parts = 0;
+	drag_state_reset();
+	if (getenv("XSYS4_CLICKNO_TRACE"))
+		NOTICE("CLICKNO после возобновления: глубина %d (ожиданий клика в стеке %d)",
+		       parts_input_depth, live_waits);
+}
+
 // Returning to the title (system.Reset) abandons any open input session; without
 // this the depth would leak and input could never be disabled again.
 void parts_input_reset(void)

@@ -254,6 +254,17 @@ static void test_input_update(void)
 			// behaves differently depending on where the cursor is.
 			mouse_set_pos(x, y);
 			NOTICE("TEST_INPUT: move %d,%d", x, y);
+		} else if (!strncmp(line, "suspend", 7)) {
+			/*
+			 * Снимок состояния (слот −6) из тестового канала — тот же, что по
+			 * F8. Нужен, чтобы цикл «снимок → перезапуск → клик» гонялся без
+			 * рук: настоящие клики мышью до движка в headless-прогоне не
+			 * доходят (окну не даётся фокус), и проверять возобновление можно
+			 * только этим каналом.
+			 */
+			void sysservice_request_snapshot(void);
+			sysservice_request_snapshot();
+			NOTICE("TEST_INPUT: suspend (снимок состояния)");
 		} else if (sscanf(line, "wheel %d", &x) == 1) {
 			// Deterministic mouse-wheel for testing scrollable UIs (BACK LOG).
 			// Route through wheel_add() — the exact funnel a real SDL_MOUSEWHEEL
@@ -972,6 +983,25 @@ void handle_events(void)
 		case SDL_KEYDOWN:
 			if (e.key.keysym.scancode == SDL_SCANCODE_F9) {
 				vm_stack_trace();
+			} else if (e.key.keysym.scancode == SDL_SCANCODE_F8) {
+				/*
+				 * ★СНИМОК СОСТОЯНИЯ ПРЯМО В ИГРЕ — для проверки возобновления.
+				 *
+				 * Тот же слот −6, что и «продолжить с того же места», но снятый
+				 * НЕ из ветки выхода: игра получает сообщение, пишет образ и
+				 * ИГРАЕТ ДАЛЬШЕ. Именно так этот слот использует оригинал —
+				 * в его `SystemSuspend.asd` стек кончается на
+				 * `SceneMap@SaveMapSnapShot` → `セーブ実行`, то есть снимок
+				 * сделан посреди игры (замерено на файле Windows-сборки).
+				 *
+				 * Наш же снимок при закрытии окна ложится в ветку ВЫХОДА, и
+				 * восстановление доигрывает выход — отсюда «немой экран». По
+				 * этой причине запись при выходе спрятана под
+				 * XSYS4_SUSPEND_ON_QUIT (см. SystemService.c), а проверять
+				 * возобновление надо этой клавишей.
+				 */
+				void sysservice_request_snapshot(void);
+				sysservice_request_snapshot();
 			} else if (e.key.keysym.scancode == SDL_SCANCODE_F11) {
 				gfx_toggle_fullscreen();
 			} else if (e.key.keysym.scancode == SDL_SCANCODE_S) {
