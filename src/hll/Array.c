@@ -710,6 +710,37 @@ static bool ix_pred(union vm_value *fn, struct page *a, int index)
 {
 	int slots = array_elem_slots(a);
 	int argc = vm_hll_func_nr_args(fn[1].i);
+	/*
+	 * ★ПРЕДИКАТ, ОБЪЯВИВШИЙ ПАРУ, ДОЛЖЕН ЕЁ И ПОЛУЧИТЬ.
+	 *
+	 * Аргумент-интерфейс — это два слота (объект, база интерфейса), и лямбда
+	 * диспетчеризует через них: `vtable = obj[0]; fno = vtable[base + N]`.
+	 * Страница же бывает однослотовой — так приходит массив, поднятый из сейва
+	 * ОРИГИНАЛА (замер `XSYS4_ELEM_TRACE`: `AchievementClearTurn`, `a_type=17`).
+	 * Обрезая argc до ширины СТРАНИЦЫ, мы звали предикат с одним слотом (в логе
+	 * это видно как «fn 36550 объявляет 2 слотов аргументов, передано 1»), и он
+	 * сравнивал мусор: поиск достижения по строковому `<Id>` не совпадал ни с
+	 * одним элементом, сайт получал −1 и падал при разыменовании (§5fb-13).
+	 *
+	 * Недостающую базу берём из таблицы интерфейсов самого объекта — тем же
+	 * правилом, что и выдача элемента наружу в ffi.c.
+	 */
+	if (argc == 2 && slots == 1) {
+		union vm_value argv[2];
+		argv[0] = a->values[index];
+		argv[1] = vm_int(0);
+		int obj = argv[0].i;
+		if (obj > 0 && heap_slot_is_page(obj)) {
+			struct page *op = heap[obj].page;
+			if (op && op->type == STRUCT_PAGE && op->index >= 0
+					&& op->index < ain->nr_structures) {
+				struct ain_struct *st = &ain->structures[op->index];
+				if (st->nr_interfaces == 1)
+					argv[1] = vm_int(st->interfaces[0].vtable_offset);
+			}
+		}
+		return vm_call_hll_func(fn, argv, 2).i != 0;
+	}
 	if (argc > slots)
 		argc = slots;
 	return vm_call_hll_func(fn, &a->values[index * slots], argc).i != 0;

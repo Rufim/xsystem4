@@ -1070,6 +1070,32 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		struct gsave_record *rec, struct gsave_struct_def *sd,
 		const char *struct_name, struct ain_struct *st)
 {
+	/*
+	 * XSYS4_STRUCT_TRACE=<подстрока имени структуры> — ЧТО ИМЕННО пришло в поля
+	 * из сейва, со строками в текстовом виде. Нужна, когда сравнение в игре идёт
+	 * по строковому ключу и «не совпало» невозможно отличить от «прочиталось не
+	 * то» (§5fb-13: предикат ищет достижение по `<Id>` состояния).
+	 */
+	{
+		static const char *sT = (const char *)1;
+		if (sT == (const char *)1)
+			sT = getenv("XSYS4_STRUCT_TRACE");
+		if (sT && *sT && struct_name && strstr(struct_name, sT)) {
+			NOTICE("STRUCT '%s': полей %d", struct_name, rec->nr_indices);
+			for (int i = 0; i < rec->nr_indices; i++) {
+				struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
+				const char *fn = sd ? sd->fields[i].name : kv->name;
+				enum ain_data_type ft = sd ? sd->fields[i].type : kv->type;
+				if (ft == AIN_STRING && kv->value >= 0
+						&& kv->value < save->nr_strings
+						&& save->strings[kv->value])
+					NOTICE("   %s (тип %d) = \"%s\"", fn ? fn : "?", ft,
+					       display_sjis0(save->strings[kv->value]->text));
+				else
+					NOTICE("   %s (тип %d) = %d", fn ? fn : "?", ft, kv->value);
+			}
+		}
+	}
 	for (int i = 0; i < rec->nr_indices; i++) {
 		struct gsave_keyval *kv = &save->keyvals[rec->indices[i]];
 		const char *field_name = sd ? sd->fields[i].name : kv->name;
