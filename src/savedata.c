@@ -153,14 +153,42 @@ static void obj_maps_reset(void)
 	free(load_rec_map); load_rec_map = NULL; load_rec_nr = 0;
 }
 
-static struct gsave_flat_array *collect_flat_arrays(struct page *page, struct gsave_flat_array *fa, struct gsave *save)
+/*
+ * ОБЪЯВЛЕННЫЙ ТИП ЭЛЕМЕНТА поля, которое пишется прямо сейчас (из .ain), либо
+ * AIN_VOID, если контекста нет. Нужен ровно для перечислений: в рантайме
+ * `array<MenuState#92>` живёт как обычный `array<int>` (см. загрузку, ветка
+ * AIN_ENUM), и к моменту записи знание о перечислении в странице не осталось —
+ * а оригинал пишет в сейв ИМЕННО 92 (`GameContext.m_menuState` из шести
+ * элементов, `BattleBonusCalculator.m_bonuses` — замерено на сейвах
+ * Windows-сборки; у нас на тех же полях стояло 10).
+ */
+static enum ain_data_type save_decl_elem = AIN_VOID;
+
+static void save_decl_elem_note(struct ain_type *t)
+{
+	struct ain_type *inner = t ? t->array_type : NULL;
+	save_decl_elem = inner ? inner->data : AIN_VOID;
+}
+
+static struct gsave_flat_array *collect_flat_arrays(struct page *page, struct gsave_flat_array *fa,
+		struct gsave *save, enum ain_data_type decl_elem)
 {
 	if (page->array.rank > 1) {
 		for (int i = 0; i < page->nr_vars; i++)
-			fa = collect_flat_arrays(heap_get_page(page->values[i].i), fa, save);
+			fa = collect_flat_arrays(heap_get_page(page->values[i].i), fa, save, decl_elem);
 		return fa;
 	}
 	enum ain_data_type type = variable_type(page, 0, NULL, NULL);
+	// Перечисление возвращаем к объявленному виду: значение то же целое, но
+	// тип в файле совпадёт с оригиналом. Обратная сторона (загрузка) уже
+	// принимает 92/91 наравне с 10 — см. save_type_norm.
+	if (type == AIN_INT && (decl_elem == AIN_ENUM || decl_elem == AIN_ENUM2))
+		type = decl_elem;
+	// `array<wrap<T>>`: у оригинала элемент — 21 (`ref <структура>`), у нас
+	// страница объявляет объектный слот структурой. Значение одно и то же
+	// (индекс записи), расходится только тип в файле — см. save_type_norm.
+	if (type == AIN_STRUCT && decl_elem == AIN_WRAP)
+		type = AIN_REF_STRUCT;
 	fa->nr_values = page->nr_vars;
 	fa->type = type;
 	fa->values = xcalloc(fa->nr_values, sizeof(struct gsave_array_value));
@@ -323,6 +351,7 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 				enum ain_data_type type = st->members[i].type.data;
 				int32_t value;
 				save_path_note(st->name, st->members[i].name);
+				save_decl_elem_note(&st->members[i].type);
 				/*
 				 * Обёртки Ixseal — `wrap<T>` (82), `option<T>` (86) и ссылка на
 				 * интерфейс (89). В слоте у них либо heap-слот объекта, либо
@@ -341,8 +370,17 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 				 */
 				if (type == AIN_WRAP || type == AIN_OPTION || type == AIN_IFACE) {
 					struct ain_type *inner = st->members[i].type.array_type;
+					/*
+					 * ★`AIN_WRAP` внутри — ТОЖЕ ОБЪЕКТ. Без него
+					 * `option<wrap<T>>` уходил в скалярную ветку и терялся:
+					 * в логе прогона это 20 предупреждений «тип wrap<?> не
+					 * восстанавливается — поле осталось пустым»
+					 * (`PlayerAction.m_targets`, `m_innerAction`). На пустых
+					 * полях потери не видно, а сейв посреди боя терял цели.
+					 */
 					bool is_obj = type == AIN_IFACE || !inner
 						|| inner->data == AIN_STRUCT
+						|| inner->data == AIN_WRAP
 						|| inner->data == AIN_IFACE
 						|| inner->data == AIN_IFACE_WRAP;
 					/*
@@ -430,7 +468,11 @@ static int32_t add_value_to_gsave(enum ain_data_type type, union vm_value val, s
 				array.nr_flat_arrays *= p->nr_vars;
 			}
 			array.flat_arrays = xcalloc(array.nr_flat_arrays, sizeof(struct gsave_flat_array));
-			collect_flat_arrays(page, array.flat_arrays, save);
+			// Контекст объявления забираем и ГАСИМ: он относится к этому
+			// массиву, а вложенные записи (элементы-структуры) поставят свой.
+			enum ain_data_type decl_elem = save_decl_elem;
+			save_decl_elem = AIN_VOID;
+			collect_flat_arrays(page, array.flat_arrays, save, decl_elem);
 			return gsave_add_array(save, &array);
 		}
 	/*
@@ -562,6 +604,7 @@ int save_globals(const char *keyname, const char *filename, const char *group_na
 					&& ain->globals[i].type.array_type)
 				? ain->globals[i].type.array_type->data
 				: ain->globals[i].type.data;
+			save_decl_elem_note(&ain->globals[i].type);
 			global->value = add_value_to_gsave(global->type, global_get(i), save);
 			global++;
 		}
@@ -806,6 +849,16 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
  */
 static enum ain_data_type save_type_norm(enum ain_data_type t)
 {
+	/*
+	 * ★`ref <структура>` РАВЕН структуре по той же причине. Элемент
+	 * `array<wrap<T>>` оригинал пишет типом 21 (`AIN_REF_STRUCT`), а страница
+	 * в игре объявляет его обычным объектным слотом (13): значение в обоих
+	 * случаях — индекс записи. Замерено на сейве Windows-сборки:
+	 * `ActionHistory.m_history`, `BattlePlayerCollection.m_player`,
+	 * `PlayerActionCollection.m_actions` — все с типом элементов 21.
+	 */
+	if (t == AIN_REF_STRUCT)
+		return AIN_STRUCT;
 	return (t == AIN_ENUM || t == AIN_ENUM2) ? AIN_INT : t;
 }
 
@@ -875,8 +928,26 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		 * структуры (проверено на GameContext: девять полей подряд, тип в тип),
 		 * поэтому позиция — надёжный ключ. Без этого поля просто терялись.
 		 */
+		/*
+		 * ★А ИМЕНА У СЛУЖЕБНЫХ ПОЛЕЙ НЕ УНИКАЛЬНЫ. Тег-филлер каждого
+		 * `option<...>` зовётся в .ain одинаково — `<void>`, — и поиск по
+		 * имени отдавал ВСЕГДА ПЕРВЫЙ такой член. У `WorkerCollection`
+		 * филлеров два (теги `m_limit` и `ShowcaseId`): тег второго попадал в
+		 * слот первого, `m_limit` оказывался «пустым», и следующее сохранение
+		 * записывало в файл уже настоящую пустоту — вместимость комнат
+		 * терялась НАВСЕГДА (панель показывала `TALENT 3/-1` вместо `3/5`).
+		 * Терялись так же рекорд дневного дохода и скидки магазина.
+		 *
+		 * Поэтому сначала пробуем ПОЗИЦИЮ: порядок полей в struct-def равен
+		 * порядку членов структуры, и если имя на этой позиции совпадает —
+		 * это и есть нужный член, каким бы неуникальным имя ни было. Поиск по
+		 * имени остаётся запасным путём: он спасает, когда схема съехала.
+		 */
 		int index;
 		if ((!field_name || !*field_name) && sd && i < st->nr_members)
+			index = i;
+		else if (sd && i < st->nr_members && field_name
+				&& !strcmp(st->members[i].name, field_name))
 			index = i;
 		else
 			index = struct_member_index(st, field_name);
@@ -910,8 +981,10 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 				&& !option_var_has_value(page, index);
 			if (stale_option)
 				page->values[index].i = -1;
+			// зеркало записи: `wrap` внутри option — объект, а не скаляр
 			bool is_obj = data_type == AIN_IFACE || !inner
 				|| inner->data == AIN_STRUCT
+				|| inner->data == AIN_WRAP
 				|| inner->data == AIN_IFACE
 				|| inner->data == AIN_IFACE_WRAP;
 			if (!is_obj) {
@@ -923,6 +996,19 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 			if (kv->value < 0) {
 				variable_fini(page->values[index], AIN_STRUCT, false);
 				page->values[index].i = -1;
+				continue;
+			}
+			/*
+			 * ★ГРАНИЦЫ ПРОВЕРЯЕМ ДО РАЗЫМЕНОВАНИЯ. Поле, объявленное
+			 * объектным СЕЙЧАС, в файле СТАРОЙ сборки могло лежать скаляром:
+			 * `option<wrap<T>>` до правки уходил в скалярную ветку, и в этом
+			 * слоте оказывался не индекс записи, а heap-индекс времён записи.
+			 * Без проверки чтение уходит за массив записей — вместо честного
+			 * «поле не восстановилось» получаем порчу памяти на чужом сейве.
+			 */
+			if (kv->value >= save->nr_records) {
+				strict_or_warn("загрузка", "обёртка %s: индекс записи %d вне файла (записей %d)",
+					display_sjis1(field_name), kv->value, save->nr_records);
 				continue;
 			}
 			// Имя структуры знает сама запись — у интерфейсной ссылки
@@ -956,6 +1042,11 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 			 * перестанет грузиться совсем. Читаем так же, как соседняя ветка
 			 * обёрток (wrap/option/iface), у которых та же природа.
 			 */
+			if (kv->value >= save->nr_records) {
+				strict_or_warn("загрузка", "ref-поле %s: индекс записи %d вне файла (записей %d)",
+					display_sjis1(field_name), kv->value, save->nr_records);
+				continue;
+			}
 			struct gsave_record *r = &save->records[kv->value];
 			struct gsave_struct_def *d = save->version >= 7
 				? &save->struct_defs[r->struct_index] : NULL;
