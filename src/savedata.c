@@ -163,6 +163,11 @@ static void load_rec_remember(int32_t rec, int slot)
 // struct_index в Achievement.asd, титул не появлялся).
 static bool save_file_corrupt = false;
 
+// Запас на разницу «элементы против слотов»: у интерфейсной пары значений
+// вдвое больше элементов, у option — с тегом. Берём с запасом, задача границы —
+// отсечь мусор, а не выверить точное число.
+#define GSAVE_ARRAY_SLACK 64
+
 static void save_bad_index(const char *what, int idx, int nr)
 {
 	save_file_corrupt = true;
@@ -1174,6 +1179,31 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 		const char *struct_name, struct ain_struct *st)
 {
 	/*
+	 * ★СТОРОЖ РАЗБОРА: у битого файла граф записей перестаёт быть деревом.
+	 *
+	 * Тождество объектов держится реестром записей; если индекс описания вышел
+	 * за диапазон, запись не опознаётся, и обход уходит по кругу — загрузка
+	 * висит В НАШЕМ КОДЕ, где сторож байткода её не видит (замер: испорченный
+	 * `Achievement.asd`, лог обрывается сразу после сообщения о битом индексе).
+	 * Считаем шаги и обрываем разбор с понятным сообщением.
+	 */
+	static int depth;
+	static long steps;
+	if (++depth == 1)
+		steps = 0;
+	if (++steps > 2000000) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			WARNING("разбор сейва не сходится (>2 млн шагов на структуре '%s') — "
+				"файл повреждён, дальше не идём",
+				struct_name ? display_sjis0(struct_name) : "?");
+		}
+		save_file_corrupt = true;
+		depth--;
+		return;
+	}
+	/*
 	 * XSYS4_STRUCT_TRACE=<подстрока имени структуры> — ЧТО ИМЕННО пришло в поля
 	 * из сейва, со строками в текстовом виде. Нужна, когда сравнение в игре идёт
 	 * по строковому ключу и «не совпало» невозможно отличить от «прочиталось не
@@ -1423,6 +1453,7 @@ static void gsave_fill_struct(struct gsave *save, struct page *page,
 				display_sjis0(st->name), display_sjis1(st->members[i].name),
 				ain_strtype(ain, t, -1));
 	}
+	depth--;
 }
 
 static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type type, int struct_type, int array_rank, int32_t value, struct page *container, int varno)
@@ -1747,6 +1778,24 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			 */
 			bool decl_iface = decl_struct >= 0 && decl_struct < ain->nr_structures
 				&& ain->structures[decl_struct].is_interface;
+			/*
+			 * Размер массива тоже приходит ИЗ ФАЙЛА. У битого сейва он бывает
+			 * астрономическим, и загрузка уходит выделять миллиарды слотов —
+			 * снаружи это выглядит как зависание в нашем коде, где сторож
+			 * байткода бессилен (замер: испорченный `Achievement.asd`, экран
+			 * так и не появлялся). Верхняя граница — по числу значений,
+			 * которые в файле реально есть.
+			 */
+			if (array->dimensions[0] < 0
+					|| (array->flat_arrays && array->nr_flat_arrays > 0
+					    && array->dimensions[0] > array->flat_arrays[0].nr_values
+							    + GSAVE_ARRAY_SLACK)) {
+				save_bad_index("размера массива", array->dimensions[0],
+					       array->nr_flat_arrays > 0
+					       ? array->flat_arrays[0].nr_values + GSAVE_ARRAY_SLACK : 0);
+				heap[slot].page = NULL;
+				return vm_int(slot);
+			}
 			union vm_value dim = { .i = array->dimensions[0] };
 			if (decl_iface && !iface_pair && dim.i > 0 && (dim.i % 2) == 0
 					&& array->flat_arrays[0].nr_values == dim.i) {
@@ -1986,7 +2035,11 @@ int load_struct_list(const char *filename, struct page *list)
 		int32_t rec_index = save->globals[i].value;
 		if (rec_index < 0)
 			continue;
-		struct gsave_record *rec = &save->records[rec_index];
+		// Индекс записи тоже из файла: у битого сейва он уводит за границы
+		// таблицы (замер: испорченный Achievement.asd вис прямо здесь).
+		struct gsave_record *rec = rec_get(save, rec_index);
+		if (!rec)
+			continue;
 		struct gsave_struct_def *sd = save->version >= 7
 			? sd_get(save, rec->struct_index) : NULL;
 		const char *sname = sd ? sd->name : rec->struct_name;
@@ -2000,6 +2053,9 @@ int load_struct_list(const char *filename, struct page *list)
 	}
 	gsave_free(save);
 	obj_maps_reset();
+	if (getenv("XSYS4_SAVE_TRACE"))
+		NOTICE("SAVETRACE DeserializeStruct '%s': разобрано приёмников %d",
+		       display_utf0(filename), nr);
 	if (save_file_corrupt) {
 		// Данные частично не разобраны — честнее отдать отказ: игра покажет
 		// своё «загрузка не удалась» и останется работоспособной.
