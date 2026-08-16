@@ -905,6 +905,31 @@ void hll_call(int libno, int fno, int elem_class)
 		 */
 		int eslots = array_elem_slots(ap);
 		/*
+		 * XSYS4_ELEM_TRACE=<подстрока имени структуры элемента> — ФОРМА
+		 * КОНТЕЙНЕРА в момент, когда элемент отдаётся наружу. Отвечает на
+		 * вопрос, который по одному лишь дампу сейва не задать: пришёл
+		 * интерфейсный массив ПАРАМИ (тогда наружу идут два слота) или
+		 * однослотовыми элементами (тогда один — и стек вызывающего
+		 * разъезжается, §5fb-13).
+		 */
+		{
+			static const char *et = (const char *)1;
+			if (et == (const char *)1)
+				et = getenv("XSYS4_ELEM_TRACE");
+			if (et && *et) {
+				const char *sn = (ap->array.struct_type >= 0
+						  && ap->array.struct_type < ain->nr_structures
+						  && ain->structures[ap->array.struct_type].name)
+					? ain->structures[ap->array.struct_type].name : "";
+				if (strstr(sn, et))
+					NOTICE("ELEM '%s': a_type=%d слотов на элемент %d, "
+					       "слотов страницы %d, индекс %d, elem_class=0x%x, "
+					       "вызов %s",
+					       sn, ap->a_type, eslots, ap->nr_vars, idx,
+					       elem_class, display_sjis0(vm_current_function_name()));
+			}
+		}
+		/*
 		 * `option<wrap<структура>>` — элемент тоже ДВУХСЛОТОВЫЙ (объект + тег
 		 * наличия), но наружу идёт ССЫЛКА, а не значение. Единственный такой
 		 * сайт — `MapView@GetNode` (@0x708712, elem_class 0x30002): сразу после
@@ -947,7 +972,26 @@ void hll_call(int libno, int fno, int elem_class)
 			stack_push(0);
 			break;
 		}
-		if (eslots != 1) {
+		/*
+		 * ★ШИРИНУ ОТВЕТА ЗАДАЁТ САЙТ, А НЕ СТРАНИЦА.
+		 *
+		 * `elem_class == 0x10003` — сайт объявил элемент как `wrap<интерфейс>`
+		 * и разбирает ДВА слота (объект, база интерфейса). Страница при этом
+		 * бывает однослотовой: массив, поднятый из сейва ОРИГИНАЛА, приходит
+		 * обычным `array<структура>` (замер `XSYS4_ELEM_TRACE`:
+		 * `AchievementClearTurn`, `a_type=17`, слотов на элемент 1, сайт
+		 * `elem_class=0x10003`). Отдавая по форме СТРАНИЦЫ, мы клали один слот
+		 * там, где сайт ждёт два, — стек вызывающего съезжал, и рассылка
+		 * делегата на следующем витке принимала за страницу делегата аргумент
+		 * предыдущего вызова («Not a delegate page», §5fb-13).
+		 *
+		 * База интерфейса у однослотовой страницы неизвестна — отдаём 0, как и
+		 * `iface_base_for` на неизвестном интерфейсе: для единственного
+		 * интерфейса (смещение 0) это верно, а для класса с несколькими
+		 * остаётся приближением, пока форма таких массивов не снята замером.
+		 */
+		bool site_iface_pair = (elem_class == 0x10003);
+		if (site_iface_pair || eslots != 1) {
 			if (idx < 0 || (idx + 1) * eslots > ap->nr_vars) {
 				// Нет элемента — нулевой интерфейс той же формы (пара),
 				// как её строит X_ICAST на провале.
@@ -958,7 +1002,7 @@ void hll_call(int libno, int fno, int elem_class)
 			int obj = ap->values[idx * eslots].i;
 			heap_ref(obj);
 			stack_push(obj);
-			stack_push(ap->values[idx * eslots + 1].i);
+			stack_push(eslots > 1 ? ap->values[idx * eslots + 1].i : 0);
 			break;
 		}
 		// Тип элемента берём из САМОГО МАССИВА, а не из слота по индексу.
