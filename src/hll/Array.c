@@ -725,6 +725,38 @@ static bool ix_pred(union vm_value *fn, struct page *a, int index)
 	 * Недостающую базу берём из таблицы интерфейсов самого объекта — тем же
 	 * правилом, что и выдача элемента наружу в ffi.c.
 	 */
+	/*
+	 * XSYS4_PRED_TRACE=<номер структуры элемента> — что именно уходит в предикат:
+	 * индекс, форма страницы и слот объекта. Нужна, когда предикат падает на
+	 * первом же разыменовании: по стеку видно только «X_REF на −1», а не то,
+	 * какой элемент и из какого контейнера ему дали.
+	 */
+	{
+		static const char *pt = (const char *)1;
+		if (pt == (const char *)1)
+			pt = getenv("XSYS4_PRED_TRACE");
+		bool match = false;
+		if (pt && *pt) {
+			int fno = fn[1].i;
+			const char *fname = (fno >= 0 && fno < ain->nr_functions
+					     && ain->functions[fno].name)
+				? ain->functions[fno].name : "";
+			match = strstr(fname, pt) != NULL;
+		}
+		if (match) {
+			static int left = 12;
+			if (left > 0) {
+				left--;
+				const char *sn = (ix_stype(a) >= 0 && ix_stype(a) < ain->nr_structures
+						  && ain->structures[ix_stype(a)].name)
+					? ain->structures[ix_stype(a)].name : "?";
+				NOTICE("PRED индекс %d из %d: a_type=%d (эл. '%s') слотов %d, "
+				       "объект=%d, argc=%d", index,
+				       a->nr_vars / (slots ? slots : 1), a->a_type, sn, slots,
+				       a->values[index * slots].i, argc);
+			}
+		}
+	}
 	if (argc == 2 && slots == 1) {
 		union vm_value argv[2];
 		argv[0] = a->values[index];

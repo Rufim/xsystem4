@@ -921,6 +921,19 @@ static int32_t iface_base_for(int obj_slot, int iface_struct)
 	return 0;
 }
 
+// Конкретный класс элемента — по записи сейва (ссылка законно держит производную,
+// а в странице стоит либо интерфейс, либо класс первого элемента).
+static int elem_struct_by_record(struct gsave *save, int32_t v, int dflt)
+{
+	if (v < 0 || v >= save->nr_records)
+		return dflt;
+	struct gsave_record *rec = &save->records[v];
+	struct gsave_struct_def *d = save->version >= 7
+		? &save->struct_defs[rec->struct_index] : NULL;
+	int actual = ain_get_struct(ain, d ? d->name : rec->struct_name);
+	return actual >= 0 ? actual : dflt;
+}
+
 static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page *page, struct gsave_flat_array *flat_array)
 {
 	assert(page->type == ARRAY_PAGE);
@@ -958,6 +971,26 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 				       sn, page->a_type, es, page->nr_vars,
 				       flat_array->nr_values, flat_array->type);
 		}
+	}
+	/*
+	 * ПАРНАЯ страница, а значений СТОЛЬКО ЖЕ, сколько слотов, — это запись
+	 * оригинала «по слотам»: `объект, −1, объект, −1 …`. Кладём значения 1:1,
+	 * а вместо −1 восстанавливаем настоящую базу по таблице интерфейсов объекта
+	 * (с нулём вместо неё диспетчеризация уходит в чужой метод, см. §5fb-13).
+	 */
+	if (array_iface_pair_type(page->a_type) && es == 2
+			&& flat_array->nr_values == page->nr_vars) {
+		int iface = page->array.struct_type;
+		for (int i = 0; i < page->nr_vars; i += 2) {
+			int32_t v = flat_array->values[i].value;
+			union vm_value val = gsave_to_vm_value(save, AIN_STRUCT,
+					elem_struct_by_record(save, v, iface), 0, v, page, i);
+			page->values[i] = val;
+			int32_t base = flat_array->values[i + 1].value;
+			page->values[i + 1] = vm_int(base >= 0 ? base
+					: iface_base_for(val.i, iface));
+		}
+		return flat_array + 1;
 	}
 	if (array_iface_pair_type(page->a_type) && es == 2
 			&& flat_array->nr_values == page->nr_vars / 2) {
@@ -1621,7 +1654,30 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			 * рантайме такая страница ОДНОСЛОТОВАЯ, и подъём «по объявлению»
 			 * ронял загрузку на «unexpected number of array elements».
 			 */
+			/*
+			 * ★МАССИВ ИНТЕРФЕЙСОВ: РАЗМЕР В ФАЙЛЕ — В СЛОТАХ, А НЕ В ЭЛЕМЕНТАХ.
+			 *
+			 * Оригинал пишет каждый элемент ПАРОЙ значений — слот объекта и −1
+			 * вместо базы интерфейса. Видно прямо в файле (`Achievement.asd`,
+			 * `AchievementCollection.m_achievements`): 130 значений типа 21,
+			 * идущих как `2 −1 4 −1 6 −1 …`, при 65 реальных достижениях.
+			 *
+			 * Тип значений (21) про интерфейс ничего не говорит, поэтому случай
+			 * узнаём по ОБЪЯВЛЕНИЮ поля: `array<IAchievement>` — элемент-интерфейс,
+			 * значит страница обязана быть парной. Подняв её однослотовой, мы
+			 * получали 130 «элементов», где каждый второй — та самая −1: поиск по
+			 * такому массиву звал предикат на пустом элементе, и первый же
+			 * `X_REF` ронял игру (§5fb-13).
+			 */
+			bool decl_iface = decl_struct >= 0 && decl_struct < ain->nr_structures
+				&& ain->structures[decl_struct].is_interface;
 			union vm_value dim = { .i = array->dimensions[0] };
+			if (decl_iface && !iface_pair && dim.i > 0 && (dim.i % 2) == 0
+					&& array->flat_arrays[0].nr_values == dim.i) {
+				guessed = AIN_IFACE_WRAP;
+				elem_struct = decl_struct;
+				dim.i /= 2;
+			}
 			struct page *page = alloc_array(1, &dim, guessed, elem_struct, false);
 			heap[slot].page = page;
 			gsave_load_array(save, page, array->flat_arrays);
