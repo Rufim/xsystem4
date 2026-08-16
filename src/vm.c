@@ -17,6 +17,7 @@
 #define VM_PRIVATE
 
 #include <stdlib.h>
+#include <execinfo.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -4767,9 +4768,36 @@ _Noreturn void vm_reset(void)
 	longjmp(reset_buf, 1);
 }
 
+/*
+ * ★C-СТЕК ПО СИГНАЛУ — ДЛЯ ЗАВИСАНИЙ ВНЕ БАЙТКОДА.
+ *
+ * Стек ИГРЫ (`vm_stack_trace`) отвечает «чем занята игра», но когда движок
+ * крутится в СВОЁМ коде — разбор сейва, сборка частей, декодирование, — этот
+ * стек застывает и не говорит ничего: сторож зависаний тоже молчит, он следит
+ * за циклом VM. Живой случай (§5fb-15): загрузка повреждённого сейва не
+ * доходит до конца, лог обрывается, экран чёрный — и ни одна из трёх расставок
+ * границ не назвала место.
+ *
+ * Подключиться отладчиком к живому процессу мешает `ptrace_scope=1`, поэтому
+ * печатаем стек сами, средствами glibc. Символы видны, если бинарь собран без
+ * `-fomit-frame-pointer` и не полностью статически урезан; имена функций с
+ * внутренней компоновкой могут оказаться адресами — их доразбирает `addr2line`.
+ */
+static void dump_c_stack(void)
+{
+	void *frames[64];
+	int n = backtrace(frames, 64);
+	sys_warning("=== C-стек движка (%d кадров) ===\n", n);
+	char **names = backtrace_symbols(frames, n);
+	for (int i = 0; i < n; i++)
+		sys_warning("\t%s\n", names ? names[i] : "?");
+	free(names);
+}
+
 static void vm_sigusr1_handler(int sig)
 {
 	(void)sig;
+	dump_c_stack();
 	sys_warning("=== SIGUSR1: VM call stack (top first) ===\n");
 	vm_stack_trace();
 	sys_warning("=== end VM call stack (instr_ptr=0x%zx) ===\n", instr_ptr);

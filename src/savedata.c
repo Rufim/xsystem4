@@ -2044,6 +2044,20 @@ int load_struct_list(const char *filename, struct page *list)
 			? sd_get(save, rec->struct_index) : NULL;
 		const char *sname = sd ? sd->name : rec->struct_name;
 		struct ain_struct *st = &ain->structures[dst->index];
+		/*
+		 * ★ИМЕНИ МОЖЕТ НЕ БЫТЬ ВОВСЕ. В версии 9 имя структуры лежит ТОЛЬКО в
+		 * таблице описаний, и у повреждённого файла (битый `struct_index`)
+		 * описание не находится — `sname` остаётся NULL, а `strcmp` с ним
+		 * падает в libc. Именно так движок и умирал на испорченном
+		 * `Achievement.asd`: SIGSEGV сразу после нашего же сообщения о битом
+		 * индексе (§5fb-15, стенд tools/gsave_corrupt.c).
+		 */
+		if (!sname) {
+			strict_or_warn("загрузка", "приёмник %d (%s): в сейве нет имени "
+				       "структуры — запись повреждена",
+				       i, display_sjis0(st->name));
+			continue;
+		}
 		if (strcmp(sname, st->name)) {
 			strict_or_warn("загрузка", "приёмник %d — %s, а в сейве %s",
 			               i, display_sjis0(st->name), display_sjis1(sname));
