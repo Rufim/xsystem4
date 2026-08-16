@@ -1002,7 +1002,45 @@ void hll_call(int libno, int fno, int elem_class)
 			int obj = ap->values[idx * eslots].i;
 			heap_ref(obj);
 			stack_push(obj);
-			stack_push(eslots > 1 ? ap->values[idx * eslots + 1].i : 0);
+			/*
+			 * ★БАЗУ ИНТЕРФЕЙСА У ОДНОСЛОТОВОЙ СТРАНИЦЫ ВОССТАНАВЛИВАЕМ ПО
+			 * ТАБЛИЦЕ ИНТЕРФЕЙСОВ ОБЪЕКТА, А НЕ ОТДАЁМ НОЛЬ.
+			 *
+			 * База — не украшение: сайт диспетчеризует через неё
+			 * (`vtable = obj[0]; fno = vtable[base + N]; CALLMETHOD`). С нулём
+			 * вызывается ЧУЖОЙ метод, и предикат поиска молча не совпадает ни с
+			 * одним элементом — `Array.First` промахивается на всех 130
+			 * достижениях, сайт получает ссылку −1 и падает при разыменовании
+			 * (§5fb-13, сейв ОРИГИНАЛА).
+			 *
+			 * Какой именно интерфейс — из страницы не спросишь (после загрузки
+			 * там стоит конкретный класс), поэтому берём единственный интерфейс
+			 * объекта. Если их несколько, выбрать не из чего: оставляем 0 и
+			 * говорим об этом вслух — молчаливый неверный вызов хуже.
+			 */
+			int base = 0;
+			if (eslots > 1) {
+				base = ap->values[idx * eslots + 1].i;
+			} else if (obj > 0 && heap_slot_is_page(obj)) {
+				struct page *op = heap[obj].page;
+				if (op && op->type == STRUCT_PAGE && op->index >= 0
+						&& op->index < ain->nr_structures) {
+					struct ain_struct *st = &ain->structures[op->index];
+					if (st->nr_interfaces == 1) {
+						base = st->interfaces[0].vtable_offset;
+					} else if (st->nr_interfaces > 1) {
+						static bool warned = false;
+						if (!warned) {
+							warned = true;
+							WARNING("Array-элемент '%s' отдаётся как интерфейсная "
+								"пара, но интерфейсов у него %d — базу выбрать "
+								"не из чего, беру 0",
+								st->name ? st->name : "?", st->nr_interfaces);
+						}
+					}
+				}
+			}
+			stack_push(base);
 			break;
 		}
 		// Тип элемента берём из САМОГО МАССИВА, а не из слота по индексу.
