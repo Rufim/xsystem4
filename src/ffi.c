@@ -1022,6 +1022,28 @@ void hll_call(int libno, int fno, int elem_class)
 			if (eslots > 1) {
 				base = ap->values[idx * eslots + 1].i;
 			} else if (obj > 0 && heap_slot_is_page(obj)) {
+				// ★СЧЁТЧИК САМОГО ПУТИ: сюда попадают только массивы, пришедшие
+				// ОДНОСЛОТОВЫМИ там, где сайт ждёт пару. Пока форма страницы
+				// верна, ветка мертва — и это надо знать точно, а не по
+				// отсутствию симптомов: у 10 классов частей второй интерфейс
+				// стоит со смещением до +106, и подстановка нуля увела бы вызов
+				// в чужой метод молча (§5fb-13, замер по .ain).
+				{
+					static const char *gt = (const char *)1;
+					if (gt == (const char *)1)
+						gt = getenv("XSYS4_IFACE_GUESS_TRACE");
+					if (gt && *gt) {
+						struct page *gp = heap[obj].page;
+						struct ain_struct *gs = (gp && gp->type == STRUCT_PAGE
+							&& gp->index >= 0 && gp->index < ain->nr_structures)
+							? &ain->structures[gp->index] : NULL;
+						NOTICE("IFACEGUESS: однослотовая страница, сайт ждёт пару — "
+						       "элемент '%s', интерфейсов %d, вызов %s",
+						       gs && gs->name ? gs->name : "?",
+						       gs ? gs->nr_interfaces : -1,
+						       display_sjis0(vm_current_function_name()));
+					}
+				}
 				struct page *op = heap[obj].page;
 				if (op && op->type == STRUCT_PAGE && op->index >= 0
 						&& op->index < ain->nr_structures) {

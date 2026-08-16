@@ -758,6 +758,22 @@ static bool ix_pred(union vm_value *fn, struct page *a, int index)
 		}
 	}
 	if (argc == 2 && slots == 1) {
+		// Тот же счётчик, что в ffi.c: предикат ждёт пару, а страница
+		// однослотовая — значит база берётся догадкой.
+		{
+			static const char *gt = (const char *)1;
+			if (gt == (const char *)1)
+				gt = getenv("XSYS4_IFACE_GUESS_TRACE");
+			if (gt && *gt) {
+				int o = a->values[index].i;
+				struct page *gp = (o > 0 && heap_slot_is_page(o)) ? heap[o].page : NULL;
+				struct ain_struct *gs = (gp && gp->type == STRUCT_PAGE
+					&& gp->index >= 0 && gp->index < ain->nr_structures)
+					? &ain->structures[gp->index] : NULL;
+				NOTICE("IFACEGUESS(предикат): элемент '%s', интерфейсов %d",
+				       gs && gs->name ? gs->name : "?", gs ? gs->nr_interfaces : -1);
+			}
+		}
 		union vm_value argv[2];
 		argv[0] = a->values[index];
 		argv[1] = vm_int(0);
