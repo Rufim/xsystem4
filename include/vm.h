@@ -223,7 +223,11 @@ struct function_call {
 	int32_t entry_sp;
 };
 
-extern struct function_call call_stack[4096];
+// Ёмкость стека вызовов игры. Важна не только самой VM: загрузчик образа
+// возобновления обязан отвергнуть файл с большей глубиной, иначе восстановление
+// пишет за границу массива (§5fb-12).
+#define CALL_STACK_MAX 4096
+extern struct function_call call_stack[CALL_STACK_MAX];
 extern int32_t call_stack_ptr;
 
 extern size_t instr_ptr;

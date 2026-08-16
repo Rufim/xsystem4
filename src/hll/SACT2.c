@@ -806,7 +806,29 @@ void sact_Key_ClearFlagNoCtrl(void)
 int sact_Key_IsDown(int keycode)
 {
 	handle_events();
-	return key_is_down(keycode);
+	int down = key_is_down(keycode);
+	/*
+	 * XSYS4_KEY_TRACE=1 — какие коды опрос считает НАЖАТЫМИ. Нужен, когда
+	 * игра висит в ожидании отпускания (`CMessageTextView::IsKeysDown`
+	 * опрашивает набор кодов и крутится, пока хоть один нажат): без этого
+	 * «зависло в ожидании» не отличить от «залипла конкретная клавиша».
+	 * Печатаем только положительные ответы и не чаще раза в 500 мс на код.
+	 */
+	// getenv кэшируем: опрос клавиш крутится в busy-петлях ожидания реплики,
+	// и скан environ на каждый вызов там ощутим.
+	static const char *key_trace = (const char *)1;
+	if (key_trace == (const char *)1)
+		key_trace = getenv("XSYS4_KEY_TRACE");
+	if (down && key_trace && *key_trace) {
+		static uint32_t last[512];
+		uint32_t now = SDL_GetTicks();
+		unsigned idx = (unsigned)keycode < 512 ? (unsigned)keycode : 0;
+		if (now - last[idx] > 500) {
+			last[idx] = now;
+			NOTICE("KEY код %d — НАЖАТА", keycode);
+		}
+	}
+	return down;
 }
 
 int sact_CG_IsExist(int cg_no)

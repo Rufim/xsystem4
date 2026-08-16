@@ -46,11 +46,15 @@
  * все цифры), у ТЕКСТОВОЙ — флаг разрешённой разметки.
  */
 /*
+ * v13: в реестре активностей пишется список СЛУЖЕБНЫХ частей (helpers) — без него
+ * после возобновления их некому снять, и текст прежней реплики оставался висеть
+ * поверх новой (§5fb-11).
+ *
  * v12: у части пишется признак КОРНЯ АКТИВНОСТИ (`is_activity_root`). Сцена после
  * загрузки поднимается снимком частей, раскладка заново не читается — без признака
  * корень терял точку привязки, которую ему ставит код игры (§5dz, п.1).
  */
-#define CURRENT_SAVE_VERSION 12
+#define CURRENT_SAVE_VERSION 13
 
 // Тайминг загрузки образа по типам состояний (печать под XSYS4_XPE_TRACE):
 // «задержки листания scrollback» — это перезагрузка образа на каждую страницу,
@@ -1130,6 +1134,10 @@ static void load_parts(struct iarray_reader *r, int version, bool back_scene)
 	if (back_scene)
 		no += BACK_SCENE_PARTS_OFFSET;
 	struct parts *parts = parts_get(no);
+	// Номер занят — счётчик загрузчика раскладки не должен выдать его снова
+	// (см. pe_act_seq_reserve).
+	if (!back_scene)
+		pe_act_seq_reserve(no);
 	parts->back_scene_copy = back_scene;
 	if (getenv("XSYS4_BS_TRACE"))
 		NOTICE("BS load part=%d%s", no, back_scene ? " (копия бэк-сцены)" : "");
@@ -1607,7 +1615,7 @@ static bool parts_engine_load(struct page **buffer, bool restore_globals, bool b
 		}
 	}
 	if (version >= 5) {
-		if (!pe_activities_load(&r, restore_globals))
+		if (!pe_activities_load(&r, restore_globals, version))
 			return false;
 	}
 	if (version >= 6) {

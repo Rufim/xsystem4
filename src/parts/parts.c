@@ -1780,6 +1780,19 @@ void parts_debug_dump(void)
 		}
 		// Активность, за которой числится часть (пусто — часть создана игрой).
 		const char *actname = pe_parts_activity_name(p->no);
+		// ★ТЕКСТ ТЕКСТОВОГО СОСТОЯНИЯ. «Две реплики поверх друг друга» по одним
+		// номерам частей не разобрать: надо видеть, КАКАЯ часть какую строку
+		// держит (§5fb — после возобновления старая реплика оставалась висеть).
+		char txtbuf[160] = "";
+		if (p->states[p->state].type == PARTS_TEXT) {
+			struct string *s = parts_text_get(&p->states[p->state].text);
+			if (s) {
+				if (s->size)
+					snprintf(txtbuf, sizeof(txtbuf), " ТЕКСТ=\"%.100s\"",
+						 display_sjis0(s->text));
+				free_string(s);
+			}
+		}
 		NOTICE("  dump part %d: act=\"%s\" ctrl=%d lshow=%d gshow=%d z=%d pos=%d,%d st0type=%d parent=%d hovered=%d state=%d hitbox=%d,%d,%dx%d wh=%dx%d origin=%d mul=%d,%d,%d add=%d,%d,%d%s rev=%d%d mir=%d%d scale=%.2f,%.2f rotz=%.2f/%.2f rotxy=%.2f,%.2f pass=%d eip=%d clk=%d btn=%d cmask=%d alpha=%d lhid=%d mw=%d link=%d clip=%d isclip=%d tex=%u cg=\"%s\"",
 		       p->no, actname ? actname : "", p->controller_no,
 		       p->local.show, p->global.show, p->global.z,
@@ -1808,6 +1821,8 @@ void parts_debug_dump(void)
 		       p->global.alpha, parts_hidden_by_layer(p), p->message_window,
 		       p->linked_to, p->alpha_clipper_parts_no, p->is_alpha_clipper,
 		       p->states[p->state].common.texture.handle, cgname);
+		if (txtbuf[0])
+			NOTICE("      часть %d%s", p->no, txtbuf);
 		n++;
 	}
 	NOTICE("parts_debug_dump: %d parts total", n);
@@ -3479,15 +3494,65 @@ void PE_SetParentPartsNumber(int parts_no, int parent_parts_no)
  * Порядок — обход общего списка частей (по z), а не TAILQ children: он один и
  * тот же для Numof/Get/GetChildIndex, чего требует их совместное употребление.
  */
-static int parts_effective_parent_no(struct parts *p)
+// Родитель по тем же правилам, но БЕЗ проверки цикла — для шага вверх по цепочке.
+static int parts_raw_parent_no(struct parts *p)
 {
 	if (p->pending_parent > 0)
 		return p->pending_parent;
-	// 0 — заказанная, но ещё не применённая ОТВЯЗКА (см. PE_SetParentPartsNumber):
-	// для перечисления потомков парт уже ничей.
 	if (p->pending_parent == 0)
 		return -1;
 	return p->parent ? p->parent->no : -1;
+}
+
+static int parts_effective_parent_no(struct parts *p)
+{
+	int cand = parts_raw_parent_no(p);
+	if (cand <= 0)
+		return -1;
+	/*
+	 * ★ЗАМКНУТУЮ СВЯЗЬ НЕ ПОКАЗЫВАЕМ КАК РОДСТВО.
+	 *
+	 * Цикл предков отсеивается в `parts_update` (dirty-очередь), но перечисление
+	 * потомков смотрит на ОТЛОЖЕННУЮ связь — то есть на состояние ДО этого
+	 * отсева. Пока пара частей ссылается друг на друга неприменёнными
+	 * `pending_parent`, `GetChild` честно называет каждую потомком другой, и
+	 * обход дерева у игры (`activity::detail::CallUserComponentEventWithChild`
+	 * спускается по `IParts@GetChild`) уходит в бесконечную рекурсию: стек
+	 * вызовов переполняется и движок падает уже далеко от причины (§5fb-12 —
+	 * SIGSEGV после возобновления, 4096 кадров одной и той же функции).
+	 *
+	 * Для перечисления такая часть считается ничьей: связь либо будет отвергнута
+	 * тем же отсевом на ближайшем апдейте, либо применена — и тогда цикла уже
+	 * не будет.
+	 */
+	/*
+	 * Предел подъёма — глубина дерева, а не длина кольца: осмысленные деревья
+	 * частей у всех четырёх игр — это единицы уровней (окно → рамка → текст),
+	 * поэтому цепочка длиннее PARTS_MAX_DEPTH означает кольцо ВЫШЕ нас, в
+	 * которое мы сами не входим. Такое кольцо тоже надо оборвать: иначе каждый
+	 * из сотен вызовов перечисления крутил бы подъём до упора — падение
+	 * сменилось бы многосекундным фризом.
+	 */
+	enum { PARTS_MAX_DEPTH = 64 };
+	struct parts *anc = parts_try_get(cand);
+	for (int guard = 0; anc; guard++) {
+		if (anc == p || guard >= PARTS_MAX_DEPTH) {
+			static int warned = 0;
+			if (warned < 8) {
+				warned++;
+				WARNING("парт %d: связь с %d замкнута в кольцо (%s) — "
+					"для перечисления потомков парт считается ничьим",
+					p->no, cand,
+					anc == p ? "через сам парт" : "выше по цепочке");
+			}
+			return -1;
+		}
+		int next = parts_raw_parent_no(anc);
+		if (next <= 0)
+			break;
+		anc = parts_try_get(next);
+	}
+	return cand;
 }
 
 // «Убрать потомка» — отвязка, но только если он и правда потомок этого парта

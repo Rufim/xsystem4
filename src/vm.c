@@ -69,7 +69,7 @@ int32_t stack_ptr = 0;        // pointer to the top of the stack
 static size_t stack_size;     // current size of the stack
 
 // Stack of function call frames
-struct function_call call_stack[4096];
+struct function_call call_stack[CALL_STACK_MAX];
 int32_t call_stack_ptr = 0;
 
 struct ain *ain;
@@ -83,6 +83,9 @@ static int fn_trace_list[32];
 static int fn_trace_count = -1;
 // Diagnostic: XSYS4_SP_CHECK — проверять баланс стека на каждом RETURN.
 static bool sp_check = false;
+// XSYS4_VM_WATCHDOG=<секунды> — сторож зависаний в байткоде (см. цикл vm_execute).
+static int vm_watchdog_sec = -1;
+static uint32_t vm_watchdog_ticks, vm_watchdog_last;
 // XSYS4_GLOBAL_PAGE_CHECK: сверять целость глобальной страницы после каждой инструкции.
 static bool gp_check = false;
 static uint8_t sp_check_reported[65536];
@@ -984,8 +987,46 @@ static void scenario_call(int slot)
  *   - callee pushes return value on the stack
  *   - RETURN jumps to return address (saved in stack frame)
  */
+/*
+ * ★ПЕРЕПОЛНЕНИЕ СТЕКА ВЫЗОВОВ — ОШИБКА С ИМЕНАМИ, А НЕ ПОРЧА ПАМЯТИ.
+ *
+ * `call_stack` — массив фиксированной длины, и записи ЗА ЕГО ГРАНИЦЕЙ затирают
+ * соседние глобалы движка: первым уезжает указатель `ain`, после чего падение
+ * приходит в безобидной строке (`instr_ptr = ain->functions[fno].address`), а
+ * настоящая причина — рекурсия — в отчёте не видна вовсе (§5fb-12: SIGSEGV с
+ * call_stack_ptr = 9145 при ёмкости 4096). Здесь обрываем ДО записи и печатаем
+ * то, чем такой отчёт полезен: хвост стека и самые частые в нём функции.
+ */
+static void report_call_stack_overflow(int fno)
+{
+	sys_warning("=== ПЕРЕПОЛНЕНИЕ СТЕКА ВЫЗОВОВ: кадров %d, ёмкость %d ===\n",
+		    call_stack_ptr, CALL_STACK_MAX);
+	sys_warning("--- последние 30 кадров:\n");
+	for (int i = call_stack_ptr - 1; i >= 0 && i > call_stack_ptr - 31; i--) {
+		struct ain_function *ff = &ain->functions[call_stack[i].fno];
+		sys_warning("\t0x%08x in %s\n", call_stack[i].call_address,
+			    display_sjis0(ff->name));
+	}
+	// Кто именно зациклился: в глубоком стеке это видно только по ПОВТОРАМ.
+	sys_warning("--- самые частые функции в стеке:\n");
+	int seen[8] = {0}, cnt[8] = {0}, nr = 0;
+	for (int i = 0; i < call_stack_ptr; i++) {
+		int f2 = call_stack[i].fno;
+		int j = 0;
+		for (; j < nr; j++)
+			if (seen[j] == f2) { cnt[j]++; break; }
+		if (j == nr && nr < 8) { seen[nr] = f2; cnt[nr] = 1; nr++; }
+	}
+	for (int j = 0; j < nr; j++)
+		sys_warning("\t%d× %s\n", cnt[j], display_sjis0(ain->functions[seen[j]].name));
+	VM_ERROR("call stack overflow при вызове %s",
+		 display_sjis1(ain->functions[fno].name));
+}
+
 static int _function_call(int fno, int return_address)
 {
+	if (unlikely(call_stack_ptr >= CALL_STACK_MAX))
+		report_call_stack_overflow(fno);
 	struct ain_function *f = &ain->functions[fno];
 	int slot = heap_alloc_slot(VM_PAGE);
 	heap_set_page(slot, alloc_page(LOCAL_PAGE, fno, f->nr_vars));
@@ -4519,6 +4560,10 @@ static void vm_execute(void)
 	if (optrace_on < 0) {
 		optrace_on = getenv("XSYS4_OPTRACE") ? 1 : 0;
 		sp_check = getenv("XSYS4_SP_CHECK") != NULL;
+		{
+			const char *w = getenv("XSYS4_VM_WATCHDOG");
+			vm_watchdog_sec = w && *w ? atoi(w) : 0;
+		}
 		gp_check = getenv("XSYS4_GLOBAL_PAGE_CHECK") != NULL;
 		// XSYS4_IP_TRACE=<lo>-<hi> (hex): построчный лог «опкод, sp до -> sp после»
 		// для диапазона адресов. Так ищется функция, которая возвращается с лишними
@@ -4529,6 +4574,84 @@ static void vm_execute(void)
 	}
 	for (;;) {
 		uint16_t opcode;
+		/*
+		 * ★СТОРОЖ ЗАВИСАНИЙ В БАЙТКОДЕ: `XSYS4_VM_WATCHDOG=<секунды>`.
+		 *
+		 * Существующий сторож длинного кадра (XSYS4_SLOW_FRAME_MS, video.c)
+		 * срабатывает в цикле ОТРИСОВКИ, а если игра ушла в петлю внутри
+		 * байткода, управление туда не возвращается вовсе: окно живо, движок
+		 * жжёт ядро, лог молчит, и даже SIGUSR1-дамп не показывает динамики.
+		 * Ровно так выглядит зависание ADV после возобновления (§5fb-10).
+		 *
+		 * Здесь стек печатается ПРЯМО ИЗ ЦИКЛА, раз в заданный срок, поэтому
+		 * видно и место петли, и то, что оно не меняется.
+		 */
+		if (unlikely(vm_watchdog_sec > 0) && unlikely(!(++vm_watchdog_ticks & 0xFFFFF))) {
+			uint32_t now = SDL_GetTicks();
+			if (!vm_watchdog_last)
+				vm_watchdog_last = now;
+			else if (now - vm_watchdog_last > (uint32_t)vm_watchdog_sec * 1000) {
+				vm_watchdog_last = now;
+				sys_warning("=== WATCHDOG: дамп стека (порог %d с), "
+					    "ip=0x%08lX ===\n", vm_watchdog_sec,
+					    (unsigned long)instr_ptr);
+				vm_stack_trace();
+				/*
+				 * ★ЛОКАЛЫ ЗАВИСШЕГО КАДРА. Одного адреса мало: петля вида
+				 * `foreach_r` (счётчик вниз до нуля) выглядит в стеке так же,
+				 * как настоящий бесконечный цикл, и различает их только
+				 * ЗНАЧЕНИЕ счётчика — миллиард итераций против десятка.
+				 * Печатаем int-значения с именами переменных из .ain.
+				 */
+				for (int fr = 0; fr < 3 && fr < call_stack_ptr; fr++) {
+					struct page *lp = get_local_page(fr);
+					if (!lp || lp->nr_vars <= 0)
+						continue;
+					struct ain_function *f =
+						&ain->functions[call_stack[call_stack_ptr-1-fr].fno];
+					sys_warning("\tлокалы %s (страница %d):",
+						    display_sjis0(f->name),
+						    call_stack[call_stack_ptr-1-fr].page_slot);
+					for (int v = 0; v < lp->nr_vars && v < 16; v++) {
+						const char *vn = v < f->nr_vars && f->vars[v].name
+							? display_sjis0(f->vars[v].name) : "?";
+						sys_warning(" %s=%d", vn, lp->values[v].i);
+					}
+					sys_warning("\n");
+					// ★ЧЕМ ОКАЗАЛИСЬ ЭЛЕМЕНТЫ КОНТЕЙНЕРА. Висячая ссылка в
+					// массиве видна только по ТИПУ страницы, на которую она
+					// указывает: слот, переиспользованный под чужую страницу,
+					// читается без ошибки и молча пишется мимо (§5fb).
+					for (int v = 0; v < lp->nr_vars && v < 16; v++) {
+						int32_t s = lp->values[v].i;
+						// heap[] — union: строковый слот, прочитанный как
+						// страница, даёт мусорный nr_vars и уводит диагностику
+						// за границы буфера (та же грабля, что у SIGUSR2-дампера).
+						if (s < 1 || !heap_slot_is_page(s))
+							continue;
+						struct page *p = heap[s].page;
+						if (heap[s].ref <= 0 || !p || p->type != ARRAY_PAGE)
+							continue;
+						sys_warning("\t  массив в слоте %d: %d элем.:", s, p->nr_vars);
+						for (int e = 0; e < p->nr_vars && e < 8; e++) {
+							int32_t o = p->values[e].i;
+							const char *what = "не слот";
+							if (o >= 1 && heap_slot_is_page(o)) {
+								struct page *op = heap[o].page;
+								what = !op ? "пусто"
+									: op->type == STRUCT_PAGE ? "структура"
+									: op->type == ARRAY_PAGE ? "массив"
+									: op->type == LOCAL_PAGE ? "★ЛОКАЛЫ ЧУЖОГО КАДРА"
+									: op->type == GLOBAL_PAGE ? "★ГЛОБАЛИ"
+									: op->type == DELEGATE_PAGE ? "делегат" : "?";
+							}
+							sys_warning(" [%d]=%d (%s)", e, o, what);
+						}
+						sys_warning("\n");
+					}
+				}
+			}
+		}
 		if (instr_ptr == VM_RETURN)
 			return;
 		if (unlikely(instr_ptr >= ain->code_size)) {
@@ -4572,8 +4695,15 @@ static void vm_execute(void)
 			}
 		}
 		if (unlikely(ip_trace_hi) && rec_ip >= ip_trace_lo && rec_ip <= ip_trace_hi)
-			sys_warning("IPTRACE 0x%06x %-14s sp %d->%d\n", rec_ip,
-				    instructions[rec_op].name ? instructions[rec_op].name : "?", rec_sp, stack_ptr);
+			// ★И ВЕРХУШКА СТЕКА: «sp 18->17» говорит, СКОЛЬКО снято, но не ЧТО
+			// положено. Для петли, где подозревается запись по чужой ссылке,
+			// нужен именно слот/значение — по нему видно, во что превратилось
+			// разыменование (X_REF) и куда пойдёт присваивание.
+			sys_warning("IPTRACE 0x%06x %-14s sp %d->%d  top=%d %d\n", rec_ip,
+				    instructions[rec_op].name ? instructions[rec_op].name : "?",
+				    rec_sp, stack_ptr,
+				    stack_ptr >= 1 ? stack[stack_ptr-1].i : -999999,
+				    stack_ptr >= 2 ? stack[stack_ptr-2].i : -999999);
 		if (optrace_on > 0 && !optrace_underflow_logged && stack_ptr < 0) {
 			optrace_underflow_logged = true;
 			sys_warning("=== FIRST STACK UNDERFLOW: after %s @0x%06x (sp %d -> %d) ===\n",

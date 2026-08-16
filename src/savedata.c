@@ -184,14 +184,48 @@ static struct gsave_flat_array *collect_flat_arrays(struct page *page, struct gs
 	// принимает 92/91 наравне с 10 — см. save_type_norm.
 	if (type == AIN_INT && (decl_elem == AIN_ENUM || decl_elem == AIN_ENUM2))
 		type = decl_elem;
-	// `array<wrap<T>>`: у оригинала элемент — 21 (`ref <структура>`), у нас
-	// страница объявляет объектный слот структурой. Значение одно и то же
-	// (индекс записи), расходится только тип в файле — см. save_type_norm.
-	if (type == AIN_STRUCT && decl_elem == AIN_WRAP)
+	/*
+	 * ★ЭЛЕМЕНТ-ССЫЛКА: ТИП ПО ОБЪЯВЛЕНИЮ, ЗНАЧЕНИЕ ОДНО НА ЭЛЕМЕНТ.
+	 *
+	 * Снято с файла достижений ОРИГИНАЛА (`Achievement.asd`,
+	 * `AchievementCollection.m_achievements`): у него 65 значений типа 89
+	 * (`ref <интерфейс>`). У нас на том же поле было 130 значений — ровно
+	 * вдвое больше, потому что у ИНТЕРФЕЙСНОГО элемента два слота страницы
+	 * (объект и база интерфейса, см. array_elem_slots), а мы писали по
+	 * слотам. Тип при этом стоял 13.
+	 *
+	 * Правило: `wrap<интерфейс>`/`ref <интерфейс>` → 89, `wrap<структура>` →
+	 * 21 (так оригинал пишет `ActionHistory.m_history`), и в обоих случаях
+	 * значение — ОДНО на элемент, то есть слот объекта.
+	 */
+	int es = array_elem_slots(page);
+	/*
+	 * ★ПРИЗНАК ПАРЫ — ТИП МАССИВА, А НЕ ШИРИНА ЭЛЕМЕНТА. Два слота на элемент
+	 * бывают не только у интерфейсной пары: столько же занимает
+	 * `array<option<wrap<Структура>>>` (объект и ТЕГ НАЛИЧИЯ, см.
+	 * elem_slots_for_type), а таких объявлений у Dohna 32 — списки работников,
+	 * предметов, кнопок. По одной ширине они неотличимы: `variable_type`
+	 * нулевого слота у обоих отвечает AIN_STRUCT. Схлопни мы option как пару —
+	 * тег наличия не попал бы в файл вовсе, а на загрузке его место заняла бы
+	 * «база интерфейса» 0, что для option значит «значение ЕСТЬ» (1 = пусто):
+	 * все пустые элементы ожили бы ссылками на мёртвые объекты.
+	 */
+	bool iface_pair = array_iface_pair_type(page->a_type);
+	if (type == AIN_STRUCT && iface_pair)
+		type = AIN_IFACE;
+	else if (type == AIN_STRUCT && decl_elem == AIN_WRAP)
 		type = AIN_REF_STRUCT;
-	fa->nr_values = page->nr_vars;
+	fa->nr_values = iface_pair ? page->nr_vars / (es > 1 ? es : 1) : page->nr_vars;
 	fa->type = type;
 	fa->values = xcalloc(fa->nr_values, sizeof(struct gsave_array_value));
+	if (iface_pair && es > 1) {
+		for (int i = 0; i < fa->nr_values; i++) {
+			fa->values[i].type = type;
+			fa->values[i].value = add_value_to_gsave(AIN_STRUCT,
+					page->values[i * es], save);
+		}
+		return ++fa;
+	}
 	for (int i = 0; i < page->nr_vars; i++) {
 		fa->values[i].type = type;
 		fa->values[i].value = add_value_to_gsave(type, page->values[i], save);
@@ -859,7 +893,32 @@ static enum ain_data_type save_type_norm(enum ain_data_type t)
 	 */
 	if (t == AIN_REF_STRUCT)
 		return AIN_STRUCT;
+	// Интерфейсный элемент в файле — 89, а нулевой слот пары страница
+	// объявляет структурой; значение и там, и там индекс записи.
+	if (t == AIN_IFACE)
+		return AIN_STRUCT;
 	return (t == AIN_ENUM || t == AIN_ENUM2) ? AIN_INT : t;
+}
+
+/*
+ * База интерфейса для пары (объект, база): позиция таблицы методов интерфейса
+ * `iface` в структуре объекта. В рантайме её кладёт X_REF/присваивание
+ * (src/vm.c, поиск по `interfaces[] = {struct_type, vtable_offset}`), а при
+ * загрузке сейва в файле лежит ТОЛЬКО объект — базу надо вывести самим.
+ */
+static int32_t iface_base_for(int obj_slot, int iface_struct)
+{
+	if (iface_struct < 0 || !heap_index_valid(obj_slot))
+		return 0;
+	struct page *p = heap[obj_slot].page;
+	if (!p || p->type != STRUCT_PAGE || p->index < 0 || p->index >= ain->nr_structures)
+		return 0;
+	struct ain_struct *s = &ain->structures[p->index];
+	for (int i = 0; i < s->nr_interfaces; i++) {
+		if (s->interfaces[i].struct_type == iface_struct)
+			return s->interfaces[i].vtable_offset;
+	}
+	return 0;
 }
 
 static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page *page, struct gsave_flat_array *flat_array)
@@ -871,13 +930,87 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 		return flat_array;
 	}
 
+	/*
+	 * ★ПАРА (объект, база интерфейса) — ОДНО значение в файле на ДВА слота.
+	 * Так пишет оригинал, так теперь пишем и мы (см. collect_flat_arrays).
+	 * Условие — ТИП массива: по одной ширине элемента пару не отличить от
+	 * `array<option<...>>`, у которого второй слот это тег наличия.
+	 */
+	int es = array_elem_slots(page);
+	if (array_iface_pair_type(page->a_type) && es == 2
+			&& flat_array->nr_values == page->nr_vars / 2) {
+		/*
+		 * ★ТИП ОБЪЕКТА — ИЗ ЗАПИСИ, ИНТЕРФЕЙС ДЛЯ БАЗЫ — ИЗ СТРАНИЦЫ.
+		 *
+		 * `page->array.struct_type` у generic-контейнера — это КОНКРЕТНЫЙ класс,
+		 * подобранный по первому непустому элементу (см. gsave_to_vm_value), а
+		 * ссылка законно держит производную: подставь мы его каждому элементу —
+		 * загрузка упала бы на сверке имён («structure name mismatch»), как это
+		 * уже было с `ref`-элементами. Поэтому класс уточняем поэлементно по
+		 * записи, ровно как в ветке AIN_REF_STRUCT ниже.
+		 *
+		 * База интерфейса ищется в таблице интерфейсов объекта по ИНТЕРФЕЙСУ.
+		 * Если в странице стоит конкретный класс, а не интерфейс, искать нечего —
+		 * `iface_base_for` вернёт 0, что верно для единственного интерфейса
+		 * (он лежит по смещению 0) и остаётся приближением для класса с
+		 * несколькими: объявленного типа контейнера на этом шаге нет.
+		 */
+		int page_struct = page->array.struct_type;
+		bool page_is_iface = page_struct >= 0 && page_struct < ain->nr_structures
+			&& ain->structures[page_struct].is_interface;
+		for (int i = 0; i < flat_array->nr_values; i++) {
+			int32_t v = flat_array->values[i].value;
+			int elem_struct = page_struct;
+			if (v >= 0 && v < save->nr_records) {
+				struct gsave_record *rec = &save->records[v];
+				struct gsave_struct_def *d = save->version >= 7
+					? &save->struct_defs[rec->struct_index] : NULL;
+				int actual = ain_get_struct(ain, d ? d->name : rec->struct_name);
+				if (actual >= 0)
+					elem_struct = actual;
+			}
+			union vm_value val = gsave_to_vm_value(save, AIN_STRUCT, elem_struct,
+					0, v, page, i * 2);
+			page->values[i * 2] = val;
+			page->values[i * 2 + 1] =
+				vm_int(page_is_iface ? iface_base_for(val.i, page_struct) : 0);
+		}
+		return flat_array + 1;
+	}
+
+	// Числа в сообщении: без них «не сходится» не отличить от «не тот массив»
+	// — а разошедшийся массив ещё надо найти среди сотен.
 	if (page->nr_vars != flat_array->nr_values)
-		VM_ERROR("Bad save file: unexpected number of array elements");
+		VM_ERROR("Bad save file: unexpected number of array elements "
+		         "(страница %d слотов, тип %d; в файле %d значений типа %d)",
+		         page->nr_vars, page->a_type,
+		         flat_array->nr_values, flat_array->type);
 	for (int i = 0; i < page->nr_vars; i++) {
 		int struct_type, array_rank;
 		enum ain_data_type data_type = variable_type(page, i, &struct_type, &array_rank);
 		if (save_type_norm(data_type) != save_type_norm(flat_array->values[i].type))
 			VM_ERROR("Bad save file: unexpected array element type");
+		/*
+		 * ★У ЭЛЕМЕНТА-ССЫЛКИ ТИП БЕРЁМ ИЗ ЗАПИСИ, а не из объявления.
+		 *
+		 * Ровно та же природа, что у `ref`-поля структуры (см. ветку
+		 * AIN_REF_STRUCT в gsave_fill_struct): ссылка законно держит
+		 * ПРОИЗВОДНУЮ, и подстановка объявленного типа роняет загрузку на
+		 * сверке имён — «Bad save file: structure name mismatch» в
+		 * `AchievementCollection@Load` на старте игры (элементы там разных
+		 * наследников `IAchievement`). Тип элемента страницы у нас один на
+		 * весь массив, поэтому уточняем поэлементно.
+		 */
+		if (flat_array->values[i].type == AIN_REF_STRUCT
+				&& flat_array->values[i].value >= 0
+				&& flat_array->values[i].value < save->nr_records) {
+			struct gsave_record *r = &save->records[flat_array->values[i].value];
+			struct gsave_struct_def *d = save->version >= 7
+				? &save->struct_defs[r->struct_index] : NULL;
+			int actual = ain_get_struct(ain, d ? d->name : r->struct_name);
+			if (actual >= 0)
+				struct_type = actual;
+		}
 		union vm_value val = gsave_to_vm_value(save, data_type, struct_type, array_rank,
 		                                       flat_array->values[i].value, page, i);
 		page->values[i] = val;
@@ -1353,6 +1486,9 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			// теперь занято страницей-владельцем значения.)
 			enum ain_data_type guessed;
 			int elem_struct = -1;
+			// Элемент-интерфейс занимает пару слотов: значений в файле вдвое
+			// меньше, чем слотов страницы (см. ветку AIN_IFACE ниже).
+			bool iface_pair = false;
 			switch (elem) {
 			case AIN_VOID:
 			case AIN_INT:       guessed = AIN_ARRAY_INT; break;
@@ -1368,8 +1504,35 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 			// (heap[slot].page = NULL) и сцена не строилась вовсе.
 			case AIN_ENUM:
 			case AIN_ENUM2:     guessed = AIN_ARRAY_INT; break;
+			/*
+			 * ★`ref <структура>` В ЭЛЕМЕНТЕ — ТОТ ЖЕ ОБЪЕКТНЫЙ ПУТЬ.
+			 *
+			 * Так оригинал пишет `array<wrap<T>>` (замер: `ActionHistory.
+			 * m_history`, `BattlePlayerCollection.m_player` — тип элементов 21),
+			 * и с недавних пор так же пишем мы. Без этой ветки чтение уходило в
+			 * default: «array<?> с элементом ref hll_struct не поддержан»,
+			 * массив приходил ПУСТЫМ, и первый же вызов делегата по его
+			 * элементу ронял движок — `Not a delegate page` в
+			 * `AchievementCollection@GetCleared` на СТАРТЕ игры, стоило
+			 * появиться своему `Achievement.asd`.
+			 */
+			/*
+			 * ★ЭЛЕМЕНТ-ИНТЕРФЕЙС (89): ПАРА СЛОТОВ НА ЭЛЕМЕНТ.
+			 *
+			 * Так оригинал пишет `array<wrap<интерфейс>>` (замер:
+			 * `AchievementCollection.m_achievements` в его `Achievement.asd` —
+			 * 65 значений типа 89). Страницу поднимаем интерфейсной, иначе
+			 * элементы съезжают вдвое: у пары два слота (объект и база в его
+			 * таблице методов, см. array_elem_slots).
+			 */
+			case AIN_IFACE:
+				guessed = decl_array != AIN_VOID ? decl_array : AIN_IFACE_WRAP;
+				iface_pair = true;
+				// fallthrough — структуру элемента ищем так же, по записи
+			case AIN_REF_STRUCT:
 			case AIN_STRUCT:
-				guessed = AIN_ARRAY_STRUCT;
+				if (!iface_pair)
+					guessed = AIN_ARRAY_STRUCT;
 				// ★Тип элемента угадываем по ПЕРВОЙ НЕПУСТОЙ записи: в объектном
 				// слоте законно лежит −1 («значения нет»), и `records[-1]` — это
 				// чтение за границей массива записей с мусорным struct_index.
@@ -1399,6 +1562,17 @@ static union vm_value gsave_to_vm_value(struct gsave *save, enum ain_data_type t
 				heap[slot].page = NULL;
 				return vm_int(slot);
 			}
+			/*
+			 * ★ТИП СТРАНИЦЫ БЕРЁМ ИЗ САМОГО СЕЙВА, а не из объявления.
+			 *
+			 * Соблазн «объявление точнее» проверен и отвергнут замером: у
+			 * `array<wrap<интерфейс>>` объявление даёт ДВА слота на элемент
+			 * (см. array_elem_slots), а в файле — и у нас, и у ОРИГИНАЛА —
+			 * значений ровно по числу элементов (`Achievement.asd`: размер
+			 * 130, значений 130; у оригинала 9 при размере 9). То есть в
+			 * рантайме такая страница ОДНОСЛОТОВАЯ, и подъём «по объявлению»
+			 * ронял загрузку на «unexpected number of array elements».
+			 */
 			union vm_value dim = { .i = array->dimensions[0] };
 			struct page *page = alloc_array(1, &dim, guessed, elem_struct, false);
 			heap[slot].page = page;

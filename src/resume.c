@@ -1104,11 +1104,49 @@ static void load_rsave_string(int slot, struct rsave_heap_string *s)
 static void load_rsave_array(int slot, struct rsave_heap_array *a)
 {
 	if (a->rank_minus_1 < 0) {
+		/*
+		 * ★ПУСТОЙ МАССИВ ВОССТАНАВЛИВАЕМ ТИПИЗИРОВАННЫМ, А НЕ NULL-СТРАНИЦЕЙ.
+		 *
+		 * `rank_minus_1 = -1` в образе значит «страница не размещена», но ТИП
+		 * элемента оригинал при этом ПИШЕТ (`data_type`/`struct_type`/`root_rank`;
+		 * в снимке ADV таких массивов 10112 из 68503). Восстановленный как голый
+		 * NULL, массив теряет тип, и первая же вставка идёт мимо владения:
+		 * `ix_dtype(NULL)` отвечает «массив int», `Array.Insert` не берёт ссылку
+		 * на объект, объект умирает сразу после вставки, а слот переиспользуется
+		 * под чужую страницу.
+		 *
+		 * Чем это ломало Dohna (§5fb-10, «после F8 ввод мёртв»): очередь
+		 * прочитанных реплик `CReadMessageTextManager::m_readMessageTextQueue`
+		 * приходит из образа пустой. Первый клик → `SetReadMessage` кладёт туда
+		 * `SReadMessageTextInfo` без владения, объект гибнет, слот достаётся
+		 * ЛОКАЛЬНОЙ СТРАНИЦЕ следующего вызова — и `EraseMessageNumber`, проходя
+		 * очередь, пишет «прочитано» прямо в СЧЁТЧИК СВОЕГО ЖЕ ЦИКЛА (локал 1).
+		 * Счётчик вечно возвращается в 1, игра уходит в петлю: экран замирает,
+		 * ввод не отвечает. Замер: `XSYS4_ARRAY_OWN=SReadMessageTextInfo` —
+		 * «владение НЕ ВЗЯТО (тип элемента 14, страница ОТСУТСТВУЕТ (NULL))».
+		 *
+		 * Поведенчески NULL и 0-элементная типизированная страница неотличимы
+		 * (`Numof`/`Empty` дают одно и то же) — ровно этим правилом уже живут
+		 * `ix_resize` и `ix_erase_at`, которые пересоздают типизированную
+		 * страницу при сжатии до нуля.
+		 */
+		struct page *empty = NULL;
+		if (a->data_type) {
+			union vm_value dim = { .i = 0 };
+			int rank = a->root_rank >= 0 ? a->root_rank + 1 : 1;
+			empty = alloc_array(rank, &dim, a->data_type,
+					    resolve_struct_symbol(&a->struct_type), false);
+			if (empty) {
+				empty->a_type = a->data_type;
+				empty->array.struct_type = resolve_struct_symbol(&a->struct_type);
+				empty->array.rank = rank;
+			}
+		}
 		alloc_heap_slot(slot);
 		heap[slot].ref = a->ref;
 		heap[slot].seq = a->seq;
 		heap[slot].type = VM_PAGE;
-		heap[slot].page = NULL;
+		heap[slot].page = empty;
 		return;
 	}
 	struct page *page = alloc_page(ARRAY_PAGE, a->data_type, a->nr_slots);
@@ -1415,6 +1453,17 @@ static void load_json_call_stack(cJSON *json)
  */
 static bool rsave_call_stack_loadable(struct rsave *save)
 {
+	/*
+	 * ★ГЛУБИНА ИЗ ФАЙЛА — ТОЖЕ ВХОДНЫЕ ДАННЫЕ. `call_stack` — массив
+	 * фиксированной длины, и загрузчик пушит в него столько кадров, сколько
+	 * записано в образе: запись за границей затирает соседние глобалы движка
+	 * (первым уезжает указатель `ain`) и роняет процесс далеко от причины.
+	 * Игра сама доходила до 9145 кадров при ёмкости 4096 (§5fb-12), так что
+	 * образ с такой глубиной — не выдумка: отказываем как от нечитаемого,
+	 * и игра получит своё «загрузка не удалась» вместо падения.
+	 */
+	if (save->nr_call_frames < 0 || save->nr_call_frames > CALL_STACK_MAX)
+		return false;
 	if (save->nr_return_records == 0 || save->return_records[0].return_addr != -1)
 		return false;
 	struct rsave_return_record *rr = save->return_records;
@@ -1440,6 +1489,10 @@ static void load_rsave_call_stack(struct rsave *save)
 {
 	call_stack_ptr = 0;
 
+	// Пара к rsave_call_stack_loadable (см. там про глубину).
+	if (save->nr_call_frames < 0 || save->nr_call_frames > CALL_STACK_MAX)
+		ERROR("invalid resume save: кадров %d при ёмкости %d",
+		      save->nr_call_frames, CALL_STACK_MAX);
 	if (save->nr_return_records == 0 || save->return_records[0].return_addr != -1)
 		ERROR("invalid resume save");
 	struct rsave_return_record *rr = save->return_records;

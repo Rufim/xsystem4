@@ -1866,6 +1866,18 @@ static void pe_act_write_cb(struct ht_slot *slot, void *data)
 	iarray_write(w, a->nr_end_keys);
 	for (int i = 0; i < a->nr_end_keys; i++)
 		iarray_write(w, a->end_keys[i]);
+	/*
+	 * ★v13: СЛУЖЕБНЫЕ ЧАСТИ. Их создаёт сам загрузчик раскладки (текст окна
+	 * реплик, «мигалка», надписи кнопок), игра о них не знает и снять их может
+	 * только движок — по этому списку. Пока список не переживал образ,
+	 * `ReleaseActivity` после возобновления снимал 3 обычные части окна, а текст
+	 * оставался сиротой на экране и продолжал рисовать ПРЕЖНЮЮ реплику поверх
+	 * новой (§5fb-11; замер: часть 90000158 с act="" и parent=-1, новой реплике
+	 * достаётся 90000008).
+	 */
+	iarray_write(w, a->nr_helpers);
+	for (int i = 0; i < a->nr_helpers; i++)
+		iarray_write(w, a->helpers[i]);
 }
 
 void pe_activities_save(struct iarray_writer *w)
@@ -1878,7 +1890,7 @@ void pe_activities_save(struct iarray_writer *w)
 		ht_foreach(pe_activities, pe_act_write_cb, w);
 }
 
-bool pe_activities_load(struct iarray_reader *r, bool apply)
+bool pe_activities_load(struct iarray_reader *r, bool apply, int version)
 {
 	int n = iarray_read(r);
 	if (n < 0 || n > 100000) {
@@ -1967,6 +1979,19 @@ bool pe_activities_load(struct iarray_reader *r, bool apply)
 			a->nr_end_keys = nr_end_keys;
 		} else if (ex_text) {
 			free_string(ex_text);
+		}
+		// v13: список служебных частей (см. writer).
+		if (version >= 13) {
+			int nr_helpers = iarray_read(r);
+			if (nr_helpers < 0 || nr_helpers > 100000 || r->error) {
+				free_string(name);
+				return false;
+			}
+			for (int k = 0; k < nr_helpers; k++) {
+				int hno = iarray_read(r);
+				if (a)
+					pe_act_add_helper(a, hno);
+			}
 		}
 		free_string(name);
 	}
@@ -2141,6 +2166,29 @@ static bool PE_AddActivityParts(struct string *act, struct string *parts_name, i
  * parses it and creates the real parts so the dialog/menu actually renders.
  */
 static int pe_act_part_seq = 90000000;  // unique base for activity-created parts
+
+/*
+ * ★НОМЕРА ЧАСТЕЙ АКТИВНОСТЕЙ ДОЛЖНЫ ПЕРЕЖИВАТЬ ВОЗОБНОВЛЕНИЕ.
+ *
+ * Счётчик живёт только в памяти движка: после перезапуска он снова начинает с
+ * 90000000, а части, поднятые из образа, уже занимают 90000001 и дальше. Первая
+ * же новая постройка выдаёт занятый номер — и вместо новой части игра получает
+ * ЧУЖУЮ, вместе с её родителем и потомками. Отсюда кольца в дереве
+ * (замер: 90000056 ↔ 90000060 после возобновления) и падение обхода, а следом
+ * пустые компоненты у `CActivityWrap@CompParts` — `AdvNamePlate@Create` брал
+ * табличку имени и получал null.
+ *
+ * Резервируем по фактам: каждая восстановленная часть сдвигает счётчик выше
+ * себя. Это лечит и образы, записанные прежними сборками (в них счётчика нет
+ * и быть не может), поэтому отдельного поля в формате не заводим.
+ */
+void pe_act_seq_reserve(int parts_no)
+{
+	// Только диапазон загрузчика раскладки: номера частей самой игры лежат
+	// в других диапазонах (напр. 1000001003) и счётчика не касаются.
+	if (parts_no > pe_act_part_seq && parts_no < 100000000)
+		pe_act_part_seq = parts_no;
+}
 
 // look up a child node by UTF-8 name (converted to the .ex file's SJIS encoding)
 static struct ex_tree *act_child(struct ex_tree *t, const char *utf8)

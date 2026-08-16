@@ -1094,7 +1094,9 @@ extern struct parts_controller_stack ctrl_stack;
 struct iarray_writer;
 struct iarray_reader;
 void pe_activities_save(struct iarray_writer *w);
-bool pe_activities_load(struct iarray_reader *r, bool apply);
+// Сдвинуть счётчик номеров частей активностей выше восстановленного номера.
+void pe_act_seq_reserve(int parts_no);
+bool pe_activities_load(struct iarray_reader *r, bool apply, int version);
 extern bool parts_multi_controller;
 
 struct parts *parts_try_get(int parts_no);

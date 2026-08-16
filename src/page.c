@@ -1046,6 +1046,24 @@ void delete_page(int slot)
 	struct page *page = heap_get_page(slot);
 	if (!page)
 		return;
+	/*
+	 * `XSYS4_FREE_TRACE=<подстрока имени структуры>` — КТО УБИЛ ОБЪЕКТ. Висячая
+	 * ссылка проявляется далеко от места порчи: слот переиспользуется под чужую
+	 * страницу, и запись по элементу контейнера молча уходит мимо (§5fb — элемент
+	 * очереди прочитанных реплик указывал на локалы чужого кадра). Ответ даёт
+	 * только стек в момент ОСВОБОЖДЕНИЯ, поэтому печатаем его здесь.
+	 */
+	if (page->type == STRUCT_PAGE && page->index >= 0
+	    && page->index < ain->nr_structures) {
+		static const char *ft = (const char *)1;
+		if (ft == (const char *)1)
+			ft = getenv("XSYS4_FREE_TRACE");
+		if (ft && *ft && strstr(ain->structures[page->index].name, ft)) {
+			NOTICE("FREETRACE освобождается %s, слот %d — стек игры:",
+			       ain->structures[page->index].name, slot);
+			vm_stack_trace();
+		}
+	}
 	if (page->type == STRUCT_PAGE) {
 		delete_struct(page->index, slot);
 	}

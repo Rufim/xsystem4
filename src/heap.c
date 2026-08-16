@@ -677,8 +677,19 @@ struct string *heap_get_string(int index)
 struct page *heap_get_delegate_page(int index)
 {
 	struct page *page = heap_get_page(index);
-	if (unlikely(page && page->type != DELEGATE_PAGE))
-		VM_ERROR("Not a delegate page: %d", index);
+	if (unlikely(page && page->type != DELEGATE_PAGE)) {
+		// Чем слот оказался — без этого «не делегат» не отличить от
+		// «делегат чужого объекта» и не связать с загрузкой сейва.
+		static const char *kinds[] = { "глобали", "локали", "структура",
+					       "массив", "делегат" };
+		const char *kind = page->type <= DELEGATE_PAGE ? kinds[page->type] : "?";
+		const char *sname = page->type == STRUCT_PAGE && page->index >= 0
+			&& page->index < ain->nr_structures
+			? ain->structures[page->index].name : "";
+		VM_ERROR("Not a delegate page: %d (это %s%s%s, полей %d, ref=%d)",
+			 index, kind, *sname ? " " : "", display_sjis0(sname),
+			 page->nr_vars, heap[index].ref);
+	}
 	return page;
 }
 
