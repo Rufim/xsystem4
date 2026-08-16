@@ -24,6 +24,7 @@
 #include "system4/string.h"
 #include "system4/utfsjis.h"
 
+#include "apeg_movie.h"
 #include "asset_manager.h"
 #include "audio.h"
 #include "vm.h"
@@ -401,6 +402,13 @@ static void parts_state_free(struct parts_state *state)
 		parts_flat_free(&state->flat);
 		break;
 	case PARTS_MOVIE:
+		if (state->movie.apeg) {
+			// Ролик нового API: текстура наша, её и сносим.
+			apeg_movie_close(state->movie.apeg);
+			state->movie.apeg = NULL;
+			gfx_delete_texture(&state->common.texture);
+			break;
+		}
 		// The texture is owned by the SACT sprite.
 		state->common.texture.handle = 0;
 		if (state->movie.sprite_no >= 0)
@@ -483,6 +491,7 @@ void parts_state_reset(struct parts_state *state, enum parts_type type)
 		break;
 	case PARTS_MOVIE:
 		state->movie.sprite_no = -1;
+		state->movie.apeg = NULL;
 		break;
 	case PARTS_LAYOUT_BOX:
 		state->layout_box.layout_type = PARTS_LAYOUT_VERTICAL;
@@ -1599,6 +1608,17 @@ static bool parts_animation_update(struct parts_animation *anim, int passed_time
 	}
 }
 
+/* Ролик тикает по тем же часам, что анимация: догнать кадр и, если он сменился,
+ * залить его в текстуру части. */
+static bool parts_movie_update(struct parts_movie *movie)
+{
+	if (!movie->apeg || !apeg_movie_update(movie->apeg))
+		return false;
+	gfx_update_texture_with_pixels(&movie->common.texture,
+				       (void *)apeg_movie_pixels(movie->apeg));
+	return true;
+}
+
 static void parts_update_loop(struct parts *parts, int passed_time)
 {
 	bool dirty = false;
@@ -1611,6 +1631,9 @@ static void parts_update_loop(struct parts *parts, int passed_time)
 		break;
 	case PARTS_FLAT:
 		dirty = parts_flat_update(&parts->states[parts->state].flat, passed_time);
+		break;
+	case PARTS_MOVIE:
+		dirty = parts_movie_update(&parts->states[parts->state].movie);
 		break;
 	default:
 		break;
@@ -5559,6 +5582,12 @@ bool PE_init_parts_movie(int parts_no, int width, int height, int bg_r, int bg_g
 
 	struct parts *parts = parts_get(parts_no);
 	struct parts_movie *movie = parts_get_movie(parts, state);
+	// Обратный случай к PE_create_parts_movie: на части мог висеть ролик APEG.
+	if (movie->apeg) {
+		apeg_movie_close(movie->apeg);
+		movie->apeg = NULL;
+		gfx_delete_texture(&movie->common.texture);
+	}
 
 	int sp_no = sact_SP_GetUnuseNum(0);
 	struct sact_sprite *sp = sact_create_sprite(sp_no, width, height, bg_r, bg_g, bg_b, 255);
@@ -5574,6 +5603,104 @@ bool PE_init_parts_movie(int parts_no, int width, int height, int bg_r, int bg_g
 	parts_set_dims(parts, &movie->common, width, height);
 	parts_dirty(parts);
 	return true;
+}
+
+/*
+ * Новое API movie-частей (Ixseal): ролик APEG принадлежит самой части.
+ * `CreatePartsMovie(Number, FileName, SoundID, SoundGroup, Red, Green, Blue, State)` —
+ * ★цвет фона приходит НЕ в RGB, а в YCbCr: игра переводит его сама
+ * (`movie::detail::CDrawMovie@SetBackColor`), а движок хранит кадр в YCbCr.
+ */
+bool PE_create_parts_movie(int parts_no, struct string *filename, int sound_id, int sound_group,
+			   int back_y, int back_cb, int back_cr, int state)
+{
+	(void)sound_id;   // номер звука движку не нужен: звук лежит внутри ролика
+	if (!parts_state_valid(--state) || !filename)
+		return false;
+
+	struct parts *parts = parts_get(parts_no);
+	struct parts_movie *movie = parts_get_movie(parts, state);
+	if (movie->apeg) {
+		apeg_movie_close(movie->apeg);
+		movie->apeg = NULL;
+		gfx_delete_texture(&movie->common.texture);
+	}
+	// ★Часть могла до этого обслуживать СТАРОЕ API (InitPartsMovie): текстура там
+	// принадлежит спрайту SACT. Не отпустив спрайт, мы утекли бы им, а потом снесли
+	// бы чужую текстуру как свою.
+	if (movie->sprite_no >= 0) {
+		sact_SP_Delete(movie->sprite_no);
+		movie->sprite_no = -1;
+		movie->common.texture.handle = 0;
+	}
+
+	struct apeg_movie *m = apeg_movie_open(filename->text, sound_group, back_y, back_cb, back_cr);
+	if (!m)
+		return false;
+	movie->apeg = m;
+	int w = apeg_movie_width(m), h = apeg_movie_height(m);
+	gfx_init_texture_with_pixels(&movie->common.texture, w, h,
+				     (void *)apeg_movie_pixels(m));
+	// Размер части игра читает сразу после создания (IParts@Size::get), поэтому
+	// он должен встать здесь, из заголовка ролика.
+	parts_set_dims(parts, &movie->common, w, h);
+	parts_dirty(parts);
+	return true;
+}
+
+static struct parts_movie *parts_try_get_movie(int parts_no, int state)
+{
+	if (!parts_state_valid(--state))
+		return NULL;
+	struct parts *parts = parts_try_get(parts_no);
+	if (!parts || parts->states[state].type != PARTS_MOVIE)
+		return NULL;
+	return parts->states[state].movie.apeg ? &parts->states[state].movie : NULL;
+}
+
+bool PE_release_parts_movie(int parts_no, int state)
+{
+	struct parts_movie *movie = parts_try_get_movie(parts_no, state);
+	if (!movie)
+		return false;
+	apeg_movie_close(movie->apeg);
+	movie->apeg = NULL;
+	gfx_delete_texture(&movie->common.texture);
+	return true;
+}
+
+bool PE_play_parts_movie(int parts_no, int msec, int state)
+{
+	struct parts_movie *movie = parts_try_get_movie(parts_no, state);
+	if (!movie)
+		return false;
+	return apeg_movie_play(movie->apeg, msec);
+}
+
+void PE_set_movie_time(int parts_no, int msec, int state)
+{
+	struct parts_movie *movie = parts_try_get_movie(parts_no, state);
+	if (movie)
+		apeg_movie_set_time(movie->apeg, msec);
+}
+
+bool PE_is_end_parts_movie(int parts_no, int state)
+{
+	struct parts_movie *movie = parts_try_get_movie(parts_no, state);
+	// Ролика нет — считаем, что он уже кончился: иначе игра повиснет в ожидании.
+	return movie ? apeg_movie_is_end(movie->apeg) : true;
+}
+
+int PE_get_parts_movie_end_time(int parts_no, int state)
+{
+	struct parts_movie *movie = parts_try_get_movie(parts_no, state);
+	return movie ? apeg_movie_end_time(movie->apeg) : 0;
+}
+
+int PE_get_parts_movie_current_time(int parts_no, int state)
+{
+	struct parts_movie *movie = parts_try_get_movie(parts_no, state);
+	return movie ? apeg_movie_current_time(movie->apeg) : 0;
 }
 
 int PE_get_movie_sprite(int parts_no, int state)

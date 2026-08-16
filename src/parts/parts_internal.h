@@ -606,6 +606,10 @@ struct parts_flat {
 struct parts_movie {
 	struct parts_common common;
 	int sprite_no;  // SACT sprite number used as movie render target
+	// Новое API (CreatePartsMovie/PlayPartsMovie): ролик APEG принадлежит самой
+	// части, кадр кладётся в её текстуру. У старого API (InitPartsMovie) поле
+	// пустое, а целью служит спрайт SACT выше.
+	struct apeg_movie *apeg;
 };
 
 enum parts_layout_type {

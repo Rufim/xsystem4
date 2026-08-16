@@ -4760,53 +4760,51 @@ static void PE_SetButtonFlatName(int parts_no, struct string *name) {
 		PE_SetPartsFlat(parts_no, name, st);
 }
 
-// Newer movie-parts API (CreatePartsMovie/PlayPartsMovie/IsEndPartsMovie/
-// ReleasePartsMovie). Video playback for these is not implemented yet, so we
-// treat the movie as instantly finished — this SKIPS the OP movie so the game
-// proceeds to the title menu instead of waiting forever on a black screen.
-static bool PE_CreatePartsMovie(int parts_no, struct string *filename, int a, int b, int c, int d, int e, int f) {
-	(void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
-	/*
-	 * ★ГОВОРИМ ВСЛУХ, КАКОЙ РОЛИК ПРОПУЩЕН (§5ex). Заглушка молчала, и «в
-	 * оригинале тут ролик, а у нас нет» приходилось искать сверкой с оригиналом.
-	 * Печатаем ПО РАЗУ НА ИМЯ: это и список того, что предстоит поддержать, и
-	 * ответ на вопрос «каким файлом играется вот эта сцена» без отдельного
-	 * прогона с полной трассой частей.
-	 */
-	{
-		static struct string *seen[16];
-		static int nr_seen;
-		const char *name = filename ? filename->text : "(null)";
-		bool known = false;
-		for (int i = 0; i < nr_seen; i++)
-			if (!strcmp(seen[i]->text, name))
-				known = true;
-		if (!known) {
-			if (nr_seen < 16 && filename)
-				seen[nr_seen++] = string_ref(filename);
-			WARNING("movie-parts: игра просит ролик '%s' (часть %d) — "
-				"воспроизведение не реализовано, ролик пропущен",
-				display_sjis0(name), parts_no);
-		}
-	}
+/*
+ * Новое API movie-частей (Ixseal): ролики формата APEG, декодер — src/apeg.c,
+ * проигрыватель — src/movie_apeg.c, кадр ложится в текстуру ЧАСТИ (§5ex).
+ * Раньше здесь стояли заглушки, докладывавшие «ролик уже кончился», чтобы игра
+ * не висела на чёрном экране.
+ *
+ * Сигнатуры — из .ain:
+ *   bool CreatePartsMovie(int Number, string FileName, int SoundID, int SoundGroup,
+ *                         int Red, int Green, int Blue, int State)
+ *   bool PlayPartsMovie(int Number, int MSec, int State)
+ * ★«Red/Green/Blue» на деле Y/Cb/Cr — игра переводит цвет фона сама.
+ */
+static bool PE_CreatePartsMovie(int parts_no, struct string *filename, int sound_id,
+				int sound_group, int back_y, int back_cb, int back_cr, int state)
+{
 	if (getenv("XSYS4_PARTS_TRACE"))
-		NOTICE("PARTS CreatePartsMovie(%d, '%s') [skip]", parts_no,
-		       filename ? filename->text : "(null)");
+		NOTICE("PARTS CreatePartsMovie(%d, '%s', звук %d/%d, состояние %d)", parts_no,
+		       filename ? filename->text : "(null)", sound_id, sound_group, state);
+	if (!PE_create_parts_movie(parts_no, filename, sound_id, sound_group,
+				   back_y, back_cb, back_cr, state)) {
+		WARNING("movie-parts: ролик '%s' (часть %d) не открылся",
+			display_sjis0(filename ? filename->text : "(null)"), parts_no);
+		return false;
+	}
 	return true;
 }
-static bool PE_PlayPartsMovie(int parts_no, int state) {
-	(void)state;
+static bool PE_PlayPartsMovie(int parts_no, int msec, int state) {
 	if (getenv("XSYS4_PARTS_TRACE"))
-		NOTICE("PARTS PlayPartsMovie(%d) [skip]", parts_no);
-	return true;
+		NOTICE("PARTS PlayPartsMovie(%d, %d мс, состояние %d)", parts_no, msec, state);
+	return PE_play_parts_movie(parts_no, msec, state);
 }
 static bool PE_IsEndPartsMovie(int parts_no, int state) {
-	(void)parts_no; (void)state;
-	return true;  // report finished immediately so the OP is skipped
+	return PE_is_end_parts_movie(parts_no, state);
 }
 static bool PE_ReleasePartsMovie(int parts_no, int state) {
-	(void)parts_no; (void)state;
-	return true;
+	return PE_release_parts_movie(parts_no, state);
+}
+static void PE_SetMovieTime(int parts_no, int msec, int state) {
+	PE_set_movie_time(parts_no, msec, state);
+}
+static int PE_GetPartsMovieEndTime(int parts_no, int state) {
+	return PE_get_parts_movie_end_time(parts_no, state);
+}
+static int PE_GetPartsMovieCurrentTime(int parts_no, int state) {
+	return PE_get_parts_movie_current_time(parts_no, state);
 }
 /*
  * Игра меняет подпись кнопки этой функцией — например в CONFIG кнопки «Reset»
@@ -5290,6 +5288,9 @@ HLL_LIBRARY(PartsEngine,
 	    HLL_EXPORT(PlayPartsMovie, PE_PlayPartsMovie),
 	    HLL_EXPORT(IsEndPartsMovie, PE_IsEndPartsMovie),
 	    HLL_EXPORT(ReleasePartsMovie, PE_ReleasePartsMovie),
+	    HLL_EXPORT(SetMovieTime, PE_SetMovieTime),
+	    HLL_EXPORT(GetPartsMovieEndTime, PE_GetPartsMovieEndTime),
+	    HLL_EXPORT(GetPartsMovieCurrentTime, PE_GetPartsMovieCurrentTime),
 	    HLL_EXPORT(GetPartsCGName, PE_GetPartsCGName),
 	    HLL_EXPORT(SetPartsCGSurfaceArea, PE_SetPartsCGSurfaceArea),
 	    HLL_EXPORT(SetLoopCG, PE_SetLoopCG),
