@@ -937,6 +937,28 @@ static struct gsave_flat_array *gsave_load_array(struct gsave *save, struct page
 	 * `array<option<...>>`, у которого второй слот это тег наличия.
 	 */
 	int es = array_elem_slots(page);
+	/*
+	 * XSYS4_ARRAY_LOAD_TRACE=<подстрока типа> — форма контейнера, в который
+	 * ложатся значения из сейва. Отвечает на вопрос, который иначе не задать:
+	 * восстановлен ли интерфейсный массив ПАРАМИ или схлопнут в однослотовые
+	 * элементы (тогда Array.First отдаёт наружу один слот вместо пары, и стек
+	 * вызывающего разъезжается — см. §5fb-13).
+	 */
+	{
+		static const char *alt = (const char *)1;
+		if (alt == (const char *)1)
+			alt = getenv("XSYS4_ARRAY_LOAD_TRACE");
+		if (alt && *alt) {
+			const char *sn = (page->array.struct_type >= 0
+					  && page->array.struct_type < ain->nr_structures)
+				? ain->structures[page->array.struct_type].name : "";
+			if (strstr(sn, alt))
+				NOTICE("ARRLOAD '%s': a_type=%d слотов на элемент %d, "
+				       "слотов страницы %d, значений в файле %d (тип %d)",
+				       sn, page->a_type, es, page->nr_vars,
+				       flat_array->nr_values, flat_array->type);
+		}
+	}
 	if (array_iface_pair_type(page->a_type) && es == 2
 			&& flat_array->nr_values == page->nr_vars / 2) {
 		/*
