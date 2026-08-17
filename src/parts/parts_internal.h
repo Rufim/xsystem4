@@ -873,9 +873,12 @@ struct parts {
 	bool enable_input_process;
 	// PartsEngine.Parts_SetWheelable: принимает ли часть нотчи колеса. Геттера в
 	// библиотеке НЕТ (только сеттер fn203), поэтому смысл взят из имени и сайта
-	// `CParts@MouseWheelEvent::add` — подписка на колесо включает приём. Дефолт true =
-	// прежнее поведение движка (Tsumamigui 3 и Escalayer этой функции не объявляют
-	// вовсе — тул ainliball, — так что у них флаг всегда true и скролл BACK LOG цел).
+	// `CParts@MouseWheelEvent::add` — подписка на колесо включает приём.
+	// ★Дефолт зависит от игры (parts_set_wheelable_default): у тех, кто эту функцию
+	// ОБЪЯВЛЯЕТ (Dohna), заявка приходит на каждую подписку и снятие, поэтому дефолт
+	// «не принимает» — иначе колесо адресовалось бы первой попавшейся части. У тех,
+	// кто не объявляет (Tsumamigui 3, Escalayer — тул ainliball), заявок нет вовсе,
+	// и дефолт остаётся true, иначе колесо у них умерло бы целиком.
 	bool wheelable;
 	// クリップ領域: SetComponentClipArea/GetComponentClipAreaPos{X,Y,Width,Height} +
 	// SetComponentEnableClipArea/IsComponentEnableClipArea. Хранится и возвращается;

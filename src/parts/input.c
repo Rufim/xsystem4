@@ -192,8 +192,11 @@ void parts_input_reset_drag(struct parts *parts)
  */
 static bool parts_can_take_cursor(struct parts *parts)
 {
-	// ★`wheelable` СЮДА НЕ ГОДИТСЯ: его дефолт — true у КАЖДОЙ части (parts_init),
-	// то есть признаком способности к вводу он не является и обнулял весь гейт.
+	// ★`wheelable` СЮДА НЕ ГОДИТСЯ. Раньше довод был «дефолт true у КАЖДОЙ части»;
+	// с §5fc-2 дефолт зависит от игры и у Dohna равен false, но вывод тот же:
+	// флаг говорит лишь «часть подписана на КОЛЕСО», а курсор нужен и без него —
+	// у new-API-игр подписанная часть и так проходит гейт (детектор либо
+	// delegate_index >= 0), а у старых флаг поднят у всех и гейт бы обнулился.
 	// is_textbox здесь с тех пор, как загрузчик раскладок перестал раздавать
 	// кликабельность (clickable > 0 теперь ТОЛЬКО от クリック許可/SetClickable):
 	// поле ввода берёт фокус кликом (PE_textbox_click), и курсор ему нужен.
@@ -713,17 +716,59 @@ void PE_UpdateInputState(int passed_time)
 			// of hover; consumed harmlessly if no whole handler is registered.
 			parts_msg_push_global(PARTS_MSG_MOUSE_WHEEL, "ii", wheel_fwd, wheel_back);
 			bool delivered = false;
+			/*
+			 * ★Нотч получает ОДНА часть — верхняя под курсором, которой игра
+			 * заявила приём колеса (`Parts_SetWheelable`, см. дефолт флага в
+			 * parts_set_wheelable_default). Не `is_hovered`: hover эксклюзивен по
+			 * ВСЕМ частям, а колесо адресуется только подписанным, и лежащая
+			 * сверху неподписанная часть его перехватывать не должна.
+			 *
+			 * Замер, который этого потребовал: галерея CG. Обработчик листания
+			 * страниц (`ThumbnailPage@RegisterEvent(134,50)`: Forward>0 → страница
+			 * −1, Back>0 → +1) висит на подложке активности `Base` (90000058,
+			 * 1280×472, z=5), а hover забирала лежащая поверх сетка миниатюр
+			 * (90000060, z=7) — у неё обработчика колеса нет. `WHEEL deliver
+			 * part=90000060` было единственной строкой доставки, лямбда листания не
+			 * вызывалась ни разу, счётчик страниц стоял на 1/10.
+			 *
+			 * ★Почему НЕ «всем под курсором» (эту версию отбросило ревью байткода):
+			 * тогда нотч уходит сразу в несколько обработчиков, и ломаются два
+			 * штатных механизма игры. `ScrollBase@RegisterWheelEvent` вешает на свою
+			 * часть-цель ПУСТОЙ обработчик (FUNC 36647 — один `RETURN`): при
+			 * эксклюзивной доставке это щит, прикрывающий подложки под списком, при
+			 * рассылке всем — бессмыслица. `InputDisabler` (полноэкранные части с
+			 * z = INT_MAX) вешает обработчик, чтобы ГЛУШИТЬ ввод на переходах —
+			 * рассылка всем проваливает нотч сквозь блокер.
+			 */
 			PARTS_LIST_FOREACH_REVERSE(parts) {
-				if (parts->is_hovered && parts->wheelable) {
+				if (!parts->wheelable)
+					continue;
+				bool under_cursor = parts->enable_input_process
+					&& !parts_input_disabled_by_parent(parts)
+					&& parts_can_take_cursor(parts)
+					&& parts->global.show && parts->global.alpha > 0
+					&& !parts->construction_mask
+					&& !parts_hidden_by_layer(parts)
+					&& parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos);
+				if (under_cursor) {
 					parts_msg_push(parts, PARTS_MSG_MOUSE_WHEEL, "ii",
 							wheel_fwd, wheel_back);
 					delivered = true;
 					if (getenv("XSYS4_BL_TRACE"))
 						NOTICE("WHEEL deliver part=%d fwd=%d back=%d", parts->no, wheel_fwd, wheel_back);
+					// `カーソル透過` пропускает курсор сквозь себя — значит и нотч:
+					// останавливаемся на первой НЕПРОЗРАЧНОЙ для курсора части, ровно
+					// как hover (hover_consumed ставится тем же условием). Для игр
+					// без флага `Parts_SetWheelable` (Tsumamigui 3, Escalayer — там
+					// wheelable у всех частей true) это в точности прежний набор
+					// адресатов, то есть путь их бэклога не трогаем.
+					if (!parts->pass_cursor)
+						break;
 				}
 			}
 			if (getenv("XSYS4_BL_TRACE") && !delivered)
-				NOTICE("WHEEL fwd=%d back=%d but NO hovered part (pos=%d,%d began=%d)",
+				NOTICE("WHEEL fwd=%d back=%d но под курсором НЕТ части, "
+				       "подписанной на колесо (pos=%d,%d began=%d)",
 				       wheel_fwd, wheel_back, cur_pos.x, cur_pos.y, parts_began_click);
 			mouse_clear_parts_wheel();
 		}
@@ -1185,13 +1230,40 @@ int PE_GetClickPartsNumber(void)
 
 bool PE_IsCursorIn(int parts_no, int mouse_x, int mouse_y, int state)
 {
-	if (!parts_state_valid(--state))
+	// XSYS4_CURSORIN_TRACE — игра САМА спрашивает «курсор внутри части?» (у Dohna так
+	// устроен путь колеса: ScrollBase вешает whole-обработчик, а тот пропускает щелчок
+	// только если точка внутри части-цели). Ответ «нет» обрывает путь молча, поэтому
+	// печатаем и коробку, и то, из чего она посчитана.
+	bool trace = !!getenv("XSYS4_CURSORIN_TRACE");
+	int want_state = state;
+	if (!parts_state_valid(--state)) {
+		if (trace)
+			NOTICE("CURSORIN no=%d (%d,%d) state=%d НЕВЕРНОЕ состояние", parts_no,
+			       mouse_x, mouse_y, want_state);
 		return false;
+	}
 
 	struct parts *parts = parts_try_get(parts_no);
-	if (!parts)
+	if (!parts) {
+		if (trace)
+			NOTICE("CURSORIN no=%d (%d,%d) ЧАСТИ НЕТ", parts_no, mouse_x, mouse_y);
 		return false;
+	}
 
 	Point mouse_pos = { mouse_x, mouse_y };
-	return parts_hittest(parts, state, mouse_pos);
+	bool in = parts_hittest(parts, state, mouse_pos);
+	if (trace) {
+		struct parts_common *c = &parts->states[state].common;
+		NOTICE("CURSORIN no=%d (%d,%d) -> %s hitbox=%d,%d %dx%d wh=%dx%d "
+		       "gpos=%d,%d parent=%d ppos=%d,%d show=%d scale=%.2f,%.2f pixhit=%d",
+		       parts_no, mouse_x, mouse_y, in ? "ДА" : "нет",
+		       c->hitbox.x, c->hitbox.y, c->hitbox.w, c->hitbox.h, c->w, c->h,
+		       parts->global.pos.x, parts->global.pos.y,
+		       parts->parent ? parts->parent->no : -1,
+		       parts->parent ? parts->parent->global.pos.x : 0,
+		       parts->parent ? parts->parent->global.pos.y : 0,
+		       parts->global.show, parts->global.scale.x, parts->global.scale.y,
+		       parts->pixel_hittest);
+	}
+	return in;
 }

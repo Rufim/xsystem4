@@ -2893,6 +2893,8 @@ static void act_set_state_cg(int no, struct ex_tree *ti, const char *state_utf8,
 		if (w > 0 && h > 0) {
 			// Часть ещё не существует: у прямоугольного состояния нет
 			// картинки, а значит и сеттера, который создал бы её попутно.
+			// ★С §5fc часть создаёт и сам PE_SetPartsRectangleDetectionSize,
+			// так что вызов ниже уже подстраховка, а не единственный путь.
 			PE_EnsureParts(no);
 			PE_SetPartsRectangleDetectionSize(no, w, h, state);
 		}
@@ -6149,6 +6151,24 @@ static void PartsEngine_PreLink(void)
 		PE_set_message_empty_type_minus_one();
 		PE_set_message_types_ixseal();
 	}
+
+	/*
+	 * `Parts_SetWheelable` — это ЗАЯВКА ИГРЫ «у этой части есть обработчик колеса».
+	 * В байткоде Dohna она стоит ровно в четырёх местах, и все четыре одинаковы:
+	 * `SetWheelable(no, !Delegate.Empty(набор))` внутри `AddMouseWheelEvent`,
+	 * `EraseMouseWheelEvent`, `CParts@MouseWheelEvent::add` и `::remove` — флаг
+	 * взводится с подпиской и снимается со снятием ПОСЛЕДНЕГО обработчика.
+	 * Значит нотч адресуется по флагу, и дефолт «принимает» его обессмысливает.
+	 * Гейт — по объявлению функции в .ain: игры, которые её не объявляют
+	 * (Tsumamigui 3, Escalayer Reboot), заявок не шлют, и для них дефолт остаётся
+	 * прежним, иначе колесо у них умерло бы целиком.
+	 */
+	// Форма имени взята из замера, а не из догадки: библиотека объявляет и
+	// экспортирует ровно `Parts_SetWheelable` (см. HLL_EXPORT ниже). Игр с голым
+	// `SetWheelable` под рукой нет, и гадать нельзя: у такой игры сеттер остался бы
+	// НЕСЛИНКОВАННЫМ, а дефолт «не принимает» убил бы колесо целиком и молча.
+	if (get_fun(libno, "Parts_SetWheelable"))
+		parts_set_wheelable_default(false);
 
 	// Строковые геттеры: Ixseal отдаёт строку ВОЗВРАТОМ, v6/v7 — через
 	// out-параметр `ref string` (см. большой комментарий выше). Гейт — форма,

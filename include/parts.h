@@ -333,6 +333,10 @@ bool PE_IsEnableInputProcess(int parts_no);
 void PE_SetEnableInput(bool enable);
 bool PE_IsEnableInput(void);
 void PE_SetPartsWheelable(int parts_no, bool wheelable);
+// Дефолт флага `wheelable` у новых частей. Выставляется один раз при линковке
+// PartsEngine: игра, объявившая Parts_SetWheelable, сама заявляет каждую подписку на
+// колесо, поэтому у неё дефолт «не принимает» (см. поле wheelable в parts_internal.h).
+void parts_set_wheelable_default(bool value);
 void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate);
 void PE_SetHSliderBarScrollRate(int parts_no, float rate);
 int PE_GetPartsConstructionProcessCount(int parts_no, int state);

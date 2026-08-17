@@ -124,6 +124,16 @@ bool parts_exists(int parts_no);
 struct parts_controller_stack ctrl_stack;
 bool parts_multi_controller;
 
+// Дефолт `wheelable` у новых частей — см. parts_set_wheelable_default и поле
+// wheelable в parts_internal.h: игра, объявившая Parts_SetWheelable, заявляет приём
+// колеса сама, остальным флаг заявлять нечем.
+static bool wheelable_default = true;
+
+void parts_set_wheelable_default(bool value)
+{
+	wheelable_default = value;
+}
+
 static void ctrl_stack_init(void);
 
 #define PARTS_PARAMS_INITIALIZER (struct parts_params) { \
@@ -157,7 +167,7 @@ static void parts_init(struct parts *parts)
 	parts->want_save_back_scene = true;
 	parts->enable_input_process = true;
 	parts->checkbox_enabled = true;
-	parts->wheelable = true;
+	parts->wheelable = wheelable_default;
 	parts->on_cursor_sound = -1;
 	parts->on_click_sound = -1;
 	parts->origin_mode = 1;
@@ -1228,6 +1238,12 @@ static void parts_invalidate_ancestor_layout(struct parts *parts)
 
 void parts_set_dims(struct parts *parts, struct parts_common *common, int w, int h)
 {
+	// XSYS4_SIZE_TRACE=<номер>|all — кто и когда задал части размер. Нужна там, где
+	// область попадания пуста (hitbox 0×0) и надо отличить «размер не пришёл вовсе»
+	// от «пришёл, но в другое состояние/часть».
+	const char *st = getenv("XSYS4_SIZE_TRACE");
+	if (st && (!strcmp(st, "all") || atoi(st) == parts->no))
+		NOTICE("SIZE part=%d %dx%d -> %dx%d", parts->no, common->w, common->h, w, h);
 	bool resized = common->w != w || common->h != h;
 	common->w = w;
 	common->h = h;
@@ -4910,10 +4926,14 @@ int PE_GetPartsCheckBoxB(int parts_no)
  * Загрузчик раскладок нумерует части сам, а РЕАЛЬНО часть появляется как
  * побочный эффект первого сеттера, который пользуется `parts_get`
  * (PE_SetPartsCG/PE_SetPartsFlat/...). Состоянию «прямоугольная часть»
- * (`矩形パーツ`) грузить нечего — это чистая область попадания, — а
- * `PE_SetPartsRectangleDetectionSize` намеренно НЕ создаёт часть
- * (`parts_try_get`, HLL-семантика: на несуществующий номер вернуть false),
- * поэтому загрузчику нужен явный способ её создать.
+ * (`矩形パーツ`) грузить нечего — это чистая область попадания.
+ *
+ * ★Поправка (§5fc): «`PE_SetPartsRectangleDetectionSize` намеренно НЕ создаёт
+ * часть» здесь стояло как факт, а замером это никогда не подтверждалось —
+ * `parts_try_get` пришёл из апстрима без обоснования. Первый же замер оказался
+ * ОБРАТНЫМ: размер, пришедший до создания части, терялся, и колесо мыши не
+ * прокручивало списки Dohna. Теперь размер часть создаёт, а этот вызов остаётся
+ * как явное «часть нужна» для загрузчика раскладок.
  */
 // Пометить часть как маску построения (см. construction_mask в parts_internal.h):
 // содержимое `構築パーツ` не построено, поэтому заливка-заглушка годится только
@@ -4930,13 +4950,38 @@ void PE_EnsureParts(int parts_no)
 	parts_get(parts_no);
 }
 
+/*
+ * ★Размер прямоугольной области попадания СОЗДАЁТ часть, если её ещё нет.
+ *
+ * Раньше здесь стоял `parts_try_get` («на несуществующий номер вернуть false»), и
+ * замер показал, чем это кончается: у Dohna колесо мыши не прокручивало ни список
+ * достижений, ни магазин. Путь колеса у игры такой — `ScrollBase@RegisterWheelEvent`
+ * вешает whole-обработчик, тот зовёт `AFL_Parts_IsPointIn` на своей части-цели
+ * (`ScrollBase@CreateWheelTargetParts`) и лишь при попадании доходит до
+ * `ScrollBase@OnWheel`. Часть-цель создаётся так: `CRectParts@RectSize::set` →
+ * `Parts_SetPartsRectangleDetectionSize` — то есть размер приходит ПЕРВЫМ вызовом,
+ * когда парта ещё нет. Замер `XSYS4_SIZE_TRACE`: «SIZE part=1000001065 664x560
+ * ОТБРОШЕН: части ещё нет», а после — `CURSORIN no=1000001065 -> нет hitbox 0x0`:
+ * часть появлялась позже от других сеттеров, но уже пустой, и попадание было
+ * невозможно ни в одной точке.
+ *
+ * Создавать безопасно: `PARTS_RECT_DETECTION` не рисуется (render.c), это чистая
+ * область попадания, и симметричный `PE_SetPartsCGDetectionSize` давно живёт с
+ * `parts_get`.
+ */
 bool PE_SetPartsRectangleDetectionSize(int parts_no, int w, int h, int state)
 {
 	if (!parts_state_valid(--state))
 		return false;
-	struct parts *parts = parts_try_get(parts_no);
-	if (!parts)
+	// ★Отрицательный номер СОЗДАВАТЬ НЕЛЬЗЯ. Игра зовёт сеттеры результатом
+	// `GetPartsNumber(...)`, а он бывает −1; «часть −1» — известная мина: обход детей
+	// принимал её за контейнер и уходил в бесконечную рекурсию (см. pending_ctype_set).
+	// С прежним `parts_try_get` от этого спасал сам поиск по таблице.
+	if (parts_no < 0)
 		return false;
+	// Своей строки трассы здесь не печатаем: размер всё равно ляжет через
+	// parts_set_dims, и она бы двоила одно и то же событие в логе.
+	struct parts *parts = parts_get(parts_no);
 	if (parts->states[state].type != PARTS_RECT_DETECTION)
 		parts_state_reset(&parts->states[state], PARTS_RECT_DETECTION);
 	parts_set_dims(parts, &parts->states[state].common, w, h);
