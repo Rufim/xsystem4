@@ -134,6 +134,13 @@ void parts_set_wheelable_default(bool value)
 	wheelable_default = value;
 }
 
+// Заявляет ли ИГРА приём колеса сама (то есть объявлена ли Parts_SetWheelable).
+// Нужно доставке нотча: у таких игр адресат строго один, см. parts/input.c.
+bool parts_wheelable_declared(void)
+{
+	return !wheelable_default;
+}
+
 static void ctrl_stack_init(void);
 
 #define PARTS_PARAMS_INITIALIZER (struct parts_params) { \

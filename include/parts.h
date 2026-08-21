@@ -337,6 +337,8 @@ void PE_SetPartsWheelable(int parts_no, bool wheelable);
 // PartsEngine: игра, объявившая Parts_SetWheelable, сама заявляет каждую подписку на
 // колесо, поэтому у неё дефолт «не принимает» (см. поле wheelable в parts_internal.h).
 void parts_set_wheelable_default(bool value);
+// Заявляет ли игра приём колеса сама (объявлена ли Parts_SetWheelable).
+bool parts_wheelable_declared(void);
 void PE_SetPartsHScrollbarScrollRate(int parts_no, float rate);
 void PE_SetHSliderBarScrollRate(int parts_no, float rate);
 int PE_GetPartsConstructionProcessCount(int parts_no, int state);

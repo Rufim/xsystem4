@@ -740,6 +740,8 @@ void PE_UpdateInputState(int passed_time)
 			 * z = INT_MAX) вешает обработчик, чтобы ГЛУШИТЬ ввод на переходах —
 			 * рассылка всем проваливает нотч сквозь блокер.
 			 */
+			bool trace = !!getenv("XSYS4_BL_TRACE");
+			bool stopped = false;
 			PARTS_LIST_FOREACH_REVERSE(parts) {
 				if (!parts->wheelable)
 					continue;
@@ -750,19 +752,47 @@ void PE_UpdateInputState(int passed_time)
 					&& !parts->construction_mask
 					&& !parts_hidden_by_layer(parts)
 					&& parts_hittest(parts, PARTS_STATE_DEFAULT, cur_pos);
-				if (under_cursor) {
+				if (!under_cursor)
+					continue;
+				/*
+				 * ★У игры, которая ЗАЯВЛЯЕТ приём колеса, адресат РОВНО ОДИН —
+				 * `カーソル透過` тут не при чём. Часть-цель колеса ScrollBase
+				 * объявлена прозрачной для курсора (замер `XSYS4_HLL_IN_FUNC`:
+				 * `Parts_SetPassCursor <- CParts@Transparent::set` из
+				 * `CreateWheelTargetParts`), поэтому «идти сквозь прозрачные»
+				 * означало проваливаться ПОД список. На экране таланта
+				 * (Talent → персонаж → Items) под списком предметов лежит часть
+				 * `WheelTarget` сцены `SceneStatus`, и один щелчок листал СРАЗУ
+				 * И предметы, И персонажей справа; в оригинале листается то, над
+				 * чем курсор. Пустой обработчик на части-цели ScrollBase (FUNC
+				 * 36647) для этого и нужен — он ЩИТ, а щит обязан поглощать.
+				 *
+				 * У игр без заявок (Tsumamigui 3, Escalayer: `Parts_SetWheelable`
+				 * не объявлена, флаг поднят у всех частей) щита нет и такой
+				 * эксклюзив отрезал бы адресатов, которых прежняя hover-модель
+				 * находила: там останавливаемся на первой НЕПРОЗРАЧНОЙ части —
+				 * то есть в точности на прежнем наборе (`hover_consumed`
+				 * ставится тем же условием).
+				 */
+				bool stop = parts_wheelable_declared() || !parts->pass_cursor;
+				// ★Трасса НЕ должна менять доставку (иначе диагностика лечит баг
+				// сама собой, см. METHOD-LOG §5fb-14): нотч посылаем ровно тем же
+				// частям, что и без неё, а обход под трассой лишь доходит до конца,
+				// чтобы напечатать пропущенных кандидатов.
+				if (!stopped) {
 					parts_msg_push(parts, PARTS_MSG_MOUSE_WHEEL, "ii",
 							wheel_fwd, wheel_back);
 					delivered = true;
-					if (getenv("XSYS4_BL_TRACE"))
-						NOTICE("WHEEL deliver part=%d fwd=%d back=%d", parts->no, wheel_fwd, wheel_back);
-					// `カーソル透過` пропускает курсор сквозь себя — значит и нотч:
-					// останавливаемся на первой НЕПРОЗРАЧНОЙ для курсора части, ровно
-					// как hover (hover_consumed ставится тем же условием). Для игр
-					// без флага `Parts_SetWheelable` (Tsumamigui 3, Escalayer — там
-					// wheelable у всех частей true) это в точности прежний набор
-					// адресатов, то есть путь их бэклога не трогаем.
-					if (!parts->pass_cursor)
+				}
+				if (trace)
+					NOTICE("WHEEL %s part=%d z=%d pass=%d act=%s fwd=%d back=%d",
+					       stopped ? "кандидат (нотч НЕ послан)" : "АДРЕСАТ",
+					       parts->no, parts->global.z, (int)parts->pass_cursor,
+					       pe_parts_activity_name(parts->no) ?: "-",
+					       wheel_fwd, wheel_back);
+				if (stop) {
+					stopped = true;
+					if (!trace)
 						break;
 				}
 			}
